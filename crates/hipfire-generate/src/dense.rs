@@ -36,8 +36,8 @@ use hipfire_runtime::emit_text::{
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator,
-    StopReason,
+    accept_greedy_prefix, ClientEvent, EvictRetain, FinishSummary, SpecRequestConfig, SpecTarget,
+    Speculator, StopReason,
 };
 
 pub fn glimmer_turn_key(fp: u64, ordinal: usize) -> u64 {
@@ -446,11 +446,19 @@ pub fn generate_deepseek4_spec(
         };
 
     // Configure the speculator's sampling before the loop — mirrors generate_dflash's
-    // set_sampling before generate_spec. Greedy (temp<=1e-6) leaves it at argmax-accept
+    // configure_request before generate_spec. Greedy (temp<=1e-6) leaves it at argmax-accept
     // (byte-identical to the prior hardcoded-greedy path); temp>0 drives the DSpark
     // sampled verify, and cactus_delta>0 applies the opt-in acceptance boost.
     if let Some(spec) = m.speculator.as_mut() {
-        spec.set_sampling(temp, top_p, top_k, cactus_delta);
+        spec.configure_request(SpecRequestConfig {
+            temp,
+            top_p,
+            top_k,
+            min_p: 0.0,
+            cactus_delta,
+            rng_seed: SpecRequestConfig::default().rng_seed,
+            allow_ngram_modifier: false,
+        });
     }
 
     // Open the wire contract before any token can reach the client. The CLI's

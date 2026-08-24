@@ -154,6 +154,10 @@ required-features = []
 name = "eval_hipfire"
 required-features = ["deltanet"]
 
+[[example]]
+name = "collect_artifacts"
+required-features = ["lab"]
+
 # eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
 # Stdlib only; no GPU / arch features.
 [[example]]
@@ -167,26 +171,22 @@ required-features = []
 name = "c8_sampler_validate"
 required-features = []
 
-# ─── Tier 1 calibration binaries (foundation scaffolds, 2026-05-19) ────
-#
-# `collect_imatrix` and `collect_hessian` are the hipfire-native
-# replacements for the Tier 2 wrappers above. Both currently ship as
-# `unimplemented!()` scaffolds — argument parsing + module docs only —
-# so that the workspace compiles cleanly while follow-on subagent
-# tasks build the forward pass, on-GPU activation/Hessian reductions,
-# and the GGUF/HFHS-v1 writers on top.
-#
-# Stdlib only at this stage; no GPU / arch features required for the
-# scaffold itself. When the forward pass lands these bins will pick up
-# `required-features = ["deltanet"]` if they need GPU-gated kernels.
-[[bin]]
-name = "collect_imatrix"
-path = "src/bin/collect_imatrix.rs"
-required-features = []
+[[example]]
+name = "calib_sweep"
+required-features = ["lab"]
 
+
+
+# ─── Tier 1 calibration binaries ────────────────────────────────────────
+# The native single-load calibration collector is the `collect_artifacts`
+# example (Hessian + imatrix → one HFQM `.calib.hfq`), fronted by
+# `hipfire collect-artifacts` and the daemon `Collect` op. The old
+# `collect_hessian` / `collect_imatrix` scaffolds were removed once the
+# collector + HFQM container superseded them. `hfq` is the HFQ container
+# manipulation tool (list/extract/meta-set/meta-get/rearch).
 [[bin]]
-name = "collect_hessian"
-path = "src/bin/collect_hessian.rs"
+name = "hfq"
+path = "src/bin/hfq.rs"
 required-features = []
 
 [[test]]
@@ -327,6 +327,10 @@ name = "diag_mq4_lloyd_multiacc"
 required-features = ["lab"]
 
 [[example]]
+name = "dispatch_floor_probe"
+required-features = ["lab"]
+
+[[example]]
 name = "ds4_gfx1201_owner_worker_transport"
 required-features = ["lab"]
 
@@ -375,6 +379,10 @@ name = "gemma4_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "gl_e4m3_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "hfq_load_pipeline_bench"
 required-features = ["lab"]
 
@@ -412,6 +420,14 @@ required-features = ["lab"]
 
 [[example]]
 name = "measure_launch"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4v2_gemm_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4v2_parity"
 required-features = ["lab"]
 
 [[example]]

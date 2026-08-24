@@ -23,6 +23,7 @@ members = [
     "crates/hipfire-arch-cohere2moe",
     "crates/hipfire-arch-dots-ocr",
     "crates/hipfire-quantize",
+    "crates/saddle-quant",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/redline",

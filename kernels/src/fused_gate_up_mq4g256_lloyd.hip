@@ -1,7 +1,7 @@
 // Fused Gate+Up MQ4-Lloyd: two GEMVs in one launch (gate proj + up proj for
 // the FFN). Mirrors fused_gate_up_mq3g256_lloyd.hip — gid-demuxes A/y by
-// gate vs up, then runs the standard slow MQ4-Lloyd inner body. Block stride
-// 160 B / group, 16-entry fp16 codebook, 4-bit nibble unpack.
+// gate vs up, then runs the standard MQ4-Lloyd inner body with LDS codebook.
+// Block stride 160 B / group, 16-entry fp16 codebook, 4-bit nibble unpack.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -19,6 +19,8 @@ extern "C" __global__ void fused_gate_up_mq4g256_lloyd(
     const int tid = threadIdx.x;
 
     // Pick which projection this block computes (gate or up).
+    // All lanes in the block share the same gid, so this demux is uniform —
+    // no divergence, and any __syncthreads inside the K loop is safe.
     const char* A;
     float* y;
     int local_row;
@@ -32,28 +34,17 @@ extern "C" __global__ void fused_gate_up_mq4g256_lloyd(
     const char* row_ptr = A + (long long)local_row * groups_per_row * 160;
     const int boff = tid * 4;
 
+    __shared__ float cbt[16];
+
     float acc = 0.0f;
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gptr = row_ptr + g * 160;
 
-        const __half* cb_h = reinterpret_cast<const __half*>(gptr);
-        float cb0  = __half2float(cb_h[0]);
-        float cb1  = __half2float(cb_h[1]);
-        float cb2  = __half2float(cb_h[2]);
-        float cb3  = __half2float(cb_h[3]);
-        float cb4  = __half2float(cb_h[4]);
-        float cb5  = __half2float(cb_h[5]);
-        float cb6  = __half2float(cb_h[6]);
-        float cb7  = __half2float(cb_h[7]);
-        float cb8  = __half2float(cb_h[8]);
-        float cb9  = __half2float(cb_h[9]);
-        float cb10 = __half2float(cb_h[10]);
-        float cb11 = __half2float(cb_h[11]);
-        float cb12 = __half2float(cb_h[12]);
-        float cb13 = __half2float(cb_h[13]);
-        float cb14 = __half2float(cb_h[14]);
-        float cb15 = __half2float(cb_h[15]);
+        if (tid < 16) {
+            cbt[tid] = __half2float(((const __half*)gptr)[tid]);
+        }
+        __syncthreads();
 
         const unsigned char* data = (const unsigned char*)(gptr + 32);
 
@@ -73,23 +64,14 @@ extern "C" __global__ void fused_gate_up_mq4g256_lloyd(
 
         int base_idx = g * 256 + tid * 8;
 
-        #define CB_LOOKUP4(q) (                                                          \
-            (q) ==  0 ? cb0  : (q) ==  1 ? cb1  : (q) ==  2 ? cb2  : (q) ==  3 ? cb3  :  \
-            (q) ==  4 ? cb4  : (q) ==  5 ? cb5  : (q) ==  6 ? cb6  : (q) ==  7 ? cb7  :  \
-            (q) ==  8 ? cb8  : (q) ==  9 ? cb9  : (q) == 10 ? cb10 : (q) == 11 ? cb11 :  \
-            (q) == 12 ? cb12 : (q) == 13 ? cb13 : (q) == 14 ? cb14 : cb15                \
-        )
-
-        acc += CB_LOOKUP4(q0) * x[base_idx]
-             + CB_LOOKUP4(q1) * x[base_idx + 1]
-             + CB_LOOKUP4(q2) * x[base_idx + 2]
-             + CB_LOOKUP4(q3) * x[base_idx + 3]
-             + CB_LOOKUP4(q4) * x[base_idx + 4]
-             + CB_LOOKUP4(q5) * x[base_idx + 5]
-             + CB_LOOKUP4(q6) * x[base_idx + 6]
-             + CB_LOOKUP4(q7) * x[base_idx + 7];
-
-        #undef CB_LOOKUP4
+        acc += cbt[q0] * x[base_idx]
+             + cbt[q1] * x[base_idx + 1]
+             + cbt[q2] * x[base_idx + 2]
+             + cbt[q3] * x[base_idx + 3]
+             + cbt[q4] * x[base_idx + 4]
+             + cbt[q5] * x[base_idx + 5]
+             + cbt[q6] * x[base_idx + 6]
+             + cbt[q7] * x[base_idx + 7];
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

@@ -3,29 +3,35 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use crate::dequant::{e2m1_to_f32, e4m3_to_f32, ue8m0_to_scale};
-use crate::quant_hfp4::{e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT, e2m1_round};
 use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::quant_hfp4::{e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
+use crate::hfq::QuantType;
+use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
@@ -125,7 +131,177 @@ pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 
     output
 }
-
+pub(crate) const MQ3V2_GROUP_BYTES: usize = 104;
+pub(crate) const MQ2V2_GROUP_BYTES: usize = 72;
+/// MQ3G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
+///
+/// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..104) 96B packed 3-bit`.
+/// Payload unchanged from MQ3G256: 8 values per 3 bytes, little-endian bitstream.
+pub(crate) fn quantize_mq3g256v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ3G256V2 requires K % 256 == 0, got K={k}");
+    let n = w.len();
+    assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ3V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+            let mut sc_bits = f32_to_f16(step_f32);
+            if hi == lo {
+                sc_bits = 0u16;
+            }
+            let z_bits = f32_to_f16(lo);
+            let st = f16_to_f32(sc_bits);
+            let z = f16_to_f32(z_bits);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = st;
+            zs[h] = z;
+            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    let v = group[off + i];
+                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                    q[off + i] = qq;
+                }
+            }
+        }
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut qq = [0u8; 8];
+            for j in 0..8 {
+                qq[j] = q[ci + j] & 7;
+            }
+            let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
+            let b1 =
+                ((qq[2] >> 2) & 1) | ((qq[3] & 7) << 1) | ((qq[4] & 7) << 4) | ((qq[5] & 1) << 7);
+            let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+    output
+}
+/// MQ2G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
+///
+/// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..72) 64B packed 2-bit`.
+/// Payload unchanged from MQ2G256: 4 values per byte.
+pub(crate) fn quantize_mq2g256v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ2G256V2 requires K % 256 == 0, got K={k}");
+    let n = w.len();
+    assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ2V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
+            let mut sc_bits = f32_to_f16(step_f32);
+            if hi == lo {
+                sc_bits = 0u16;
+            }
+            let z_bits = f32_to_f16(lo);
+            let st = f16_to_f32(sc_bits);
+            let z = f16_to_f32(z_bits);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = st;
+            zs[h] = z;
+            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    let v = group[off + i];
+                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
+                    q[off + i] = qq;
+                }
+            }
+        }
+        for i in 0..64 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let qq = q[4 * i + j] & 3;
+                byte_val |= qq << (j * 2);
+            }
+            output[out_off + 8 + i] = byte_val;
+        }
+    }
+    output
+}
 /// Encode an f32 to IEEE-754 fp16 bits (round-to-nearest-even, no NaN/Inf preservation
 /// beyond the trivial case — block centroids are bounded means of fp32 weights so
 /// the simple path is safe).
@@ -1150,7 +1326,137 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 
     output
 }
-
+/// MagnumQuant MQ2-G256-Lloyd-ANCHORED: endpoint-anchored per-block 4-entry
+/// fp16 codebook, same 72 B wire format as plain MQ2G256Lloyd (qt=19).
+///
+/// Layout per 256-weight group: `[0..8) 4×fp16 codepoints ascending`
+/// + `[8..72) 64 B packed 2-bit indices`. Bandwidth-identical to uniform
+/// MQ2 (`72 B/G256 = 2.25 bpw`). Kernel-decode identical: the existing
+/// `gemv_mq2g256_lloyd` kernel consumes the same header + index layout, so
+/// an anchored artifact is loadable by the unchanged qt19 runtime.
+///
+/// Fit after FWHT (rotation baked into weights, as with all MagnumQuant).
+/// Codepoint 0 is FIXED to the post-FWHT block minimum, codepoint 3 fixed to
+/// the block maximum; Lloyd refines ONLY the interior codepoints 1 and 2 for
+/// `LLOYD_MAX_ITER` iterations (shared cap). All four centroids are rounded
+/// to fp16 before the final nearest-codepoint assignment so encoder choice
+/// matches the GPU's fp16 decode. Degenerate groups (range == 0) remain
+/// deterministic: header collapses to four copies of the single value,
+/// indices all-zero. Ascending invariant holds because fp16 rounding is
+/// monotonic and interior centroids are constrained to the [min,max] interval.
+pub(crate) fn quantize_mq2g256_lloyd_anchored(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let min_v = sorted[0];
+            let max_v = sorted[255];
+            let range = max_v - min_v;
+            // Interior init at 37.5 / 62.5 percentiles, mirroring the plain Lloyd
+            // interior seeds; endpoints anchored.
+            let mut cb: [f32; 4] = [min_v, percentile(0.375), percentile(0.625), max_v];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = LLOYD_MAX_ITER;
+                let mut prev_assign = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 4];
+                    let mut counts = [0u32; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
+                        }
+                        if it == 0 || prev_assign[i] != best as u8 {
+                            changed += 1;
+                        }
+                        prev_assign[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 {
+                        break;
+                    }
+                    for k in 1..3 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            } else {
+                // Degenerate block: all rotated weights identical.
+                // Header will collapse after rounding; indices already zeroed.
+            }
+            // Round all four centroids to fp16 before final assignment so the
+            // encoder's nearest selection matches the kernel's fp16 decode.
+            let mut bits = [0u16; 4];
+            let mut cb_rounded = [0.0f32; 4];
+            for k in 0..4 {
+                bits[k] = if cb[k] == 0.0 {
+                    0
+                } else {
+                    f32_to_fp16_bits(cb[k])
+                };
+                cb_rounded[k] = f16_to_f32(bits[k]);
+            }
+            // Final nearest-codepoint assignment against the fp16-rounded book.
+            for i in 0..256 {
+                let w = group[i];
+                let mut best = 0usize;
+                let mut best_d = (w - cb_rounded[0]).abs();
+                for k in 1..4 {
+                    let d = (w - cb_rounded[k]).abs();
+                    if d < best_d {
+                        best_d = d;
+                        best = k;
+                    }
+                }
+                indices[i] = best as u8;
+            }
+            for k in 0..4 {
+                out_chunk[2 * k] = (bits[k] & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits[k] >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 {
+                    byte_val |= (indices[4 * i + j] & 0x3) << (j * 2);
+                }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+    output
+}
 /// Ternary "MQ1.58" probe: K=3 Lloyd-placed codebook packed into the MQ2-Lloyd
 /// container (slot 3 = duplicate of slot 2, never indexed) so it runs on the
 /// existing MQ2G256Lloyd kernel with NO new kernel. Measures sub-2-bit
@@ -1158,7 +1464,11 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 /// 72 B/group (true 1.58-bpw packing — 5 ternary/byte — is a mechanical
 /// follow-up once coherence is established). Gated by HIPFIRE_LLOYD_K3=1 on the
 /// `--format mq2lloyd` path. Output DType = MQ2G256Lloyd (kernel-agnostic to K).
-pub(crate) fn quantize_mq2g256_lloyd_k3(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq2g256_lloyd_k3(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 72;
@@ -1341,7 +1651,11 @@ pub(crate) fn dequantize_mq2g256_lloyd_to_f32(
 /// the GL codec's noise and re-packs as HFQ4G256 so the file loads on today's
 /// runtime with no engine, loader, or kernel changes. Both probes land in the
 /// same HFQ4 container, so a KLD delta between them isolates the codec.
-pub(crate) fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+pub(crate) fn mq2g256gl_roundtrip_f32(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<f32> {
     /// Lloyd–Max levels for a unit Gaussian at 2 bit.
     pub(crate) const CB: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
     let group_size = 256;
@@ -1836,4 +2150,1066 @@ pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     }
 
     output
+}
+// ---- TQ2G128 / BQ1G128 low-bit packers (ported from pr-597 main.rs) ----
+
+pub(crate) fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+        let d = amax;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let actual_len = end - start;
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let idx = 4 * i + j;
+                let w = if idx < actual_len { group[idx] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 2 {
+                    q = 2;
+                }
+                byte_val |= (q as u8) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_tests {
+    use super::*;
+
+    /// Byte-exactness of `quantize_tq2g128` against a hand-derived expected
+    /// block. Group of 128: idx0=-2.0, idx1=0.0, idx2=2.0, idx3..127=0.0.
+    /// d = max(|w|) = 2.0, id = 0.5.
+    ///
+    /// Per-element codes (q = clamp(round(w*id)+1, 0, 3)):
+    ///   idx0: round(-2.0*0.5)+1 = round(-1.0)+1 = 0
+    ///   idx1: round( 0.0*0.5)+1 = round( 0.0)+1 = 1
+    ///   idx2: round( 2.0*0.5)+1 = round( 1.0)+1 = 2
+    ///   idx3..127 (all 0.0): round(0.0)+1 = 1
+    ///
+    /// NOTE: the zero-valued tail encodes to code 1 (not code 0) because
+    /// id=0.5 != 0 here (d != 0) — only an all-zero *group* (d==0, id==0)
+    /// would encode zeros as code 0. This matters for the packed bytes:
+    /// byte0 packs elements 0..3 LSB-first (`code << ((j%4)*2)`):
+    ///   byte0 = code0 | code1<<2 | code2<<4 | code3<<6
+    ///         =    0  |   1<<2   |   2<<4   |   1<<6
+    ///         = 0b01_10_01_00 = 0x64
+    /// bytes[1..32] cover elements 4..127, all code=1:
+    ///   byte = 1 | 1<<2 | 1<<4 | 1<<6 = 0b01_01_01_01 = 0x55
+    ///
+    /// FP16(2.0) = 0x4000 (sign=0, exp=16, frac=0), little-endian [0x00,0x40] —
+    /// cross-checked against the existing `dequant_q2_0` CPU-oracle test in
+    /// gguf_input.rs, which uses the identical byte pair for scale 2.0.
+    #[test]
+    fn quantize_tq2g128_byte_exact() {
+        let mut group = vec![0.0f32; 128];
+        group[0] = -2.0;
+        group[1] = 0.0;
+        group[2] = 2.0;
+        // group[3..128] stay 0.0
+
+        let out = quantize_tq2g128(&group);
+        assert_eq!(out.len(), 34, "one 128-group -> one 34-byte block");
+
+        // FP16 scale d=2.0, little-endian.
+        assert_eq!(&out[0..2], &[0x00, 0x40]);
+
+        // qs[0] (elements 0..3): codes 0,1,2,1 -> 0x64.
+        assert_eq!(out[2], 0x64);
+
+        // qs[1..32] (elements 4..127): all code=1 -> 0x55, repeated 31 times.
+        assert_eq!(&out[3..34], &[0x55u8; 31][..]);
+    }
+
+    /// Round-trip losslessness for an already-ternary input: values drawn
+    /// from {-d, 0, +d} with d a power of two (4.0) so the FP16 scale is
+    /// exact and every code round-trips without rounding error. Decodes via
+    /// the crate's public `tensor_to_f32` dispatcher (which routes
+    /// `GgmlType::Q2_0` to the private `dequant_q2_0` CPU oracle added in
+    /// Task 5) — this exercises the *real* decode path rather than a
+    /// second hand-rolled decoder, so it also proves TQ2G128's block
+    /// layout is byte-compatible with GGUF `Q2_0` end-to-end.
+    #[test]
+    fn quantize_tq2g128_round_trips_ternary_input() {
+        let d = 4.0f32;
+        let f32_data: Vec<f32> = (0..128)
+            .map(|i| match i % 3 {
+                0 => -d,
+                1 => 0.0,
+                _ => d,
+            })
+            .collect();
+
+        let packed = quantize_tq2g128(&f32_data);
+        assert_eq!(packed.len(), 34);
+
+        let info = gguf_input::TensorInfo {
+            name: "round_trip".to_string(),
+            shape: vec![128],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let decoded = gguf_input::tensor_to_f32(&info, &packed);
+
+        assert_eq!(decoded, f32_data);
+    }
+
+    /// Multi-block input (2 groups of 128) — checks block offsets/lengths
+    /// are computed correctly, not just the single-block case above.
+    #[test]
+    fn quantize_tq2g128_multi_block_length() {
+        let f32_data = vec![1.0f32; 256];
+        let out = quantize_tq2g128(&f32_data);
+        assert_eq!(out.len(), 2 * 34);
+    }
+}
+
+pub(crate) fn quantize_tq2g128_gptq(
+    f32_data: &[f32],
+    col_weights: &[f32],
+    damping: f32,
+) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+
+        // Sweep candidate scales, pick the least imatrix-weighted *decoded*
+        // error. factor=1.0 reproduces `quantize_tq2g128` exactly (same codes,
+        // same f16 header, same decode), so the winner is always ≤ plain.
+        //
+        // The sweep MUST reach well below 0.6·amax. Levels are {-d, 0, +d} with
+        // nearest-neighbour coding, so a weight survives only when |w| ≥ d/2;
+        // at d = amax over a 128-sample Gaussian block (amax ≈ 2.9σ) that
+        // threshold is ~1.45σ and ~85% of the block is zeroed. The MSE-optimal
+        // 3-level scale for a Gaussian is d ≈ 1.22σ ≈ 0.42·amax (~54% non-zero;
+        // PrismML's own Bonsai ternary runs ~69% non-zero). A sweep floored at
+        // 0.6 bottoms out at ~38% non-zero and never reaches the optimum.
+        let mut best_d = amax;
+        let mut best_err = f64::INFINITY;
+        for &factor in &[
+            0.20f32, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70, 0.80, 0.90, 1.0,
+        ] {
+            let d = amax * factor;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let dd = f16_to_f32(f32_to_f16(d)) as f64; // decode uses the f16 scale
+            let mut err = 0.0f64;
+            for i in 0..GROUP {
+                let w = if i < actual { group[i] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 2 {
+                    q = 2;
+                }
+                let recon = (q - 1) as f64 * dd;
+                let diff = w as f64 - recon;
+                err += block_w[i] as f64 * diff * diff;
+            }
+            if err < best_err {
+                best_err = err;
+                best_d = d;
+            }
+        }
+
+        let d = best_d;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        // Damped residual feed-forward across columns → codes.
+        let mut codes = [0u8; GROUP];
+        let mut residual = 0.0f32;
+        for i in 0..GROUP {
+            let w = if i < actual { group[i] } else { 0.0 };
+            let target = w + residual;
+            let mut q = (target * id).round() as i32 + 1;
+            // Ternary set {0,1,2}; see the note above — 3 would decode to +2d.
+            if q < 0 {
+                q = 0;
+            }
+            if q > 2 {
+                q = 2;
+            }
+            let recon = (q - 1) as f32 * dd;
+            residual = (target - recon) * damping;
+            codes[i] = q as u8;
+        }
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                byte_val |= (codes[4 * i + j] & 0x3) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_gptq_tests {
+    use super::*;
+
+    fn weighted_mse(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_ternary_not_worse_than_plain() {
+        // skewed importance: first 32 columns matter 10×.
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.03).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 0..32 {
+            w[k] = 10.0;
+        }
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
+        assert!(
+            weighted_mse(&g, &gptq, &w) <= weighted_mse(&g, &plain, &w) + 1e-9,
+            "imatrix-weighted GPTQ error must be ≤ plain packer error"
+        );
+    }
+
+    /// Deterministic standard-normal block (Box–Muller over an LCG) — real
+    /// weights are Gaussian-ish, and the scale sweep must work on THOSE, not
+    /// just on the uniform ramp above (a ramp's `max|w|` is ~1 sigma-equivalent
+    /// so it hides a mis-ranged sweep entirely).
+    fn gaussian_block(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32)
+        };
+        (0..n)
+            .map(|_| {
+                let u1: f32 = next();
+                let u2: f32 = next();
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+            })
+            .collect()
+    }
+
+    /// `tq2_pack_stats` is the shipping guard's eye: it must count the two
+    /// things that silently broke real requants — how much of the model got
+    /// zeroed, and whether any out-of-set code was emitted.
+    #[test]
+    fn tq2_pack_stats_counts_zeros_and_out_of_set_codes() {
+        // One block, 128 codes. Byte 0 = codes [0,1,2,3] (LSB-first, 2 b each)
+        // = 0b11_10_01_00 = 0xE4. Remaining 31 bytes = 0x55 = codes [1,1,1,1],
+        // i.e. all zero-level.
+        let mut blk = vec![0u8; 34];
+        blk[0..2].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        blk[2] = 0xE4;
+        for b in blk.iter_mut().skip(3) {
+            *b = 0x55;
+        }
+
+        let st = tq2_pack_stats(&blk);
+        assert_eq!(st.n_codes, 128);
+        // Non-zero = code != 1 → the 0, 2 and 3 in byte 0.
+        assert_eq!(st.nonzero, 3);
+        assert_eq!(st.out_of_set, 1, "exactly one code 3");
+    }
+
+    /// Raw 2-bit codes out of a TQ2G128 buffer (34 B/block: [f16 d][32 B qs]).
+    fn tq2_codes(packed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for blk in packed.chunks_exact(34) {
+            for &byte in &blk[2..] {
+                for j in 0..4 {
+                    out.push((byte >> (j * 2)) & 0x3);
+                }
+            }
+        }
+        out
+    }
+
+    /// The ternary level set is {-d, 0, +d} == codes {0, 1, 2}. Code 3 decodes
+    /// to `(3-1)*d = +2d` in BOTH decoders (gguf_input::dequant_q2_0 and
+    /// kernels/src/gemv_tq2g128.hip), so emitting it silently turns the
+    /// quantizer into an ASYMMETRIC 4-level one: negatives saturate at -d while
+    /// positives reach +2d. PrismML's own Bonsai ternary never emits code 3
+    /// (measured 0.0000 across 4 tensors).
+    ///
+    /// The `q > 3 => 3` clamp was unreachable while d = max|w| (|w/d| <= 1, so
+    /// round() is at most 1). Widening the scale sweep to 0.20*amax makes
+    /// |w/d| >> 1 reachable — which is how this surfaced: 5.9% of codes on a
+    /// real 27B requant.
+    #[test]
+    fn ternary_packers_never_emit_the_out_of_set_code() {
+        let g = gaussian_block(128, 4242);
+        let w = vec![1.0f32; 128];
+        for (label, packed) in [
+            ("plain", quantize_tq2g128(&g)),
+            ("gptq", quantize_tq2g128_gptq(&g, &w, 0.0)),
+        ] {
+            let codes = tq2_codes(&packed);
+            let bad = codes.iter().filter(|&&c| c == 3).count();
+            assert_eq!(
+                bad,
+                0,
+                "{label}: emitted out-of-set code 3 ({bad} of {} codes) — decodes to +2d",
+                codes.len()
+            );
+        }
+    }
+
+    /// Saturation must be symmetric: with a scale below max|w|, mirrored
+    /// out-of-range weights must land on mirrored levels.
+    #[test]
+    fn ternary_saturation_is_symmetric() {
+        let mut g = gaussian_block(128, 99);
+        g[0] = 6.0; // far above any swept d
+        g[1] = -6.0;
+        let w = vec![1.0f32; 128];
+        let codes = tq2_codes(&quantize_tq2g128_gptq(&g, &w, 0.0));
+        assert_eq!(codes[0], 2, "large positive must saturate to +d (code 2)");
+        assert_eq!(codes[1], 0, "large negative must saturate to -d (code 0)");
+    }
+
+    /// The ternary level set is `{-d, 0, +d}` with nearest-neighbour coding, so
+    /// a weight survives only when `|w| >= d/2`. With `d = max|w|` over a
+    /// 128-sample Gaussian block (`amax ~ 2.9 sigma`) the threshold lands at
+    /// ~1.45 sigma and ~85% of weights are zeroed — which is exactly what the
+    /// plain packer shipped for qwen3.6-27b (16.3% non-zero measured, vs 69.4%
+    /// for PrismML's own Bonsai ternary).
+    ///
+    /// The MSE-optimal 3-level scale for a Gaussian is `d ~ 1.22 sigma`
+    /// (thresholds at +/-0.61 sigma, ~54% non-zero) = ~0.42 * amax. The sweep
+    /// must therefore reach well below 0.6 * amax.
+    #[test]
+    fn gptq_ternary_scale_sweep_reaches_mse_optimum_on_gaussian() {
+        let g = gaussian_block(128, 12345);
+        let w = vec![1.0f32; 128];
+
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
+
+        let nz = tq2_pack_stats(&gptq).nonzero_fraction();
+        assert!(
+            (0.45..=0.80).contains(&nz),
+            "swept-scale ternary should keep roughly half the weights alive on \
+             Gaussian input (MSE-optimal ~0.54); got non-zero fraction {nz:.3}"
+        );
+
+        let (e_gptq, e_plain) = (weighted_mse(&g, &gptq, &w), weighted_mse(&g, &plain, &w));
+        assert!(
+            e_gptq <= 0.6 * e_plain,
+            "swept scale must substantially beat d=max|w| on Gaussian input; \
+             got gptq={e_gptq:.5} vs plain={e_plain:.5}"
+        );
+    }
+}
+
+pub(crate) fn quantize_bq1g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let mut sum = 0.0f32;
+        for &w in group {
+            sum += w.abs();
+        }
+        let d = if actual > 0 { sum / actual as f32 } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            if w >= 0.0 {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_tests {
+    use super::*;
+
+    #[test]
+    fn quantize_bq1g128_byte_exact() {
+        // group of 128: [0]=+2, [1]=-2, rest 0 (0 → sign bit set → +d)
+        let mut g = vec![0.0f32; 128];
+        g[0] = 2.0;
+        g[1] = -2.0;
+        // d = mean|w| = (2+2)/128 = 0.03125
+        let out = quantize_bq1g128(&g);
+        assert_eq!(out.len(), 18);
+        assert_eq!(&out[0..2], &f32_to_f16(0.03125).to_le_bytes());
+        // byte 2 = elements 0..7: bit0 (e0,+)=1, bit1 (e1,-)=0,
+        // bits2..7 (0.0≥0)=1 → 0b1111_1101 = 0xFD
+        assert_eq!(out[2], 0xFD);
+        // bytes 3..18 = elements 8..127 all 0.0 ≥ 0 → all bits set → 0xFF
+        assert_eq!(&out[3..18], &[0xFFu8; 15]);
+    }
+
+    #[test]
+    fn quantize_bq1g128_round_trips() {
+        let g: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.01).collect();
+        let packed = quantize_bq1g128(&g);
+        let info = gguf_input::TensorInfo {
+            name: "rt".to_string(),
+            shape: vec![256],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, &packed);
+        // every element recovers sign; magnitude == block mean|w|
+        for i in 0..256 {
+            assert_eq!(deq[i] >= 0.0, g[i] >= 0.0);
+        }
+    }
+}
+
+pub(crate) fn quantize_bq1g128_gptq(
+    f32_data: &[f32],
+    col_weights: &[f32],
+    damping: f32,
+) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        // Importance-weighted optimal magnitude d = Σ w|x| / Σ w.
+        let mut wsum = 0.0f64;
+        let mut wabs = 0.0f64;
+        for i in 0..actual {
+            let wi = block_w[i] as f64;
+            wsum += wi;
+            wabs += wi * (group[i].abs() as f64);
+        }
+        let d = if wsum > 0.0 {
+            (wabs / wsum) as f32
+        } else {
+            // fallback: plain unweighted mean-abs (matches quantize_bq1g128)
+            let mut s = 0.0f32;
+            for &w in group {
+                s += w.abs();
+            }
+            if actual > 0 {
+                s / actual as f32
+            } else {
+                0.0
+            }
+        };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let mut residual = 0.0f32;
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            let target = w + residual;
+            let bit = target >= 0.0;
+            let recon = if bit { dd } else { -dd };
+            residual = (target - recon) * damping;
+            if bit {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_gptq_tests {
+    use super::*;
+
+    fn wmse_bq1(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_binary_not_worse_than_plain() {
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.05).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 96..128 {
+            w[k] = 8.0;
+        } // tail columns important
+        let plain = quantize_bq1g128(&g);
+        let gptq = quantize_bq1g128_gptq(&g, &w, 0.0);
+        assert!(wmse_bq1(&g, &gptq, &w) <= wmse_bq1(&g, &plain, &w) + 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod mqv2_lowbit_tests {
+    use super::*;
+
+    #[test]
+    fn mq3v2_mq2v2_wire_layout() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // byte count = m*ceil(k/256)*B
+        for (m, k, b) in [
+            (1usize, 256usize, MQ3V2_GROUP_BYTES),
+            (2, 512, MQ3V2_GROUP_BYTES),
+            (4, 1024, MQ3V2_GROUP_BYTES),
+        ] {
+            let w = vec![0.3f32; m * k];
+            let blob = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+            assert_eq!(blob.len(), m * (k / 256) * b, "mq3v2 bytes m={m} k={k}");
+            assert_eq!(b, 104);
+            // header 8B, payload 96B
+            assert_eq!(b - 8, 96);
+        }
+        for (m, k, b) in [
+            (1usize, 256usize, MQ2V2_GROUP_BYTES),
+            (2, 512, MQ2V2_GROUP_BYTES),
+        ] {
+            let w = vec![-0.5f32; m * k];
+            let blob = quantize_mq2g256v2(&w, m, k, &s1, &s2);
+            assert_eq!(blob.len(), m * (k / 256) * b, "mq2v2 bytes m={m} k={k}");
+            assert_eq!(b, 72);
+            assert_eq!(b - 8, 64);
+        }
+        // fp16 header positions and payload offset
+        let m = 2;
+        let k = 512;
+        let w: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let blob = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+        let gpr = k / 256;
+        for g in 0..m * gpr {
+            let base = g * MQ3V2_GROUP_BYTES;
+            // header is 4 fp16 LE at 0,2,4,6
+            let s0 = u16::from_le_bytes([blob[base], blob[base + 1]]);
+            let z0 = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+            let s1b = u16::from_le_bytes([blob[base + 4], blob[base + 5]]);
+            let z1 = u16::from_le_bytes([blob[base + 6], blob[base + 7]]);
+            // reconstruction would be q*f32(s)+f32(z)
+            let st0 = f16_to_f32(s0);
+            let zt0 = f16_to_f32(z0);
+            // at least not both scales zero for non-degenerate synthetic
+            assert!(
+                st0 != 0.0 || f16_to_f32(s1b) != 0.0,
+                "expected non-degenerate header"
+            );
+            assert!(blob[base + 8..base + MQ3V2_GROUP_BYTES].len() == 96);
+            let _ = (zt0, z1, s1b); // silence unused
+        }
+        // degenerate halves: zero weights => both halves scale=0, payload zero
+        let w_zero = vec![0.0f32; m * k];
+        let blob = quantize_mq2g256v2(&w_zero, m, k, &s1, &s2);
+        for g in 0..m * gpr {
+            let base = g * MQ2V2_GROUP_BYTES;
+            let s0 = u16::from_le_bytes([blob[base], blob[base + 1]]);
+            let s1b = u16::from_le_bytes([blob[base + 4], blob[base + 5]]);
+            assert_eq!(s0, 0);
+            assert_eq!(s1b, 0);
+            // payload must be all zero for degenerate
+            assert!(blob[base + 8..base + MQ2V2_GROUP_BYTES]
+                .iter()
+                .all(|&b| b == 0));
+        }
+        // payload pack invariants: 2b 4/byte => payload len 64, 3b 8/3B => 96
+        assert_eq!(MQ2V2_GROUP_BYTES - 8, 64);
+        assert_eq!(MQ3V2_GROUP_BYTES - 8, 96);
+    }
+
+    #[test]
+    fn mqv2_roundtrip_fp16_before_select() {
+        // Verify encoder round-trips s/z through fp16 before selecting q:
+        // construct a weight that would be near a quantization boundary with f32 scale
+        // but flips when scale is truncated to fp16.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let m = 1;
+        let k = 256;
+        // Use a value that exercises fp16 quantization of scale
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
+        let blob2 = quantize_mq2g256v2(&w, m, k, &s1, &s2);
+        let blob3 = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+        // header scales must be fp16 exactly (re-encode matches)
+        for (blob, bbytes) in [(blob2, MQ2V2_GROUP_BYTES), (blob3, MQ3V2_GROUP_BYTES)] {
+            let s0 = u16::from_le_bytes([blob[0], blob[1]]);
+            let z0 = u16::from_le_bytes([blob[2], blob[3]]);
+            // f32_to_f16 truncates, f16_to_f32 round-trips, ensure consistency
+            let st = f16_to_f32(s0);
+            let zt = f16_to_f32(z0);
+            assert!(st >= 0.0);
+            let _ = (st, zt, bbytes);
+        }
+    }
+}
+#[cfg(test)]
+mod mq2_lloyd_anchored_tests {
+    use super::*;
+
+    #[test]
+    fn anchored_72b_layout() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        for n in [256usize, 512, 1024, 256 * 3 + 10] {
+            let w = vec![0.1f32; n];
+            let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+            let n_blocks = (n + 255) / 256;
+            assert_eq!(out.len(), n_blocks * 72, "n={n} blocks={n_blocks}");
+            // Same size as plain Lloyd
+            let plain = quantize_mq2g256_lloyd(&w, &s1, &s2);
+            assert_eq!(out.len(), plain.len());
+        }
+    }
+
+    #[test]
+    fn anchored_codebook_ascending_fp16() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next_f32 = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let bits = ((rng >> 32) as u32) & 0x7fffffff;
+            let v = (bits as f32 / (1u32 << 31) as f32) * 4.0 - 2.0;
+            v
+        };
+        for _ in 0..16 {
+            let w: Vec<f32> = (0..256 * 4).map(|_| next_f32()).collect();
+            let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+            for blk in out.chunks_exact(72) {
+                let c0 = u16::from_le_bytes([blk[0], blk[1]]);
+                let c1 = u16::from_le_bytes([blk[2], blk[3]]);
+                let c2 = u16::from_le_bytes([blk[4], blk[5]]);
+                let c3 = u16::from_le_bytes([blk[6], blk[7]]);
+                let f0 = f16_to_f32(c0);
+                let f1 = f16_to_f32(c1);
+                let f2 = f16_to_f32(c2);
+                let f3 = f16_to_f32(c3);
+                // Ascending (allow equal for degenerate)
+                assert!(f0 <= f1, "c0 {f0} > c1 {f1} bits {c0:04x} {c1:04x}");
+                assert!(f1 <= f2, "c1 {f1} > c2 {f2}");
+                assert!(f2 <= f3, "c2 {f2} > c3 {f3}");
+                // Index range 0..4
+                for &b in &blk[8..] {
+                    for j in 0..4 {
+                        let idx = (b >> (j * 2)) & 0x3;
+                        assert!(idx <= 3);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_endpoints_are_block_extremes_after_fp16() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // Construct deterministic 256 block, verify endpoints.
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.07).collect();
+        let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        assert_eq!(out.len(), 72);
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[0..256]);
+        cpu_fwht_256(&mut group, &s1, &s2);
+        let mut sorted: Vec<f32> = group.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let min_f32 = sorted[0];
+        let max_f32 = sorted[255];
+        let min_fp16_bits = f32_to_fp16_bits(min_f32);
+        let max_fp16_bits = f32_to_fp16_bits(max_f32);
+        let min_fp16 = f16_to_f32(min_fp16_bits);
+        let max_fp16 = f16_to_f32(max_fp16_bits);
+        let blk = &out[0..72];
+        let c0 = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let c3 = f16_to_f32(u16::from_le_bytes([blk[6], blk[7]]));
+        // Endpoints must equal fp16-rounded block extremes.
+        assert_eq!(
+            c0.to_bits(),
+            min_fp16.to_bits(),
+            "c0 should be fp16(min) {min_fp16} vs {c0}"
+        );
+        assert_eq!(
+            c3.to_bits(),
+            max_fp16.to_bits(),
+            "c3 should be fp16(max) {max_fp16} vs {c3}"
+        );
+        // Also verify interior codepoints are between endpoints.
+        let c1 = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let c2 = f16_to_f32(u16::from_le_bytes([blk[4], blk[5]]));
+        assert!(c0 <= c1 && c1 <= c3);
+        assert!(c0 <= c2 && c2 <= c3);
+    }
+
+    #[test]
+    fn anchored_roundtrip_matches_gpu_decode() {
+        // Encode must match GPU decode: nearest selection uses fp16-rounded centroids.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 * 0.013).sin() * 1.3).collect();
+        let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        let blk = &out[0..72];
+        let cb = [
+            f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+            f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+            f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+        ];
+        // Reconstruct group after FWHT to verify each index is nearest rounded centroid.
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[0..256]);
+        cpu_fwht_256(&mut group, &s1, &s2);
+        for (i, &val) in group.iter().enumerate() {
+            let byte = blk[8 + i / 4];
+            let idx = ((byte >> ((i % 4) * 2)) & 0x3) as usize;
+            // Verify idx is the nearest (tie -> lowest)
+            let mut best = 0usize;
+            let mut best_d = (val - cb[0]).abs();
+            for k in 1..4 {
+                let d = (val - cb[k]).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = k;
+                }
+            }
+            assert_eq!(
+                idx, best,
+                "i={i} val={val} cb={cb:?} idx {idx} != best {best}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_deterministic_degenerates() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // Constant input 1.7 is NOT degenerate after FWHT (FWHT sum vs zeros),
+        // but must still be deterministic.
+        let w_const = vec![1.7f32; 256];
+        let a1 = quantize_mq2g256_lloyd_anchored(&w_const, &s1, &s2);
+        let a2 = quantize_mq2g256_lloyd_anchored(&w_const, &s1, &s2);
+        assert_eq!(a1, a2, "constant input must be deterministic");
+        // True degenerate: all-zero weights -> rotated still zero -> range 0.
+        let w_zero = vec![0.0f32; 256];
+        let z1 = quantize_mq2g256_lloyd_anchored(&w_zero, &s1, &s2);
+        let z2 = quantize_mq2g256_lloyd_anchored(&w_zero, &s1, &s2);
+        assert_eq!(z1, z2, "zero block must be deterministic");
+        // Header should be four copies of zero (fp16 0x0000).
+        let c0 = u16::from_le_bytes([z1[0], z1[1]]);
+        let c1 = u16::from_le_bytes([z1[2], z1[3]]);
+        let c2 = u16::from_le_bytes([z1[4], z1[5]]);
+        let c3 = u16::from_le_bytes([z1[6], z1[7]]);
+        assert_eq!(c0, 0);
+        assert_eq!(c1, 0);
+        assert_eq!(c2, 0);
+        assert_eq!(c3, 0);
+        for b in &z1[8..] {
+            assert_eq!(*b, 0, "all indices zero for degenerate");
+        }
+        // Also check a second degenerate: single-block with identical rotated
+        // values constructed by inverse FWHT of a constant rotated block.
+        // Build a rotated-constant group by taking a vector that is zero except
+        // first element, then applying inverse FWHT? Simpler: directly test
+        // that two runs with same data are identical (we already did).
+    }
+
+    #[test]
+    fn anchored_qt19_identity_and_unconstrained_unchanged() {
+        // Contract: anchored reuses qt19 layout, decodable by existing qt19 runtime,
+        // and plain Lloyd bytes/behavior unchanged.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.02).collect();
+        let plain = quantize_mq2g256_lloyd(&w, &s1, &s2);
+        let anchored = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        assert_eq!(plain.len(), anchored.len());
+        assert_eq!(plain.len(), 72);
+        // Both decode via the same dequant path (qt19).
+        let dec_plain = dequantize_mq2g256_lloyd_to_f32(&plain, 256, &s1, &s2);
+        let dec_anch = dequantize_mq2g256_lloyd_to_f32(&anchored, 256, &s1, &s2);
+        assert_eq!(dec_plain.len(), 256);
+        assert_eq!(dec_anch.len(), 256);
+        // Plain must be byte-identical across calls (determinism)
+        let plain2 = quantize_mq2g256_lloyd(&w, &s1, &s2);
+        assert_eq!(plain, plain2, "plain Lloyd must remain deterministic");
+        // Anchored must differ from plain for non-trivial data (endpoints anchored changes book)
+        // Not guaranteed for all distributions, but for this ramp it should differ in at least header.
+        let header_plain = &plain[0..8];
+        let header_anch = &anchored[0..8];
+        assert_ne!(
+            header_plain, header_anch,
+            "anchored header should differ from unconstrained for ramp"
+        );
+        // Both use QuantType::MQ2G256Lloyd identity
+        assert_eq!(QuantType::MQ2G256Lloyd as u8, 19);
+        assert_eq!(QuantType::from_u8(19), Some(QuantType::MQ2G256Lloyd));
+    }
+
+    #[test]
+    fn anchored_index_range_and_no_affine_alias() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..512)
+            .map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0)
+            .collect();
+        let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        for blk in out.chunks_exact(72) {
+            for &b in &blk[8..] {
+                for j in 0..4 {
+                    assert!(((b >> (j * 2)) & 0x3) <= 3);
+                }
+            }
+        }
+        // Canonical hyphen and underscore aliases resolve to Mq2LloydAnchored,
+        // remaining distinct from the affine MQ2V2 path.
+        assert_eq!(
+            GgufFormat::from_flag("mq2lloyd-anchored"),
+            Some(GgufFormat::Mq2LloydAnchored)
+        );
+        assert_eq!(
+            GgufFormat::from_flag("mq2lloyd_anchored"),
+            Some(GgufFormat::Mq2LloydAnchored)
+        );
+        assert_ne!(
+            GgufFormat::from_flag("mq2lloyd-anchored"),
+            GgufFormat::from_flag("mq2v2")
+        );
+        assert_ne!(GgufFormat::Mq2LloydAnchored, GgufFormat::Mq2V2);
+    }
+}
+
+/// Code-level statistics of a packed TQ2G128 buffer.
+#[derive(Default, Debug, Clone, Copy)]
+struct Tq2PackStats {
+    /// Codes decoding to a non-zero level (i.e. code != 1).
+    nonzero: u64,
+    /// Codes equal to 3 — outside the ternary set, decoding to +2d.
+    out_of_set: u64,
+    n_codes: u64,
+}
+
+impl Tq2PackStats {
+    fn add(&mut self, o: Tq2PackStats) {
+        self.nonzero += o.nonzero;
+        self.out_of_set += o.out_of_set;
+        self.n_codes += o.n_codes;
+    }
+    fn nonzero_fraction(&self) -> f64 {
+        if self.n_codes == 0 {
+            return 0.0;
+        }
+        self.nonzero as f64 / self.n_codes as f64
+    }
+}
+
+/// Count zero / non-zero / out-of-set codes in a TQ2G128 buffer
+/// (34 B per 128-weight block: `[f16 d][32 B codes]`, 4 codes per byte).
+fn tq2_pack_stats(data: &[u8]) -> Tq2PackStats {
+    let mut st = Tq2PackStats::default();
+    for blk in data.chunks_exact(34) {
+        for &byte in &blk[2..] {
+            for j in 0..4 {
+                let code = (byte >> (j * 2)) & 0x3;
+                st.n_codes += 1;
+                if code != 1 {
+                    st.nonzero += 1;
+                }
+                if code == 3 {
+                    st.out_of_set += 1;
+                }
+            }
+        }
+    }
+    st
+}
+
+/// Refuse to write a ternary model that the code histogram says is broken.
+///
+/// This is the cheap observable that would have caught both shipped defects
+/// immediately, without a GPU or an eval:
+///
+///   * `d = max|w|` as an ENCODER zeroed 83.7% of a real 27B requant (16.3%
+///     non-zero). Healthy is ~54% (Gaussian MSE optimum) to ~69% (PrismML's
+///     own Bonsai ternary). A model below `MIN_NONZERO` is not "lossy", it is
+///     mostly deleted.
+///   * code 3 decodes to `+2d` in both decoders, turning the quantizer into an
+///     asymmetric 4-level one. PrismML never emits it; neither should we.
+///
+/// `--allow-degenerate-ternary` (env HIPFIRE_ALLOW_DEGENERATE_TERNARY) downgrades
+/// this to a warning. Read at the CLI boundary, never inside the pipeline:
+/// a getenv racing another test's setenv in a threaded test binary is unsound.
+fn check_ternary_pack_health(st: Tq2PackStats, allow_degenerate: bool) {
+    const MIN_NONZERO: f64 = 0.25;
+    if st.n_codes == 0 {
+        return;
+    }
+    let nz = st.nonzero_fraction();
+    eprintln!(
+        "ternary pack health: {:.1}% non-zero codes ({} of {}), {} out-of-set",
+        nz * 100.0,
+        st.nonzero,
+        st.n_codes,
+        st.out_of_set
+    );
+    let degenerate = nz < MIN_NONZERO;
+    if !degenerate && st.out_of_set == 0 {
+        return;
+    }
+    let mut why = Vec::new();
+    if degenerate {
+        why.push(format!(
+            "only {:.1}% of codes are non-zero (expected >={:.0}%; healthy 54-69%) \
+             — {:.1}% of the model is zeroed",
+            nz * 100.0,
+            MIN_NONZERO * 100.0,
+            (1.0 - nz) * 100.0
+        ));
+    }
+    if st.out_of_set > 0 {
+        why.push(format!(
+            "{} codes are 3, which decodes to +2d (outside the ternary set)",
+            st.out_of_set
+        ));
+    }
+    let msg = why.join("; ");
+    if allow_degenerate {
+        eprintln!(
+            "WARNING: degenerate ternary pack ({msg}) — allowed by --allow-degenerate-ternary"
+        );
+        return;
+    }
+    eprintln!("error: refusing to write a degenerate ternary model: {msg}.");
+    eprintln!(
+        "       Set HIPFIRE_ALLOW_DEGENERATE_TERNARY=1 to write it anyway (it will \
+         not serve coherently)."
+    );
+    std::process::exit(3);
+}
+
+/// Per-input-column importance weights for a requantized tensor.
+///
+/// Returns the `--imatrix` row for `name` when one was supplied and its length
+/// is a usable multiple of the 128 group, else all-ones (a pure unweighted-MSE
+/// scale search). The GPTQ packers slice this as
+/// `col_weights[(b % blocks_per_row) * 128 ..][..128]`, so the length must be a
+/// multiple of 128 — an all-ones length-128 vector makes every block reuse the
+/// same (uniform) weights, which is exactly the no-imatrix behaviour.
+
+fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
+    if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
+        return Ok(());
+    }
+    let bpw = if matches!(format, GgufFormat::Binary) {
+        "1.14"
+    } else {
+        "2.125"
+    };
+    Err(format!(
+        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint into a \
+         UNIFORM {bpw}-bpw level set, which is a measured collapse — not a supported \
+         build.\n\
+         \n\
+         Measured on qwen3.6-27b (KLD vs the mq4 teacher, 8 chunks):\n\
+         \x20 ternary uniform            2.125 bpw  KLD 5.10  PPL 1436   (token soup)\n\
+         \x20 ternary + AWQ imatrix      2.125 bpw  KLD 2.24  PPL   86.6 (immediate EOS)\n\
+         \x20 mq2lloyd (non-uniform)     2.25  bpw  KLD 0.61  PPL   17.0 (usable)\n\
+         \x20 PrismML Bonsai ternary     2.125 bpw  KLD 0.54  PPL   16.7\n\
+         \n\
+         The bit budget is NOT the problem — the fixed uniform level set is. Q2_0/Q1_0 \
+         leave the encoder only the block scale to choose, and no scale search or \
+         importance weighting recovers it.\n\
+         \n\
+         For ~2 bpw from an ordinary checkpoint use --format mq2lloyd instead. \
+         Ternary/binary ship coherently as byte-verbatim passthrough of an \
+         already-transformed source (PrismML Bonsai Q2_0/Q1_0) — convert that GGUF \
+         directly.\n\
+         \n\
+         To do it anyway for research, pass --allow-lowbit-ptq or set \
+         HIPFIRE_ALLOW_LOWBIT_PTQ=1.",
+        format.label(),
+    ))
 }

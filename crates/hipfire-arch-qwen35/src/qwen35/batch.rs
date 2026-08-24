@@ -5,24 +5,25 @@
 //! Qwen3.5 continuous-batch state: `PrefillBatchScratch`, `Qwen35DecodeBatchState`,
 //! lane-mask helpers, and the independent-lane batched decode entry points.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
 use super::config::LayerType;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
-use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
 use super::prefill::moe_grouped_m_total_max;
+use super::prefill::run_plain_gemm_key;
+use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_runtime::llama;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::WeightTensor;
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// Per-layer batched intermediates used by `forward_prefill_batch`. Each
 /// row is one token in the batch; rows are contiguous [N × K] blocks so
@@ -695,6 +696,12 @@ impl Qwen35DecodeBatchState {
             DType::Q8_0
                 | DType::HFQ4G256
                 | DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
                 | DType::HFQ6G256
                 | DType::MQ6G256
                 | DType::MQ3G256
@@ -1366,6 +1373,90 @@ pub(crate) fn lm_head_batched(
             llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &output.buf,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ4G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ4CG256 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4CG256BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ6G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ5G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq5G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ3G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq3G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ2G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq2G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
                 rot,
                 logits,
                 output.m,

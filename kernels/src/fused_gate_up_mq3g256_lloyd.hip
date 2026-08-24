@@ -3,8 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Fused Gate+Up MQ3-Lloyd: two GEMVs in one launch.
-// Baseline (non-RDNA3) variant. Per-row math identical to
-// gemv_mq3g256_lloyd.hip (8-way switch dispatch on per-row codebook).
+// Per-row math identical to gemv_mq3g256_lloyd.hip (LDS codebook path).
 // gfx1100/1101/1102 use the K4+LDS variant in
 // fused_gate_up_mq3g256_lloyd.gfx1100.hip via the kernels.rs arch selector.
 
@@ -36,20 +35,17 @@ extern "C" __global__ void fused_gate_up_mq3g256_lloyd(
     const char* row_ptr = A + (long long)local_row * groups_per_row * 112;
     const int boff = tid * 3;
 
+    __shared__ float cbt[8];
+
     float acc = 0.0f;
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gptr = row_ptr + g * 112;
 
-        const __half* cb_h = reinterpret_cast<const __half*>(gptr);
-        float cb0 = __half2float(cb_h[0]);
-        float cb1 = __half2float(cb_h[1]);
-        float cb2 = __half2float(cb_h[2]);
-        float cb3 = __half2float(cb_h[3]);
-        float cb4 = __half2float(cb_h[4]);
-        float cb5 = __half2float(cb_h[5]);
-        float cb6 = __half2float(cb_h[6]);
-        float cb7 = __half2float(cb_h[7]);
+        if (tid < 8) {
+            cbt[tid] = __half2float(((const __half*)gptr)[tid]);
+        }
+        __syncthreads();
 
         const unsigned char* data = (const unsigned char*)(gptr + 16);
 
@@ -68,22 +64,14 @@ extern "C" __global__ void fused_gate_up_mq3g256_lloyd(
 
         int base_idx = g * 256 + tid * 8;
 
-        #define CB_LOOKUP3(q) (                                          \
-            (q) == 0 ? cb0 : (q) == 1 ? cb1 : (q) == 2 ? cb2 : (q) == 3  \
-            ? cb3 : (q) == 4 ? cb4 : (q) == 5 ? cb5 : (q) == 6 ? cb6     \
-            : cb7                                                         \
-        )
-
-        acc += CB_LOOKUP3(q0) * x[base_idx]
-             + CB_LOOKUP3(q1) * x[base_idx + 1]
-             + CB_LOOKUP3(q2) * x[base_idx + 2]
-             + CB_LOOKUP3(q3) * x[base_idx + 3]
-             + CB_LOOKUP3(q4) * x[base_idx + 4]
-             + CB_LOOKUP3(q5) * x[base_idx + 5]
-             + CB_LOOKUP3(q6) * x[base_idx + 6]
-             + CB_LOOKUP3(q7) * x[base_idx + 7];
-
-        #undef CB_LOOKUP3
+        acc += cbt[q0] * x[base_idx]
+             + cbt[q1] * x[base_idx + 1]
+             + cbt[q2] * x[base_idx + 2]
+             + cbt[q3] * x[base_idx + 3]
+             + cbt[q4] * x[base_idx + 4]
+             + cbt[q5] * x[base_idx + 5]
+             + cbt[q6] * x[base_idx + 6]
+             + cbt[q7] * x[base_idx + 7];
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

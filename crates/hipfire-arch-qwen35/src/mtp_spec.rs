@@ -1194,6 +1194,227 @@ fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usiz
 
 
 
+/// Enqueue the target lm_head over every MTP verify row.
+///
+/// All MTP entry points share this dispatcher. In particular, MQ V2 must not
+/// fall through to `n_verify` sequential GEMVs now that the validated gfx11 /
+/// gfx12 batched lm_head family exists.
+#[allow(clippy::too_many_arguments)]
+fn mtp_trunk_verify_lm_head(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    verify_hidden: &GpuTensor,
+    verify_rot: &GpuTensor,
+    logits_view: &GpuTensor,
+    n_verify: usize,
+    dim: usize,
+    vocab: usize,
+) -> HipResult<()> {
+    match w_out.gpu_dtype {
+        DType::Q8_0 => {
+            if mtp_q8_verify_wmma_enabled_from_env() {
+                gpu.gemm_q8_0_batched_chunked(
+                    &w_out.buf,
+                    verify_hidden,
+                    logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            } else {
+                gpu.gemm_q8_0_batched(
+                    &w_out.buf,
+                    verify_hidden,
+                    logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
+        }
+        DType::HFQ4G256 => {
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf,
+                verify_hidden,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ4G256 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ3G256 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq3g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::HFQ6G256 => {
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf,
+                verify_hidden,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ6G256 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ4G256V2 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ6G256V2 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_mq6g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ5G256V2 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_mq5g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ3G256V2 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_mq3g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ2G256V2 => {
+            let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_mq2g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        _ => {
+            for i in 0..n_verify {
+                let row = verify_hidden.sub_offset(i * dim, dim);
+                let logits_row = logits_view.sub_offset(i * vocab, vocab);
+                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mtp_shared_verify_accept_rollback(
     gpu: &mut Gpu,
@@ -1269,113 +1490,16 @@ fn mtp_shared_verify_accept_rollback(
 
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    match w_out.gpu_dtype {
-        DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            }
-        }
-        DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ4G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ3G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ6G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        _ => {
-            for i in 0..n_verify {
-                let row = state.verify_hidden.sub_offset(i * dim, dim);
-                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
-            }
-        }
-    }
+    mtp_trunk_verify_lm_head(
+        gpu,
+        w_out,
+        &state.verify_hidden,
+        &state.verify_rot,
+        &logits_view,
+        n_verify,
+        dim,
+        vocab,
+    )?;
 
     let mut accept_count = 0usize;
     let hit_eos;
@@ -1973,114 +2097,16 @@ pub fn spec_step_mtp(
     // n_verify is hoisted above (before tape_captured computation).
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    match w_out.gpu_dtype {
-        DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            }
-        }
-        DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ4G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ3G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ6G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        _ => {
-            // Fallback: per-row weight_gemv. Same path verify_dflash_block uses.
-            for i in 0..n_verify {
-                let row = state.verify_hidden.sub_offset(i * dim, dim);
-                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
-            }
-        }
-    }
+    mtp_trunk_verify_lm_head(
+        gpu,
+        w_out,
+        &state.verify_hidden,
+        &state.verify_rot,
+        &logits_view,
+        n_verify,
+        dim,
+        vocab,
+    )?;
 
     // GPU-side batched argmax over (max_n + 1) rows.
     let argmax_view = state.verify_argmax.sub_offset(0, n_verify);
@@ -2444,113 +2470,16 @@ pub fn spec_step_mtp_compressed(
     // ── 3. Trunk batched lm_head over verify positions ─────────────────────
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    match w_out.gpu_dtype {
-        DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            }
-        }
-        DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ4G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ3G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ6G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        _ => {
-            for i in 0..n_verify {
-                let row = state.verify_hidden.sub_offset(i * dim, dim);
-                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
-            }
-        }
-    }
+    mtp_trunk_verify_lm_head(
+        gpu,
+        w_out,
+        &state.verify_hidden,
+        &state.verify_rot,
+        &logits_view,
+        n_verify,
+        dim,
+        vocab,
+    )?;
 
     let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
     gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;

@@ -5,19 +5,19 @@
 //! Qwen3.5 weight structs (dense / MoE layers), EP shard provenance and seals,
 //! `Qwen35Weights`, and the persistent DeltaNet state (`DeltaNetState`).
 
+use super::config::LayerType;
+use super::config::Qwen35Config;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
-use hipfire_runtime::MmqScreenable;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::screen_weight_tensor;
+use hipfire_runtime::MmqScreenable;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
-use super::config::LayerType;
-use super::config::Qwen35Config;
 
 // ─── Weight structs ─────────────────────────────────────────────────────
 
@@ -103,7 +103,9 @@ pub(crate) struct PackedExpertOwners {
 /// `None`, which `MoeResolution::resolve` collapses to the unchanged uniform
 /// fast path. We pre-filter to `None` for the uniform/empty cases here so the
 /// common path allocates nothing and is byte-identical to before SP2.
-pub(crate) fn per_expert_tier_tables(ffn: &MoeFfnWeights) -> (Option<Vec<DType>>, Option<Vec<DType>>) {
+pub(crate) fn per_expert_tier_tables(
+    ffn: &MoeFfnWeights,
+) -> (Option<Vec<DType>>, Option<Vec<DType>>) {
     if let Some(global) = ffn.global_expert_dtypes.as_ref() {
         let gu: Vec<DType> = global.iter().map(|(g, _)| *g).collect();
         let dn: Vec<DType> = global.iter().map(|(_, d)| *d).collect();
@@ -144,14 +146,27 @@ pub fn mixed_expert_tag(gate_dtype: DType, down_dtype: DType) -> HipResult<u8> {
         ));
     }
     match (gate_dtype, down_dtype) {
-        // Mixed MQ4 gate family (7 pairs)
+        // Mixed MQ4 gate family (7 pairs) — MQ4G256V2 is the same container family
+        // as MQ4G256 for the grouped dispatch, so every gate pair that admits
+        // MQ4 also admits V2 (including the cross V2↔MQ4 uniform gate which
+        // keeps mixed-shard models loadable). The kernel selection is container-aware
+        // via forward_slots::fused_*_key_for, so admitting here never misroutes.
         (DType::MQ4G256, DType::MQ6G256) => Ok(0),
+        (DType::MQ4G256V2, DType::MQ6G256) => Ok(0),
         (DType::MQ4G256, DType::MQ2G256Lloyd) => Ok(1),
+        (DType::MQ4G256V2, DType::MQ2G256Lloyd) => Ok(1),
         (DType::MQ4G256, DType::MQ4G256) => Ok(2),
+        (DType::MQ4G256V2, DType::MQ4G256V2) => Ok(2),
+        (DType::MQ4G256V2, DType::MQ4G256) => Ok(2),
+        (DType::MQ4G256, DType::MQ4G256V2) => Ok(2),
         (DType::MQ4G256, DType::MQ3G256Lloyd) => Ok(3),
+        (DType::MQ4G256V2, DType::MQ3G256Lloyd) => Ok(3),
         (DType::MQ4G256, DType::MFP4G32E8) => Ok(4),
+        (DType::MQ4G256V2, DType::MFP4G32E8) => Ok(4),
         (DType::MQ4G256, DType::MFP3G32E8) => Ok(5),
+        (DType::MQ4G256V2, DType::MFP3G32E8) => Ok(5),
         (DType::MQ4G256, DType::MFP2G32E8) => Ok(6),
+        (DType::MQ4G256V2, DType::MFP2G32E8) => Ok(6),
         // Matching non-MQ4 pairs (6 pairs)
         (DType::MQ6G256, DType::MQ6G256) => Ok(0),
         (DType::MQ2G256Lloyd, DType::MQ2G256Lloyd) => Ok(1),
@@ -175,10 +190,24 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         30 => Ok(DType::MQ4G256Lloyd),
         34 => Ok(DType::MFP4G32E8),
         36 => Ok(DType::MFP3G32E8),
-        37 => Ok(DType::MFP2G32E8),
         38 => Ok(DType::MQ2G256GL),
         39 => Ok(DType::MQ3G256GL),
+        40 => Ok(DType::TQ2G128),
+        41 => Ok(DType::BQ1G128),
+        44 => Ok(DType::MQ4G256V2),
+        45 => Ok(DType::MQ4CG256),
+        // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction
+        // through WeightTensor/GpuTensor; do not map to legacy MQ2/3/5/6.
+        47 => Ok(DType::MQ6G256V2),
+        48 => Ok(DType::MQ5G256V2),
+        49 => Ok(DType::MQ3G256V2),
+        50 => Ok(DType::MQ2G256V2),
+        // qt=6 (HFQ4G256) and qt=37 (MFP2G32E8) are shipped formats and MUST stay
+        // mapped here. Dropping an arm from this match is not a compile error — it
+        // degrades to "graded EP: unsupported quant_type", so the loss stays
+        // invisible until a model of that format fails to load.
         6 => Ok(DType::HFQ4G256),
+        37 => Ok(DType::MFP2G32E8),
         3 => Ok(DType::Q8_0),
         1 => Ok(DType::F16),
         2 => Ok(DType::F32),
@@ -1410,7 +1439,12 @@ impl DeltaNetState {
     /// Non-owning single-lane view into state allocated by
     /// [`Self::new_batched_with_quant`]. Used only to seed prompts through the
     /// existing sequential prefill path. The returned view must not be freed.
-    pub(crate) fn q8_lane_view(&self, config: &Qwen35Config, lane: usize, batch: usize) -> HipResult<Self> {
+    pub(crate) fn q8_lane_view(
+        &self,
+        config: &Qwen35Config,
+        lane: usize,
+        batch: usize,
+    ) -> HipResult<Self> {
         if self.quant != StateQuant::Q8 || lane >= batch {
             return Err(HipError::new(
                 0,
@@ -1777,5 +1811,24 @@ mod tests {
         // here every later expert differs from expert[0].
         let tiers = vec![DType::MQ4G256, DType::MQ6G256, DType::MQ6G256];
         assert_eq!(mixed_tier_table(tiers.clone()), Some(tiers));
+    }
+
+    #[test]
+    fn dtype_from_quant_type_neutral_v2_one_to_one() {
+        // Each qt maps one-to-one to its V2 DType and exact block bytes;
+        // V2 DTypes are distinct from legacy MQ2/3/5/6.
+        assert_eq!(dtype_from_quant_type(47).unwrap(), DType::MQ6G256V2);
+        assert_eq!(dtype_from_quant_type(48).unwrap(), DType::MQ5G256V2);
+        assert_eq!(dtype_from_quant_type(49).unwrap(), DType::MQ3G256V2);
+        assert_eq!(dtype_from_quant_type(50).unwrap(), DType::MQ2G256V2);
+        // Legacy unchanged.
+        assert_eq!(dtype_from_quant_type(15).unwrap(), DType::MQ6G256);
+        assert_ne!(dtype_from_quant_type(47).unwrap(), DType::MQ6G256);
+        assert_ne!(dtype_from_quant_type(49).unwrap(), DType::MQ3G256);
+        // Bad qt fails closed.
+        assert!(dtype_from_quant_type(99).is_err());
+        // qt44/45 still map to their V2/C DTypes.
+        assert_eq!(dtype_from_quant_type(44).unwrap(), DType::MQ4G256V2);
+        assert_eq!(dtype_from_quant_type(45).unwrap(), DType::MQ4CG256);
     }
 }

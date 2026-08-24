@@ -40,6 +40,11 @@ pub mod carrier;
 /// based draft verify.
 #[cfg(feature = "deltanet")]
 pub mod dflash_spec;
+/// Retained-PM4 route state for the fixed B=16 DFlash2 target-verify forward
+/// (`DflashVerifyPm4`). Owns the phase machine, admission binding, and
+/// route-proof counters; `speculative` owns the GPU half.
+/// Not deltanet-gated, matching `speculative`, which consumes it.
+pub mod dflash_verify_pm4;
 /// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
 /// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
 /// modification of it — see the module doc for why), routing attention

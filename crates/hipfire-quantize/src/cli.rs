@@ -3,24 +3,29 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -52,6 +57,31 @@ pub(crate) struct QuantizeArgs {
     /// Allow an architecture override to move Qwen3 off its pillar IDs.
     #[arg(long)]
     pub force_arch_id: bool,
+
+    /// Reuse the source checkpoint's AWQ sidecars as an imatrix for the
+    /// low-bit packers' column weighting. Value is the alpha the source was
+    /// AWQ-built with (see `awq_col_weights`); defaults to the CLI's own
+    /// --awq default. Off entirely when the flag is absent.
+    #[arg(long, value_name = "ALPHA", num_args = 0..=1, default_missing_value = "0.55")]
+    pub awq_imatrix: Option<f32>,
+
+    /// Requantize an ordinary checkpoint down to ternary/binary anyway.
+    /// See `lowbit_ptq_gate` — this is a measured collapse regime.
+    #[arg(long, env = "HIPFIRE_ALLOW_LOWBIT_PTQ")]
+    pub allow_lowbit_ptq: bool,
+
+    /// Upstream URL recorded in the output's `hipfire_provenance`.
+    #[arg(long, value_name = "URL")]
+    pub source_url: Option<String>,
+
+    /// SPDX license recorded in the output's `hipfire_provenance`.
+    #[arg(long, value_name = "SPDX")]
+    pub license: Option<String>,
+
+    /// Write a ternary model even if the pack-health check says it is
+    /// degenerate (see `check_ternary_pack_health`). Research escape hatch.
+    #[arg(long, env = "HIPFIRE_ALLOW_DEGENERATE_TERNARY")]
+    pub allow_degenerate_ternary: bool,
 
     /// Emit only tensors selected by a REAP plan.
     #[arg(long, value_name = "PLAN_DIR", conflicts_with = "reap_bake")]
@@ -149,6 +179,16 @@ pub(crate) struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     pub include_prefix: Option<String>,
+
+    /// Product tier for Qwen3.8 ladder: xt keeps lm_head at base codec, base lifts lm_head, pro also lifts ssm_out (linear_attn.out_proj).
+    /// embed_tokens and linear_attn.conv1d.weight remain Q8 at every rung; structural tensors remain F16.
+    #[arg(long, value_name = "TIER")]
+    pub tier: Option<String>,
+
+    /// Per-class fixed-tier codec overrides, e.g. lm_head:mq6v2,ssm_out:mq5v2.
+    /// Accepted classes: lm_head,embed,router,attn,ssm_out; accepted dtypes: q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2.
+    #[arg(long, value_name = "SPEC")]
+    pub fixed_tier: Option<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected

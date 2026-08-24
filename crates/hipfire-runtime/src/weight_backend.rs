@@ -10,7 +10,10 @@
 use crate::hfq::HfqFile;
 use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{
+    DType, Gpu, GpuTensor, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES,
+    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
+};
 
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
 /// 16 bits of an f32). Used by the qt=16 paths in dequant_weight_raw/dequant_f32.
@@ -95,18 +98,19 @@ pub enum EmbedPlan {
 /// Pure quant_type → plan. GPU-free, unit-testable.
 ///
 /// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
-/// qt 1|2|16 → HostF32, else → panic with the supported-format list.
+/// qt 1|2|16|40|41 → HostF32, else → panic with the supported-format list.
 pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
-        1 | 2 | 16 => Ok(EmbedPlan::HostF32),
+        1 | 2 | 16 | 40 | 41 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}; \
-                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32). \
+                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
+                 40 (TQ2G128→F32), 41 (BQ1G128→F32). \
                  Add the format to embed_classify to support it."
             ),
         )),
@@ -413,8 +417,47 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 39,
         dtype: DType::MQ3G256GL,
     },
+    // PrismML Bonsai ternary / binary. Renumbered 38/39 -> 40/41 when master
+    // claimed 38/39 for the GL codebook formats; the IDs are on-disk contract,
+    // so a clash silently mis-decodes (64/96 B GL groups read as 34/18 B
+    // ternary blocks) rather than erroring.
+    RawCodec {
+        quant_type: 40,
+        dtype: DType::TQ2G128,
+    },
+    RawCodec {
+        quant_type: 41,
+        dtype: DType::BQ1G128,
+    },
+    RawCodec {
+        quant_type: 44,
+        dtype: DType::MQ4G256V2,
+    },
+    RawCodec {
+        quant_type: 45,
+        dtype: DType::MQ4CG256,
+    },
+    // Neutral-size Magnum V2 family (qt47-50): same neutral header as qt44
+    // (LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1, `[6..8)` fp16 z1,
+    // `[8..B)` legacy payload). Half 0 covers q[0..128), half 1 q[128..256);
+    // `w = q*f32(s[h])+f32(z[h])`; `K%256==0`; B=200/168/104/72.
+    RawCodec {
+        quant_type: 47,
+        dtype: DType::MQ6G256V2,
+    },
+    RawCodec {
+        quant_type: 48,
+        dtype: DType::MQ5G256V2,
+    },
+    RawCodec {
+        quant_type: 49,
+        dtype: DType::MQ3G256V2,
+    },
+    RawCodec {
+        quant_type: 50,
+        dtype: DType::MQ2G256V2,
+    },
 ];
-
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
 pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
@@ -433,7 +476,13 @@ pub(crate) fn decode_raw_codec(
     k: usize,
     name: &str,
 ) -> HipResult<WeightTensor> {
-    if codec.dtype.requires_k_mod_256() && k % 256 != 0 {
+    // Low-bit layout validation — centralized before any upload/host-dequant.
+    // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
+    // Both require K%128==0 and exact packed length m*(k/128)*block_bytes.
+    // Checked arithmetic so overflow is an actionable error, not a silent wrap.
+    if let Some(block_bytes) = lowbit_block_bytes(codec.dtype) {
+        validate_lowbit_layout(codec.dtype, data.len(), m, k, name, block_bytes)?;
+    } else if codec.dtype.requires_k_mod_256() && k % 256 != 0 {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
@@ -441,6 +490,86 @@ pub(crate) fn decode_raw_codec(
                 codec.dtype
             ),
         ));
+    }
+    if codec.dtype == DType::MQ4G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * 136;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ4CG256 {
+        let gpr = k / 256;
+        // Pad layout: 136 B/group (fp16 scale+zero @+0, 4 B zero pad @+4,
+        // 128 B nibbles @+8). Compact 132 B groups are not a production path.
+        let expected = m * gpr * MQ4C_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ6G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ6G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ5G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ5G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ3G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ3G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ2G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ2G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
     }
     let buf = gpu.upload_raw(data, &[data.len()])?;
     Ok(WeightTensor {
@@ -452,6 +581,78 @@ pub(crate) fn decode_raw_codec(
         paro: None,
         awq_scale: None,
     })
+}
+
+/// Block bytes for low-bit codecs, or None for other codecs.
+fn lowbit_block_bytes(dtype: DType) -> Option<usize> {
+    match dtype {
+        DType::TQ2G128 => Some(34),
+        DType::BQ1G128 => Some(18),
+        _ => None,
+    }
+}
+
+/// Compute expected packed byte length for TQ2G128/BQ1G128 with checked arithmetic.
+/// Returns error with dtype/shape/caller context if K%128!=0 or arithmetic overflows.
+fn lowbit_expected_bytes(
+    dtype: DType,
+    m: usize,
+    k: usize,
+    name: &str,
+    block_bytes: usize,
+) -> HipResult<usize> {
+    if k % 128 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) requires K%128==0: K={k} not divisible by 128",
+                dtype
+            ),
+        ));
+    }
+    let groups = k / 128;
+    let bytes_per_row = groups.checked_mul(block_bytes).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) byte length overflow: (k/128)*{block_bytes} overflows usize (k/128={groups})",
+                dtype
+            ),
+        )
+    })?;
+    bytes_per_row.checked_mul(m).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) byte length overflow: m*(k/128)*{block_bytes} overflows usize (bytes_per_row={bytes_per_row}, m={m})",
+                dtype
+            ),
+        )
+    })
+}
+
+/// Validate that `data_len` exactly matches the published low-bit layout.
+/// Checked arithmetic so overflow is an error; includes dtype, shape/caller,
+/// expected and actual length in the message. GPU-free, unit-testable.
+fn validate_lowbit_layout(
+    dtype: DType,
+    data_len: usize,
+    m: usize,
+    k: usize,
+    name: &str,
+    block_bytes: usize,
+) -> HipResult<()> {
+    let expected = lowbit_expected_bytes(dtype, m, k, name, block_bytes)?;
+    if data_len != expected {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) expects {expected} bytes (m*(k/128)*{block_bytes}) but got {data_len}",
+                dtype
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Quant `data` → device `WeightTensor [m, k]`. Moved from
@@ -589,6 +790,49 @@ fn fwht256_inplace(group: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     for i in 0..256 {
         group[i] *= scale_inv * signs1[i];
     }
+}
+
+/// TQ2G128 ternary block → F32, GPU-free pure fn (unit-testable in isolation
+/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (34
+/// bytes / 128-elem group): `[FP16 d (2B)][qs[32]]`, codes packed 4/byte
+/// LSB-first; `value = (code - 1) * d`. Mirrors the proven Task-5/Task-8v
+/// CPU oracle for `dequant_tq2g128_to_f16`.
+fn dequant_tq2_to_f32(data: &[u8], n: usize) -> Vec<f32> {
+    const BLK: usize = 34;
+    let nblocks = n / 128;
+    let mut out = Vec::with_capacity(n);
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        for j in 0..128 {
+            let code = (data[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x3;
+            out.push((code as i32 - 1) as f32 * d);
+        }
+    }
+    out
+}
+
+/// BQ1G128 binary block → F32, GPU-free pure fn (unit-testable in isolation
+/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (18
+/// bytes / 128-elem group): `[FP16 d (2B)][16 packed sign-bit bytes,
+/// LSB-first]`; element `e` reads byte `2 + e/8`, bit `e % 8`; `value =
+/// bit ? +d : -d`. Mirrors the proven Task-9 GPU/CPU oracle in
+/// `crates/rdna-compute/examples/test_dequant_bq1g128.rs` and the
+/// `dequant_bq1g128_to_f16.hip` kernel body.
+fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
+    const BLK: usize = 18;
+    let nblocks = n / 128;
+    let mut out = Vec::with_capacity(n);
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        for j in 0..128 {
+            let byte = data[base + 2 + (j >> 3)];
+            let bit = (byte >> (j & 7)) & 1;
+            out.push(if bit == 1 { d } else { -d });
+        }
+    }
+    out
 }
 
 pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
@@ -948,6 +1192,8 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             }
             out
         }
+        40 => dequant_tq2_to_f32(data, n),
+        41 => dequant_bq1_to_f32(data, n),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     };
     gpu.upload_f32(&f32_data[..n], &[n])
@@ -1225,12 +1471,86 @@ mod tests {
     }
     #[test]
     fn embed_classify_host_f32() {
-        for qt in [1, 2, 16] {
+        for qt in [1, 2, 16, 40, 41] {
             match embed_classify(qt).unwrap() {
                 EmbedPlan::HostF32 => {}
                 other => panic!("qt={qt}: expected HostF32, got {other:?}"),
             }
         }
+    }
+    /// quant_type 40 (TQ2G128) → `EmbedPlan::HostF32`, so
+    /// `token_embd` routes through the existing host-decode-to-F32 embedding
+    /// path instead of tripping the "unsupported embedding quant_type"
+    /// panic seen in Task 16's diagnosis run.
+    #[test]
+    fn embed_classify_tq2g128_is_host_f32() {
+        match embed_classify(40).unwrap() {
+            EmbedPlan::HostF32 => {}
+            other => panic!("qt=40: expected HostF32, got {other:?}"),
+        }
+    }
+    /// quant_type 41 (BQ1G128) → `EmbedPlan::HostF32`,
+    /// mirroring the qt=40 TQ2G128 arm above.
+    #[test]
+    fn embed_classify_bq1g128_is_host_f32() {
+        match embed_classify(41).unwrap() {
+            EmbedPlan::HostF32 => {}
+            other => panic!("qt=41: expected HostF32, got {other:?}"),
+        }
+    }
+    /// Task 15b RED→GREEN gate: `dequant_tq2_to_f32` on a single 34-byte
+    /// Q2_0 block, `d=2.0` (FP16 bytes `[0x00, 0x40]`), `qs[0]=0xE4` (codes
+    /// 0,1,2,3 LSB-first) and the rest of `qs` zeroed (code 0 everywhere).
+    /// `value = (code-1)*d` so: code0→-2.0, code1→0.0, code2→2.0, code3→4.0,
+    /// then 124 more code-0 elements at -2.0. Mirrors the proven Task-5/
+    /// Task-8v oracle for `dequant_tq2g128_to_f16`.
+    #[test]
+    fn dequant_tq2_to_f32_single_block() {
+        let mut data = [0u8; 34];
+        data[0] = 0x00;
+        data[1] = 0x40; // FP16 2.0
+        data[2] = 0xE4; // codes [0,1,2,3] LSB-first (0b11_10_01_00)
+                        // data[3..34] already zero => codes 0 for elements 4..127
+        let out = dequant_tq2_to_f32(&data, 128);
+        assert_eq!(out.len(), 128);
+        assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]);
+        for (i, &v) in out.iter().enumerate().skip(4) {
+            assert_eq!(v, -2.0, "expected tail code-0 => -d at index {i}");
+        }
+    }
+    /// SP-B final-review cleanup: `dequant_bq1_to_f32` had no dedicated unit
+    /// test (the bug it once had was missed by every per-task review). Single
+    /// 18-byte Q1_0 block, `d=0.5` (FP16 bytes `[0x00, 0x38]`), all 16 `qs`
+    /// bytes `0xFF` (every sign bit set) => all 128 elements decode to `+d`.
+    /// Then clearing bit 0 of `qs[0]` flips element 0 to `-d` while element 1
+    /// stays `+d`. Mirrors the Task-9 device-parity oracle and the already-
+    /// passing `dequant_q1_0_sign_only` test in `gguf_input.rs`.
+    #[test]
+    fn dequant_bq1_to_f32_single_block() {
+        let mut data = [0u8; 18];
+        data[0] = 0x00;
+        data[1] = 0x38; // FP16 0.5
+        for b in data[2..18].iter_mut() {
+            *b = 0xFF; // all 128 sign bits set => all +d
+        }
+        let out = dequant_bq1_to_f32(&data, 128);
+        assert_eq!(out.len(), 128);
+        for (i, &v) in out.iter().enumerate() {
+            assert!((v - 0.5).abs() < 1e-3, "expected +d at index {i}, got {v}");
+        }
+
+        data[2] &= !1; // clear bit 0 of qs[0] => element 0 flips to -d
+        let out = dequant_bq1_to_f32(&data, 128);
+        assert!(
+            (out[0] - (-0.5)).abs() < 1e-3,
+            "expected -d at index 0, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 0.5).abs() < 1e-3,
+            "expected +d at index 1, got {}",
+            out[1]
+        );
     }
     #[test]
     fn embed_classify_errors_on_unknown() {
@@ -1324,6 +1644,18 @@ mod tests {
             // 96 B/group (or vice versa) → token soup, not a crash.
             (38, DType::MQ2G256GL),
             (39, DType::MQ3G256GL),
+            // Bonsai ternary/binary — renumbered off 38/39 (taken by GL above).
+            (40, DType::TQ2G128), // ternary Bonsai-27B, 34 B/group-128
+            (41, DType::BQ1G128), // binary Bonsai-27B, 18 B/group-128
+            // qt=44/45: 136 B/group pad layouts (PR599). MQ4C is NOT 132.
+            (44, DType::MQ4G256V2),
+            (45, DType::MQ4CG256),
+            // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction;
+            // do not alias to legacy MQ2/3/5/6. Each maps one-to-one to its V2 DType.
+            (47, DType::MQ6G256V2), // 200 B/G256 6.25bpw
+            (48, DType::MQ5G256V2), // 168 B/G256 5.25bpw
+            (49, DType::MQ3G256V2), // 104 B/G256 3.25bpw
+            (50, DType::MQ2G256V2), // 72 B/G256 2.25bpw
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));
@@ -1355,5 +1687,302 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// quant_type 40 (ternary Bonsai-27B TQ2G128) must resolve to
+    /// DType::TQ2G128 via the RAW_CODECS loader table.
+    #[test]
+    fn tq2g128_quant_type_40_maps_to_tq2g128() {
+        let codec = raw_codec(40).expect("quant_type 40 registered");
+        assert_eq!(codec.dtype, DType::TQ2G128);
+    }
+    /// quant_type 41 (binary Bonsai-27B BQ1G128)
+    /// must resolve to DType::BQ1G128 via the RAW_CODECS loader table.
+    #[test]
+    fn bq1g128_quant_type_41_maps_to_bq1g128() {
+        let c = raw_codec(41).expect("no RAW_CODECS row for qt=41");
+        assert_eq!(c.dtype, DType::BQ1G128);
+    }
+
+    // ── Low-bit layout-validation contract (GPU-free) ─────────────────────────
+    // TQ2G128: 34 B per 128, BQ1G128: 18 B per 128, K%128==0, exact byte length
+    // m*(k/128)*block_bytes with checked arithmetic. Centralized in
+    // decode_raw_codec via validate_lowbit_layout / lowbit_expected_bytes.
+
+    #[test]
+    fn lowbit_block_bytes_mapping() {
+        assert_eq!(lowbit_block_bytes(DType::TQ2G128), Some(34));
+        assert_eq!(lowbit_block_bytes(DType::BQ1G128), Some(18));
+        assert_eq!(lowbit_block_bytes(DType::HFQ4G256), None);
+        assert_eq!(lowbit_block_bytes(DType::Q8_0), None);
+        assert_eq!(lowbit_block_bytes(DType::HFP4G32), None);
+    }
+
+    #[test]
+    fn lowbit_block_bytes_none_for_other_dtypes() {
+        for dt in [
+            DType::Q4K,
+            DType::Q8HFQ,
+            DType::MQ4G256,
+            DType::MQ2G256GL,
+            DType::F32,
+            DType::F16,
+        ] {
+            assert_eq!(lowbit_block_bytes(dt), None, "{dt:?} must not be low-bit");
+        }
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_tq2g128_valid_layouts() {
+        // Single-row, single-group: m=1,k=128 => 1*1*34 =34
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 1, 128, "test", 34).unwrap(),
+            34
+        );
+        // m=32,k=128 => 32*1*34=1088
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 32, 128, "test", 34).unwrap(),
+            32 * 34
+        );
+        // m=1,k=256 => 1*2*34=68
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 1, 256, "test", 34).unwrap(),
+            68
+        );
+        // Real Bonsai shape: m=8192,k=4096 => 8192*(4096/128)*34 =8192*32*34=8912896
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 8192, 4096, "test", 34).unwrap(),
+            8192 * 32 * 34
+        );
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 8192, 4096, "test", 34).unwrap(),
+            8912896
+        );
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_bq1g128_valid_layouts() {
+        // m=1,k=128 => 18
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 1, 128, "test", 18).unwrap(),
+            18
+        );
+        // m=32,k=128 => 576
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 32, 128, "test", 18).unwrap(),
+            576
+        );
+        // m=8192,k=4096 => 8192*32*18=4718592
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 8192, 4096, "test", 18).unwrap(),
+            4718592
+        );
+        // m=4096,k=512 => 4096*4*18=294912
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 4096, 512, "test", 18).unwrap(),
+            4096 * 4 * 18
+        );
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_rejects_k_not_divisible() {
+        for k in [1, 127, 129, 256 - 1, 255, 257, 1000] {
+            let err = lowbit_expected_bytes(DType::TQ2G128, 1, k, "caller_ctx", 34).unwrap_err();
+            assert!(
+                err.message.contains("K%128==0") || err.message.contains("requires K%128"),
+                "k={k}: expected K%128 error, got {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("TQ2G128"),
+                "must include dtype: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("caller_ctx"),
+                "must include caller: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&format!("k={k}")) || err.message.contains(&format!("K={k}")),
+                "must include shape K: {}",
+                err.message
+            );
+        }
+        // BQ1G128 same guard
+        let err = lowbit_expected_bytes(DType::BQ1G128, 4, 200, "my_layer", 18).unwrap_err();
+        assert!(err.message.contains("BQ1G128"));
+        assert!(err.message.contains("my_layer"));
+        assert!(err.message.contains("K%128"));
+    }
+
+    #[test]
+    fn validate_lowbit_layout_accepts_exact() {
+        // TQ2G128 m=2,k=128 => 68 bytes
+        validate_lowbit_layout(DType::TQ2G128, 68, 2, 128, "accept", 34).unwrap();
+        // BQ1G128 m=2,k=128 => 36 bytes
+        validate_lowbit_layout(DType::BQ1G128, 36, 2, 128, "accept", 18).unwrap();
+        // m=0 => 0 bytes expected (degenerate but valid)
+        validate_lowbit_layout(DType::TQ2G128, 0, 0, 128, "zero_m", 34).unwrap();
+        validate_lowbit_layout(DType::BQ1G128, 0, 0, 256, "zero_m", 18).unwrap();
+    }
+
+    #[test]
+    fn validate_lowbit_layout_rejects_short_and_long() {
+        // TQ2G128 m=1,k=128 expects 34, give 33 and 35
+        let exp = 34;
+        for bad in [exp - 1, exp + 1, exp + 10, 0] {
+            let err =
+                validate_lowbit_layout(DType::TQ2G128, bad, 1, 128, "my_caller", 34).unwrap_err();
+            assert!(
+                err.message.contains("TQ2G128"),
+                "dtype in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("m=1"),
+                "shape m in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("k=128"),
+                "shape k in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("my_caller"),
+                "caller in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&exp.to_string()),
+                "expected in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&bad.to_string()),
+                "actual in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("expects"),
+                "expects phrase: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("but got"),
+                "but got phrase: {}",
+                err.message
+            );
+        }
+        // BQ1G128 m=4,k=256 => 4*2*18=144, test short
+        let err = validate_lowbit_layout(DType::BQ1G128, 100, 4, 256, "bq_caller", 18).unwrap_err();
+        assert!(err.message.contains("BQ1G128"));
+        assert!(err.message.contains("expects 144"));
+        assert!(err.message.contains("but got 100"));
+    }
+
+    #[test]
+    fn validate_lowbit_layout_error_contains_context() {
+        let err =
+            validate_lowbit_layout(DType::TQ2G128, 10, 8, 256, "attn.q_proj", 34).unwrap_err();
+        // 8 rows *2 groups *34 =544 expected, got 10
+        assert!(err.message.contains("TQ2G128"));
+        assert!(err.message.contains("m=8"));
+        assert!(err.message.contains("k=256"));
+        assert!(err.message.contains("attn.q_proj"));
+        assert!(err.message.contains("expects 544"));
+        assert!(err.message.contains("but got 10"));
+        assert!(err.message.contains("m*(k/128)*34"));
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_overflow() {
+        // bytes_per_row*m overflows: choose m=usize::MAX, k=128 => bytes_per_row=34 => 34*MAX overflows
+        let err =
+            lowbit_expected_bytes(DType::TQ2G128, usize::MAX, 128, "overflow_m", 34).unwrap_err();
+        assert!(err.message.contains("overflow"), "got {}", err.message);
+        assert!(err.message.contains("TQ2G128"), "dtype: {}", err.message);
+        assert!(
+            err.message.contains("overflow_m"),
+            "caller: {}",
+            err.message
+        );
+        assert!(err.message.contains("m="), "shape: {}", err.message);
+        // BQ1G128 overflow same
+        let err = lowbit_expected_bytes(DType::BQ1G128, usize::MAX, 256, "ov_bq", 18).unwrap_err();
+        assert!(err.message.contains("overflow"));
+        assert!(err.message.contains("BQ1G128"));
+        assert!(err.message.contains("ov_bq"));
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_zero_m() {
+        // m=0 => 0 expected regardless of K (as long as K%128==0)
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 0, 4096, "zero", 34).unwrap(),
+            0
+        );
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 0, 128, "zero", 18).unwrap(),
+            0
+        );
+    }
+
+    /// MQ4C (qt=45) ships as 136 B/group pad layout — same total as MQ4 v1/v2.
+    /// Compact 132 B groups are rejected at load; do not reintroduce them.
+    #[test]
+    fn mq4c_group_bytes_is_136_not_compact_132() {
+        assert_eq!(MQ4C_GROUP_BYTES, 136, "MQ4C pad layout is 136 B/group");
+        assert_ne!(
+            MQ4C_GROUP_BYTES, 132,
+            "compact 132 B MQ4C is not production"
+        );
+        // decode_raw_codec expected length: m * (k/256) * MQ4C_GROUP_BYTES
+        let m = 4usize;
+        let k = 512usize;
+        let gpr = k / 256;
+        let expected = m * gpr * MQ4C_GROUP_BYTES;
+        assert_eq!(expected, m * gpr * 136);
+        assert_ne!(expected, m * gpr * 132);
+        let codec = raw_codec(45).expect("qt=45 MQ4CG256 codec");
+        assert_eq!(codec.dtype, DType::MQ4CG256);
+    }
+
+    #[test]
+    fn mq_v2_group_bytes_match_spec() {
+        assert_eq!(MQ6G256V2_GROUP_BYTES, 200, "qt47 MQ6G256V2 is 200 B/group");
+        assert_eq!(MQ5G256V2_GROUP_BYTES, 168, "qt48 MQ5G256V2 is 168 B/group");
+        assert_eq!(MQ3G256V2_GROUP_BYTES, 104, "qt49 MQ3G256V2 is 104 B/group");
+        assert_eq!(MQ2G256V2_GROUP_BYTES, 72, "qt50 MQ2G256V2 is 72 B/group");
+        // Each qt maps one-to-one to its DType and exact block bytes.
+        assert_eq!(raw_codec(47).unwrap().dtype, DType::MQ6G256V2);
+        assert_eq!(raw_codec(48).unwrap().dtype, DType::MQ5G256V2);
+        assert_eq!(raw_codec(49).unwrap().dtype, DType::MQ3G256V2);
+        assert_eq!(raw_codec(50).unwrap().dtype, DType::MQ2G256V2);
+        // Existing qts unchanged.
+        assert_eq!(raw_codec(44).unwrap().dtype, DType::MQ4G256V2);
+        assert_eq!(raw_codec(45).unwrap().dtype, DType::MQ4CG256);
+        assert_eq!(raw_codec(15).unwrap().dtype, DType::MQ6G256);
+        assert_eq!(raw_codec(17).unwrap().dtype, DType::MQ3G256);
+        assert_eq!(raw_codec(18).unwrap().dtype, DType::MQ2G256);
+    }
+
+    #[test]
+    fn mq_v2_require_k_mod_256_and_awq() {
+        for dt in [
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert!(dt.requires_k_mod_256(), "{dt:?} must require K%256==0");
+            assert!(dt.supports_awq_sidecar(), "{dt:?} must support AWQ sidecar");
+        }
+        // Legacy counterparts remain distinct DTypes (no alias).
+        assert_ne!(DType::MQ6G256V2, DType::MQ6G256);
+        assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
+        assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
+        assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
     }
 }

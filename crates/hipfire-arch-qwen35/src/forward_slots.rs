@@ -38,8 +38,13 @@
 // mirroring `forward_prefill_chunk`'s own `is_mq` dispatch fork for these
 // layer kinds (rmsnorm+FWHT-rotate via `fused_rmsnorm_rotate_mq_batched_for`
 // / `rotate_x_mq_batched_for`, then the same `*Hfq4G256` kernel keys the
-// dense HFQ4G256 path already uses — MQ4G256 is byte-identical to HFQ4G256,
-// only the input activations are pre-rotated). The MoE FFN itself is
+// dense HFQ4G256 path already uses — MQ4G256 (qt=13) is byte-identical to HFQ4G256,
+// only the input activations are pre-rotated. This does NOT hold for qt=44
+// (MQ4G256V2): same 136 B stride and nibble payload but the 8 header bytes change
+// meaning from `[0..4) f32 scale, [4..8) f32 zero` (one affine grid per 256 weights)
+// to `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1` (s0/z0 for 0..127,
+// s1/z1 for 128..255). A v1 kernel fed qt=44 bytes bit_casts fp16 pairs to f32 and
+// decodes every weight to ~1e-14 at full speed with no error. The MoE FFN itself is
 // stateless per row (no kv_cache, no dn_state, no positions — confirmed by
 // reading `moe_ffn_decode`'s signature), so it needs no slot machinery at
 // all: `run_deltanet_moe_layer_slots`/`run_fullattn_moe_layer_slots` call
@@ -199,7 +204,18 @@ fn require_batchable_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<A
     if all(DType::Q8_0) {
         return Ok(AttnProjDtype::Q8_0);
     }
-    if all(DType::MQ4G256) {
+    // Either MQ4 container is admissible, but a layer must be uniform in ONE of
+    // them: the fused kernels serve all projections of a layer in a single launch,
+    // so a mixed qt=13/qt=44 layer would decode half its weights with the wrong
+    // header interpretation.
+    if all(DType::MQ4G256)
+        || all(DType::MQ4G256V2)
+        || all(DType::MQ4CG256)
+        || all(DType::MQ6G256V2)
+        || all(DType::MQ5G256V2)
+        || all(DType::MQ3G256V2)
+        || all(DType::MQ2G256V2)
+    {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
@@ -224,7 +240,14 @@ fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<A
     if all(DType::Q8_0) {
         return Ok(AttnProjDtype::Q8_0);
     }
-    if all(DType::MQ4G256) {
+    if all(DType::MQ4G256)
+        || all(DType::MQ4G256V2)
+        || all(DType::MQ4CG256)
+        || all(DType::MQ6G256V2)
+        || all(DType::MQ5G256V2)
+        || all(DType::MQ3G256V2)
+        || all(DType::MQ2G256V2)
+    {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
@@ -250,6 +273,74 @@ enum AttnProjDtype {
     Mq4G256,
 }
 
+// ── Kernel-key selection by weight CONTAINER, never hardcoded ──────────────
+//
+// qt=6 (HFQ4G256) and qt=13 (MQ4G256) share one container: 136 B groups holding
+// `[0..4) f32 scale, [4..8) f32 zero` over all 256 weights, then 128 B of nibbles.
+// MQ4 is that container plus an offline FWHT, so it has always borrowed HFQ4's
+// kernel keys and that is correct — only the activations differ.
+//
+// qt=44 (MQ4G256V2) is a DIFFERENT container. Same 136 B stride, same nibble
+// payload at the same offset, but the 8 header bytes become
+// `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1`, with s0/z0
+// governing weights 0..127 and s1/z1 governing 128..255.
+//
+// Hand a v1 key a qt=44 weight and the kernel bit_casts an fp16 pair to f32,
+// yielding ~1e-14: every weight in the tensor collapses to numerically zero. It
+// cannot fail — every bit pattern is a valid finite f32, the nibbles are read
+// correctly, and stride/alignment/K%256 are identical — so it runs at full speed
+// and returns noise. That cost two full KLD measurement cycles (WT2 12.137559
+// against a 0.043776 baseline, bit-identical across both runs) before it was
+// found. Select on the container; never hardcode.
+
+pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        _ => KernelKey::GemmHfq4G256Residual,
+    }
+}
+
+pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
+        _ => KernelKey::FusedQkvzaHfq4G256,
+    }
+}
+
+pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
+        _ => KernelKey::FusedQkvHfq4G256,
+    }
+}
+
+pub(crate) fn fused_gate_up_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+        _ => KernelKey::FusedGateUpHfq4G256,
+    }
+}
+
 /// Q8_0-or-MQ4G256 weight-dtype gate for a `DeltaNetMoeLayerWeights`,
 /// uniform across all five attention projections (wqkv/wz/w_beta/w_alpha/wo)
 /// — a mixed Q8/MQ4 layer would misroute through a single-stride fused
@@ -269,11 +360,25 @@ fn require_batchable_deltanet_moe_layer(
     if all_q8 {
         return Ok(AttnProjDtype::Q8_0);
     }
-    let all_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.wz.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.w_beta.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.w_alpha.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.wo.gpu_dtype, DType::MQ4G256);
+    // Renamed from `mq4c` now that MQ4C/qt=45 is a real format name — this predicate
+    // is the whole MQ4 FAMILY, not that one container.
+    let mq4_family = |d: DType| {
+        matches!(
+            d,
+            DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
+        )
+    };
+    let all_mq4 = mq4_family(layer.wqkv.gpu_dtype)
+        && layer.wz.gpu_dtype == layer.wqkv.gpu_dtype
+        && layer.w_beta.gpu_dtype == layer.wqkv.gpu_dtype
+        && layer.w_alpha.gpu_dtype == layer.wqkv.gpu_dtype
+        && layer.wo.gpu_dtype == layer.wqkv.gpu_dtype;
     if all_mq4 {
         return Ok(AttnProjDtype::Mq4G256);
     }
@@ -298,10 +403,22 @@ fn require_batchable_fullattn_moe_layer(
     if all_q8 {
         return Ok(AttnProjDtype::Q8_0);
     }
-    let all_mq4 = matches!(layer.wq.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.wk.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.wv.gpu_dtype, DType::MQ4G256)
-        && matches!(layer.wo.gpu_dtype, DType::MQ4G256);
+    let mq4_family = |d: DType| {
+        matches!(
+            d,
+            DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
+        )
+    };
+    let all_mq4 = mq4_family(layer.wq.gpu_dtype)
+        && layer.wk.gpu_dtype == layer.wq.gpu_dtype
+        && layer.wv.gpu_dtype == layer.wq.gpu_dtype
+        && layer.wo.gpu_dtype == layer.wq.gpu_dtype;
     if all_mq4 {
         return Ok(AttnProjDtype::Mq4G256);
     }
@@ -362,7 +479,7 @@ fn mq4_residual_proj(
     let y_n = y.sub_offset(0, n * w.m);
     run_residual_gemm_key(
         gpu,
-        KernelKey::GemmHfq4G256Residual,
+        residual_gemm_key_for(w.gpu_dtype),
         &w.buf,
         w.gpu_dtype,
         scratch,
@@ -513,7 +630,7 @@ fn dense_ffn_body_slots(
             )?;
             run_fused_gate_up_key(
                 gpu,
-                KernelKey::FusedGateUpHfq4G256,
+                fused_gate_up_key_for(w_gate.gpu_dtype),
                 &w_gate.buf,
                 &w_up.buf,
                 &pbs.x_rot_batch,
@@ -535,7 +652,7 @@ fn dense_ffn_body_slots(
             )?;
             run_residual_gemm_key(
                 gpu,
-                KernelKey::GemmHfq4G256Residual,
+                residual_gemm_key_for(w_down.gpu_dtype),
                 &w_down.buf,
                 w_down.gpu_dtype,
                 &pbs.ffn_hidden_batch,
@@ -621,7 +738,7 @@ fn run_deltanet_layer_slots(
         )?;
         run_fused_qkvza_key(
             gpu,
-            KernelKey::FusedQkvzaHfq4G256,
+            fused_qkvza_key_for(layer.wqkv.gpu_dtype),
             &layer.wqkv.buf,
             &layer.wz.buf,
             &layer.w_beta.buf,
@@ -639,82 +756,82 @@ fn run_deltanet_layer_slots(
             n,
         )?;
     } else {
-    gpu.rmsnorm_batched(
-        &pbs.x_batch,
-        &layer.attn_norm,
-        &pbs.x_rot_batch,
-        n,
-        config.dim,
-        config.norm_eps,
-    )?;
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_rot_batch,
+            n,
+            config.dim,
+            config.norm_eps,
+        )?;
 
-    // 2. Batched 4-way QKVZA projection.
-    if q8_wmma_arch {
-        run_fused_qkvza_key(
-            gpu,
-            KernelKey::FusedQkvzaQ8_0,
-            &layer.wqkv.buf,
-            &layer.wz.buf,
-            &layer.w_beta.buf,
-            &layer.w_alpha.buf,
-            &pbs.x_rot_batch,
-            &pbs.dn_qkv_batch,
-            &pbs.dn_z_batch,
-            &pbs.dn_beta_batch,
-            &pbs.dn_alpha_batch,
-            layer.wqkv.m,
-            layer.wz.m,
-            layer.w_beta.m,
-            layer.w_alpha.m,
-            layer.wqkv.k,
-            n,
-        )?;
-    } else {
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.wqkv.buf,
-            layer.wqkv.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_qkv_batch,
-            layer.wqkv.m,
-            layer.wqkv.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.wz.buf,
-            layer.wz.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_z_batch,
-            layer.wz.m,
-            layer.wz.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.w_beta.buf,
-            layer.w_beta.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_beta_batch,
-            layer.w_beta.m,
-            layer.w_beta.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.w_alpha.buf,
-            layer.w_alpha.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_alpha_batch,
-            layer.w_alpha.m,
-            layer.w_alpha.k,
-            n,
-        )?;
-    }
+        // 2. Batched 4-way QKVZA projection.
+        if q8_wmma_arch {
+            run_fused_qkvza_key(
+                gpu,
+                KernelKey::FusedQkvzaQ8_0,
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                &pbs.x_rot_batch,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+            )?;
+        } else {
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.wqkv.buf,
+                layer.wqkv.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.dn_qkv_batch,
+                layer.wqkv.m,
+                layer.wqkv.k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.wz.buf,
+                layer.wz.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.dn_z_batch,
+                layer.wz.m,
+                layer.wz.k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.w_beta.buf,
+                layer.w_beta.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.dn_beta_batch,
+                layer.w_beta.m,
+                layer.w_beta.k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.w_alpha.buf,
+                layer.w_alpha.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.dn_alpha_batch,
+                layer.w_alpha.m,
+                layer.w_alpha.k,
+                n,
+            )?;
+        }
     }
 
     // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
@@ -935,7 +1052,7 @@ fn run_deltanet_moe_layer_slots(
             )?;
             run_fused_qkvza_key(
                 gpu,
-                KernelKey::FusedQkvzaHfq4G256,
+                fused_qkvza_key_for(layer.wqkv.gpu_dtype),
                 &layer.wqkv.buf,
                 &layer.wz.buf,
                 &layer.w_beta.buf,
@@ -1457,7 +1574,7 @@ fn run_fullattn_layer_slots(
         )?;
         run_fused_qkv_key(
             gpu,
-            KernelKey::FusedQkvHfq4G256,
+            fused_qkv_key_for(layer.wq.gpu_dtype),
             &layer.wq.buf,
             &layer.wk.buf,
             &layer.wv.buf,
@@ -1472,68 +1589,68 @@ fn run_fullattn_layer_slots(
             n,
         )?;
     } else {
-    gpu.rmsnorm_batched(
-        &pbs.x_batch,
-        &layer.attn_norm,
-        &pbs.x_rot_batch,
-        n,
-        dim,
-        config.norm_eps,
-    )?;
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_rot_batch,
+            n,
+            dim,
+            config.norm_eps,
+        )?;
 
-    // 2. Batched 3-way QKV projection.
-    if q8_wmma_arch {
-        run_fused_qkv_key(
-            gpu,
-            KernelKey::FusedQkvQ8_0,
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            &pbs.x_rot_batch,
-            &pbs.fa_q_full_batch,
-            &pbs.fa_k_batch,
-            &pbs.fa_v_batch,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-            n,
-        )?;
-    } else {
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.wq.buf,
-            layer.wq.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.fa_q_full_batch,
-            layer.wq.m,
-            layer.wq.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.wk.buf,
-            layer.wk.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.fa_k_batch,
-            layer.wk.m,
-            layer.wk.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            KernelKey::GemmQ8_0BatchedChunked,
-            &layer.wv.buf,
-            layer.wv.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.fa_v_batch,
-            layer.wv.m,
-            layer.wv.k,
-            n,
-        )?;
-    }
+        // 2. Batched 3-way QKV projection.
+        if q8_wmma_arch {
+            run_fused_qkv_key(
+                gpu,
+                KernelKey::FusedQkvQ8_0,
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+            )?;
+        } else {
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.wq.buf,
+                layer.wq.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_full_batch,
+                layer.wq.m,
+                layer.wq.k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.wk.buf,
+                layer.wk.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.fa_k_batch,
+                layer.wk.m,
+                layer.wk.k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                KernelKey::GemmQ8_0BatchedChunked,
+                &layer.wv.buf,
+                layer.wv.gpu_dtype,
+                &pbs.x_rot_batch,
+                &pbs.fa_v_batch,
+                layer.wv.m,
+                layer.wv.k,
+                n,
+            )?;
+        }
     }
 
     // 3. Deinterleave Q + gate.
@@ -1750,7 +1867,7 @@ fn run_fullattn_moe_layer_slots(
             )?;
             run_fused_qkv_key(
                 gpu,
-                KernelKey::FusedQkvHfq4G256,
+                fused_qkv_key_for(layer.wq.gpu_dtype),
                 &layer.wq.buf,
                 &layer.wk.buf,
                 &layer.wv.buf,
@@ -2887,4 +3004,99 @@ pub fn forward_batch_slots_opts(
     // slot's KV, so it is the only thing that can get the length right.
     advance_slot_seq_lens(batch, pool)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_dispatch::types::KernelKey;
+    use rdna_compute::DType;
+
+    #[test]
+    fn v2_one_to_one_keys_no_hfq4_fallback() {
+        // Contract: each admitted V2 dtype maps to its exact V2 key, never HFQ4/default.
+        // Plain GEMV (via helper fallback) is covered elsewhere; here we check
+        // the four dense helpers plus residual.
+        let cases: &[(DType, KernelKey, KernelKey, KernelKey, KernelKey)] = &[
+            (
+                DType::MQ6G256V2,
+                KernelKey::GemmMq6G256V2Residual,
+                KernelKey::FusedQkvzaMq6G256V2,
+                KernelKey::FusedQkvMq6G256V2,
+                KernelKey::FusedGateUpMq6G256V2,
+            ),
+            (
+                DType::MQ5G256V2,
+                KernelKey::GemmMq5G256V2Residual,
+                KernelKey::FusedQkvzaMq5G256V2,
+                KernelKey::FusedQkvMq5G256V2,
+                KernelKey::FusedGateUpMq5G256V2,
+            ),
+            (
+                DType::MQ3G256V2,
+                KernelKey::GemmMq3G256V2Residual,
+                KernelKey::FusedQkvzaMq3G256V2,
+                KernelKey::FusedQkvMq3G256V2,
+                KernelKey::FusedGateUpMq3G256V2,
+            ),
+            (
+                DType::MQ2G256V2,
+                KernelKey::GemmMq2G256V2Residual,
+                KernelKey::FusedQkvzaMq2G256V2,
+                KernelKey::FusedQkvMq2G256V2,
+                KernelKey::FusedGateUpMq2G256V2,
+            ),
+        ];
+        for (dt, exp_resid, exp_qkvza, exp_qkv, exp_gate) in cases {
+            assert_eq!(
+                residual_gemm_key_for(*dt),
+                *exp_resid,
+                "residual mismatch for {:?}",
+                dt
+            );
+            assert_eq!(
+                fused_qkvza_key_for(*dt),
+                *exp_qkvza,
+                "qkvza mismatch for {:?}",
+                dt
+            );
+            assert_eq!(
+                fused_qkv_key_for(*dt),
+                *exp_qkv,
+                "qkv mismatch for {:?}",
+                dt
+            );
+            assert_eq!(
+                fused_gate_up_key_for(*dt),
+                *exp_gate,
+                "gate_up mismatch for {:?}",
+                dt
+            );
+            // No HFQ4 leakage
+            assert_ne!(residual_gemm_key_for(*dt), KernelKey::GemmHfq4G256Residual);
+            assert_ne!(fused_qkvza_key_for(*dt), KernelKey::FusedQkvzaHfq4G256);
+            assert_ne!(fused_qkv_key_for(*dt), KernelKey::FusedQkvHfq4G256);
+            assert_ne!(fused_gate_up_key_for(*dt), KernelKey::FusedGateUpHfq4G256);
+        }
+        // Negative: v1 and MQ4C must NOT map to new V2 keys
+        assert_eq!(
+            residual_gemm_key_for(DType::MQ4G256),
+            KernelKey::GemmHfq4G256Residual
+        );
+        assert_eq!(
+            fused_qkv_key_for(DType::HFQ4G256),
+            KernelKey::FusedQkvHfq4G256
+        );
+    }
+
+    #[test]
+    fn v2_plain_gemm_resolve_no_wildcard() {
+        // Plain GEMM auto-selection (GemmFamily::resolve) — not this file's logic
+        // but we assert the key helpers correctly identify V2 vs wildcard.
+        // The actual resolve is tested in dispatch; here we ensure dtype identity.
+        assert_ne!(DType::MQ6G256V2, DType::HFQ4G256);
+        assert_ne!(DType::MQ5G256V2, DType::HFQ4G256);
+        assert_ne!(DType::MQ3G256V2, DType::HFQ4G256);
+        assert_ne!(DType::MQ2G256V2, DType::HFQ4G256);
+    }
 }

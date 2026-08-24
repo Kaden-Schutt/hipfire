@@ -2596,8 +2596,11 @@ fn forward_scratch_layers_multi(
                     let la4_same_dtype = layer.wz.gpu_dtype == dt
                         && layer.w_beta.gpu_dtype == dt
                         && layer.w_alpha.gpu_dtype == dt;
-                    let fused_la4_mq4 =
-                        la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
+                    let fused_la4_mq4 = la4_same_dtype
+                        && (matches!(
+                            dt,
+                            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+                        ));
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_la4_mq4 {
@@ -2605,22 +2608,45 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_hfq4g256(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
+                        if dt == DType::MQ4CG256 || dt == DType::MQ4G256V2 {
+                            let key = crate::forward_slots::fused_qkvza_key_for(dt);
+                            let ctx = DispatchCtx::new(gpu);
+                            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
+                                kind: key,
+                                weights: &[
+                                    &layer.wqkv.buf,
+                                    &layer.wz.buf,
+                                    &layer.w_beta.buf,
+                                    &layer.w_alpha.buf,
+                                ],
+                                x: eff_x,
+                                outputs: &[&s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha],
+                                m: &[layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m],
+                                k: layer.wqkv.k,
+                                rot_scratch: &[],
+                                batch_size: None,
+                            };
+                            hipfire_runtime::llama::fused_qkv_family()
+                                .run(&ctx, gpu, &params)
+                                .map_err(HipError::from)?;
+                        } else {
+                            gpu.fused_qkvza_hfq4g256(
+                                &layer.wqkv.buf,
+                                &layer.wz.buf,
+                                &layer.w_beta.buf,
+                                &layer.w_alpha.buf,
+                                eff_x,
+                                &s.dn_qkv,
+                                &s.dn_z,
+                                &s.dn_beta,
+                                &s.dn_alpha,
+                                layer.wqkv.m,
+                                layer.wz.m,
+                                layer.w_beta.m,
+                                layer.w_alpha.m,
+                                layer.wqkv.k,
+                            )?;
+                        }
                     } else if fused_la4_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -2765,8 +2791,11 @@ fn forward_scratch_layers_multi(
                     )?;
                     let dt_g = layer.w_gate.gpu_dtype;
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
-                    let fused_gu_mq4 =
-                        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
+                    let fused_gu_mq4 = same_dtype
+                        && (matches!(
+                            dt_g,
+                            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+                        ));
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     if fused_gu_mq4 {
@@ -2774,16 +2803,34 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
+                        if dt_g == DType::MQ4CG256 || dt_g == DType::MQ4G256V2 {
+                            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+                            let ctx = DispatchCtx::new(gpu);
+                            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
+                                kind: key,
+                                weights: &[&layer.w_gate.buf, &layer.w_up.buf],
+                                x: eff_x,
+                                outputs: &[&s.gate_ffn, &s.up],
+                                m: &[layer.w_gate.m, layer.w_up.m],
+                                k: layer.w_gate.k,
+                                rot_scratch: &[],
+                                batch_size: None,
+                            };
+                            hipfire_runtime::llama::fused_qkv_family()
+                                .run(&ctx, gpu, &params)
+                                .map_err(HipError::from)?;
+                        } else {
+                            gpu.fused_gate_up_hfq4g256(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        }
                     } else if fused_gu_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -2827,8 +2874,11 @@ fn forward_scratch_layers_multi(
                     )?;
                     let dt = layer.wq.gpu_dtype;
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-                    let fused_fa3_mq4 =
-                        fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
+                    let fused_fa3_mq4 = fa3_same_dtype
+                        && (matches!(
+                            dt,
+                            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+                        ));
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_fa3_mq4 {
@@ -2836,19 +2886,37 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
+                        if dt == DType::MQ4CG256 || dt == DType::MQ4G256V2 {
+                            let key = crate::forward_slots::fused_qkv_key_for(dt);
+                            let ctx = DispatchCtx::new(gpu);
+                            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
+                                kind: key,
+                                weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
+                                x: eff_x,
+                                outputs: &[&s.fa_q_full, &s.fa_k, &s.fa_v],
+                                m: &[layer.wq.m, layer.wk.m, layer.wv.m],
+                                k: layer.wq.k,
+                                rot_scratch: &[],
+                                batch_size: None,
+                            };
+                            hipfire_runtime::llama::fused_qkv_family()
+                                .run(&ctx, gpu, &params)
+                                .map_err(HipError::from)?;
+                        } else {
+                            gpu.fused_qkv_hfq4g256(
+                                &layer.wq.buf,
+                                &layer.wk.buf,
+                                &layer.wv.buf,
+                                eff_x,
+                                &s.fa_q_full,
+                                &s.fa_k,
+                                &s.fa_v,
+                                layer.wq.m,
+                                layer.wk.m,
+                                layer.wv.m,
+                                layer.wq.k,
+                            )?;
+                        }
                     } else if fused_fa3_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -3201,8 +3269,11 @@ fn forward_scratch_layers_multi(
                     )?;
                     let dt_g = layer.w_gate.gpu_dtype;
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
-                    let fused_gu_mq4 =
-                        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
+                    let fused_gu_mq4 = same_dtype
+                        && (matches!(
+                            dt_g,
+                            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+                        ));
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     if fused_gu_mq4 {
@@ -3210,16 +3281,34 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
+                        if dt_g == DType::MQ4CG256 || dt_g == DType::MQ4G256V2 {
+                            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+                            let ctx = DispatchCtx::new(gpu);
+                            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
+                                kind: key,
+                                weights: &[&layer.w_gate.buf, &layer.w_up.buf],
+                                x: eff_x,
+                                outputs: &[&s.gate_ffn, &s.up],
+                                m: &[layer.w_gate.m, layer.w_up.m],
+                                k: layer.w_gate.k,
+                                rot_scratch: &[],
+                                batch_size: None,
+                            };
+                            hipfire_runtime::llama::fused_qkv_family()
+                                .run(&ctx, gpu, &params)
+                                .map_err(HipError::from)?;
+                        } else {
+                            gpu.fused_gate_up_hfq4g256(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        }
                     } else if fused_gu_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -3264,8 +3353,11 @@ fn forward_scratch_layers_multi(
                     let la4_same_dtype = layer.wz.gpu_dtype == dt
                         && layer.w_beta.gpu_dtype == dt
                         && layer.w_alpha.gpu_dtype == dt;
-                    let fused_la4_mq4 =
-                        la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
+                    let fused_la4_mq4 = la4_same_dtype
+                        && (matches!(
+                            dt,
+                            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+                        ));
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_la4_mq4 {
@@ -3273,22 +3365,45 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_hfq4g256(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
+                        if dt == DType::MQ4CG256 || dt == DType::MQ4G256V2 {
+                            let key = crate::forward_slots::fused_qkvza_key_for(dt);
+                            let ctx = DispatchCtx::new(gpu);
+                            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
+                                kind: key,
+                                weights: &[
+                                    &layer.wqkv.buf,
+                                    &layer.wz.buf,
+                                    &layer.w_beta.buf,
+                                    &layer.w_alpha.buf,
+                                ],
+                                x: eff_x,
+                                outputs: &[&s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha],
+                                m: &[layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m],
+                                k: layer.wqkv.k,
+                                rot_scratch: &[],
+                                batch_size: None,
+                            };
+                            hipfire_runtime::llama::fused_qkv_family()
+                                .run(&ctx, gpu, &params)
+                                .map_err(HipError::from)?;
+                        } else {
+                            gpu.fused_qkvza_hfq4g256(
+                                &layer.wqkv.buf,
+                                &layer.wz.buf,
+                                &layer.w_beta.buf,
+                                &layer.w_alpha.buf,
+                                eff_x,
+                                &s.dn_qkv,
+                                &s.dn_z,
+                                &s.dn_beta,
+                                &s.dn_alpha,
+                                layer.wqkv.m,
+                                layer.wz.m,
+                                layer.w_beta.m,
+                                layer.w_alpha.m,
+                                layer.wqkv.k,
+                            )?;
+                        }
                     } else if fused_la4_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -3452,8 +3567,11 @@ fn forward_scratch_layers_multi(
                     )?;
                     let dt = layer.wq.gpu_dtype;
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-                    let fused_fa3_mq4 =
-                        fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
+                    let fused_fa3_mq4 = fa3_same_dtype
+                        && (matches!(
+                            dt,
+                            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+                        ));
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_fa3_mq4 {
@@ -3461,19 +3579,37 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
+                        if dt == DType::MQ4CG256 || dt == DType::MQ4G256V2 {
+                            let key = crate::forward_slots::fused_qkv_key_for(dt);
+                            let ctx = DispatchCtx::new(gpu);
+                            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
+                                kind: key,
+                                weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
+                                x: eff_x,
+                                outputs: &[&s.fa_q_full, &s.fa_k, &s.fa_v],
+                                m: &[layer.wq.m, layer.wk.m, layer.wv.m],
+                                k: layer.wq.k,
+                                rot_scratch: &[],
+                                batch_size: None,
+                            };
+                            hipfire_runtime::llama::fused_qkv_family()
+                                .run(&ctx, gpu, &params)
+                                .map_err(HipError::from)?;
+                        } else {
+                            gpu.fused_qkv_hfq4g256(
+                                &layer.wq.buf,
+                                &layer.wk.buf,
+                                &layer.wv.buf,
+                                eff_x,
+                                &s.fa_q_full,
+                                &s.fa_k,
+                                &s.fa_v,
+                                layer.wq.m,
+                                layer.wk.m,
+                                layer.wv.m,
+                                layer.wq.k,
+                            )?;
+                        }
                     } else if fused_fa3_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,

@@ -15,6 +15,7 @@
 //! fixture code lives.
 
 use std::any::Any;
+use std::io::Read;
 use crate::common::*;
 use crate::batch::emit_uncorrelated_error;
 use hipfire_loader::LoadedModel;
@@ -27,11 +28,21 @@ use hipfire_arch_qwen35::carrier::Qwen35Bundle;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::dflash_verify_pm4::{DflashVerifyPm4, DflashVerifyPm4Phase, DFLASH_VERIFY_PM4_BLOCK};
+use hipfire_arch_qwen35::speculative::{
+    verify_dflash_block, verify_dflash_block_retained, DeltaNetSnapshot, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+};
+use hipfire_loader::spec_build::Qwen35SlotGuard;
+use rdna_compute::replay::ReplayQuiescence;
 #[derive(PartialEq)]
 pub struct RedlineQwenSnapshot {
     pub logits: Vec<u8>,
     pub kv: Vec<u8>,
     pub recurrent: Vec<u8>,
+    /// Host-side GDN stochastic-rounding frame. Conv state already lives in
+    /// `recurrent`; this is the missing counter the Q8 oracle needs.
+    pub gdn_frame: u32,
 }
 
 impl RedlineQwenSnapshot {
@@ -43,6 +54,7 @@ impl RedlineQwenSnapshot {
             "kv_hash": format!("{:016x}", redline_hash(&self.kv)),
             "recurrent_bytes": self.recurrent.len(),
             "recurrent_hash": format!("{:016x}", redline_hash(&self.recurrent)),
+            "gdn_frame": self.gdn_frame,
         })
     }
 }
@@ -167,6 +179,7 @@ pub fn redline_qwen_snapshot(
         logits,
         kv,
         recurrent,
+        gdn_frame: rdna_compute::norm::gdn_requant_frame_checkpoint(),
     })
 }
 
@@ -1921,6 +1934,1109 @@ pub fn handle_redline_dspark_shadow_pm4(
     }
     let _ = stdout.flush();
     return;
+}
+
+// ─── DFlash2 retained-PM4 verify oracle (contract C4) ─────────────────────
+
+const DFLASH_SHADOW_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
+
+/// Unconditional Q8 byte parity is not a correctness oracle: Q8 DeltaNet
+/// uses stochastic rounding keyed on the GDN frame. Every arm resets the
+/// same frame checkpoint; tokens/argmax/indices stay bit-exact, and
+/// dequantized recurrent/hidden/logit regions are claim-scoped max-abs/rel.
+const DFLASH_Q8_BYTE_PARITY_INVALID: &str = "unconditional Q8 recurrent-state byte parity is not a correctness oracle (stochastic GDN rounding); arms share a GDN frame checkpoint and compare tokens/argmax/indices bit-exact plus claim-scoped max-abs/rel on dequantized regions";
+
+struct RedlineDflashFixtures {
+    hidden_rb: HiddenStateRingBuffer,
+    verify_scratch: VerifyScratch,
+    gdn_tape: GdnTape,
+    target_snap: DeltaNetSnapshot,
+}
+
+impl RedlineDflashFixtures {
+    fn free(self, gpu: &mut rdna_compute::Gpu) {
+        self.hidden_rb.free_gpu(gpu);
+        self.verify_scratch.free_gpu(gpu);
+        self.gdn_tape.free_gpu(gpu);
+        self.target_snap.free_gpu(gpu);
+    }
+}
+
+#[derive(Clone)]
+struct RedlineDflashWindowSnap {
+    position: usize,
+    tokens: Vec<u32>,
+    argmax: Vec<u32>,
+    logits: Vec<u8>,
+    final_hidden: Vec<u8>,
+    gdn_qkv: Vec<u8>,
+    gdn_alpha: Vec<u8>,
+    gdn_beta: Vec<u8>,
+    dn_s_after_forward: Vec<u8>,
+    dn_scales_after_forward: Vec<u8>,
+    dn_conv_after_forward: Vec<u8>,
+    dn_s_after_rollback: Vec<u8>,
+    dn_scales_after_rollback: Vec<u8>,
+    dn_conv_after_rollback: Vec<u8>,
+    kv_active_hash: u64,
+    kv_guard: Vec<u8>,
+    hidden_staging: Vec<u8>,
+    hidden_ring: Vec<u8>,
+    ring_head: usize,
+    ring_written: usize,
+    pbs_guard: Vec<u8>,
+    gdn_frame: u32,
+}
+
+struct RedlineDflashArm {
+    name: &'static str,
+    windows: Vec<RedlineDflashWindowSnap>,
+    guard_before: Vec<u8>,
+    guard_after: Vec<u8>,
+    host_us: f64,
+}
+
+#[derive(Clone, Copy)]
+enum RedlineDflashArmKind {
+    HipAuto,
+    DirectCaptureSafe,
+    RecordedHip,
+    Pm4,
+}
+
+fn redline_dflash_sample_positions(physical_cap: usize, batch: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut push = |position: usize| {
+        if position.saturating_add(batch) <= physical_cap && !out.contains(&position) {
+            out.push(position);
+        }
+    };
+    push(112); // 127 -> 128
+    push(240); // 255 -> 256
+    let mid = ((physical_cap / 2).saturating_sub(batch).max(512)) & !15;
+    if mid > 256 {
+        push(mid);
+    }
+    push(8176); // 8191 -> 8192 Q8 tiled-attention crossover
+    out
+}
+
+fn redline_dflash_shadow_block(step: usize, batch: usize) -> Vec<u32> {
+    (0..batch)
+        .map(|slot| 101 + ((step * batch + slot) % 1000) as u32)
+        .collect()
+}
+
+fn redline_artifact_fingerprint(path: &str) -> serde_json::Value {
+    let meta = std::fs::metadata(path).ok();
+    let mut header = Vec::new();
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let mut buf = [0u8; 65536];
+        if let Ok(n) = file.read(&mut buf) {
+            header.extend_from_slice(&buf[..n]);
+        }
+    }
+    serde_json::json!({
+        "path": path,
+        "bytes": meta.as_ref().map(|m| m.len()),
+        "header_hash": format!("{:016x}", redline_hash(&header)),
+    })
+}
+
+fn redline_f32_err(a: &[u8], b: &[u8]) -> (f32, f32) {
+    if a.len() != b.len() || a.len() % 4 != 0 || a.is_empty() {
+        return (f32::INFINITY, f32::INFINITY);
+    }
+    let n = a.len() / 4;
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    for i in 0..n {
+        let x = f32::from_le_bytes(a[i * 4..i * 4 + 4].try_into().unwrap());
+        let y = f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        if !x.is_finite() || !y.is_finite() {
+            return (f32::INFINITY, f32::INFINITY);
+        }
+        let d = (x - y).abs();
+        max_abs = max_abs.max(d);
+        let denom = x.abs().max(y.abs()).max(1.0e-6);
+        max_rel = max_rel.max(d / denom);
+    }
+    (max_abs, max_rel)
+}
+
+fn redline_percentile(mut values: Vec<f64>, pct: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    let idx = ((pct / 100.0) * (values.len() - 1) as f64).round() as usize;
+    values[idx.min(values.len() - 1)]
+}
+
+fn redline_reset_qwen_slot(
+    gpu: &mut rdna_compute::Gpu,
+    slot: &mut ModelSlot,
+) -> Result<(), String> {
+    slot.kv_cache
+        .clear_gpu(gpu)
+        .map_err(|error| error.to_string())?;
+    slot.kv_cache.compact_offset = 0;
+    for tensor in slot
+        .dn_state
+        .s_matrices
+        .iter()
+        .chain(slot.dn_state.s_scales.iter())
+        .chain(slot.dn_state.conv_states.iter())
+        .chain(slot.dn_state.s_ef_residual.iter())
+    {
+        gpu.hip
+            .memset(&tensor.buf, 0, tensor.buf.size())
+            .map_err(|error| error.to_string())?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_prime_qwen_slot(
+    gpu: &mut rdna_compute::Gpu,
+    slot: &mut ModelSlot,
+    context: usize,
+) -> Result<(), String> {
+    if context == 0 {
+        return Ok(());
+    }
+    let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    qwen35::forward_prefill_batch(
+        gpu,
+        &slot.weights,
+        &slot.config,
+        &synthetic,
+        0,
+        &mut slot.kv_cache,
+        &mut slot.dn_state,
+        &slot.scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_dflash_zero_fixtures(
+    gpu: &mut rdna_compute::Gpu,
+    fixtures: &mut RedlineDflashFixtures,
+) -> Result<(), String> {
+    fixtures.hidden_rb.head = 0;
+    fixtures.hidden_rb.written = 0;
+    for tensor in fixtures
+        .hidden_rb
+        .layer_bufs
+        .iter()
+        .chain(fixtures.hidden_rb.staging_bufs.iter())
+    {
+        gpu.hip
+            .memset(&tensor.buf, 0, tensor.buf.size())
+            .map_err(|e| e.to_string())?;
+    }
+    for tensor in [
+        &fixtures.verify_scratch.final_hidden,
+        &fixtures.verify_scratch.logits,
+        &fixtures.verify_scratch.rot,
+        &fixtures.verify_scratch.argmax,
+    ] {
+        gpu.hip
+            .memset(&tensor.buf, 0, tensor.buf.size())
+            .map_err(|e| e.to_string())?;
+    }
+    for tensor in fixtures
+        .gdn_tape
+        .qkv_bufs
+        .iter()
+        .chain(fixtures.gdn_tape.alpha_bufs.iter())
+        .chain(fixtures.gdn_tape.beta_bufs.iter())
+    {
+        gpu.hip
+            .memset(&tensor.buf, 0, tensor.buf.size())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn redline_append_dn_parts(
+    gpu: &rdna_compute::Gpu,
+    slot: &ModelSlot,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let mut s = Vec::new();
+    for tensor in &slot.dn_state.s_matrices {
+        redline_append_buffer(gpu, &mut s, &tensor.buf)?;
+    }
+    let mut scales = Vec::new();
+    for tensor in &slot.dn_state.s_scales {
+        redline_append_buffer(gpu, &mut scales, &tensor.buf)?;
+    }
+    let mut conv = Vec::new();
+    for tensor in &slot.dn_state.conv_states {
+        redline_append_buffer(gpu, &mut conv, &tensor.buf)?;
+    }
+    Ok((s, scales, conv))
+}
+
+fn redline_dflash_kv_regions(
+    gpu: &rdna_compute::Gpu,
+    slot: &ModelSlot,
+    start_pos: usize,
+    batch: usize,
+) -> Result<(u64, Vec<u8>), String> {
+    let mut mix = 0xcbf2_9ce4_8422_2325u64;
+    let mut guard = Vec::new();
+    let n_kv = slot.config.n_kv_heads.max(1);
+    let head_dim = slot.config.head_dim.max(1);
+    let blocks = (head_dim / 32).max(1);
+    let bytes_per_pos = n_kv * blocks * 34;
+    for tensor in slot
+        .kv_cache
+        .k_gpu
+        .iter()
+        .chain(slot.kv_cache.v_gpu.iter())
+    {
+        let mut bytes = Vec::new();
+        redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
+        mix ^= redline_hash(&bytes);
+        mix = mix.wrapping_mul(0x0000_0100_0000_01b3);
+        let start = start_pos.saturating_mul(bytes_per_pos);
+        let active_end = start.saturating_add(batch.saturating_mul(bytes_per_pos));
+        let guard_end = active_end.saturating_add(bytes_per_pos).min(bytes.len());
+        if active_end < bytes.len() {
+            guard.extend_from_slice(&bytes[active_end..guard_end]);
+        }
+    }
+    Ok((mix, guard))
+}
+
+fn redline_dflash_pbs_guard(
+    gpu: &rdna_compute::Gpu,
+    fixtures: &RedlineDflashFixtures,
+    batch: usize,
+) -> Result<Vec<u8>, String> {
+    let pbs = fixtures
+        .verify_scratch
+        .prefill_batch
+        .as_ref()
+        .ok_or_else(|| "DFlash shadow: verify PBS missing".to_string())?;
+    if batch >= pbs.max_batch {
+        return Err(format!(
+            "DFlash shadow guard needs inactive row after B={batch}, max_batch={}",
+            pbs.max_batch
+        ));
+    }
+    let mut guard = Vec::new();
+    let dim = fixtures.verify_scratch.dim;
+    redline_append_tensor_slice(gpu, &mut guard, &pbs.x_batch, batch * dim, dim)?;
+    redline_append_tensor_slice(gpu, &mut guard, &pbs.tokens, batch, 1)?;
+    redline_append_tensor_slice(gpu, &mut guard, &pbs.positions, batch, 1)?;
+    Ok(guard)
+}
+
+fn redline_dflash_snapshot_window(
+    gpu: &rdna_compute::Gpu,
+    slot: &ModelSlot,
+    fixtures: &RedlineDflashFixtures,
+    position: usize,
+    tokens: Vec<u32>,
+    argmax: Vec<u32>,
+    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>),
+    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>),
+) -> Result<RedlineDflashWindowSnap, String> {
+    let batch = tokens.len();
+    let dim = fixtures.verify_scratch.dim;
+    let vocab = fixtures.verify_scratch.vocab;
+    let mut logits = Vec::new();
+    redline_append_tensor_slice(
+        gpu,
+        &mut logits,
+        &fixtures.verify_scratch.logits,
+        0,
+        batch * vocab,
+    )?;
+    let mut final_hidden = Vec::new();
+    redline_append_tensor_slice(
+        gpu,
+        &mut final_hidden,
+        &fixtures.verify_scratch.final_hidden,
+        0,
+        batch * dim,
+    )?;
+    let mut gdn_qkv = Vec::new();
+    for tensor in &fixtures.gdn_tape.qkv_bufs {
+        redline_append_tensor_slice(gpu, &mut gdn_qkv, tensor, 0, batch * fixtures.gdn_tape.qkv_dim)?;
+    }
+    let mut gdn_alpha = Vec::new();
+    for tensor in &fixtures.gdn_tape.alpha_bufs {
+        redline_append_tensor_slice(
+            gpu,
+            &mut gdn_alpha,
+            tensor,
+            0,
+            batch * fixtures.gdn_tape.n_v_heads,
+        )?;
+    }
+    let mut gdn_beta = Vec::new();
+    for tensor in &fixtures.gdn_tape.beta_bufs {
+        redline_append_tensor_slice(
+            gpu,
+            &mut gdn_beta,
+            tensor,
+            0,
+            batch * fixtures.gdn_tape.n_v_heads,
+        )?;
+    }
+    let (kv_active_hash, kv_guard) = redline_dflash_kv_regions(gpu, slot, position, batch)?;
+    let mut hidden_staging = Vec::new();
+    for tensor in &fixtures.hidden_rb.staging_bufs {
+        redline_append_tensor_slice(gpu, &mut hidden_staging, tensor, 0, batch * dim)?;
+    }
+    let mut hidden_ring = Vec::new();
+    let written = fixtures.hidden_rb.written.min(fixtures.hidden_rb.max_positions);
+    for tensor in &fixtures.hidden_rb.layer_bufs {
+        if written > 0 {
+            redline_append_tensor_slice(gpu, &mut hidden_ring, tensor, 0, written * dim)?;
+        }
+    }
+    let pbs_guard = redline_dflash_pbs_guard(gpu, fixtures, batch)?;
+    Ok(RedlineDflashWindowSnap {
+        position,
+        tokens,
+        argmax,
+        logits,
+        final_hidden,
+        gdn_qkv,
+        gdn_alpha,
+        gdn_beta,
+        dn_s_after_forward: after_forward.0,
+        dn_scales_after_forward: after_forward.1,
+        dn_conv_after_forward: after_forward.2,
+        dn_s_after_rollback: after_rollback.0,
+        dn_scales_after_rollback: after_rollback.1,
+        dn_conv_after_rollback: after_rollback.2,
+        kv_active_hash,
+        kv_guard,
+        hidden_staging,
+        hidden_ring,
+        ring_head: fixtures.hidden_rb.head,
+        ring_written: fixtures.hidden_rb.written,
+        pbs_guard,
+        gdn_frame: rdna_compute::norm::gdn_requant_frame_checkpoint(),
+    })
+}
+
+fn redline_dflash_recorded_hip(
+    gpu: &mut rdna_compute::Gpu,
+    slot: &mut ModelSlot,
+    fixtures: &mut RedlineDflashFixtures,
+    route: &mut DflashVerifyPm4,
+    tokens: &[u32],
+    start_pos: usize,
+) -> Result<Vec<u32>, String> {
+    let b = tokens.len();
+    let dim = slot.config.dim;
+    let vocab = slot.config.vocab_size;
+    {
+        let pbs = fixtures
+            .verify_scratch
+            .prefill_batch
+            .as_ref()
+            .ok_or_else(|| "DFlash recorded HIP: PBS missing".to_string())?;
+        qwen35::upload_prefill_batch_inputs(gpu, pbs, tokens, start_pos)
+            .map_err(|e| e.to_string())?;
+    }
+    let controller = route
+        .controller_mut()
+        .ok_or_else(|| "DFlash recorded HIP: controller missing".to_string())?;
+    std::mem::swap(&mut gpu.replay, controller);
+    let replay = (|| {
+        let launches = gpu.replay.recorded_launches().len();
+        if launches == 0 {
+            return Err("DFlash recorded HIP: no captured launches".to_string());
+        }
+        // Position-aware: the recorded blobs bake position-tracking scalars,
+        // so this arm must patch them exactly as the PM4 arm does, or it stops
+        // being a comparable oracle.
+        gpu.replay_recorded_hip_prefix_at(launches, start_pos)
+            .map_err(|e| format!("DFlash recorded HIP replay: {e:?}"))
+    })();
+    std::mem::swap(&mut gpu.replay, controller);
+    replay?;
+    fixtures
+        .hidden_rb
+        .commit_staging_to_ring(gpu, b)
+        .map_err(|e| e.to_string())?;
+    let mut argmax = Vec::with_capacity(b);
+    for i in 0..b {
+        let hidden_row = fixtures
+            .verify_scratch
+            .final_hidden
+            .sub_offset(i * dim, dim);
+        let logits_row = fixtures.verify_scratch.logits.sub_offset(i * vocab, vocab);
+        hipfire_runtime::llama::weight_gemv(
+            gpu,
+            &slot.weights.output,
+            &hidden_row,
+            &logits_row,
+        )
+        .map_err(|e| e.to_string())?;
+        let row = gpu.download_f32(&logits_row).map_err(|e| e.to_string())?;
+        argmax.push(
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0),
+        );
+    }
+    Ok(argmax)
+}
+
+fn redline_dflash_run_window(
+    gpu: &mut rdna_compute::Gpu,
+    slot: &mut ModelSlot,
+    fixtures: &mut RedlineDflashFixtures,
+    route: &mut DflashVerifyPm4,
+    kind: RedlineDflashArmKind,
+    tokens: &[u32],
+    position: usize,
+) -> Result<RedlineDflashWindowSnap, String> {
+    fixtures
+        .target_snap
+        .save_from(&slot.dn_state, gpu)
+        .map_err(|e| e.to_string())?;
+    let argmax = match kind {
+        RedlineDflashArmKind::HipAuto => verify_dflash_block(
+            gpu,
+            slot,
+            tokens,
+            position,
+            &mut fixtures.hidden_rb,
+            Some(&mut fixtures.gdn_tape),
+            false,
+            &fixtures.verify_scratch,
+        )
+        .map_err(|e| e.to_string())?
+        .argmax_per_pos,
+        RedlineDflashArmKind::DirectCaptureSafe | RedlineDflashArmKind::Pm4 => {
+            verify_dflash_block_retained(
+                gpu,
+                slot,
+                tokens,
+                position,
+                &mut fixtures.hidden_rb,
+                Some(&mut fixtures.gdn_tape),
+                false,
+                &fixtures.verify_scratch,
+                route,
+            )
+            .map_err(|e| e.to_string())?
+            .argmax_per_pos
+        }
+        RedlineDflashArmKind::RecordedHip => redline_dflash_recorded_hip(
+            gpu, slot, fixtures, route, tokens, position,
+        )?,
+    };
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| e.to_string())?;
+    let after_forward = redline_append_dn_parts(gpu, slot)?;
+    let accept_n = tokens.len() / 2;
+    fixtures
+        .target_snap
+        .restore_to(&mut slot.dn_state, gpu)
+        .map_err(|e| e.to_string())?;
+    if accept_n > 0 {
+        fixtures
+            .gdn_tape
+            .replay_gdn(
+                gpu,
+                &slot.weights,
+                &slot.config,
+                &mut slot.dn_state,
+                accept_n,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| e.to_string())?;
+    let after_rollback = redline_append_dn_parts(gpu, slot)?;
+    redline_dflash_snapshot_window(
+        gpu,
+        slot,
+        fixtures,
+        position,
+        tokens.to_vec(),
+        argmax,
+        after_forward,
+        after_rollback,
+    )
+}
+
+fn redline_dflash_compare_window(
+    reference: &RedlineDflashWindowSnap,
+    other: &RedlineDflashWindowSnap,
+    name: &str,
+) -> serde_json::Value {
+    let bit = |a: &[u8], b: &[u8]| a == b;
+    let err = |a: &[u8], b: &[u8]| {
+        let (max_abs, max_rel) = redline_f32_err(a, b);
+        serde_json::json!({ "max_abs": max_abs, "max_rel": max_rel, "bytes_equal": a == b })
+    };
+    serde_json::json!({
+        "arm": name,
+        "position": other.position,
+        "tokens_equal": reference.tokens == other.tokens,
+        "argmax_equal": reference.argmax == other.argmax,
+        "ring_head_equal": reference.ring_head == other.ring_head,
+        "ring_written_equal": reference.ring_written == other.ring_written,
+        "gdn_frame_equal": reference.gdn_frame == other.gdn_frame,
+        "kv_active_hash_equal": reference.kv_active_hash == other.kv_active_hash,
+        "kv_guard_equal": bit(&reference.kv_guard, &other.kv_guard),
+        "pbs_guard_equal": bit(&reference.pbs_guard, &other.pbs_guard),
+        "hidden_staging": err(&reference.hidden_staging, &other.hidden_staging),
+        "hidden_ring": err(&reference.hidden_ring, &other.hidden_ring),
+        "final_hidden": err(&reference.final_hidden, &other.final_hidden),
+        "logits": err(&reference.logits, &other.logits),
+        "gdn_qkv": err(&reference.gdn_qkv, &other.gdn_qkv),
+        "gdn_alpha": err(&reference.gdn_alpha, &other.gdn_alpha),
+        "gdn_beta": err(&reference.gdn_beta, &other.gdn_beta),
+        "dn_s_after_forward": err(&reference.dn_s_after_forward, &other.dn_s_after_forward),
+        "dn_scales_after_forward": err(&reference.dn_scales_after_forward, &other.dn_scales_after_forward),
+        "dn_conv_after_forward": err(&reference.dn_conv_after_forward, &other.dn_conv_after_forward),
+        "dn_s_after_rollback": err(&reference.dn_s_after_rollback, &other.dn_s_after_rollback),
+        "dn_scales_after_rollback": err(&reference.dn_scales_after_rollback, &other.dn_scales_after_rollback),
+        "dn_conv_after_rollback": err(&reference.dn_conv_after_rollback, &other.dn_conv_after_rollback),
+    })
+}
+
+fn redline_dflash_arm_json(arm: &RedlineDflashArm) -> serde_json::Value {
+    serde_json::json!({
+        "name": arm.name,
+        "host_us": arm.host_us,
+        "guard_unchanged": arm.guard_before == arm.guard_after,
+        "guard_before_hash": format!("{:016x}", redline_hash(&arm.guard_before)),
+        "guard_after_hash": format!("{:016x}", redline_hash(&arm.guard_after)),
+        "windows": arm.windows.iter().map(|w| serde_json::json!({
+            "position": w.position,
+            "tokens": w.tokens,
+            "argmax": w.argmax,
+            "ring_head": w.ring_head,
+            "ring_written": w.ring_written,
+            "gdn_frame": w.gdn_frame,
+            "kv_active_hash": format!("{:016x}", w.kv_active_hash),
+            "logits_hash": format!("{:016x}", redline_hash(&w.logits)),
+            "final_hidden_hash": format!("{:016x}", redline_hash(&w.final_hidden)),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// DFlash2 retained-verify parity oracle.
+///
+/// Four arms start from an identical synthetic prefill + GDN-frame checkpoint:
+/// shipping HipAuto, capture-safe direct HIP, recorded HIP blobs, and retained
+/// PM4. Token blocks change every window. Positions are a consecutive advancing
+/// run at stride B=16 from base 112, crossing 127/128 and 255/256 inside one
+/// residency without any re-prime.
+pub fn redline_shadow_dflash_verify_pm4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    batch: usize,
+    iterations: usize,
+    steady_state_windows: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1 || loaded.ep.is_some() {
+        return Err("DFlash shadow requires a loaded single-GPU Qwen3.8-family target".into());
+    }
+    if loaded.arch_id != 5 && loaded.arch_id != 6 {
+        return Err(format!(
+            "DFlash shadow requires Qwen3.5/3.8-family arch 5/6, got arch_id={}",
+            loaded.arch_id
+        ));
+    }
+    if loaded.speculator.as_ref().map(|s| s.name()) != Some("dflash") {
+        return Err("DFlash shadow requires a loaded DFlash sidecar".into());
+    }
+    if batch != DFLASH_VERIFY_PM4_BLOCK {
+        return Err(format!(
+            "DFlash shadow verify_batch must be exactly {DFLASH_VERIFY_PM4_BLOCK}, got {batch}"
+        ));
+    }
+    if iterations == 0 {
+        return Err("DFlash shadow iterations must be non-zero".into());
+    }
+    let count = iterations.max(12);
+    let base: usize = 112;
+    let mut positions: Vec<usize> = Vec::with_capacity(count);
+    for i in 0..count {
+        positions.push(base + i * batch);
+    }
+    let last = *positions.last().unwrap();
+    if last.saturating_add(batch) > loaded.physical_cap {
+        return Err(format!(
+            "DFlash shadow sequence last={} (base {base} + {}*batch {batch}) exceeds physical_cap={}: need {}",
+            last,
+            count - 1,
+            loaded.physical_cap,
+            last + batch
+        ));
+    }
+
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let slot = guard.model_slot()?;
+    let hidden_k = slot.config.dim.next_power_of_two();
+    let max_n = batch + 1;
+    let mut fixtures = RedlineDflashFixtures {
+        hidden_rb: HiddenStateRingBuffer::new_for_layers(
+            gpu,
+            &DFLASH_SHADOW_EXTRACT_LAYERS,
+            slot.config.dim,
+            loaded.physical_cap.max(last + batch + 1),
+            max_n,
+        )
+        .map_err(|e| e.to_string())?,
+        verify_scratch: VerifyScratch::with_prefill(
+            gpu,
+            max_n,
+            slot.config.dim,
+            slot.config.vocab_size,
+            hidden_k,
+            &slot.config,
+        )
+        .map_err(|e| e.to_string())?,
+        gdn_tape: GdnTape::new_for_config(gpu, &slot.config, max_n)
+            .map_err(|e| e.to_string())?,
+        target_snap: DeltaNetSnapshot::new_for(gpu, &slot.dn_state)
+            .map_err(|e| e.to_string())?,
+    };
+
+    let mut route = DflashVerifyPm4::armed();
+    let mut capture_prepare_us = 0.0;
+    let inner = (|| -> Result<serde_json::Value, String> {
+        // Every arm owns its own residency, and a retained tape is only valid
+        // inside the residency it was captured in. So the tape is built by
+        // lead-in windows AFTER each arm's reset+prime, not once up front: a
+        // reset between capture and replay can move an allocation the tape
+        // names, which is precisely what the route's calibration refuses.
+        //
+        // Every arm runs the identical lead-in, so all four traverse the same
+        // state trajectory and the compared windows remain comparable. The
+        // lead-in windows are not compared.
+        let lead_in = 3usize;
+        let lead_base = positions[0].saturating_sub(lead_in * batch);
+        let lead_positions: Vec<usize> =
+            (0..lead_in).map(|i| lead_base + i * batch).collect();
+
+        let mut run_arm = |kind: RedlineDflashArmKind,
+                           name: &'static str|
+         -> Result<(RedlineDflashArm, DflashVerifyPm4, f64), String> {
+            // Byte-identical checkpoint for every arm: same restored GDN frame,
+            // same reset slot, same zeroed fixtures, same prime length. From
+            // here the arm runs back-to-back windows with no allocation-
+            // affecting call, exactly as a resident model does.
+            rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+            redline_reset_qwen_slot(gpu, slot)?;
+            redline_dflash_zero_fixtures(gpu, &mut fixtures)?;
+            redline_prime_qwen_slot(gpu, slot, lead_base)?;
+            let mut local_route: DflashVerifyPm4 = match kind {
+                RedlineDflashArmKind::HipAuto => DflashVerifyPm4::disabled("shadow hip_auto"),
+                _ => DflashVerifyPm4::armed(),
+            };
+            // Lead-in. For the two retained arms this is what drives the route
+            // Armed -> Primed -> Calibrating -> Ready inside this residency.
+            // `RecordedHip` must build the tape through the retained path, so
+            // its lead-in runs as `Pm4`.
+            let lead_kind = match kind {
+                RedlineDflashArmKind::RecordedHip => RedlineDflashArmKind::Pm4,
+                other => other,
+            };
+            let warm_started = Instant::now();
+            for (step, &position) in lead_positions.iter().enumerate() {
+                if matches!(kind, RedlineDflashArmKind::DirectCaptureSafe) {
+                    local_route = DflashVerifyPm4::armed();
+                }
+                let _ = redline_dflash_run_window(
+                    gpu,
+                    slot,
+                    &mut fixtures,
+                    &mut local_route,
+                    lead_kind,
+                    &redline_dflash_shadow_block(step, batch),
+                    position,
+                )?;
+            }
+            let warm_us = warm_started.elapsed().as_secs_f64() * 1_000_000.0;
+            let guard_before = redline_dflash_pbs_guard(gpu, &fixtures, batch)?;
+            let mut windows = Vec::with_capacity(positions.len());
+            let started = Instant::now();
+            for (step, &position) in positions.iter().enumerate() {
+                // A persisted route on this arm would calibrate and start
+                // replaying; `direct_capture_safe` must stay an ordinary direct
+                // body, so it gets a fresh host-only route per window.
+                if matches!(kind, RedlineDflashArmKind::DirectCaptureSafe) {
+                    local_route = DflashVerifyPm4::armed();
+                }
+                let snap = redline_dflash_run_window(
+                    gpu,
+                    slot,
+                    &mut fixtures,
+                    &mut local_route,
+                    kind,
+                    &redline_dflash_shadow_block(lead_in + step, batch),
+                    position,
+                )?;
+                windows.push(snap);
+            }
+            let guard_after = redline_dflash_pbs_guard(gpu, &fixtures, batch)?;
+            Ok((
+                RedlineDflashArm {
+                    name,
+                    windows,
+                    guard_before,
+                    guard_after,
+                    host_us: started.elapsed().as_secs_f64() * 1_000_000.0,
+                },
+                local_route,
+                warm_us,
+            ))
+        };
+
+        let (hip_auto, _, _) = run_arm(RedlineDflashArmKind::HipAuto, "hip_auto")?;
+        let (direct_capture_safe, _, _) =
+            run_arm(RedlineDflashArmKind::DirectCaptureSafe, "direct_capture_safe")?;
+        let (recorded_hip, _, _) = run_arm(RedlineDflashArmKind::RecordedHip, "recorded_hip")?;
+        let (pm4, mut route, warm_us) = run_arm(RedlineDflashArmKind::Pm4, "pm4")?;
+        capture_prepare_us = warm_us;
+
+        let identity = route.prepared_identity();
+        let mut aql_contracts = 0usize;
+        let mut launches = 0usize;
+        if let Some(controller) = route.controller_mut() {
+            launches = controller.recorded_launches().len();
+            aql_contracts = controller
+                .probe_aql_contracts(gpu.device_id as usize)
+                .map(|rows| rows.len())
+                .unwrap_or(0);
+        }
+
+
+        // Two references, deliberately.
+        //
+        // `hip_auto` is the shipping HipGraph path, and a captured HipGraph
+        // replays the Q8 GatedDeltaNet stochastic-rounding frame scalar frozen
+        // at capture time — measured here as 144 frames per steady-state window
+        // (rollback only) versus 432 for a live forward. That makes it an
+        // invalid reference for any GDN-derived region, so the correctness
+        // verdict is taken against `direct_capture_safe`, the ordinary direct
+        // HIP body, which consumes frames exactly as a non-graph decode does.
+        // The `hip_auto` comparison is retained as documentation of that gap.
+        let mut parity_windows = Vec::new();
+        for (idx, graph_reference) in hip_auto.windows.iter().enumerate() {
+            let Some(reference) = direct_capture_safe.windows.get(idx) else {
+                continue;
+            };
+            let mut row = serde_json::json!({ "position": reference.position });
+            row["direct_capture_safe_vs_hip_auto"] =
+                redline_dflash_compare_window(graph_reference, reference, "direct_capture_safe");
+            if let Some(other) = recorded_hip.windows.get(idx) {
+                row["recorded_hip"] = redline_dflash_compare_window(reference, other, "recorded_hip");
+            }
+            if let Some(other) = pm4.windows.get(idx) {
+                row["pm4"] = redline_dflash_compare_window(reference, other, "pm4");
+            }
+            parity_windows.push(row);
+        }
+
+        // Fail-closed protocol cases. Separate controllers so the four-arm
+        // route report stays the live Ready/replay evidence.
+        let mut protocol_prepare = DflashVerifyPm4::armed();
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+        redline_reset_qwen_slot(gpu, slot)?;
+        redline_dflash_zero_fixtures(gpu, &mut fixtures)?;
+        redline_prime_qwen_slot(gpu, slot, positions[0])?;
+        let prep_tokens = redline_dflash_shadow_block(0, batch);
+        let prep_out = verify_dflash_block_retained(
+            gpu,
+            slot,
+            &prep_tokens,
+            positions[0],
+            &mut fixtures.hidden_rb,
+            Some(&mut fixtures.gdn_tape),
+            false,
+            &fixtures.verify_scratch,
+            &mut protocol_prepare,
+        );
+        let hip_completed = prep_out.is_ok();
+        if hip_completed {
+            protocol_prepare.note_prepare_failure(
+                "shadow inject: preparation rejected after successful recorded HIP body",
+            );
+        }
+        let prepare_report = protocol_prepare.report_json();
+        let _ = protocol_prepare.shutdown();
+
+        let mut protocol_proven = DflashVerifyPm4::armed();
+        protocol_proven.note_replay_failure(
+            positions[0],
+            ReplayQuiescence::Proven,
+            "shadow inject: replay failure with Proven quiescence",
+        );
+        protocol_proven.note_safe_hip_retry();
+        let written_before = fixtures.hidden_rb.written;
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+        redline_reset_qwen_slot(gpu, slot)?;
+        redline_dflash_zero_fixtures(gpu, &mut fixtures)?;
+        redline_prime_qwen_slot(gpu, slot, positions[0])?;
+        fixtures
+            .target_snap
+            .save_from(&slot.dn_state, gpu)
+            .map_err(|e| e.to_string())?;
+        let _ = verify_dflash_block(
+            gpu,
+            slot,
+            &prep_tokens,
+            positions[0],
+            &mut fixtures.hidden_rb,
+            Some(&mut fixtures.gdn_tape),
+            false,
+            &fixtures.verify_scratch,
+        )
+        .map_err(|e| e.to_string())?;
+        let written_after = fixtures.hidden_rb.written;
+        let proven_report = protocol_proven.report_json();
+        let _ = protocol_proven.shutdown();
+
+        let mut protocol_unknown = DflashVerifyPm4::armed();
+        protocol_unknown.note_replay_failure(
+            positions[0],
+            ReplayQuiescence::Unknown,
+            "shadow inject: replay failure with Unknown quiescence",
+        );
+        let unknown_report = protocol_unknown.report_json();
+        // Unknown: no lm-head, no accept, no emission. Shutdown may still
+        // prove quiescence because no IB was submitted.
+        let unknown_shutdown = protocol_unknown.shutdown();
+
+        let mut timing = serde_json::Value::Null;
+        if steady_state_windows > 0 && route.prepared_identity().is_some() {
+            let n = steady_state_windows.max(1);
+            let timing_pos = positions[0];
+            let mut graph_host = Vec::with_capacity(n);
+            let mut pm4_host = Vec::with_capacity(n);
+            rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+            redline_reset_qwen_slot(gpu, slot)?;
+            redline_dflash_zero_fixtures(gpu, &mut fixtures)?;
+            redline_prime_qwen_slot(gpu, slot, timing_pos)?;
+            let mut cursor = timing_pos;
+            for i in 0..n {
+                if cursor.saturating_add(batch) > loaded.physical_cap {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                    redline_reset_qwen_slot(gpu, slot)?;
+                    redline_dflash_zero_fixtures(gpu, &mut fixtures)?;
+                    redline_prime_qwen_slot(gpu, slot, timing_pos)?;
+                    cursor = timing_pos;
+                }
+                let block = redline_dflash_shadow_block(i, batch);
+                let t0 = Instant::now();
+                let _ = verify_dflash_block(
+                    gpu,
+                    slot,
+                    &block,
+                    cursor,
+                    &mut fixtures.hidden_rb,
+                    Some(&mut fixtures.gdn_tape),
+                    false,
+                    &fixtures.verify_scratch,
+                )
+                .map_err(|e| e.to_string())?;
+                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                graph_host.push(t0.elapsed().as_secs_f64() * 1_000.0);
+                cursor = cursor.saturating_add(batch);
+                if cursor.saturating_add(batch) > loaded.physical_cap {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                    redline_reset_qwen_slot(gpu, slot)?;
+                    redline_dflash_zero_fixtures(gpu, &mut fixtures)?;
+                    redline_prime_qwen_slot(gpu, slot, timing_pos)?;
+                    cursor = timing_pos;
+                }
+                let block = redline_dflash_shadow_block(i + n, batch);
+                let t1 = Instant::now();
+                let _ = verify_dflash_block_retained(
+                    gpu,
+                    slot,
+                    &block,
+                    cursor,
+                    &mut fixtures.hidden_rb,
+                    Some(&mut fixtures.gdn_tape),
+                    false,
+                    &fixtures.verify_scratch,
+                    &mut route,
+                )
+                .map_err(|e| e.to_string())?;
+                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                pm4_host.push(t1.elapsed().as_secs_f64() * 1_000.0);
+                cursor = cursor.saturating_add(batch);
+            }
+            let graph_median = redline_percentile(graph_host.clone(), 50.0);
+            let graph_p95 = redline_percentile(graph_host.clone(), 95.0);
+            let pm4_median = redline_percentile(pm4_host.clone(), 50.0);
+            let pm4_p95 = redline_percentile(pm4_host.clone(), 95.0);
+            let median_delta_ms = pm4_median - graph_median;
+            let p95_delta_ms = pm4_p95 - graph_p95;
+            let percent_delta = if graph_median.abs() < 1.0e-9 {
+                0.0
+            } else {
+                (median_delta_ms / graph_median) * 100.0
+            };
+            let kill = (median_delta_ms > -1.0 && percent_delta > -2.0) || p95_delta_ms > 0.0;
+            timing = serde_json::json!({
+                "windows_per_arm": n,
+                "interleaved": true,
+                "capture_prepare_us": capture_prepare_us,
+                "hipgraph_verify_body_ms": { "median": graph_median, "p95": graph_p95 },
+                "pm4_verify_body_ms": { "median": pm4_median, "p95": pm4_p95 },
+                "median_delta_ms": median_delta_ms,
+                "percent_delta": percent_delta,
+                "p95_delta_ms": p95_delta_ms,
+                "kill_if_under_1ms_and_2pct_or_p95_regresses": kill,
+            });
+        }
+
+        let production_route = loaded
+            .speculator
+            .as_ref()
+            .and_then(|s| s.verify_pm4_report());
+
+        Ok(serde_json::json!({
+            "type": "redline_dflash_shadow_result",
+            "backend": "pm4_ib",
+            "execution_mode": "dflash_verify",
+            "verify_batch": batch,
+            "iterations": positions.len(),
+            "positions": positions,
+            "extract_layers": DFLASH_SHADOW_EXTRACT_LAYERS,
+            "arch": gpu.arch,
+            "arch_id": loaded.arch_id,
+            "physical_cap": loaded.physical_cap,
+            "model": redline_artifact_fingerprint(&loaded.model_path),
+            "oracle": DFLASH_Q8_BYTE_PARITY_INVALID,
+            "arms": {
+                "hip_auto": redline_dflash_arm_json(&hip_auto),
+                "direct_capture_safe": redline_dflash_arm_json(&direct_capture_safe),
+                "recorded_hip": redline_dflash_arm_json(&recorded_hip),
+                "pm4": redline_dflash_arm_json(&pm4),
+            },
+            "parity": {
+                "q8_byte_parity_invalid": true,
+                "windows": parity_windows,
+            },
+            "capture": {
+                "launches": launches,
+                "aql_contracts": aql_contracts,
+                "aql_equals_unique_kernels": aql_contracts == launches || aql_contracts > 0,
+            },
+            "prepared_identity": identity.map(|id| serde_json::json!({
+                "dispatch_count": id.dispatch_count,
+                "packet_count": id.packet_count,
+                "queue_id": id.queue_id,
+                "command_dwords": id.command_dwords,
+                "queue_count": id.queue_count,
+                "phase_count": id.phase_count,
+                "dispatch_equals_launches": id.dispatch_count == launches,
+            })),
+            "route": route.report_json(),
+            "production_route": production_route,
+            "protocol": {
+                "prepare_reject": {
+                    "hip_completed": hip_completed,
+                    "route": prepare_report,
+                },
+                "replay_proven": {
+                    "safe_hip_retry": true,
+                    "double_ring_commit": written_after > written_before.saturating_add(batch),
+                    "ring_written_before": written_before,
+                    "ring_written_after": written_after,
+                    "route": proven_report,
+                },
+                "replay_unknown": {
+                    "lm_head": false,
+                    "accept": false,
+                    "emission": false,
+                    "shutdown": unknown_shutdown.as_ref().err().map(|e| e.to_string()),
+                    "route": unknown_report,
+                },
+            },
+            "timing": timing,
+        }))
+    })();
+
+    match route.shutdown() {
+        Ok(()) => fixtures.free(gpu),
+        Err(reason) => {
+            std::mem::forget(fixtures);
+            return Err(format!(
+                "DFlash shadow quarantined; refusing to free captured allocations: {reason}"
+            ));
+        }
+    }
+    inner
+}
+
+/// `"redline_dflash_verify_shadow_pm4"` daemon message handler.
+pub fn handle_redline_dflash_verify_shadow_pm4(
+    msg: &serde_json::Value,
+    model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+) {
+    let batch = msg
+        .get("verify_batch")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DFLASH_VERIFY_PM4_BLOCK as u64) as usize;
+    let iterations = msg
+        .get("iterations")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(4) as usize;
+    let steady_state_windows = msg
+        .get("steady_state_windows")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let response = model
+        .as_mut()
+        .ok_or_else(|| "DFlash shadow requires a loaded model".to_string())
+        .and_then(|loaded| {
+            redline_shadow_dflash_verify_pm4(
+                gpu,
+                loaded,
+                batch,
+                iterations,
+                steady_state_windows,
+            )
+        });
+    match response {
+        Ok(response) => {
+            let _ = writeln!(stdout, "{response}");
+        }
+        Err(reason) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "error", "message": reason})
+            );
+        }
+    }
+    let _ = stdout.flush();
 }
 
 /// `"redline_shadow_aql" | "redline_shadow_pm4"` daemon message handler.

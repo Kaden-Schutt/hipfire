@@ -3,25 +3,30 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
 
@@ -73,6 +78,14 @@ impl QuantType {
             37 => Some(Self::MFP2G32E8),
             38 => Some(Self::MQ2G256GL),
             39 => Some(Self::MQ3G256GL),
+            40 => Some(Self::TQ2G128),
+            41 => Some(Self::BQ1G128),
+            44 => Some(Self::MQ4G256V2),
+            45 => Some(Self::MQ4CG256),
+            47 => Some(Self::MQ6G256V2),
+            48 => Some(Self::MQ5G256V2),
+            49 => Some(Self::MQ3G256V2),
+            50 => Some(Self::MQ2G256V2),
             _ => None,
         }
     }
@@ -163,7 +176,45 @@ pub(crate) enum QuantType {
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
-                    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    TQ2G128 = 40, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
+    // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..2,
+    // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
+    // See findings/prismml-q2_0-layout.md.
+    BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
+    // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
+    // Byte-identical to GGUF ggml_type Q1_0=41.
+    /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
+    /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
+    /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
+    /// `8 + 4*t`, covering weights `8t..8t+7`.
+    ///
+    /// Header layout (little-endian, low 16 bits = scale, high 16 bits = zero):
+    ///   [0..2) fp16 scale for half 0 (weights 0-127)
+    ///   [2..4) fp16 zero  for half 0
+    ///   [4..6) fp16 scale for half 1 (weights 128-255)
+    ///   [6..8) fp16 zero  for half 1
+    ///   [8..136) 128 B nibbles, packed exactly as qt=13 (low nibble = even index)
+    MQ4G256V2 = 44,
+    /// MQ4CG256 (qt=45): FWHT-rotated 4-bit, single affine grid per 256, fp16 header, 136 B/group (pad layout).
+    /// Per-group, 136 B stride: `[0..4)` fp16 header, `[4..8)` zero padding, `[8..136)` 128 B nibbles.
+    /// Header is ONE packed dword, low 16 bits fp16 scale, high 16 bits fp16 zero, governing
+    /// all 256 weights (`w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16).
+    MQ4CG256 = 45,
+    /// MQ6G256V2 (qt=47): FWHT-rotated 6-bit, per-128 asymmetric fp16 header. 200 B/group (6b 4/3B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..200) 192 B packed 6-bit.
+    /// Half 0 covers q[0..128), half 1 q[128..256); reconstruction q*f32(s[h])+f32(z[h]).
+    MQ6G256V2 = 47,
+    /// MQ5G256V2 (qt=48): FWHT-rotated 5-bit, per-128 asymmetric fp16 header. 168 B/group (5b 8/5B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..168) 160 B packed 5-bit.
+    MQ5G256V2 = 48,
+    /// MQ3G256V2 (qt=49): FWHT-rotated 3-bit, per-128 asymmetric fp16 header. 104 B/group (3b 8/3B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..104) 96 B packed 3-bit.
+    MQ3G256V2 = 49,
+    /// MQ2G256V2 (qt=50): FWHT-rotated 2-bit, per-128 asymmetric fp16 header. 72 B/group (2b 4/B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..72) 64 B packed 2-bit.
+    /// Half 0 covers q[0..128), half 1 q[128..256); degenerate half uses scale=0, zero=f16(lo), q=0.
+    MQ2G256V2 = 50,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -196,11 +247,17 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mq2
         | GgufFormat::Mq3
         | GgufFormat::Mq4
+        | GgufFormat::Mq4V2
+        | GgufFormat::Mq4C
         | GgufFormat::Mq5
         | GgufFormat::Mq6
         | GgufFormat::Mq2Lloyd
+        | GgufFormat::Mq2LloydAnchored
         | GgufFormat::Mq3Lloyd
         | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
+        GgufFormat::Mq2V2 | GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2 => {
+            GgufFormat::Mq6V2
+        }
         GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
         GgufFormat::Hfp4 => GgufFormat::Hfp4,
         GgufFormat::Mfp4 => GgufFormat::Mfp4,
@@ -210,6 +267,8 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
         GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
         GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
+        GgufFormat::Ternary => GgufFormat::Ternary,
+        GgufFormat::Binary => GgufFormat::Binary,
     }
 }
 
@@ -218,7 +277,6 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
 /// upward-in-bit-width pairings. Cross-family (MQ↔HFQ, MQ↔HFP) and
 /// downward-in-bits promotions are rejected at parse time.
 pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
-    use crate::pipeline_gguf::GgufFormat::*;
     if base == promote {
         return true; // no-op promotion is always safe
     }
@@ -227,19 +285,38 @@ pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -
         // different runtime kernel families from standard MQ. Lloyd→non-Lloyd
         // mixed-format dispatch has no runtime support today; the plan's
         // "Future expansion" section targets the MQ2-Lloyd + MQ3-Lloyd pair
-        // specifically. Tightened per combined-review finding G2.
-        (Mq2Lloyd, Mq3Lloyd) => true,
-        (Mq2Lloyd | Mq3Lloyd, _) => false,
-        (_, Mq2Lloyd | Mq3Lloyd) => false,
-
+        (GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored, GgufFormat::Mq3Lloyd) => true,
+        (GgufFormat::Mq2LloydAnchored, GgufFormat::Mq2LloydAnchored) => true,
+        (GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored | GgufFormat::Mq3Lloyd, _) => false,
+        (_, GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored | GgufFormat::Mq3Lloyd) => false,
         // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq5 | Mq6) => true,
-        (Mq3, Mq4 | Mq5 | Mq6) => true,
-        (Mq4, Mq5 | Mq6) => true,
-        (Mq5, Mq6) => true,
-
+        (
+            GgufFormat::Mq2,
+            GgufFormat::Mq3
+            | GgufFormat::Mq4
+            | GgufFormat::Mq4V2
+            | GgufFormat::Mq4C
+            | GgufFormat::Mq5
+            | GgufFormat::Mq6,
+        ) => true,
+        (
+            GgufFormat::Mq3,
+            GgufFormat::Mq4
+            | GgufFormat::Mq4V2
+            | GgufFormat::Mq4C
+            | GgufFormat::Mq5
+            | GgufFormat::Mq6,
+        ) => true,
+        (
+            GgufFormat::Mq4 | GgufFormat::Mq4V2 | GgufFormat::Mq4C,
+            GgufFormat::Mq5 | GgufFormat::Mq6,
+        ) => true,
+        (GgufFormat::Mq5, GgufFormat::Mq6) => true,
+        (GgufFormat::Mq2V2, GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2) => true,
+        (GgufFormat::Mq3V2, GgufFormat::Mq5V2 | GgufFormat::Mq6V2) => true,
+        (GgufFormat::Mq5V2, GgufFormat::Mq6V2) => true,
         // HFQ-family upward bit-width
-        (Hfq4, Hfq6) => true,
+        (GgufFormat::Hfq4, GgufFormat::Hfq6) => true,
 
         // Everything else: explicitly not in the supported matrix.
         // Cross-family (MQ↔HFQ↔FP4) rejected — runtime mixed-format dispatch
@@ -317,7 +394,12 @@ pub(crate) fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLe
     kmap_resolve_mode(name, n_layers, is_moe, 0)
 }
 
-pub(crate) fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
+pub(crate) fn kmap_resolve_mode(
+    name: &str,
+    n_layers: usize,
+    is_moe: bool,
+    kmap_mode: u8,
+) -> QuantLevel {
     // Vision tensors (809 on Glimmer) stay F16 and must not be mis-classified
     // as text. This also prevents `vision_tower.layers.N` from being parsed
     // as a text layer index for edge-layer Promote6. Additive: text tensors

@@ -207,6 +207,80 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     }
     output
 }
+/// MagnumQuant MQ4G256 v2 (qt=44): per-128 asymmetric, fp16 header, G256 layout.
+///
+/// Lifted from hipfire-quantize/main.rs `quantize_mq4g256v2`. 136 B/group:
+/// `[0..2)` fp16 scale h0, `[2..4)` fp16 zero h0, `[4..6)` fp16 scale h1,
+/// `[6..8)` fp16 zero h1, `[8..136)` packed nibbles (same order as MQ4-G256).
+const MQ4V2_GROUP_BYTES: usize = 136;
+
+fn quantize_mq4g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    // m,k are the logical 2D shape; encoding is linear over w (API parity with main).
+    let _ = (m, k);
+    let group_size = 256;
+    let block_bytes = MQ4V2_GROUP_BYTES;
+    let n = w.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&w[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+            let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+            let z_bits = f32_to_f16(lo);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            let st = f16_to_f32(sc_bits);
+            let z = f16_to_f32(z_bits);
+            sts[h] = st;
+            zs[h] = z;
+            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    let v = group[off + i];
+                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
+                    q[off + i] = qq;
+                }
+            }
+        }
+        for i in 0..128 {
+            let lo_q = q[2 * i];
+            let hi_q = q[2 * i + 1];
+            output[out_off + 8 + i] = (lo_q & 0xF) | ((hi_q & 0xF) << 4);
+        }
+    }
+    output
+}
 
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// 200 bytes per 256 weights (0.781 B/w). Same binary layout as HFQ6-G256.
@@ -252,6 +326,284 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+const MQ6V2_GROUP_BYTES: usize = 200;
+const MQ5V2_GROUP_BYTES: usize = 168;
+const MQ3V2_GROUP_BYTES: usize = 104;
+const MQ2V2_GROUP_BYTES: usize = 72;
+
+fn quantize_mq6g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ6G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ6V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 63.0 } else { 0.0 };
+            let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+            let z_bits = f32_to_f16(lo);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = f16_to_f32(sc_bits);
+            zs[h] = f16_to_f32(z_bits);
+            degenerate[h] = hi == lo || step_f32 == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 63.0) as u8;
+                }
+            }
+        }
+        for i in (0..256).step_by(4) {
+            let bo = out_off + 8 + (i / 4) * 3;
+            let q0 = q[i] & 63;
+            let q1 = q[i + 1] & 63;
+            let q2 = q[i + 2] & 63;
+            let q3 = q[i + 3] & 63;
+            output[bo] = q0 | (q1 << 6);
+            output[bo + 1] = (q1 >> 2) | (q2 << 4);
+            output[bo + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
+    output
+}
+
+fn quantize_mq5g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ5G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ5V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 31.0 } else { 0.0 };
+            let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+            let z_bits = f32_to_f16(lo);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = f16_to_f32(sc_bits);
+            zs[h] = f16_to_f32(z_bits);
+            degenerate[h] = hi == lo || step_f32 == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 31.0) as u8;
+                }
+            }
+        }
+        for i in (0..256).step_by(8) {
+            let bo = out_off + 8 + (i / 8) * 5;
+            let q0 = q[i] & 31;
+            let q1 = q[i + 1] & 31;
+            let q2 = q[i + 2] & 31;
+            let q3 = q[i + 3] & 31;
+            let q4 = q[i + 4] & 31;
+            let q5 = q[i + 5] & 31;
+            let q6 = q[i + 6] & 31;
+            let q7 = q[i + 7] & 31;
+            output[bo] = q0 | (q1 << 5);
+            output[bo + 1] = (q1 >> 3) | (q2 << 2) | (q3 << 7);
+            output[bo + 2] = (q3 >> 1) | (q4 << 4);
+            output[bo + 3] = (q4 >> 4) | (q5 << 1) | (q6 << 6);
+            output[bo + 4] = (q6 >> 2) | (q7 << 3);
+        }
+    }
+    output
+}
+
+fn quantize_mq3g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ3G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ3V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+            let sc = if hi == lo { 0u16 } else { f32_to_f16(step) };
+            let zb = f32_to_f16(lo);
+            scales[h] = sc;
+            zeros[h] = zb;
+            sts[h] = f16_to_f32(sc);
+            zs[h] = f16_to_f32(zb);
+            degenerate[h] = hi == lo || step == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                }
+            }
+        }
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut qq = [0u8; 8];
+            for j in 0..8 {
+                qq[j] = q[ci + j] & 7;
+            }
+            let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
+            let b1 =
+                ((qq[2] >> 2) & 1) | ((qq[3] & 7) << 1) | ((qq[4] & 7) << 4) | ((qq[5] & 1) << 7);
+            let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+    output
+}
+
+fn quantize_mq2g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ2G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ2V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
+            let sc = if hi == lo { 0u16 } else { f32_to_f16(step) };
+            let zb = f32_to_f16(lo);
+            scales[h] = sc;
+            zeros[h] = zb;
+            sts[h] = f16_to_f32(sc);
+            zs[h] = f16_to_f32(zb);
+            degenerate[h] = hi == lo || step == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
+                }
+            }
+        }
+        for i in 0..64 {
+            let mut bv = 0u8;
+            for j in 0..4 {
+                let qq = q[4 * i + j] & 3;
+                bv |= qq << (j * 2);
+            }
+            output[out_off + 8 + i] = bv;
+        }
+    }
+    output
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -268,6 +620,16 @@ enum QuantType {
     MQ4G256 = 13,
     MQ6G256 = 15,
     MQ3G256 = 17,
+    /// MQ4G256 v2 (qt=44): per-128 asymmetric fp16 header, 136 B/group G256 layout.
+    MQ4G256V2 = 44,
+    /// MQ6G256 v2 (qt=47): 200 B/group, per-128 fp16 s0/z0/s1/z1 + 6-bit payload.
+    MQ6G256V2 = 47,
+    /// MQ5G256 v2 (qt=48): 168 B/group, per-128 fp16 + 5-bit payload.
+    MQ5G256V2 = 48,
+    /// MQ3G256 v2 (qt=49): 104 B/group, per-128 fp16 + 3-bit payload.
+    MQ3G256V2 = 49,
+    /// MQ2G256 v2 (qt=50): 72 B/group, per-128 fp16 + 2-bit payload.
+    MQ2G256V2 = 50,
 }
 
 struct HfqTensor {
@@ -373,7 +735,7 @@ fn resolve_model_path(input: &str) -> String {
 
 /// Returns true for tensors that must stay in F32 for numerical fidelity:
 /// any RMSNorm weight. The rest (Q/K/V/O/fc/gate/up/down projections) can
-/// be cast to F16.
+/// be cast to F16 (or MQ when requested).
 fn is_norm_tensor(name: &str) -> bool {
     name.contains("input_layernorm")
         || name.contains("post_attention_layernorm")
@@ -381,6 +743,30 @@ fn is_norm_tensor(name: &str) -> bool {
         || name.contains("k_norm")
         || name == "hidden_norm.weight"
         || name == "norm.weight"
+}
+
+/// DFlash2 dynamic-conv base kernels and candidate-selector codebooks must stay
+/// lossless (F16/F32 per container policy) — never weight-quantized to MQ.
+fn is_lossless_non_mq_tensor(name: &str) -> bool {
+    name.ends_with("base_kernel")
+        || name.ends_with("predecessor_codebook")
+        || name.ends_with("successor_codebook")
+        || name.contains(".base_kernel")
+        || name.contains("predecessor_codebook")
+        || name.contains("successor_codebook")
+}
+
+fn json_u64(v: &serde_json::Value, key: &str) -> Option<u64> {
+    v.get(key).and_then(|x| x.as_u64())
+}
+
+/// Prefer nested `dflash_config` field, then legacy top-level config key.
+fn dflash_u64(
+    dflash_cfg: &serde_json::Value,
+    config: &serde_json::Value,
+    key: &str,
+) -> Option<u64> {
+    json_u64(dflash_cfg, key).or_else(|| json_u64(config, key))
 }
 
 fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
@@ -397,8 +783,13 @@ fn main() {
     let mut output_path: Option<String> = None;
     let mut keep_f32 = false;
     let mut use_mq4 = false;
+    let mut use_mq4v2 = false;
     let mut use_mq6 = false;
     let mut use_mq3 = false;
+    let mut use_mq6v2 = false;
+    let mut use_mq5v2 = false;
+    let mut use_mq3v2 = false;
+    let mut use_mq2v2 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -419,6 +810,10 @@ fn main() {
                 use_mq4 = true;
                 i += 1;
             }
+            "--mq4v2" => {
+                use_mq4v2 = true;
+                i += 1;
+            }
             "--mq6" => {
                 use_mq6 = true;
                 i += 1;
@@ -427,9 +822,25 @@ fn main() {
                 use_mq3 = true;
                 i += 1;
             }
+            "--mq6v2" => {
+                use_mq6v2 = true;
+                i += 1;
+            }
+            "--mq5v2" => {
+                use_mq5v2 = true;
+                i += 1;
+            }
+            "--mq3v2" => {
+                use_mq3v2 = true;
+                i += 1;
+            }
+            "--mq2v2" => {
+                use_mq2v2 = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq6]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq4v2 | --mq6 | --mq6v2 | --mq5v2 | --mq3v2 | --mq2v2]"
                 );
                 std::process::exit(0);
             }
@@ -439,9 +850,17 @@ fn main() {
             }
         }
     }
-    let n_format_flags = (keep_f32 as u8) + (use_mq3 as u8) + (use_mq4 as u8) + (use_mq6 as u8);
+    let n_format_flags = (keep_f32 as u8)
+        + (use_mq3 as u8)
+        + (use_mq4 as u8)
+        + (use_mq4v2 as u8)
+        + (use_mq6 as u8)
+        + (use_mq6v2 as u8)
+        + (use_mq5v2 as u8)
+        + (use_mq3v2 as u8)
+        + (use_mq2v2 as u8);
     if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq3, --mq4, and --mq6 are mutually exclusive");
+        eprintln!("--keep-f32, --mq3, --mq4, --mq4v2, --mq6, --mq6v2, --mq5v2, --mq3v2, --mq2v2 are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -460,8 +879,18 @@ fn main() {
         "MQ3-G256 (weights), F32 (norms)"
     } else if use_mq4 {
         "MQ4-G256 (weights), F32 (norms)"
+    } else if use_mq4v2 {
+        "MQ4V2-G256/qt44 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
     } else if use_mq6 {
         "MQ6-G256 (weights), F32 (norms)"
+    } else if use_mq6v2 {
+        "MQ6V2-G256/qt47 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
+    } else if use_mq5v2 {
+        "MQ5V2-G256/qt48 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
+    } else if use_mq3v2 {
+        "MQ3V2-G256/qt49 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
+    } else if use_mq2v2 {
+        "MQ2V2-G256/qt50 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
     } else {
         "F16 (weights), F32 (norms)"
     };
@@ -478,35 +907,43 @@ fn main() {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let is_dflash = architectures
-        .iter()
-        .any(|v| v.as_str() == Some("DFlashDraftModel"));
+    let is_dflash = architectures.iter().any(|v| {
+        matches!(
+            v.as_str(),
+            Some("DFlashDraftModel") | Some("DFlash2DraftModel")
+        )
+    });
     if !is_dflash {
         eprintln!(
-            "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel"
+            "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel or DFlash2DraftModel"
         );
     }
 
+    // Nested `dflash_config` (DFlash2 + modern DFlash) with top-level fallbacks
+    // for legacy DFlashDraftModel metadata that stored block_size / etc. flat.
     let dflash_cfg = config
         .get("dflash_config")
-        .expect("config.json missing dflash_config block");
-    let block_size = config
-        .get("block_size")
-        .and_then(|v| v.as_u64())
-        .expect("config.json missing block_size") as u32;
-    let mask_token_id = dflash_cfg
-        .get("mask_token_id")
-        .and_then(|v| v.as_u64())
-        .expect("dflash_config missing mask_token_id") as u32;
-    let target_layer_ids = parse_int_array(
-        dflash_cfg
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let block_size = dflash_u64(&dflash_cfg, &config, "block_size")
+        .expect("config.json missing block_size (nested dflash_config or top-level)")
+        as u32;
+    let mask_token_id = dflash_u64(&dflash_cfg, &config, "mask_token_id")
+        .expect("missing mask_token_id (dflash_config or top-level)")
+        as u32;
+    let target_layer_ids = {
+        let arr = dflash_cfg
             .get("target_layer_ids")
-            .expect("dflash_config missing target_layer_ids"),
-    );
-    let num_target_layers = config
-        .get("num_target_layers")
-        .and_then(|v| v.as_u64())
+            .or_else(|| config.get("target_layer_ids"))
+            .expect("missing target_layer_ids (dflash_config or top-level)");
+        parse_int_array(arr)
+    };
+    let num_target_layers = dflash_u64(&dflash_cfg, &config, "num_target_layers")
         .expect("config.json missing num_target_layers");
+    let conv_group_size = dflash_u64(&dflash_cfg, &config, "conv_group_size");
+    let conv_kernel_size = dflash_u64(&dflash_cfg, &config, "conv_kernel_size");
+    let selector_rank = dflash_u64(&dflash_cfg, &config, "selector_rank");
+    let selector_top_k = dflash_u64(&dflash_cfg, &config, "selector_top_k");
 
     let num_hidden_layers = config
         .get("num_hidden_layers")
@@ -546,15 +983,32 @@ fn main() {
         "mq3"
     } else if use_mq4 {
         "mq4"
+    } else if use_mq4v2 {
+        "mq4v2"
     } else if use_mq6 {
         "mq6"
+    } else if use_mq6v2 {
+        "mq6v2"
+    } else if use_mq5v2 {
+        "mq5v2"
+    } else if use_mq3v2 {
+        "mq3v2"
+    } else if use_mq2v2 {
+        "mq2v2"
     } else {
         "f16"
     };
     // FWHT sign tables for MQ rotation. Seeds 42/1042 match the engine's
     // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let needs_fwht = use_mq3 || use_mq4 || use_mq6;
+    let needs_fwht = use_mq3
+        || use_mq4
+        || use_mq4v2
+        || use_mq6
+        || use_mq6v2
+        || use_mq5v2
+        || use_mq3v2
+        || use_mq2v2;
     let signs1: Vec<f32> = if needs_fwht {
         gen_fwht_signs(42, 256)
     } else {
@@ -565,25 +1019,71 @@ fn main() {
     } else {
         Vec::new()
     };
+    let rope_theta = config
+        .get("rope_theta")
+        .cloned()
+        .or_else(|| {
+            config
+                .get("rope_parameters")
+                .and_then(|r| r.get("rope_theta").cloned())
+        })
+        .unwrap_or_else(|| serde_json::Value::from(10_000_000.0));
+    let mut dflash_meta = serde_json::json!({
+        "block_size": block_size,
+        "mask_token_id": mask_token_id,
+        "target_layer_ids": target_layer_ids,
+        "num_target_layers": num_target_layers,
+        "num_hidden_layers": num_hidden_layers,
+        "hidden_size": hidden_size,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "intermediate_size": intermediate_size,
+        "rms_norm_eps": config.get("rms_norm_eps").cloned().unwrap_or_else(|| serde_json::Value::from(1e-6)),
+        "rope_theta": rope_theta,
+        "vocab_size": config.get("vocab_size").cloned(),
+        "draft_dtype": draft_dtype,
+    });
+    // Preserve nested dflash_config (DFlash2 fields live here) and mirror
+    // known optional knobs onto the flat dflash object for runtime loaders.
+    // layer_types / sliding_window stay available so runtime can pick Windowed
+    // with last-layer window = W (all-sliding DFlash2).
+    if let Some(obj) = dflash_meta.as_object_mut() {
+        if dflash_cfg
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+        {
+            obj.insert("dflash_config".into(), dflash_cfg.clone());
+        }
+        if let Some(v) = conv_group_size {
+            obj.insert("conv_group_size".into(), serde_json::Value::from(v));
+        }
+        if let Some(v) = conv_kernel_size {
+            obj.insert("conv_kernel_size".into(), serde_json::Value::from(v));
+        }
+        if let Some(v) = selector_rank {
+            obj.insert("selector_rank".into(), serde_json::Value::from(v));
+        }
+        if let Some(v) = selector_top_k {
+            obj.insert("selector_top_k".into(), serde_json::Value::from(v));
+        }
+        for key in [
+            "layer_types",
+            "sliding_window",
+            "use_sliding_window",
+            "is_causal",
+            "max_window_layers",
+        ] {
+            if let Some(v) = config.get(key) {
+                obj.insert(key.into(), v.clone());
+            }
+        }
+    }
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
-        "dflash": {
-            "block_size": block_size,
-            "mask_token_id": mask_token_id,
-            "target_layer_ids": target_layer_ids,
-            "num_target_layers": num_target_layers,
-            "num_hidden_layers": num_hidden_layers,
-            "hidden_size": hidden_size,
-            "num_attention_heads": num_attention_heads,
-            "num_key_value_heads": num_key_value_heads,
-            "head_dim": head_dim,
-            "intermediate_size": intermediate_size,
-            "rms_norm_eps": config.get("rms_norm_eps").cloned().unwrap_or_else(|| serde_json::Value::from(1e-6)),
-            "rope_theta": config.get("rope_theta").cloned().unwrap_or_else(|| serde_json::Value::from(10_000_000.0)),
-            "vocab_size": config.get("vocab_size").cloned(),
-            "draft_dtype": draft_dtype,
-        },
+        "dflash": dflash_meta,
         "tokenizer": serde_json::Value::Null,
     });
     let metadata_json = serde_json::to_string(&metadata).unwrap();
@@ -623,26 +1123,64 @@ fn main() {
 
         // Classification rules:
         //   norms → always F32 (small, precision-critical).
-        //   other (projections) → F32 if --keep-f32,
-        //                         MQ{3,4,6}-G256 if requested (and N ≥ 256),
-        //                         else F16.
+        //   DFlash2 base_kernel + selector codebooks → F16/F32 only (never MQ).
+        //   other projections → F32 if --keep-f32,
+        //                       MQ{3,4,4v2,6}-G256 if requested (and eligible),
+        //                       else F16.
         // MQ divisibility: quantizers pad the final partial group with
         // zeros. That's safe for weights since the padded lanes are never read
         // at inference. We still require N ≥ 256 to ensure a full first group
-        // (per-group scale/min carries meaning).
+        // (per-group scale/min carries meaning). MQ4V2 (qt=44) only applies to
+        // eligible 2D matrix weights using the established MQ4V2 G256 layout.
+        let mq_mode = use_mq3
+            || use_mq4
+            || use_mq4v2
+            || use_mq6
+            || use_mq6v2
+            || use_mq5v2
+            || use_mq3v2
+            || use_mq2v2;
         let (quant_type, group_size, bytes) = if is_norm_tensor(name) {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
         } else if keep_f32 {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
+        } else if mq_mode && is_lossless_non_mq_tensor(name) {
+            // Dynamic-conv base kernels + selector codebooks: F16 container default.
+            (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         } else if use_mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ4G256, 256u32, q)
+        } else if use_mq4v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ4G256V2, 256u32, q)
         } else if use_mq6 && n_elements >= 256 {
             let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ6G256, 256u32, q)
+        } else if use_mq6v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ6G256V2, 256u32, q)
+        } else if use_mq5v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ5G256V2, 256u32, q)
         } else if use_mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
+        } else if use_mq3v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ3G256V2, 256u32, q)
+        } else if use_mq2v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ2G256V2, 256u32, q)
         } else {
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         };

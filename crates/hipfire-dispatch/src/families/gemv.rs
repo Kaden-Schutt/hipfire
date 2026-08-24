@@ -490,6 +490,8 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvHfq3G128 => hip!(gpu.gemv_hfq3g128(w.buf, x, y, m, k)),
         K::GemvHfq2G256 => hip!(gpu.gemv_hfq2g256(w.buf, x, y, m, k)),
         K::GemvHfq2G128 => hip!(gpu.gemv_hfq2g128(w.buf, x, y, m, k)),
+        K::GemvTQ2G128 => hip!(gpu.gemv_tq2g128(w.buf, x, y, m, k)),
+        K::GemvBQ1G128 => hip!(gpu.gemv_bq1g128(w.buf, x, y, m, k)),
         K::GemvHfq6G256 => hip!(gpu.gemv_hfq6g256(w.buf, x, y, m, k)),
         K::GemvHfp4G32 => hip!(gpu.gemv_hfp4g32(w.buf, x, y, m, k)),
         K::GemvQ4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
@@ -497,11 +499,16 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
-        K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq4G256V2Prerotated => hip!(gpu.gemv_mq4g256v2(w.buf, x, y, m, k)),
+        K::GemvMq5G256V2Prerotated => hip!(gpu.gemv_mq5g256v2(w.buf, x, y, m, k)),
+        K::GemvMq6G256V2Prerotated => hip!(gpu.gemv_mq6g256v2(w.buf, x, y, m, k)),
+        K::GemvMq3G256V2Prerotated => hip!(gpu.gemv_mq3g256v2(w.buf, x, y, m, k)),
+        K::GemvMq2G256V2Prerotated => hip!(gpu.gemv_mq2g256v2(w.buf, x, y, m, k)),
+        K::GemvMq4CG256Prerotated => hip!(gpu.gemv_mq4cg256(w.buf, x, y, m, k)),
         K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq5G256Prerotated => hip!(gpu.gemv_mq5g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq6G256Prerotated => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
-        K::GemvMq4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),
         K::GemvMq8G256Prerotated => hip!(gpu.gemv_mq8g256_prerotated(w.buf, y, m, k)),
         K::GemvMq2G256Lloyd | K::GemvMq2G256LloydPrerotated => {
             hip!(gpu.gemv_mq2g256_lloyd(w.buf, x, y, m, k))
@@ -542,7 +549,6 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
             $e.map_err(|e| DispatchError::Hip(e.to_string()))
         };
     }
-
     match w.dtype {
         HFQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
@@ -550,6 +556,12 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         // MQ-family WithResidual requires caller-supplied pre-rotated x
         // (same contract as Prerotated) — dispatch through HFQ residual kernel.
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
+        MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual_mq4v2(w.buf, x, y, m, k)),
+        MQ5G256V2 => hip!(gpu.gemv_mq5g256v2_residual(w.buf, x, y, m, k)),
+        MQ6G256V2 => hip!(gpu.gemv_mq6g256v2_residual(w.buf, x, y, m, k)),
+        MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x, y, m, k)),
+        MQ2G256V2 => hip!(gpu.gemv_mq2g256v2_residual(w.buf, x, y, m, k)),
+        MQ4CG256 => hip!(gpu.gemv_mq4cg256_residual(w.buf, x, y, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x, y, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
@@ -593,9 +605,13 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
         HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
-        MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
+        MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual_mq4v2(w.buf, x_in, residual, m, k)),
+        MQ5G256V2 => hip!(gpu.gemv_mq5g256v2_residual(w.buf, x_in, residual, m, k)),
+        MQ6G256V2 => hip!(gpu.gemv_mq6g256v2_residual(w.buf, x_in, residual, m, k)),
+        MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x_in, residual, m, k)),
+        MQ2G256V2 => hip!(gpu.gemv_mq2g256v2_residual(w.buf, x_in, residual, m, k)),
+        MQ4CG256 => hip!(gpu.gemv_mq4cg256_residual(w.buf, x_in, residual, m, k)),
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
-        MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {

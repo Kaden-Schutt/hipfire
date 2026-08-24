@@ -18,6 +18,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
@@ -134,7 +135,14 @@ impl HfqFile {
         Self::open_with_reap_plan(path, reap_plan.as_deref())
     }
 
-    fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
+    /// `open` with the REAP plan injected instead of taken from process config.
+    ///
+    /// Public because the process config is a START-TIME SNAPSHOT
+    /// (`hipfire_config::active_or_local_process_config` is a `OnceLock`), so a
+    /// test that does `set_var("HIPFIRE_REAP_PLAN")` then `open()` only works if
+    /// it happens to be the first thing in the process to read config — an
+    /// order-dependent coin flip. Inject the plan here instead.
+    pub fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
         let mut f = Self::open_at_offset(path, 0)?;
         // REAP load-time overlay splice (SP3): when the process policy points
         // at a dir containing `overlay.hfq`, attach it so its re-quantized
@@ -1750,6 +1758,183 @@ pub fn load_weights_paroquant_llama(
         layers,
         lm_head_aliases_embd,
     })
+}
+// ─── HFQM streaming writer (calibration collector) ──────────────────────────
+
+/// One in-memory tensor for [`write_hfqm_package_mem`].
+pub struct HfqMemTensor {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data: Vec<u8>,
+}
+
+/// Descriptor for one tensor in a streaming HFQM write. `data_len` is the exact
+/// payload byte count (deterministic from `shape` + `quant_type`), so the index
+/// can be written before any payload is materialized — that is what lets the
+/// collector stream multi-GB Hessians one tensor at a time instead of holding
+/// them all in RAM.
+pub struct HfqStreamEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_len: u64,
+}
+
+/// Streaming HFQM writer: write the header + metadata + index up front (payload
+/// sizes come from `entries`), then call `write_nth(i, w)` once per entry, in
+/// index order, to stream that tensor's `data_len` bytes directly to the file.
+/// Only one tensor's payload need exist in memory at a time. `write_nth` MUST
+/// write exactly `entries[i].data_len` bytes. This is the canonical HFQM layout
+/// impl (the in-memory [`write_hfqm_package_mem`] is a thin wrapper over it).
+pub fn write_hfqm_package_streaming(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    entries: &[HfqStreamEntry],
+    mut write_nth: impl FnMut(usize, &mut dyn Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let meta = metadata_json.as_bytes();
+    let metadata_offset = 32u64;
+    let index_offset = metadata_offset + meta.len() as u64;
+    let mut index = Vec::new();
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        let nb = e.name.as_bytes();
+        if nb.len() > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQM entry name too long: {}", e.name),
+            ));
+        }
+        index.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        index.extend_from_slice(nb);
+        index.push(e.quant_type);
+        index.push(e.shape.len() as u8);
+        for &d in &e.shape {
+            index.extend_from_slice(&d.to_le_bytes());
+        }
+        index.extend_from_slice(&e.group_size.to_le_bytes());
+        index.extend_from_slice(&e.data_len.to_le_bytes());
+    }
+    let data_start = index_offset + index.len() as u64;
+    let data_offset = (data_start + 4095) & !4095;
+    let mut f = std::io::BufWriter::new(File::create(path)?);
+    f.write_all(b"HFQM")?;
+    f.write_all(&1u32.to_le_bytes())?;
+    f.write_all(&arch_id.to_le_bytes())?;
+    f.write_all(&(entries.len() as u32).to_le_bytes())?;
+    f.write_all(&metadata_offset.to_le_bytes())?;
+    f.write_all(&data_offset.to_le_bytes())?;
+    f.write_all(meta)?;
+    f.write_all(&index)?;
+    f.write_all(&vec![0u8; (data_offset - data_start) as usize])?;
+    for (i, e) in entries.iter().enumerate() {
+        let mut counter = CountingWriter {
+            inner: &mut f,
+            written: 0,
+        };
+        write_nth(i, &mut counter)?;
+        if counter.written != e.data_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HFQM entry {}: wrote {} bytes, index declared {}",
+                    e.name, counter.written, e.data_len
+                ),
+            ));
+        }
+    }
+    f.flush()?;
+    Ok(())
+}
+
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write an HFQM container from in-memory tensors. Thin wrapper over
+/// [`write_hfqm_package_streaming`] for callers that already hold every payload
+/// in RAM (e.g. small sidecars, tests). Large producers (the calibration
+/// collector) should stream instead.
+pub fn write_hfqm_package_mem(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    tensors: &[HfqMemTensor],
+) -> std::io::Result<()> {
+    let entries: Vec<HfqStreamEntry> = tensors
+        .iter()
+        .map(|t| HfqStreamEntry {
+            name: t.name.clone(),
+            quant_type: t.quant_type,
+            shape: t.shape.clone(),
+            group_size: t.group_size,
+            data_len: t.data.len() as u64,
+        })
+        .collect();
+    write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
+        w.write_all(&tensors[i].data)
+    })
+}
+
+/// HFQM package reader for calibration part files. Thin wrapper over
+/// [`HfqFile`] that exposes the collector's `combine_calib_parts` API
+/// (`entries()` + `blob_data(name)`) without duplicating index parsing.
+pub struct HfqPackage {
+    inner: HfqFile,
+}
+
+impl HfqPackage {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: HfqFile::open(path)?,
+        })
+    }
+    pub fn entries(&self) -> Vec<HfqPackageEntry> {
+        self.inner
+            .tensors()
+            .iter()
+            .map(|t| HfqPackageEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_offset: t.data_offset,
+                data_size: t.data_size,
+            })
+            .collect()
+    }
+    pub fn blob_data(&self, name: &str) -> Option<&[u8]> {
+        let info = self.inner.tensors().iter().find(|t| t.name == name)?;
+        self.inner
+            .mmap
+            .as_ref()
+            .map(|m| &m[info.data_offset..info.data_offset + info.data_size] as &[u8])
+    }
+}
+#[derive(Debug, Clone)]
+pub struct HfqPackageEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_offset: usize,
+    pub data_size: usize,
 }
 
 #[cfg(test)]
