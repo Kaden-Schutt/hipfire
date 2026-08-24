@@ -89,6 +89,18 @@ fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     }
 }
 
+fn mqv2_gfx1151_screen_waves() -> Option<usize> {
+    static WAVES: LazyLock<Option<usize>> =
+        LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_MQV2_GFX1151_MW_WAVES").as_deref() {
+                Ok("4") => Some(4),
+                Ok("8") => Some(8),
+                _ => None,
+            }
+        });
+    *WAVES
+}
+
 fn mqv2_screen_mw_waves(
     arch: &str,
     bits: u8,
@@ -108,6 +120,14 @@ fn mqv2_screen_mw_waves(
     };
     if !admitted {
         return None;
+    }
+    if arch == "gfx1151" {
+        if let Some(waves) = mqv2_gfx1151_screen_waves() {
+            return match (projection, batch_size) {
+                (GateUp, 384..) | (Residual, 416..) => Some(waves),
+                _ => None,
+            };
+        }
     }
     match (projection, batch_size) {
         (GateUp, 384..) => {
