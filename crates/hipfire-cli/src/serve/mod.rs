@@ -693,7 +693,6 @@ pub(crate) fn serve_foreground(
     let instance_token = serve_instance_token();
     // Opt-in concurrent backend. Built before ServeShared so a failure here is
     // a clean startup error rather than a half-configured server.
-    #[cfg(feature = "multi-slot")]
     let slot_engine: Option<Arc<slots::SlotBackend>> =
         match config_bool(&global, "serve.multi_slot") {
             Ok(true) => {
@@ -734,9 +733,13 @@ pub(crate) fn serve_foreground(
             }
             _ => None,
         };
+    #[cfg(feature = "multi-slot")]
+    let slot_engine_active = slot_engine.is_some();
     #[cfg(not(feature = "multi-slot"))]
     let slot_engine: Option<Arc<slots::SlotBackend>> = None;
-    let slot_concurrency = if slot_engine.is_some() {
+    #[cfg(not(feature = "multi-slot"))]
+    let slot_engine_active = false;
+    let slot_concurrency = if slot_engine_active {
         config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize
     } else {
         1
@@ -808,7 +811,7 @@ pub(crate) fn serve_foreground(
     })
     .context("failed to install serve signal handler")?;
     eprintln!("[hipfire] native serve listening on http://{bind}");
-    if !args.no_prewarm {
+    if !args.no_prewarm && !slot_engine_active {
         let shared = Arc::clone(&shared);
         thread::spawn(move || {
             shared
@@ -833,6 +836,20 @@ pub(crate) fn serve_foreground(
                 Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
             }
         });
+    } else if !args.no_prewarm {
+        // The multi-slot engine already holds trunk + vision weights; the
+        // legacy runtime path would load a second full copy and OOM consumer
+        // cards. All completion requests route to the slot backend when it is
+        // up, so eager pre-warm here is pure waste.
+        // /health reports meta.current_model; the warm gate (and any client
+        // readiness probe) needs it to name the served model even though the
+        // legacy runtime never loaded anything.
+        shared
+            .meta
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_model = Some(default_model.clone());
+        eprintln!("[hipfire] multi-slot backend owns the model; skipping legacy pre-warm");
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);

@@ -126,6 +126,7 @@ fn main() {
         remaining_prompt: prompt.clone(),
         next_pos: 0,
         decoding: false,
+        vl: None,
     }];
     let mut sched = Scheduler {
         chunk_size: prompt.len(),
@@ -146,6 +147,7 @@ fn main() {
         &scratch,
         &logits_out,
         &mut graph,
+        false,
     )
     .expect("prefill");
     gpu.hip.device_synchronize().expect("sync");

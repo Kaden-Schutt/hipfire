@@ -86,6 +86,8 @@ fn main() {
                 // no continuation tokens.
                 convo: Vec::new(),
                 continuation: Vec::new(),
+                image_bytes: None,
+                vis_span: None,
                 max_tokens: MAX_TOKENS,
                 reply: tx,
             })

@@ -222,6 +222,7 @@ fn main() {
                 remaining_prompt: feed.to_vec(),
                 next_pos: start_pos,
                 decoding: false,
+                vl: None,
             }];
             let mut produced = Vec::new();
             // Prefill may take several chunks. Sampling is only valid once the
@@ -248,6 +249,7 @@ fn main() {
                     scratch,
                     logits_out,
                     graph,
+                    false,
                 )
                 .expect("forward_batch_slots_graphed");
                 gpu.hip.device_synchronize().expect("sync");
