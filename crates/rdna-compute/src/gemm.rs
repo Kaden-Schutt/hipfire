@@ -101,6 +101,13 @@ fn mqv2_gfx1151_screen_waves() -> Option<usize> {
     *WAVES
 }
 
+fn mq4v2_gfx11_mmq_screen_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MQ4V2_GFX11_MMQ").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
 fn mqv2_screen_mw_waves(
     arch: &str,
     bits: u8,
@@ -17667,6 +17674,115 @@ impl Gpu {
         result
     }
 
+    fn gemm_mq4g256v2_mmq_prequant(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ4V2 Q8_1 MMQ requires exact gfx1100/gfx1151",
+            ));
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ4V2 Q8_1 MMQ requires K divisible by 256",
+            ));
+        }
+        self.bind_thread()?;
+        let full = m % 128 == 0 && batch_size % 128 == 0;
+        let kernel_name = match (full, add) {
+            (true, true) => "gemm_mq4g256v2_residual_mmq_full_add",
+            (true, false) => "gemm_mq4g256v2_residual_mmq_full_set",
+            (false, _) => "gemm_mq4g256v2_residual_mmq",
+        };
+        const MODULE: &str = "gemm_mq4g256v2_residual_mmq";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC,
+            kernel_name,
+        )?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_Y_K: usize = 36;
+        const MMQ_TILE_X_K: usize = 76;
+        let row_tiles = m.div_ceil(MMQ_Y);
+        let batch_tiles = batch_size.div_ceil(MMQ_X);
+        let shared_mem =
+            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    pub fn gemm_mq4g256v2_mmq_set_prequant(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant(a_raw, x_q8_ptr, y, m, k, batch_size, false)
+    }
+
+    pub fn gemm_mq4g256v2_mmq_add_prequant(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant(a_raw, x_q8_ptr, y, m, k, batch_size, true)
+    }
+
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
     /// gfx1100+ only. 16×16 output tiles via wave32 WMMA.
     /// Converts X to FP16, then uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32.
@@ -26018,6 +26134,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if mq4v2_gfx11_mmq_screen_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && batch_size >= 128
+            && batch_size % 128 == 0
+        {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            return Ok(());
+        }
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
         // always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
@@ -26494,6 +26624,19 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if mq4v2_gfx11_mmq_screen_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && batch_size >= 128
+            && batch_size % 128 == 0
+        {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_v, xq, y_v, v_m, k, batch_size)?;
+            return Ok(());
+        }
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
         // always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
@@ -27117,6 +27260,18 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if mq4v2_gfx11_mmq_screen_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && batch_size >= 128
+            && batch_size % 128 == 0
+        {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size)?;
+            return Ok(());
+        }
         // Exact gfx1100 production multi-wave same-row LDS before BT:
         // N>=384 selects MW8 when ceil(N/64) is even and MW4 when odd.
         // Below 384 retain BT6 for 96..383. Capture/replay keep the fixed
@@ -27691,6 +27846,17 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if mq4v2_gfx11_mmq_screen_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && batch_size >= 128
+            && batch_size % 128 == 0
+        {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
+            return Ok(());
+        }
         // Exact gfx1100 production multi-wave policy: MW4 for N 416..463
         // and MW8 for N>=464. Smaller measured ranges retain BT4/6/8.
         // Capture/replay keep the fixed historical base launch contract.
