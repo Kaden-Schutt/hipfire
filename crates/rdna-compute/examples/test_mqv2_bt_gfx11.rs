@@ -165,10 +165,8 @@ fn pack_mqv2(bits: u8, w: &[f32], m: usize, k: usize) -> Vec<u8> {
                             codes[ci + 7] & 7,
                         ];
                         let b0 = qq[0] | (qq[1] << 3) | ((qq[2] & 3) << 6);
-                        let b1 = ((qq[2] >> 2) & 1)
-                            | (qq[3] << 1)
-                            | (qq[4] << 4)
-                            | ((qq[5] & 1) << 7);
+                        let b1 =
+                            ((qq[2] >> 2) & 1) | (qq[3] << 1) | (qq[4] << 4) | ((qq[5] & 1) << 7);
                         let b2 = ((qq[5] >> 1) & 3) | (qq[6] << 2) | (qq[7] << 5);
                         let bo = dst + 8 + chunk * 3;
                         blob[bo] = b0;
@@ -293,20 +291,72 @@ fn launch_base_qkvza(
 ) -> Result<(), String> {
     let r = match bits {
         2 => gpu.gemm_qkvza_mq2g256v2_wmma_gfx11(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, QKVZA_QKV_M, QKVZA_Z_M,
-            QKVZA_BETA_M, QKVZA_ALPHA_M, K, n,
+            a_qkv,
+            a_z,
+            a_beta,
+            a_alpha,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            QKVZA_QKV_M,
+            QKVZA_Z_M,
+            QKVZA_BETA_M,
+            QKVZA_ALPHA_M,
+            K,
+            n,
         ),
         3 => gpu.gemm_qkvza_mq3g256v2_wmma_gfx11(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, QKVZA_QKV_M, QKVZA_Z_M,
-            QKVZA_BETA_M, QKVZA_ALPHA_M, K, n,
+            a_qkv,
+            a_z,
+            a_beta,
+            a_alpha,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            QKVZA_QKV_M,
+            QKVZA_Z_M,
+            QKVZA_BETA_M,
+            QKVZA_ALPHA_M,
+            K,
+            n,
         ),
         5 => gpu.gemm_qkvza_mq5g256v2_wmma_gfx11(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, QKVZA_QKV_M, QKVZA_Z_M,
-            QKVZA_BETA_M, QKVZA_ALPHA_M, K, n,
+            a_qkv,
+            a_z,
+            a_beta,
+            a_alpha,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            QKVZA_QKV_M,
+            QKVZA_Z_M,
+            QKVZA_BETA_M,
+            QKVZA_ALPHA_M,
+            K,
+            n,
         ),
         6 => gpu.gemm_qkvza_mq6g256v2_wmma_gfx11(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, QKVZA_QKV_M, QKVZA_Z_M,
-            QKVZA_BETA_M, QKVZA_ALPHA_M, K, n,
+            a_qkv,
+            a_z,
+            a_beta,
+            a_alpha,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            QKVZA_QKV_M,
+            QKVZA_Z_M,
+            QKVZA_BETA_M,
+            QKVZA_ALPHA_M,
+            K,
+            n,
         ),
         _ => unreachable!(),
     };
@@ -354,10 +404,18 @@ fn launch_base_gate_up(
     n: usize,
 ) -> Result<(), String> {
     let r = match bits {
-        2 => gpu.gemm_gate_up_mq2g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n),
-        3 => gpu.gemm_gate_up_mq3g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n),
-        5 => gpu.gemm_gate_up_mq5g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n),
-        6 => gpu.gemm_gate_up_mq6g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n),
+        2 => {
+            gpu.gemm_gate_up_mq2g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n)
+        }
+        3 => {
+            gpu.gemm_gate_up_mq3g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n)
+        }
+        5 => {
+            gpu.gemm_gate_up_mq5g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n)
+        }
+        6 => {
+            gpu.gemm_gate_up_mq6g256v2_wmma_gfx11(a_gate, a_up, x, y_gate, y_up, GATE_M, UP_M, K, n)
+        }
         _ => unreachable!(),
     };
     r.map_err(|e| format!("{e:?}"))
@@ -420,8 +478,18 @@ fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
 
     if let Err(e) = with_base_path(gpu, |gpu| {
         launch_base_qkvza(
-            gpu, bits, &d_qkv, &d_z, &d_beta, &d_alpha, &d_x, &d_y_ref[0], &d_y_ref[1],
-            &d_y_ref[2], &d_y_ref[3], n,
+            gpu,
+            bits,
+            &d_qkv,
+            &d_z,
+            &d_beta,
+            &d_alpha,
+            &d_x,
+            &d_y_ref[0],
+            &d_y_ref[1],
+            &d_y_ref[2],
+            &d_y_ref[3],
+            n,
         )
     }) {
         eprintln!("  [bits={bits} qkvza N={n}] base launch FAIL: {e}");
@@ -469,7 +537,10 @@ fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
             .filter(|x| x.to_bits() == sen[i].to_bits())
             .count();
         if cnt != 0 {
-            eprintln!("  [bits={bits} {} N={n}] {cnt} sentinel(s) remain", labels[i]);
+            eprintln!(
+                "  [bits={bits} {} N={n}] {cnt} sentinel(s) remain",
+                labels[i]
+            );
             ok = false;
         }
         if !check_raw_bits(labels[i], bits, n, &y_bt[i], &y_ref[i]) {
@@ -509,7 +580,16 @@ fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
 
     if let Err(e) = with_base_path(gpu, |gpu| {
         launch_base_qkv(
-            gpu, bits, &d_q, &d_k, &d_v, &d_x, &d_y_ref[0], &d_y_ref[1], &d_y_ref[2], n,
+            gpu,
+            bits,
+            &d_q,
+            &d_k,
+            &d_v,
+            &d_x,
+            &d_y_ref[0],
+            &d_y_ref[1],
+            &d_y_ref[2],
+            n,
         )
     }) {
         eprintln!("  [bits={bits} qkv N={n}] base launch FAIL: {e}");
@@ -526,19 +606,8 @@ fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     });
     gpu.hip.device_synchronize().unwrap();
     if let Err(e) = gpu.gemm_qkv_mqv2_wmma_gfx11_bt4(
-        bits,
-        &d_q,
-        &d_k,
-        &d_v,
-        &d_x,
-        &d_y_bt[0],
-        &d_y_bt[1],
-        &d_y_bt[2],
-        QKV_Q_M,
-        QKV_K_M,
-        QKV_V_M,
-        K,
-        n,
+        bits, &d_q, &d_k, &d_v, &d_x, &d_y_bt[0], &d_y_bt[1], &d_y_bt[2], QKV_Q_M, QKV_K_M,
+        QKV_V_M, K, n,
     ) {
         eprintln!("  [bits={bits} qkv N={n}] candidate launch FAIL: {e:?}");
         return false;
@@ -554,7 +623,10 @@ fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
             .filter(|x| x.to_bits() == sen[i].to_bits())
             .count();
         if cnt != 0 {
-            eprintln!("  [bits={bits} {} N={n}] {cnt} sentinel(s) remain", labels[i]);
+            eprintln!(
+                "  [bits={bits} {} N={n}] {cnt} sentinel(s) remain",
+                labels[i]
+            );
             ok = false;
         }
         if !check_raw_bits(labels[i], bits, n, &y_bt[i], &y_ref[i]) {
@@ -646,8 +718,9 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     htod_f32(gpu, &d_y_ref, &y_init);
     gpu.hip.device_synchronize().unwrap();
 
-    if let Err(e) = with_base_path(gpu, |gpu| launch_base_residual(gpu, bits, &d_a, &d_x, &d_y_ref, n))
-    {
+    if let Err(e) = with_base_path(gpu, |gpu| {
+        launch_base_residual(gpu, bits, &d_a, &d_x, &d_y_ref, n)
+    }) {
         eprintln!("  [bits={bits} residual N={n}] base launch FAIL: {e}");
         return false;
     }
@@ -662,7 +735,8 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     fill_f32(gpu, &d_y_bt, n * RESID_M, sen);
     htod_f32(gpu, &d_y_bt, &y_init);
     gpu.hip.device_synchronize().unwrap();
-    if let Err(e) = gpu.gemm_mqv2_residual_wmma_gfx11_bt4(bits, &d_a, &d_x, &d_y_bt, RESID_M, K, n) {
+    if let Err(e) = gpu.gemm_mqv2_residual_wmma_gfx11_bt4(bits, &d_a, &d_x, &d_y_bt, RESID_M, K, n)
+    {
         eprintln!("  [bits={bits} residual N={n}] candidate launch FAIL: {e:?}");
         return false;
     }
@@ -701,7 +775,10 @@ fn main() {
     eprintln!(
         "shapes: qkvza=({QKVZA_QKV_M},{QKVZA_Z_M},{QKVZA_BETA_M},{QKVZA_ALPHA_M}) qkv=({QKV_Q_M},{QKV_K_M},{QKV_V_M}) gate_up=({GATE_M},{UP_M}) residual={RESID_M} K={K} N={{128,256}}"
     );
-    assert_eq!((QKVZA_QKV_M + QKVZA_Z_M + QKVZA_BETA_M + QKVZA_ALPHA_M) % 16, 8);
+    assert_eq!(
+        (QKVZA_QKV_M + QKVZA_Z_M + QKVZA_BETA_M + QKVZA_ALPHA_M) % 16,
+        8
+    );
     assert_eq!((QKV_Q_M + QKV_K_M + QKV_V_M) % 16, 8);
     assert_eq!((GATE_M + UP_M) % 16, 8);
     assert_eq!(RESID_M % 16, 8);
@@ -715,7 +792,10 @@ fn main() {
     let mut arms = 0usize;
 
     for &bits in &BITS {
-        eprintln!("\n======== bits={bits} group_bytes={} ========", group_bytes(bits));
+        eprintln!(
+            "\n======== bits={bits} group_bytes={} ========",
+            group_bytes(bits)
+        );
         for &n in &NS {
             eprintln!("--- N={n} ---");
             let x_host: Vec<f32> = (0..n * K)

@@ -26316,8 +26316,7 @@ impl Gpu {
             ) {
                 if self.arch.as_str() == "gfx1201" {
                     return self.gemm_qkv_mq4g256v2_wmma_gfx1201_bt(
-                        a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-                        batch_tile,
+                        a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, batch_tile,
                     );
                 }
             }
@@ -27053,14 +27052,12 @@ impl Gpu {
                 match self.arch.as_str() {
                     "gfx1100" => {
                         return self.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt(
-                            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
-                            batch_tile,
+                            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, batch_tile,
                         );
                     }
                     "gfx1151" => {
                         return self.gemm_gate_up_mq4g256v2_wmma_gfx1151_bt(
-                            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
-                            batch_tile,
+                            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, batch_tile,
                         );
                     }
                     _ => {}
@@ -29018,8 +29015,8 @@ impl Gpu {
             ) == Some(4)
             {
                 return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                    5, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
-                    z_m, beta_m, alpha_m, k, batch_size,
+                    5, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                    beta_m, alpha_m, k, batch_size,
                 );
             }
         }
@@ -29708,9 +29705,7 @@ impl Gpu {
                 batch_size,
             ) == Some(4)
             {
-                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                    5, a_raw, x, y, m, k, batch_size,
-                );
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(5, a_raw, x, y, m, k, batch_size);
             }
         }
         self.bind_thread()?;
@@ -30278,8 +30273,8 @@ impl Gpu {
             ) == Some(4)
             {
                 return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                    6, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
-                    z_m, beta_m, alpha_m, k, batch_size,
+                    6, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                    beta_m, alpha_m, k, batch_size,
                 );
             }
         }
@@ -30968,9 +30963,7 @@ impl Gpu {
                 batch_size,
             ) == Some(4)
             {
-                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                    6, a_raw, x, y, m, k, batch_size,
-                );
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(6, a_raw, x, y, m, k, batch_size);
             }
         }
         self.bind_thread()?;
@@ -31538,8 +31531,8 @@ impl Gpu {
             ) == Some(4)
             {
                 return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                    3, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
-                    z_m, beta_m, alpha_m, k, batch_size,
+                    3, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                    beta_m, alpha_m, k, batch_size,
                 );
             }
         }
@@ -32213,9 +32206,7 @@ impl Gpu {
                 batch_size,
             ) == Some(4)
             {
-                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                    3, a_raw, x, y, m, k, batch_size,
-                );
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(3, a_raw, x, y, m, k, batch_size);
             }
         }
         self.bind_thread()?;
@@ -32783,8 +32774,8 @@ impl Gpu {
             ) == Some(4)
             {
                 return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                    2, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
-                    z_m, beta_m, alpha_m, k, batch_size,
+                    2, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                    beta_m, alpha_m, k, batch_size,
                 );
             }
         }
@@ -33473,9 +33464,7 @@ impl Gpu {
                 batch_size,
             ) == Some(4)
             {
-                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                    2, a_raw, x, y, m, k, batch_size,
-                );
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(2, a_raw, x, y, m, k, batch_size);
             }
         }
         self.bind_thread()?;
