@@ -91,7 +91,12 @@ pub(crate) fn compile_and_load_kernel(
         modules.insert(module_name.to_string(), module);
     }
     let module = &modules[module_name];
-    let func = hip.module_get_function(module, func_name)?;
+    let func = hip.module_get_function(module, func_name).map_err(|error| {
+        let context = format!(
+            "hipModuleGetFunction failed for symbol {func_name:?} in module {module_name:?}: {error}"
+        );
+        hip_bridge::HipError::new(error.code, &context)
+    })?;
     functions.insert(func_name.to_string(), func);
     Ok(())
 }
