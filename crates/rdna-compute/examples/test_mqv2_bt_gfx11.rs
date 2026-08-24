@@ -755,7 +755,7 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
 }
 
 fn main() {
-    // Never consult candidate env; leave HIPFIRE_MQV2_PREFILL_REUSE untouched.
+    // Base oracles force capture_mode so production batch-tile policy is bypassed.
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {

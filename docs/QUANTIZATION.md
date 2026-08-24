@@ -39,11 +39,13 @@ Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
 (Q4-grade embedding error compounds). 1D norms / scales stay F16. Direct
 recipes such as `q4k-all` intentionally bypass that embedding rule.
 
-### Magnum V2 family (qt 44 / 45 / 47–50)
+### Magnum V2 family (qt 44 / 47–50) and MQ4C (qt 45)
 
-Neutral-size Magnum header: **8 B of dual half `fp16 scale + fp16 zero` per
-128 weights**, payload packing unchanged from the matching v1 bit width.
-Group strides: bits **2/3/4/5/6 → 72/104/136/168/200** B per 256 elements.
+Magnum V2 uses a neutral-size **8 B dual half `fp16 scale + fp16 zero` header
+per 128 weights**, with payload packing unchanged from the matching v1 bit
+width. Group strides: bits **2/3/4/5/6 → 72/104/136/168/200** B per 256
+elements. MQ4C is separate: one per-256 fp16 scale+zero pair at `[0..4)`,
+zero padding at `[4..8)`, and the 4-bit payload at `+8`.
 
 | `--format` | qt | `DType` | B/group | Product note |
 |---|---:|---|---:|---|

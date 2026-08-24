@@ -7,8 +7,8 @@
 //! FP16 header halves, 256 integer codes packed contiguously LSB-first.
 //! Routing-sensitive shapes q=40/k=32/v=48, K=512, deterministic nondegenerate
 //! F32 X. On exact gfx1201, for bits∈{2,3,5,6} and N∈{128,256}:
-//!   1) run exact base `gemm_qkv_mq{bits}g256v2_wmma_gfx12` as the oracle
-//!      (candidate env HIPFIRE_MQV2_PREFILL_REUSE is cleared, never used),
+//!   1) run exact base `gemm_qkv_mq{bits}g256v2_wmma_gfx12` as the oracle,
+//!      forcing `capture_mode` so production batch-tile policy is bypassed,
 //!   2) run direct `gemm_qkv_mqv2_wmma_gfx1201_bt8(bits, …)`,
 //!  and compare q/k/v separately for raw `f32::to_bits` equality on every
 //!  element plus finite/nondegenerate (24 projection checks total).
@@ -313,9 +313,6 @@ fn launch_base(
 }
 
 fn main() {
-    // Candidate env must not be used — clear so production wrappers cannot steal.
-    std::env::remove_var("HIPFIRE_MQV2_PREFILL_REUSE");
-
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
@@ -414,11 +411,8 @@ fn main() {
             fill_sentinel(&gpu, &d_y_v_ref, sentinel_v, n * v_m);
             gpu.hip.device_synchronize().expect("sync sentinel ref");
 
-            // Re-clear candidate env each arm so no ambient setting can route.
-            std::env::remove_var("HIPFIRE_MQV2_PREFILL_REUSE");
-
-            // Force the historical gfx12 base path: production wrappers may
-            // divert to BT8 when HIPFIRE_MQV2_PREFILL_REUSE=1 and N>=96.
+            // Force the historical gfx12 base path: production batch-tile
+            // policy deliberately bypasses graph capture.
             let saved_capture = gpu.graphs.capture_mode;
             gpu.graphs.capture_mode = true;
             let t_ref = std::time::Instant::now();

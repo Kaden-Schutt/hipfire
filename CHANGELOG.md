@@ -14,11 +14,14 @@ layout and product boundary in
 
 - **Bonsai (passthrough):** qt=40 `TQ2G128` (ternary), qt=41 `BQ1G128` (1-bit).
 - **Magnum GL (passthrough):** qt=38 `MQ2G256GL`, qt=39 `MQ3G256GL`.
-- **Magnum V2 (passthrough):** dual fp16 scale+zero per 128 weights, same group
-  strides as v1 payloads — qt=44 `MQ4G256V2` (136 B), qt=45 `MQ4CG256` (136 B
-  padded-compat), qt=47 `MQ6G256V2` (200 B), qt=48 `MQ5G256V2` (168 B),
-  qt=49 `MQ3G256V2` (104 B), qt=50 `MQ2G256V2` (72 B). Bits 2/3/4/5/6 group
+- **Magnum V2 (passthrough):** dual fp16 scale+zero per 128 weights, with
+  payload packing unchanged from matching v1 widths — qt=44 `MQ4G256V2`
+  (136 B), qt=47 `MQ6G256V2` (200 B), qt=48 `MQ5G256V2` (168 B), qt=49
+  `MQ3G256V2` (104 B), and qt=50 `MQ2G256V2` (72 B). Bits 2/3/4/5/6 group
   bytes are 72/104/136/168/200.
+- **MQ4C (passthrough):** qt=45 `MQ4CG256` is a separate 136 B padded-compat
+  layout: one fp16 scale+zero header per 256 weights at `[0..4)`, zero padding
+  at `[4..8)`, and the nibble payload at `+8`.
 - **CLI alias:** `--format mq4` resolves **qt=44 MQ4G256V2**. Legacy v1 MQ4
   remains `mq4v1` / `mq4g256` / `magnum` (qt=13). Artifacts self-describe by
   qt; old files are not reinterpreted.
