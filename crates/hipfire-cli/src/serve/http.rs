@@ -5,82 +5,468 @@
 //! OpenAI HTTP gateway.
 //!
 //! Concern: request routing, JSON body limits, streaming vs non-streaming
-//! framing, SSE acknowledgement, CORS/health endpoints. Isolates `tiny_http`
+//! framing, SSE acknowledgement, CORS/health endpoints. Isolates Hyper
 //! I/O from business logic.
 
 use crate::serve::complete::{
-    self, complete_request, complete_request_cancellable, completion_json,
-    gate_chat_completions_tools, openai_stream_delta_for_event, openai_stream_terminal_chunks,
-    Completion,
+    complete_request_cancellable, completion_json, gate_chat_completions_tools,
+    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
 };
-use crate::serve::{is_batch_eligible_request, ServeMeta, ServeShared};
-use crate::serve::{Admission, AdmissionError, AdmissionGuard};
+use crate::serve::{is_batch_eligible_request, ServeShared};
+use crate::serve::{AdmissionError, AdmissionGuard};
 use crate::{list_local_models, unix_timestamp};
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use hyper::server::conn::http1;
+use hyper::{
+    body::{Frame, Incoming},
+    header, Method, Request, Response,
+};
+use hyper_util::rt::TokioIo;
 use std::{
-    io::{Read, Write},
+    convert::Infallible,
+    io,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        Arc, Mutex,
     },
-    thread,
-    time::Duration,
+    task::{Context as TaskContext, Poll},
 };
-use tiny_http::{Header, Method, Request, Response, StatusCode};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 
-pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
-    let path = request
-        .url()
+// ---------------------------------------------------------------------------
+// Boxed body and helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) type BoxBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+fn boxed<B>(body: B) -> BoxBody
+where
+    B: hyper::body::Body<Data = Bytes, Error = std::io::Error> + Send + 'static,
+{
+    UnsyncBoxBody::new(body)
+}
+
+fn boxed_full(bytes: Vec<u8>) -> BoxBody {
+    boxed(Full::new(bytes.into()).map_err(|never: Infallible| match never {}))
+}
+
+fn boxed_empty() -> BoxBody {
+    boxed(Full::new(Bytes::new()).map_err(|never: Infallible| match never {}))
+}
+
+pub(crate) fn json_response(value: serde_json::Value, status: u16) -> Response<BoxBody> {
+    let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(boxed_full(bytes))
+        .unwrap()
+}
+
+pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
+    let error_type = if (400..500).contains(&status) {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    json_response(
+        serde_json::json!({
+            "error": { "message": message, "type": error_type }
+        }),
+        status,
+    )
+}
+
+pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
+    let mut resp = openai_error(&error.message, 503);
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        header::HeaderValue::from_str(&error.retry_after_seconds.to_string()).unwrap(),
+    );
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// FlushAcks / TrackedIo — ack only after socket flush
+// ---------------------------------------------------------------------------
+
+type AckSender = std::sync::mpsc::Sender<Result<(), ()>>;
+
+/// Per-connection FIFO of terminal-ack senders. Bodies register when they yield
+/// a frame; `TrackedIo` completes them only after a successful `poll_flush`.
+#[derive(Clone, Debug, Default)]
+struct FlushAcks {
+    queue: Arc<Mutex<Vec<AckSender>>>,
+}
+
+impl FlushAcks {
+    fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn register(&self, ack: AckSender) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ack);
+    }
+
+    fn drain_ok(&self) {
+        let pending = std::mem::take(&mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()));
+        for ack in pending {
+            let _ = ack.send(Ok(()));
+        }
+    }
+
+    fn drain_err(&self) {
+        let pending = std::mem::take(&mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()));
+        for ack in pending {
+            let _ = ack.send(Err(()));
+        }
+    }
+}
+
+/// TcpStream wrapper that ties terminal acks to successful socket flushes.
+struct TrackedIo {
+    inner: TcpStream,
+    acks: FlushAcks,
+}
+
+impl TrackedIo {
+    fn new(inner: TcpStream, acks: FlushAcks) -> Self {
+        Self { inner, acks }
+    }
+}
+
+impl Drop for TrackedIo {
+    fn drop(&mut self) {
+        self.acks.drain_err();
+    }
+}
+
+impl AsyncRead for TrackedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TrackedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Err(_)) = &result {
+            self.acks.drain_err();
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        match &result {
+            Poll::Ready(Ok(())) => self.acks.drain_ok(),
+            Poll::Ready(Err(_)) => self.acks.drain_err(),
+            Poll::Pending => {}
+        }
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_shutdown(cx);
+        if let Poll::Ready(Err(_)) = &result {
+            self.acks.drain_err();
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AckBody / ChannelBody — preserve commit boundary
+// ---------------------------------------------------------------------------
+
+/// Terminal JSON body: exactly one frame. Ack is registered with the connection
+/// tracker when the frame is yielded; Ok only after `TrackedIo` flushes. Drop
+/// before registration sends Err (correlated abort).
+pub(crate) struct AckBody {
+    data: Option<Bytes>,
+    ack: Option<AckSender>,
+    tracker: FlushAcks,
+}
+
+impl AckBody {
+    pub(crate) fn new(bytes: Vec<u8>, ack: AckSender, tracker: FlushAcks) -> Self {
+        Self {
+            data: Some(bytes.into()),
+            ack: Some(ack),
+            tracker,
+        }
+    }
+}
+
+impl Drop for AckBody {
+    fn drop(&mut self) {
+        if let Some(ack) = self.ack.take() {
+            let _ = ack.send(Err(()));
+        }
+    }
+}
+
+impl hyper::body::Body for AckBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(data) = self.data.take() {
+            // Yield the frame and hand the ack to the connection tracker. Ok
+            // arrives only after a later successful socket flush — never here.
+            if let Some(ack) = self.ack.take() {
+                self.tracker.register(ack);
+            }
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        Poll::Ready(None)
+    }
+}
+
+/// Streaming SSE body: multiple frames via channel. Dropped receiver closes
+/// sender and callback returns Cancelled. Terminal chunk ack is registered with
+/// the connection tracker when that frame is yielded (not on a later body poll).
+#[derive(Debug)]
+pub(crate) struct ResponseChunk {
+    bytes: Vec<u8>,
+    ack: Option<AckSender>,
+    fail: bool,
+}
+
+impl ResponseChunk {
+    pub(crate) fn plain(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            ack: None,
+            fail: false,
+        }
+    }
+    pub(crate) fn fail() -> Self {
+        Self {
+            bytes: Vec::new(),
+            ack: None,
+            fail: true,
+        }
+    }
+}
+
+pub(crate) struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
+    tracker: FlushAcks,
+    failed: bool,
+}
+
+impl ChannelBody {
+    pub(crate) fn new(rx: tokio::sync::mpsc::Receiver<ResponseChunk>, tracker: FlushAcks) -> Self {
+        Self {
+            rx,
+            tracker,
+            failed: false,
+        }
+    }
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.failed {
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "response body failed after terminal delivery",
+            ))));
+        }
+
+        match Pin::new(&mut self.rx).poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => {
+                if chunk.fail {
+                    self.failed = true;
+                    if let Some(ack) = chunk.ack {
+                        let _ = ack.send(Err(()));
+                    }
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "response body failed after terminal delivery",
+                    ))));
+                }
+                if chunk.bytes.is_empty() {
+                    // Empty chunks carry no wire bytes — never fire ack for empty.
+                    if let Some(ack) = chunk.ack {
+                        let _ = ack.send(Err(()));
+                    }
+                    // Poll again for next chunk.
+                    return self.poll_frame(cx);
+                }
+                // Register terminal ack with the connection tracker at yield time.
+                // Do not ack on a subsequent body poll — only TrackedIo::poll_flush.
+                if let Some(ack) = chunk.ack {
+                    self.tracker.register(ack);
+                }
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk.bytes)))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation guard — Hyper drops handler future on client FIN in 0ms
+// ---------------------------------------------------------------------------
+
+struct CancelOnDrop {
+    token: CancellationToken,
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            armed: true,
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    fn cancelled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::SeqCst);
+            self.token.cancel();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public Hyper entry point
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn serve_listener(listener: TcpListener, shared: Arc<ServeShared>) -> Result<()> {
+    serve_listener_until(listener, shared, CancellationToken::new()).await
+}
+
+/// Accept loop that exits cleanly when `shutdown` is cancelled.
+pub(crate) async fn serve_listener_until(
+    listener: TcpListener,
+    shared: Arc<ServeShared>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let shared = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    // One tracker per connection so pipelined responses share FIFO
+                    // flush ordering without global state.
+                    let acks = FlushAcks::new();
+                    let io = TrackedIo::new(stream, acks.clone());
+                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let shared = Arc::clone(&shared);
+                        let acks = acks.clone();
+                        async move {
+                            Ok::<_, Infallible>(handle_request(req, shared, acks).await)
+                        }
+                    });
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(TokioIo::new(io), service)
+                        .await
+                    {
+                        // Hyper already logs connection resets; keep quiet for normal close.
+                        let msg = err.to_string();
+                        if !msg.contains("incomplete") && !msg.contains("reset") {
+                            eprintln!("[hipfire] connection error: {err:#}");
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_request(
+    req: Request<Incoming>,
+    shared: Arc<ServeShared>,
+    acks: FlushAcks,
+) -> Response<BoxBody> {
+    let path = req
+        .uri()
+        .path()
         .split('?')
         .next()
-        .unwrap_or(request.url())
+        .unwrap_or(req.uri().path())
         .to_owned();
-    match (request.method(), path.as_str()) {
-        (&Method::Get, "/health") => {
-            let meta = shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            request.respond(json_response(
-                serde_json::json!({
-                    "status": "ok",
-                    "model": meta.current_model,
-                    "loading_model": meta.loading_model,
-                    "pid": std::process::id(),
-                    "token": meta.instance_token,
-                    "native": true,
-                }),
-                200,
-            ))?;
+    let method = req.method().clone();
+
+    match (method, path.as_str()) {
+        (Method::GET, "/health") => {
+            let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+            let body = serde_json::json!({
+                "status": "ok",
+                "model": meta.current_model,
+                "loading_model": meta.loading_model,
+                "pid": std::process::id(),
+                "token": meta.instance_token,
+                "native": true,
+            });
+            json_response(body, 200)
         }
-        (&Method::Get, "/stats") => {
-            let meta = shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            request.respond(json_response(
-                serde_json::json!({
-                    "model": meta.current_model,
-                    "uptime_sec": meta.started.elapsed().as_secs(),
-                    "queue_depth": shared.admission.inflight(),
-                    "requests_served": meta.requests_served,
-                    "retries_attempted": meta.retries_attempted,
-                    "retries_succeeded": meta.retries_succeeded,
-                    "recent_tok_s": meta.recent_tok_s,
-                }),
-                200,
-            ))?;
+        (Method::GET, "/stats") => {
+            let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+            let body = serde_json::json!({
+                "model": meta.current_model,
+                "uptime_sec": meta.started.elapsed().as_secs(),
+                "queue_depth": shared.admission.inflight(),
+                "requests_served": meta.requests_served,
+                "retries_attempted": meta.retries_attempted,
+                "retries_succeeded": meta.retries_succeeded,
+                "recent_tok_s": meta.recent_tok_s,
+            });
+            json_response(body, 200)
         }
-        (&Method::Get, "/metrics") => {
-            // Prometheus text exposition. Deliberately does not touch the runtime
-            // mutex -- that is the lock a request holds for its whole duration, so
-            // scraping through it would make the monitoring stall whenever serving
-            // stalled, which is exactly when a scrape matters.
+        (Method::GET, "/metrics") => {
             let (uptime, model) = {
-                let meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
                 (meta.started.elapsed().as_secs(), meta.current_model.clone())
             };
             let body = shared.metrics.render(
@@ -89,109 +475,311 @@ pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Res
                 uptime,
                 model.as_deref(),
             );
-            let header = Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"text/plain; version=0.0.4; charset=utf-8"[..],
-            )
-            .expect("static header");
-            request.respond(Response::from_string(body).with_header(header))?;
+            let mut resp = Response::builder()
+                .status(200)
+                .header(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(boxed_full(body.into_bytes()))
+                .unwrap();
+            resp
         }
-        (&Method::Get, "/v1/models") => {
-            let runtime = shared
-                .runtime
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let local = list_local_models(&runtime.paths, &runtime.registry)?;
-            request.respond(json_response(
-                serde_json::json!({
-                    "object": "list",
-                    "data": local.into_iter().map(|model| serde_json::json!({
-                        "id": model.registry_tag.unwrap_or(model.name),
-                        "object": "model",
-                        "owned_by": "hipfire",
-                    })).collect::<Vec<_>>()
-                }),
-                200,
-            ))?;
+        (Method::GET, "/v1/models") => {
+            let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            let local = match list_local_models(&runtime.paths, &runtime.registry) {
+                Ok(m) => m,
+                Err(e) => return openai_error(&e.to_string(), 500),
+            };
+            let body = serde_json::json!({
+                "object": "list",
+                "data": local.into_iter().map(|model| serde_json::json!({
+                    "id": model.registry_tag.unwrap_or(model.name),
+                    "object": "model",
+                    "owned_by": "hipfire",
+                })).collect::<Vec<_>>()
+            });
+            json_response(body, 200)
         }
-        (&Method::Options, _) => {
-            request.respond(
-                Response::empty(204)
-                    .with_header(header("Access-Control-Allow-Origin", "*"))
-                    .with_header(header(
-                        "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization",
-                    ))
-                    .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")),
-            )?;
+        (Method::OPTIONS, _) => {
+            let mut resp = Response::builder()
+                .status(204)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(
+                    header::ACCESS_CONTROL_ALLOW_HEADERS,
+                    "Content-Type, Authorization",
+                )
+                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+                .body(boxed_empty())
+                .unwrap();
+            resp
         }
-        (&Method::Post, "/v1/chat/completions") => {
-            let body = match read_request_json(&mut request, shared.max_request_bytes) {
-                Ok(body) => body,
-                Err(error) => {
-                    let message = error.to_string();
-                    let status = if message.contains("exceeds") {
-                        413
-                    } else {
-                        400
-                    };
-                    request.respond(openai_error(&message, status))?;
-                    return Ok(());
+        (Method::POST, "/v1/chat/completions") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
                 }
             };
-            // Class-aware admission: eligible requests share capacity up to
-            // continuous_batch_size, ineligible are exclusive single-flight.
+
             let (is_eligible, model_for_lease) = {
-                let runtime = shared
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
                 let tp = runtime.tp;
                 let arch = runtime.current_arch.clone();
                 let batch_capable = runtime.continuous_batch_capable;
                 drop(runtime);
-                let eligible = is_batch_eligible_request(&body, tp, arch.as_deref(), batch_capable);
-                let model = body
+                let eligible =
+                    is_batch_eligible_request(&body_val, tp, arch.as_deref(), batch_capable);
+                let model = body_val
                     .get("model")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_owned());
                 (eligible, model)
             };
+
+            let mut cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.token();
+            let cancelled = cancel_guard.cancelled();
+
             let guard = if is_eligible {
                 match shared
                     .admission
-                    .acquire_for(true, model_for_lease.as_deref())
+                    .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
+                    .await
                 {
                     Ok(g) => g,
-                    Err(e) => {
-                        request.respond(admission_error_response(&e))?;
-                        return Ok(());
-                    }
+                    Err(e) => return admission_error_response(&e),
                 }
             } else {
-                match shared.admission.acquire() {
+                match shared.admission.acquire_async(cancel.clone()).await {
                     Ok(g) => g,
-                    Err(e) => {
-                        request.respond(admission_error_response(&e))?;
-                        return Ok(());
-                    }
+                    Err(e) => return admission_error_response(&e),
                 }
             };
-            // Tools require a lossless endpoint adapter before any generation.
-            if let Err(error) = gate_chat_completions_tools(&body) {
-                request.respond(openai_error(&error.to_string(), 400))?;
-                return Ok(());
+
+            if let Err(error) = gate_chat_completions_tools(&body_val) {
+                return openai_error(&error.to_string(), 400);
             }
-            if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
-                respond_streaming(request, shared, body, guard)?;
+
+            let is_stream = body_val.get("stream").and_then(|v| v.as_bool()) == Some(true);
+            let response = if is_stream {
+                handle_streaming(shared, body_val, guard, cancelled, acks).await
             } else {
-                respond_nonstreaming(request, shared, body, guard)?;
+                handle_nonstreaming(shared, body_val, guard, cancelled, acks).await
+            };
+            cancel_guard.disarm();
+            response
+        }
+        _ => openai_error("not found", 404),
+    }
+}
+
+async fn read_json_body(body: Incoming, max_bytes: u64) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    let mut stream = body;
+    while let Some(frame) = stream.frame().await {
+        let frame = frame.context("failed to read request body")?;
+        if let Some(data) = frame.data_ref() {
+            if bytes.len() as u64 + data.len() as u64 > max_bytes {
+                bail!("request body exceeds {max_bytes} bytes");
+            }
+            bytes.extend_from_slice(data);
+        }
+        if bytes.len() as u64 > max_bytes {
+            bail!("request body exceeds {max_bytes} bytes");
+        }
+    }
+    if bytes.len() as u64 > max_bytes {
+        bail!("request body exceeds {max_bytes} bytes");
+    }
+    serde_json::from_slice(&bytes).context("request body is not valid JSON")
+}
+
+// ---------------------------------------------------------------------------
+// Streaming / Non-streaming handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_streaming(
+    shared: Arc<ServeShared>,
+    body: serde_json::Value,
+    guard: AdmissionGuard,
+    cancelled: Arc<AtomicBool>,
+    acks: FlushAcks,
+) -> Response<BoxBody> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+
+    let id = request_id();
+    let created = unix_timestamp();
+    let include_usage = body
+        .pointer("/stream_options/include_usage")
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+
+    let first = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+    });
+    let _ = tx.try_send(ResponseChunk::plain(sse_data(&first)));
+
+    let tx_clone = tx.clone();
+    let shared_clone = Arc::clone(&shared);
+    let id_clone = id.clone();
+    let model_clone = model.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = complete_request_cancellable(
+            &shared_clone,
+            &body,
+            guard,
+            Some((id_clone.clone(), created)),
+            &cancelled,
+            |event| forward_sse_stream_event(&tx_clone, &id_clone, created, &model_clone, event),
+            |completion| deliver_sse_terminal_ack(&tx_clone, completion, include_usage),
+        );
+        finish_sse_stream(tx_clone, result);
+    });
+
+    let body = ChannelBody::new(rx, acks);
+    let mut resp = Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(boxed(body))
+        .unwrap();
+    // Ensure chunked; hyper sets it automatically for streaming bodies.
+    resp
+}
+
+async fn handle_nonstreaming(
+    shared: Arc<ServeShared>,
+    body: serde_json::Value,
+    guard: AdmissionGuard,
+    cancelled: Arc<AtomicBool>,
+    acks: FlushAcks,
+) -> Response<BoxBody> {
+    // Staged terminal channel: Ok((bytes, ack_tx)) for success, Err(msg) for preterminal.
+    let (staged_tx, staged_rx) = tokio::sync::oneshot::channel::<
+        Result<(Vec<u8>, std::sync::mpsc::Sender<Result<(), ()>>), String>,
+    >();
+    let staged_tx = Arc::new(Mutex::new(Some(staged_tx)));
+
+    let shared_clone = Arc::clone(&shared);
+    let body_for_worker = body;
+    let staged_tx_clone = Arc::clone(&staged_tx);
+    let staged_tx_for_worker = Arc::clone(&staged_tx);
+    tokio::task::spawn_blocking(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
+            let terminal = |completion: &Completion| {
+                let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
+                    hipfire_client::ClientError::Protocol(format!(
+                        "completion json serialize failed: {err}"
+                    ))
+                })?;
+                if bytes.is_empty() {
+                    return Err(hipfire_client::ClientError::Protocol(
+                        "nonstream terminal body must be non-empty".into(),
+                    ));
+                }
+                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                // Stage exactly one JSON frame and block for ack (RAII guard cancels while awaiting).
+                {
+                    let mut lock = staged_for_terminal
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if let Some(tx) = lock.take() {
+                        let _ = tx.send(Ok((bytes, ack_tx)));
+                    } else {
+                        return Err(hipfire_client::ClientError::Cancelled);
+                    }
+                }
+                match ack_rx.recv() {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                }
+            };
+            complete_request_cancellable(
+                &shared_clone,
+                &body_for_worker,
+                guard,
+                None,
+                &cancelled,
+                |_event| Ok(()),
+                terminal,
+            )
+        }));
+        // If terminal was never staged, propagate preterminal error via staged channel.
+        let mut lock = staged_tx_clone
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(tx) = lock.take() {
+            match outcome {
+                Ok(Ok(_completion)) => {
+                    // Ok but terminal never called — report as error.
+                    let _ = tx.send(Err(
+                        "generation completed without a response body".to_string()
+                    ));
+                }
+                Ok(Err(error)) => {
+                    let msg = error.to_string();
+                    let _ = tx.send(Err(msg));
+                }
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    let _ = tx.send(Err(format!("generation worker panicked: {detail}")));
+                }
+                Ok(Ok(_)) => {}
             }
         }
-        _ => request.respond(openai_error("not found", 404))?,
+    });
+
+    // Await staged terminal with handler's CancellationToken guard alive.
+    // Hyper dropping this future cancels the token and the AtomicBool watcher above.
+    match staged_rx.await {
+        Ok(Ok((bytes, ack_tx))) => {
+            // Success: exactly one JSON frame with AckBody.
+            let body = AckBody::new(bytes, ack_tx, acks);
+            let resp = Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(boxed(body))
+                .unwrap();
+            resp
+        }
+        Ok(Err(message)) => openai_error(&message, request_error_status(&message)),
+        Err(_) => openai_error("generation worker disconnected", 500),
     }
-    Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Preserved business helpers (same shapes, adapted to tokio mpsc where needed)
+// ---------------------------------------------------------------------------
 
 pub(crate) fn request_error_status(message: &str) -> u16 {
     let lower = message.to_ascii_lowercase();
@@ -211,412 +799,6 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     }
 }
 
-pub(crate) fn read_request_json(
-    request: &mut Request,
-    max_bytes: u64,
-) -> Result<serde_json::Value> {
-    if request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Content-Length"))
-        .and_then(|header| header.value.as_str().parse::<u64>().ok())
-        .is_some_and(|length| length > max_bytes)
-    {
-        bail!("request body exceeds {max_bytes} bytes");
-    }
-    let mut bytes = Vec::new();
-    request
-        .as_reader()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        bail!("request body exceeds {max_bytes} bytes");
-    }
-    serde_json::from_slice(&bytes).context("request body is not valid JSON")
-}
-
-pub(crate) fn respond_streaming(
-    request: Request,
-    shared: Arc<ServeShared>,
-    body: serde_json::Value,
-    guard: AdmissionGuard,
-) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-    thread::spawn(move || {
-        let id = request_id();
-        let created = unix_timestamp();
-        let include_usage = body
-            .pointer("/stream_options/include_usage")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let model = body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
-        let first = serde_json::json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-        });
-        let _ = sender.send(ResponseChunk::plain(sse_data(&first)));
-        let result = complete_request(
-            &shared,
-            &body,
-            guard,
-            Some((id.clone(), created)),
-            |event| forward_sse_stream_event(&sender, &id, created, &model, event),
-            |completion| {
-                // Full terminal representation before Engine can commit.
-                deliver_sse_terminal_ack(&sender, completion, include_usage)
-            },
-        );
-        finish_sse_stream(sender, result);
-    });
-    let mut writer = request.into_writer();
-    // Write status line + headers manually. We own the socket, so use
-    // Connection: close and close after the terminal chunk; do not emit
-    // keep-alive which we would then violate.
-    let header_bytes = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-    if writer.write_all(header_bytes).is_err() || writer.flush().is_err() {
-        // Client disconnected before headers — fail any queued ack and stop.
-        // Receiver will be dropped; sender's ack waiters see channel close as Cancelled.
-        return Ok(());
-    }
-    // Any write failure here means the client is gone; the shape of the error
-    // does not change what we do, so it is not inspected.
-    loop {
-        let chunk = match receiver.recv() {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        if chunk.fail {
-            if let Some(ack) = chunk.ack {
-                let _ = ack.send(Err(()));
-            }
-            // Unclean failure — abort; HTTP terminator still sent below
-            // so the client sees a clean HTTP EOF with incomplete SSE.
-            break;
-        }
-        if chunk.bytes.is_empty() {
-            // Empty chunks carry no wire bytes. Per contract never fire an ack for
-            // an empty chunk — drop it without sending.
-            drop(chunk.ack);
-            continue;
-        }
-        // Framed chunk: "{len:x}\r\n" + payload + "\r\n", then flush.
-        let len_hex = format!("{:x}\r\n", chunk.bytes.len());
-        let write_res = (|| -> std::io::Result<()> {
-            writer.write_all(len_hex.as_bytes())?;
-            writer.write_all(&chunk.bytes)?;
-            writer.write_all(b"\r\n")?;
-            writer.flush()?;
-            Ok(())
-        })();
-        match write_res {
-            Ok(()) => {
-                if let Some(ack) = chunk.ack {
-                    let _ = ack.send(Ok(()));
-                }
-            }
-            Err(_) => {
-                if let Some(ack) = chunk.ack {
-                    let _ = ack.send(Err(()));
-                }
-                break;
-            }
-        }
-    }
-    // Always send the HTTP chunked terminator so the HTTP body is
-    // considered complete. For clean close this is the normal end;
-    // for fail (premature EOF) the terminator makes the HTTP layer
-    // succeed, letting `read_openai_sse` see an SSE EOF without
-    // finish/DONE and return `PrematureEof` (the expected test shape)
-    // rather than a lower-level `Io(UnexpectedEof)`.
-    let _ = writer.write_all(b"0\r\n\r\n");
-    let _ = writer.flush();
-    // Dropping the writer closes the socket, which is what `Connection: close`
-    // promised; the client then sees EOF.
-    drop(writer);
-    Ok(())
-}
-
-/// Non-stream OpenAI completion: stage the full JSON body before commit, then
-/// wait for worker commit+done before EOF. Pre-terminal failures keep error status.
-///
-/// On Unix, while waiting for the terminal body the handler retains `Request` and
-/// polls `response_raw_fd` every ≤200ms. A confirmed client FIN sets a cancel
-/// token, waits for the worker to abort/drain and release admission, then drops
-/// the writer without an automatic 500. After terminal is staged, behavior is
-/// unchanged (200 + ChannelReader). Non-Unix / missing fd keeps the blocking wait.
-pub(crate) fn respond_nonstreaming(
-    request: Request,
-    shared: Arc<ServeShared>,
-    body: serde_json::Value,
-    guard: AdmissionGuard,
-) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-    let (status_tx, status_rx) = mpsc::channel::<Result<(), String>>();
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancelled_worker = cancelled.clone();
-    #[cfg(unix)]
-    let response_fd = request.response_raw_fd();
-    #[cfg(not(unix))]
-    let response_fd: Option<std::os::raw::c_int> = {
-        let _ = &request;
-        None
-    };
-    let watch_disconnect = response_fd.is_some();
-
-    thread::spawn(move || {
-        // Catch a panic so the client learns WHY. Without this any panic in the
-        // request path unwinds, drops `status_tx`, and `status_rx.recv()` below
-        // sees a closed channel -- which was reported to the caller as the
-        // useless "generation worker disconnected". A gemma4-12b load that OOMs
-        // at max_seq 9216 on a 17 GB card surfaced exactly that: the daemon
-        // emitted `hipMalloc: out of memory` naming the tensor, and the operator
-        // was told the worker disconnected.
-        let panic_status = status_tx.clone();
-        // The Ok arm below assumed the terminal callback had already sent a
-        // status. When `complete_request` returns Ok WITHOUT invoking it -- a
-        // completion that yields no terminal body -- nothing was ever sent, the
-        // channel closed, and every such request became the contentless
-        // "generation worker disconnected". Verified by instrumenting all four
-        // paths: only `recv-closed` fired.
-        let staged = Arc::new(AtomicBool::new(false));
-        let staged_cb = staged.clone();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let terminal = |completion: &Completion| {
-                let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
-                    hipfire_client::ClientError::Protocol(format!(
-                        "completion json serialize failed: {err}"
-                    ))
-                })?;
-                if bytes.is_empty() {
-                    return Err(hipfire_client::ClientError::Protocol(
-                        "nonstream terminal body must be non-empty".into(),
-                    ));
-                }
-                let (ack_tx, ack_rx) = mpsc::channel();
-                sender
-                    .send(ResponseChunk {
-                        bytes,
-                        ack: Some(ack_tx),
-                        fail: false,
-                    })
-                    .map_err(|_| hipfire_client::ClientError::Cancelled)?;
-                // Signal handler that terminal bytes are staged (success headers).
-                staged_cb.store(true, Ordering::SeqCst);
-                let _ = status_tx.send(Ok(()));
-                match ack_rx.recv() {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-                }
-            };
-            let result = if watch_disconnect {
-                complete_request_cancellable(
-                    &shared,
-                    &body,
-                    guard,
-                    None,
-                    &cancelled_worker,
-                    |_event| Ok(()),
-                    terminal,
-                )
-            } else {
-                complete_request(&shared, &body, guard, None, |_event| Ok(()), terminal)
-            };
-            match result {
-                Ok(_completion) => {
-                    if !staged.load(Ordering::SeqCst) {
-                        // Ok with no terminal staged: the generation completed without
-                        // producing a body. Report it rather than closing silently.
-                        let _ = status_tx.send(Err(
-                            "generation completed without a response body".to_string()
-                        ));
-                    }
-                    // Terminal already delivered+acked; close body with no post-commit bytes.
-                    drop(sender);
-                }
-                Err(error) => {
-                    let is_cancelled = error
-                        .downcast_ref::<hipfire_client::ClientError>()
-                        .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-                    if is_cancelled {
-                        // Tell the handler before leaving. This branch used to `return`
-                        // outright, which dropped `status_tx`, left `status_rx.recv()`
-                        // with a closed channel, and produced the contentless
-                        // "generation worker disconnected" for every cause that mapped
-                        // to Cancelled -- including a daemon that died mid-request. If
-                        // the client really did go away nobody reads this, so sending is
-                        // free; if it did not, the caller finally learns something.
-                        let _ = status_tx.send(Err(error.to_string()));
-                        // Drop without framing — unclean only if bytes already went out.
-                        drop(sender);
-                        return;
-                    }
-                    // If terminal was never staged, report error status to the handler.
-                    let message = error.to_string();
-                    if status_tx.send(Err(message)).is_err() {
-                        // Handler already started success body — force unclean close.
-                        drop(sender);
-                    }
-                }
-            }
-        }));
-        if let Err(payload) = outcome {
-            let detail = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            // Best effort: if the handler already took a status this is a no-op,
-            // and the body close below is what the client observes.
-            let _ = panic_status.send(Err(format!("generation worker panicked: {detail}")));
-        }
-    });
-
-    let status = wait_nonstream_status(&status_rx, response_fd, &cancelled);
-    match status {
-        NonstreamWait::Ready(Ok(())) => {
-            // Terminal body staged — success headers, reader owns JSON + waits for EOF.
-            request.respond(Response::new(
-                StatusCode(200),
-                vec![
-                    header("Content-Type", "application/json"),
-                    header("Access-Control-Allow-Origin", "*"),
-                ],
-                ChannelReader::new(receiver),
-                None,
-                None,
-            ))?;
-        }
-        NonstreamWait::Ready(Err(message)) => {
-            request.respond(openai_error(&message, request_error_status(&message)))?;
-        }
-        NonstreamWait::Disconnected(Ok(Ok(()))) => {
-            // Terminal won the race against disconnect; deliver as usual.
-            request.respond(Response::new(
-                StatusCode(200),
-                vec![
-                    header("Content-Type", "application/json"),
-                    header("Access-Control-Allow-Origin", "*"),
-                ],
-                ChannelReader::new(receiver),
-                None,
-                None,
-            ))?;
-        }
-        NonstreamWait::Disconnected(_) => {
-            // Client gone before terminal ack: wait already drained the worker /
-            // admission guard. Consume the writer without framing a 500.
-            drop(receiver);
-            drop(request.into_writer());
-        }
-    }
-    Ok(())
-}
-
-enum NonstreamWait {
-    Ready(Result<(), String>),
-    /// Disconnect observed before a status was taken; inner is the worker's
-    /// eventual status after cancel (Ok(Ok) means terminal still staged).
-    Disconnected(std::result::Result<Result<(), String>, mpsc::RecvError>),
-}
-
-/// Wait for the generation worker status, optionally probing the response
-/// socket for client FIN every ≤200ms.
-fn wait_nonstream_status(
-    status_rx: &mpsc::Receiver<Result<(), String>>,
-    #[cfg(unix)] response_fd: Option<std::os::fd::RawFd>,
-    #[cfg(not(unix))] response_fd: Option<std::os::raw::c_int>,
-    cancelled: &AtomicBool,
-) -> NonstreamWait {
-    #[cfg(unix)]
-    if let Some(fd) = response_fd {
-        loop {
-            match status_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(status) => return NonstreamWait::Ready(status),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if peer_response_closed(fd) {
-                        cancelled.store(true, Ordering::SeqCst);
-                        // Wait for abort drain + AdmissionGuard release.
-                        return NonstreamWait::Disconnected(status_rx.recv());
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return NonstreamWait::Ready(Err("generation worker disconnected".to_string()));
-                }
-            }
-        }
-    }
-
-    // Non-Unix or no capturable fd: retain blocking wait (no disconnect cancel).
-    let _ = response_fd;
-    let _ = cancelled;
-    match status_rx.recv() {
-        Ok(status) => NonstreamWait::Ready(status),
-        Err(_) => NonstreamWait::Ready(Err("generation worker disconnected".to_string())),
-    }
-}
-
-/// Unix helper: true when the response socket has a confirmed peer close.
-///
-/// Uses `poll(POLLIN|POLLHUP|POLLERR|POLLRDHUP)` plus non-consuming
-/// `recv(MSG_PEEK|MSG_DONTWAIT)`. Zero bytes or a hard socket error means
-/// closed; queued data or EAGAIN means still live.
-#[cfg(unix)]
-fn peer_response_closed(fd: std::os::fd::RawFd) -> bool {
-    let mut events = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
-    #[cfg(target_os = "linux")]
-    {
-        events |= libc::POLLRDHUP;
-    }
-
-    let mut pfd = libc::pollfd {
-        fd,
-        events,
-        revents: 0,
-    };
-    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        return !matches!(err.raw_os_error(), Some(libc::EINTR));
-    }
-    if n == 0 {
-        return false;
-    }
-    if pfd.revents & libc::POLLNVAL != 0 {
-        return true;
-    }
-    if pfd.revents & events == 0 {
-        return false;
-    }
-
-    let mut buf = [0u8; 1];
-    let nread = unsafe {
-        libc::recv(
-            fd,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if nread == 0 {
-        return true;
-    }
-    if nread > 0 {
-        return false;
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => false,
-        _ => true,
-    }
-}
-
 pub(crate) fn request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -632,12 +814,11 @@ pub(crate) fn sse_data(value: &serde_json::Value) -> Vec<u8> {
 }
 
 /// Forward one logical generate event onto the OpenAI SSE channel.
-///
 /// Delta-bearing events serialize to plain (no-ack) SSE bytes. No-delta mid-stream
-/// events (e.g. withheld tool_calls) are silent — terminal ack handles pure-tool
-/// delivery. A dropped receiver maps to [`hipfire_client::ClientError::Cancelled`].
+/// events are silent — terminal ack handles pure-tool delivery. A dropped receiver
+/// maps to `Cancelled`.
 pub(crate) fn forward_sse_stream_event(
-    sender: &mpsc::Sender<ResponseChunk>,
+    sender: &tokio::sync::mpsc::Sender<ResponseChunk>,
     id: &str,
     created: u64,
     model: &str,
@@ -652,19 +833,18 @@ pub(crate) fn forward_sse_stream_event(
             "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
         });
         sender
-            .send(ResponseChunk::plain(sse_data(&chunk)))
+            .blocking_send(ResponseChunk::plain(sse_data(&chunk)))
             .map_err(|_| hipfire_client::ClientError::Cancelled)
     } else {
-        // Mid-stream no-delta: do not queue empty probes. Terminal path acks.
         let _ = sender;
         Ok(())
     }
 }
 
 /// Serialize terminal tool_calls (if safe), finish, optional usage, and `[DONE]`
-/// into one non-empty acknowledged chunk. Waits for ChannelReader progress ack.
+/// into one non-empty acknowledged chunk. Waits for ChannelBody progress ack.
 pub(crate) fn deliver_sse_terminal_ack(
-    sender: &mpsc::Sender<ResponseChunk>,
+    sender: &tokio::sync::mpsc::Sender<ResponseChunk>,
     completion: &Completion,
     include_usage: bool,
 ) -> Result<(), hipfire_client::ClientError> {
@@ -678,9 +858,9 @@ pub(crate) fn deliver_sse_terminal_ack(
             "stream terminal payload must be non-empty".into(),
         ));
     }
-    let (ack_tx, ack_rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
     sender
-        .send(ResponseChunk {
+        .blocking_send(ResponseChunk {
             bytes,
             ack: Some(ack_tx),
             fail: false,
@@ -692,15 +872,16 @@ pub(crate) fn deliver_sse_terminal_ack(
     }
 }
 
-/// Close an OpenAI SSE body after `complete_request`.
-///
-/// Success: terminal already delivered+acked at commit_ready — emit no post-commit
-/// bytes. Cancelled: no server_error/`[DONE]`. Post-terminal engine errors force
-/// an unclean reader failure rather than appending a success/error frame.
-pub(crate) fn finish_sse_stream(sender: mpsc::Sender<ResponseChunk>, result: Result<Completion>) {
+/// Close an OpenAI SSE body after `complete_request_cancellable`.
+/// Success: terminal already delivered+acked at commit_ready — emit no post-commit bytes.
+/// Cancelled: no server_error/`[DONE]`. Post-terminal engine errors force an unclean
+/// reader failure rather than appending a success/error frame.
+pub(crate) fn finish_sse_stream(
+    sender: tokio::sync::mpsc::Sender<ResponseChunk>,
+    result: Result<Completion>,
+) {
     match result {
         Ok(_completion) => {
-            // Terminal representation already went out before commit.
             drop(sender);
         }
         Err(error) => {
@@ -712,284 +893,162 @@ pub(crate) fn finish_sse_stream(sender: mpsc::Sender<ResponseChunk>, result: Res
                 return;
             }
             eprintln!("[hipfire] streaming completion failed: {error:#}");
-            // Unclean failure: poison the reader instead of framing success/error.
-            let _ = sender.send(ResponseChunk {
-                bytes: Vec::new(),
-                ack: None,
-                fail: false,
-            });
-            // Marker for reader: empty+no-ack is ignored; use fail signal via drop
-            // after a special poison is not needed — ChannelReader fails when the
-            // optional fail flag is set. Prefer ResponseChunk::fail.
-            let _ = sender.send(ResponseChunk::fail());
+            let _ = sender.try_send(ResponseChunk::fail());
             drop(sender);
-        }
-    }
-}
-
-pub(crate) fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static HTTP header")
-}
-
-pub(crate) fn json_response(
-    value: serde_json::Value,
-    status: u16,
-) -> Response<std::io::Cursor<Vec<u8>>> {
-    let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
-    Response::new(
-        StatusCode(status),
-        vec![
-            header("Content-Type", "application/json"),
-            header("Access-Control-Allow-Origin", "*"),
-        ],
-        std::io::Cursor::new(bytes.clone()),
-        Some(bytes.len()),
-        None,
-    )
-}
-
-pub(crate) fn openai_error(message: &str, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
-    let error_type = if (400..500).contains(&status) {
-        "invalid_request_error"
-    } else {
-        "server_error"
-    };
-    json_response(
-        serde_json::json!({
-            "error": { "message": message, "type": error_type }
-        }),
-        status,
-    )
-}
-
-pub(crate) fn admission_error_response(
-    error: &AdmissionError,
-) -> Response<std::io::Cursor<Vec<u8>>> {
-    openai_error(&error.message, 503).with_header(header(
-        "Retry-After",
-        &error.retry_after_seconds.to_string(),
-    ))
-}
-
-/// One HTTP response body record. Optional `ack` is signaled only after the
-/// reader fully drains `bytes` and the *next* `read` begins (proving writer
-/// progress). Queue insertion alone never acknowledges. Drop before that next
-/// read disconnects the waiter as Cancelled.
-#[derive(Debug)]
-pub(crate) struct ResponseChunk {
-    bytes: Vec<u8>,
-    ack: Option<mpsc::Sender<Result<(), ()>>>,
-    /// When set, the next read fails uncleanly (post-terminal engine error).
-    fail: bool,
-}
-
-impl ResponseChunk {
-    pub(crate) fn plain(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes,
-            ack: None,
-            fail: false,
-        }
-    }
-
-    pub(crate) fn fail() -> Self {
-        Self {
-            bytes: Vec::new(),
-            ack: None,
-            fail: true,
-        }
-    }
-}
-
-pub(crate) struct ChannelReader {
-    receiver: mpsc::Receiver<ResponseChunk>,
-    current: std::io::Cursor<Vec<u8>>,
-    /// Ack to fire on the *next* read after the current chunk is fully drained.
-    pending_ack: Option<mpsc::Sender<Result<(), ()>>>,
-    failed: bool,
-}
-
-impl ChannelReader {
-    pub(crate) fn new(receiver: mpsc::Receiver<ResponseChunk>) -> Self {
-        Self {
-            receiver,
-            current: std::io::Cursor::new(Vec::new()),
-            pending_ack: None,
-            failed: false,
-        }
-    }
-
-    pub(crate) fn fire_pending_ack(&mut self) {
-        if let Some(ack) = self.pending_ack.take() {
-            let _ = ack.send(Ok(()));
-        }
-    }
-}
-
-impl Drop for ChannelReader {
-    fn drop(&mut self) {
-        // Drop before the next-read ack → waiter sees disconnect/Cancelled.
-        if let Some(ack) = self.pending_ack.take() {
-            let _ = ack.send(Err(()));
-        }
-    }
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if self.failed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "response body failed after terminal delivery",
-            ));
-        }
-        // Next-read after full drain acknowledges the prior chunk. Partial
-        // reads must keep draining without firing the pending ack.
-        if self.current.position() == self.current.get_ref().len() as u64 {
-            self.fire_pending_ack();
-        }
-
-        loop {
-            let read = self.current.read(output)?;
-            if read > 0 {
-                return Ok(read);
-            }
-            // Current buffer exhausted. Do not ack yet — ack waits for *next* read.
-            match self.receiver.recv() {
-                Ok(chunk) if chunk.fail => {
-                    self.failed = true;
-                    if let Some(ack) = chunk.ack {
-                        let _ = ack.send(Err(()));
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "response body failed after terminal delivery",
-                    ));
-                }
-                // Empty non-fail chunks are ignored (no ack on empty).
-                Ok(chunk) if chunk.bytes.is_empty() => {
-                    if let Some(ack) = chunk.ack {
-                        // Empty acknowledged chunk is invalid — disconnect waiter.
-                        let _ = ack.send(Err(()));
-                    }
-                    continue;
-                }
-                Ok(chunk) => {
-                    // If a previous chunk still had a pending ack (shouldn't with
-                    // single outstanding), fire it only on this next read entry —
-                    // already fired at top. Stage this chunk's ack for the read
-                    // *after* it is fully drained.
-                    self.current = std::io::Cursor::new(chunk.bytes);
-                    self.pending_ack = chunk.ack;
-                }
-                Err(_) => {
-                    // Channel closed: any pending ack is a disconnect.
-                    if let Some(ack) = self.pending_ack.take() {
-                        let _ = ack.send(Err(()));
-                    }
-                    return Ok(0);
-                }
-            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    mod peer_response_closed_tests {
-        use super::super::peer_response_closed;
-        use std::io::Write;
-        use std::net::{TcpListener, TcpStream};
-        use std::os::fd::AsRawFd;
-        use std::time::Duration;
+    use super::*;
+    use hyper::body::Body;
+    use std::future::poll_fn;
+    use std::task::Waker;
+    use std::time::Duration;
 
-        fn bind_listener() -> TcpListener {
-            TcpListener::bind("127.0.0.1:0").expect("bind loopback")
+    fn noop_cx() -> TaskContext<'static> {
+        TaskContext::from_waker(Waker::noop())
+    }
+
+    async fn loopback_pair() -> (TrackedIo, TcpStream, FlushAcks) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let acks = FlushAcks::new();
+        let tracked = TrackedIo::new(server, acks.clone());
+        (tracked, client, acks)
+    }
+
+    async fn write_all(io: &mut TrackedIo, mut buf: &[u8]) {
+        while !buf.is_empty() {
+            let n = poll_fn(|cx| Pin::new(&mut *io).poll_write(cx, buf))
+                .await
+                .expect("write");
+            assert!(n > 0, "write made no progress");
+            buf = &buf[n..];
         }
+    }
 
-        #[test]
-        fn live_idle_returns_false() {
-            let listener = bind_listener();
-            let addr = listener.local_addr().unwrap();
-            let client = TcpStream::connect(addr).expect("connect");
-            let (server, _) = listener.accept().expect("accept");
-            // Both ends live, no data, no shutdown — must be false on both sides.
-            assert!(
-                !peer_response_closed(server.as_raw_fd()),
-                "live server fd should be idle"
-            );
-            assert!(
-                !peer_response_closed(client.as_raw_fd()),
-                "live client fd should be idle"
-            );
-        }
+    async fn flush(io: &mut TrackedIo) {
+        poll_fn(|cx| Pin::new(&mut *io).poll_flush(cx))
+            .await
+            .expect("flush");
+    }
 
-        #[test]
-        fn fin_returns_true() {
-            let listener = bind_listener();
-            let addr = listener.local_addr().unwrap();
-            let client = TcpStream::connect(addr).expect("connect");
-            let (server, _) = listener.accept().expect("accept");
-            drop(client);
-            // FIN propagation is not instant; poll up to 500ms.
-            let mut closed = false;
-            for _ in 0..10 {
-                if peer_response_closed(server.as_raw_fd()) {
-                    closed = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+    #[tokio::test]
+    async fn ack_body_poll_alone_does_not_ack() {
+        let acks = FlushAcks::new();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let mut body = AckBody::new(b"{}".to_vec(), ack_tx, acks.clone());
+
+        let mut cx = noop_cx();
+        // Yield data frame — registers with tracker, must not complete Ok yet.
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert!(frame.data_ref().is_some_and(|d| d.as_ref() == b"{}"));
             }
-            assert!(closed, "server should see FIN after peer close");
+            other => panic!("expected data frame, got {other:?}"),
         }
+        // Second poll is EOF — still no Ok ack.
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("expected EOF, got {other:?}"),
+        }
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "body poll must not ack before socket flush"
+        );
 
-        #[test]
-        fn queued_bytes_not_mistaken_for_fin() {
-            let listener = bind_listener();
-            let addr = listener.local_addr().unwrap();
-            let mut client = TcpStream::connect(addr).expect("connect");
-            let mut server = listener.accept().expect("accept").0;
-            client.write_all(b"queued").expect("write");
-            client.flush().expect("flush");
-            // Give kernel time to queue.
-            std::thread::sleep(Duration::from_millis(50));
-            // Data queued, not FIN — must remain false.
-            assert!(
-                !peer_response_closed(server.as_raw_fd()),
-                "queued readable bytes must not be mistaken for FIN"
-            );
-            // Consume the queued bytes and prove liveness remains.
-            {
-                use std::io::Read;
-                let mut buf = [0u8; 6];
-                server
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .expect("timeout");
-                let n = server.read(&mut buf).expect("read queued");
-                assert_eq!(n, 6);
-                assert_eq!(&buf, b"queued");
-                // Still live after drain.
-                assert!(
-                    !peer_response_closed(server.as_raw_fd()),
-                    "still live after drain"
-                );
-                assert!(
-                    !peer_response_closed(client.as_raw_fd()),
-                    "client still live"
-                );
+        // Completing the tracker flush path delivers Ok.
+        acks.drain_ok();
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn channel_body_poll_alone_does_not_ack() {
+        let acks = FlushAcks::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        tx.try_send(ResponseChunk {
+            bytes: b"data: hi\n\n".to_vec(),
+            ack: Some(ack_tx),
+            fail: false,
+        })
+        .expect("send chunk");
+        drop(tx);
+
+        let mut body = ChannelBody::new(rx, acks.clone());
+        let mut cx = noop_cx();
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert!(frame
+                    .data_ref()
+                    .is_some_and(|d| d.as_ref() == b"data: hi\n\n"));
             }
-            // Now close peer and ensure FIN eventually true.
-            drop(client);
-            let mut fin = false;
-            for _ in 0..10 {
-                if peer_response_closed(server.as_raw_fd()) {
-                    fin = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            assert!(fin, "server should see FIN after peer close and drain");
+            other => panic!("expected data frame, got {other:?}"),
         }
+        // Further polls (EOF) must not complete the terminal ack.
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("expected EOF, got {other:?}"),
+        }
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "channel body poll must not ack before socket flush"
+        );
+        acks.drain_ok();
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn tracked_flush_delivers_ok_ack() {
+        let (mut tracked, _client, acks) = loopback_pair().await;
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let mut body = AckBody::new(b"ok".to_vec(), ack_tx, acks);
+
+        let mut cx = noop_cx();
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        assert!(ack_rx.try_recv().is_err(), "no ack before flush");
+
+        write_all(&mut tracked, b"ok").await;
+        // Write alone must not ack — only successful poll_flush.
+        assert!(ack_rx.try_recv().is_err(), "no ack before flush");
+        flush(&mut tracked).await;
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+
+        // Prevent Drop from racing: body already registered; IO drop drains empty.
+        drop(body);
+        drop(tracked);
+    }
+
+    #[tokio::test]
+    async fn tracked_io_drop_before_flush_fails_ack() {
+        let (tracked, _client, acks) = loopback_pair().await;
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let mut body = AckBody::new(b"x".to_vec(), ack_tx, acks);
+
+        let mut cx = noop_cx();
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        // Registered with tracker; drop IO without flush → Cancelled/Err.
+        drop(body);
+        drop(tracked);
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Err(())));
+    }
+
+    #[tokio::test]
+    async fn ack_body_drop_before_registration_fails() {
+        let acks = FlushAcks::new();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let body = AckBody::new(b"x".to_vec(), ack_tx, acks);
+        drop(body);
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Err(())));
     }
 }

@@ -29,7 +29,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tiny_http::Server;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod metrics;
 
@@ -125,10 +126,10 @@ pub(crate) struct AdmissionState {
     batch_model: Option<String>,
 }
 
-#[derive(Debug)]
 pub(crate) struct Admission {
     state: Mutex<AdmissionState>,
     available: Condvar,
+    notify: Notify,
     max_queue: usize,
     timeout: Duration,
     /// How many batch-eligible requests may be in flight at once. One for the
@@ -136,6 +137,18 @@ pub(crate) struct Admission {
     /// count when the multi-slot engine is active, which has its own admission
     /// behind it.
     capacity: usize,
+}
+
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("Admission")
+            .field("state", &*state)
+            .field("max_queue", &self.max_queue)
+            .field("timeout", &self.timeout)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -159,15 +172,43 @@ pub(crate) struct AdmissionGuard {
     model: Option<String>,
 }
 
+struct AdmissionWaiter {
+    admission: Arc<Admission>,
+    active: bool,
+}
+
+impl AdmissionWaiter {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for AdmissionWaiter {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.queued = state.queued.saturating_sub(1);
+        drop(state);
+        self.admission.available.notify_all();
+        self.admission.notify.notify_waiters();
+    }
+}
+
 impl Admission {
     pub(crate) fn new(max_queue: usize, timeout: Duration) -> Self {
         Self::new_with_capacity(max_queue, timeout, 1)
     }
-
     pub(crate) fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
+            notify: Notify::new(),
             max_queue,
             timeout,
             capacity: capacity.max(1),
@@ -319,6 +360,135 @@ impl Admission {
             self.timeout.as_secs().max(1)
         }
     }
+    pub(crate) async fn acquire_async(
+        self: &Arc<Self>,
+        cancel: CancellationToken,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for_async(false, None, cancel).await
+    }
+
+    pub(crate) async fn acquire_for_async(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+        cancel: CancellationToken,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        let model_owned = model.map(str::to_owned);
+        if cancel.is_cancelled() {
+            return Err(AdmissionError {
+                message: "cancelled".to_string(),
+                retry_after_seconds: self.retry_after_seconds(),
+            });
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let can_acquire = if is_eligible {
+                !state.ineligible_busy
+                    && state.eligible < self.capacity
+                    && state.queued == 0
+                    && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            } else {
+                state.eligible == 0 && !state.ineligible_busy && state.queued == 0
+            };
+            if can_acquire {
+                if is_eligible {
+                    state.eligible += 1;
+                    if state.batch_model.is_none() {
+                        state.batch_model = model_owned.clone();
+                    }
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: true,
+                        model: model_owned,
+                    });
+                }
+                state.ineligible_busy = true;
+                return Ok(AdmissionGuard {
+                    admission: Arc::clone(self),
+                    is_eligible: false,
+                    model: None,
+                });
+            }
+            if self.max_queue != 0 && state.queued >= self.max_queue {
+                return Err(AdmissionError {
+                    message: format!(
+                        "serve queue full (depth {}/{})",
+                        state.queued, self.max_queue
+                    ),
+                    retry_after_seconds: self.retry_after_seconds(),
+                });
+            }
+            state.queued = state.queued.saturating_add(1);
+        }
+        let mut queued = AdmissionWaiter {
+            admission: Arc::clone(self),
+            active: true,
+        };
+
+        let started = Instant::now();
+        loop {
+            // Register before inspecting state so a guard drop cannot notify
+            // between the state check and creation of the wait future.
+            let notified = self.notify.notified();
+            if cancel.is_cancelled() {
+                return Err(AdmissionError {
+                    message: "cancelled".to_string(),
+                    retry_after_seconds: self.retry_after_seconds(),
+                });
+            }
+            {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                let can_acquire = if is_eligible {
+                    !state.ineligible_busy
+                        && state.eligible < self.capacity
+                        && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+                } else {
+                    state.eligible == 0 && !state.ineligible_busy
+                };
+                if can_acquire {
+                    state.queued = state.queued.saturating_sub(1);
+                    queued.disarm();
+                    if is_eligible {
+                        state.eligible += 1;
+                        if state.batch_model.is_none() {
+                            state.batch_model = model_owned.clone();
+                        }
+                        return Ok(AdmissionGuard {
+                            admission: Arc::clone(self),
+                            is_eligible: true,
+                            model: model_owned.clone(),
+                        });
+                    }
+                    state.ineligible_busy = true;
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: false,
+                        model: None,
+                    });
+                }
+            }
+
+            let remaining = self.timeout.saturating_sub(started.elapsed());
+            if !self.timeout.is_zero() && remaining.is_zero() {
+                return Err(AdmissionError {
+                    message: format!("serve queue wait exceeded {}ms", self.timeout.as_millis()),
+                    retry_after_seconds: self.retry_after_seconds(),
+                });
+            }
+            if self.timeout.is_zero() {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = cancel.cancelled() => {}
+                }
+            } else {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(remaining) => {}
+                }
+            }
+        }
+    }
 }
 
 impl Drop for AdmissionGuard {
@@ -337,6 +507,7 @@ impl Drop for AdmissionGuard {
             state.ineligible_busy = false;
         }
         self.admission.available.notify_all();
+        self.admission.notify.notify_waiters();
     }
 }
 
@@ -793,7 +964,13 @@ pub(crate) fn serve_foreground(
         backoff_hook: Mutex::new(None),
     });
     let bind = format_bind(host, port);
-    let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind(&bind))
+        .map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
     fs::create_dir_all(&paths.root)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = ServePidRecord {
@@ -891,14 +1068,10 @@ pub(crate) fn serve_foreground(
             }
         });
     }
-    for request in server.incoming_requests() {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            if let Err(error) = crate::serve::http::handle_http(request, shared) {
-                eprintln!("[hipfire] HTTP request failed: {error:#}");
-            }
-        });
-    }
+    runtime.block_on(crate::serve::http::serve_listener(
+        listener,
+        Arc::clone(&shared),
+    ))?;
     let _ = fs::remove_file(pid_path);
     Ok(())
 }
@@ -1384,6 +1557,97 @@ mod tests {
         let timeout = admission.acquire().unwrap_err();
         assert!(timeout.message.contains("wait exceeded"));
         assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn async_admission_cancellation_removes_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let holder = admission.acquire().unwrap();
+            let cancel = CancellationToken::new();
+            let waiter_admission = Arc::clone(&admission);
+            let waiter_cancel = cancel.clone();
+            let waiter =
+                tokio::spawn(async move { waiter_admission.acquire_async(waiter_cancel).await });
+            while admission.inflight() != 2 {
+                tokio::task::yield_now().await;
+            }
+            cancel.cancel();
+            let error = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("cancelled waiter completes")
+                .expect("waiter task")
+                .expect_err("cancelled admission fails");
+            assert!(error.message.contains("cancelled"));
+            assert_eq!(admission.inflight(), 1);
+            drop(holder);
+            assert_eq!(admission.inflight(), 0);
+        });
+    }
+
+    #[test]
+    fn dropping_async_admission_future_removes_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let holder = admission.acquire().unwrap();
+            let waiter_admission = Arc::clone(&admission);
+            let waiter = tokio::spawn(async move {
+                waiter_admission
+                    .acquire_async(CancellationToken::new())
+                    .await
+            });
+            while admission.inflight() != 2 {
+                tokio::task::yield_now().await;
+            }
+            waiter.abort();
+            let error = waiter.await.expect_err("aborted waiter task");
+            assert!(error.is_cancelled());
+            assert_eq!(
+                admission.inflight(),
+                1,
+                "dropped admission future left a phantom queued request"
+            );
+            drop(holder);
+            assert_eq!(admission.inflight(), 0);
+        });
+    }
+
+    #[test]
+    fn async_admission_observes_guard_release_without_lost_wake() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let holder = admission.acquire().unwrap();
+            let waiter_admission = Arc::clone(&admission);
+            let waiter = tokio::spawn(async move {
+                waiter_admission
+                    .acquire_async(CancellationToken::new())
+                    .await
+            });
+            while admission.inflight() != 2 {
+                tokio::task::yield_now().await;
+            }
+            drop(holder);
+            let admitted = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("notified waiter completes")
+                .expect("waiter task")
+                .expect("waiter admitted");
+            assert_eq!(admission.inflight(), 1);
+            drop(admitted);
+            assert_eq!(admission.inflight(), 0);
+        });
     }
 
     #[test]

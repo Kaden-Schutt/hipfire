@@ -15,8 +15,12 @@ multi-slot = ["dep:hipfire-arch-qwen35"]
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
@@ -27,5 +31,6 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", default-features = fals
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tiny_http = { path = "../../vendor/tiny_http", version = "0.12" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 ureq = "3"

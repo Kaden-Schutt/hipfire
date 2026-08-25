@@ -2027,140 +2027,11 @@ pub(crate) fn complete_request_attempt(
     })
 }
 
-/// Server-owned one-retry driver over [`complete_request_attempt`].
-
-pub(crate) fn complete_request(
-    shared: &ServeShared,
-    body: &serde_json::Value,
-    guard: AdmissionGuard,
-    request_identity: Option<(String, u64)>,
-    mut event_callback: impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
-    mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
-) -> Result<Completion> {
-    let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
-
-    // Concurrent path. Takes no `shared.runtime` lock, which is the entire
-    // point: that mutex is what makes concurrent callers queue today. The
-    // retry/attempt machinery below is for the daemon Engine's cold-reset
-    // semantics and has no analogue here -- the engine either admits a request
-    // or rejects it with a reason.
-    //
-    // Reasoning correctness: slot machinery cannot honour the loaded model
-    // contract exactly (template framing, caps, reasoning metadata) without
-    // typed normalization. Route reasoning-capable requests through the
-    // daemon path and preserve slots only for models proven unsupported/plain.
-    // If no model is loaded yet we cannot prove unsupported, so fall through
-    // to the daemon which will load and negotiate the contract.
-    let slot_capable = {
-        let runtime = shared
-            .runtime
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        runtime.current_path.is_some()
-            && matches!(
-                runtime.current_reasoning_contract,
-                saddle_core::caps::ReasoningContract::Unsupported
-            )
-    };
-    if slot_capable {
-        if let Some(backend) = shared.slot_engine.clone() {
-            return crate::serve::slots::complete_request_slots(
-                &backend,
-                body,
-                &identity,
-                &mut event_callback,
-                &mut terminal_callback,
-            );
-        }
-    }
-
-    let mut attempt_index = 1u32;
-    let mut guard = guard;
-    loop {
-        let attempt_id = next_attempt_id();
-        let latches = std::cell::RefCell::new(AttemptLatches::default());
-        let outcome = complete_request_attempt(
-            shared,
-            body,
-            guard,
-            &identity,
-            attempt_id,
-            attempt_index > 1,
-            &latches,
-            None,
-            &mut event_callback,
-            &mut terminal_callback,
-        );
-        let latches = latches.into_inner();
-        match outcome {
-            Ok(completion) => {
-                if attempt_index > 1 {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.retries_succeeded = meta.retries_succeeded.saturating_add(1);
-                }
-                return Ok(completion);
-            }
-            Err(error) => {
-                let eligible = {
-                    let runtime = shared
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    runtime.engine.last_retry_reset_eligible() == Some(true)
-                };
-                if decide_retry(
-                    &error,
-                    attempt_id,
-                    &latches,
-                    eligible,
-                    shared.retry_enabled,
-                    attempt_index,
-                ) == RetryDecision::Fail
-                {
-                    return Err(error);
-                }
-                {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.retries_attempted = meta.retries_attempted.saturating_add(1);
-                }
-                eprintln!(
-                    "[hipfire] {}: typed transient daemon failure on attempt {attempt_index}; \
-                     rolling back and retrying once",
-                    identity.0
-                );
-                let hook = shared
-                    .backoff_hook
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.clone());
-                if let Some(hook) = hook {
-                    hook(shared.retry_backoff);
-                } else {
-                    std::thread::sleep(shared.retry_backoff);
-                }
-                guard = match shared.admission.acquire() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        return Err(error.context("retry aborted: admission re-acquire failed"));
-                    }
-                };
-                attempt_index = attempt_index.saturating_add(1);
-            }
-        }
-    }
-}
-
-/// Daemon-backed non-stream completion with cooperative cancellation.
+/// Server-owned retry driver with cooperative cancellation.
 ///
-/// Calls [`hipfire_client::Engine::generate_cancellable`] and never retries
-/// after cancellation. Slot backends keep the existing non-cancellable path:
-/// multi-slot does not yet observe HTTP disconnect tokens.
+/// Daemon requests use [`hipfire_client::Engine::generate_cancellable`].
+/// Multi-slot requests observe the same flag and drop their reply receiver,
+/// which makes the slot engine stop and free the abandoned slot.
 pub(crate) fn complete_request_cancellable(
     shared: &ServeShared,
     body: &serde_json::Value,
@@ -2190,6 +2061,7 @@ pub(crate) fn complete_request_cancellable(
                 &backend,
                 body,
                 &identity,
+                Some(cancelled),
                 &mut event_callback,
                 &mut terminal_callback,
             );

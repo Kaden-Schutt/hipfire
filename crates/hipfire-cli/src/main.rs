@@ -43,7 +43,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod bench_concurrency;
 mod serve;
@@ -5912,7 +5911,6 @@ mod tests {
         forward_think_fragments, inject_default_system_message, normalize_openai_messages,
         Completion, ThinkFragment,
     };
-    use crate::serve::http::handle_http;
     use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
     fn test_paths(label: &str) -> Paths {
@@ -7874,7 +7872,7 @@ mod tests {
         daemon
     }
 
-    /// In-process tiny_http harness: Engine::spawn_configured → handle_http.
+    /// In-process Hyper harness: Engine::spawn_configured → serve_listener_until.
     /// Does not touch HIPFIRE_DAEMON_BIN.
     #[cfg(unix)]
     struct Task11HttpHarness {
@@ -7882,9 +7880,8 @@ mod tests {
         port: u16,
         model_name: String,
         shared: Arc<ServeShared>,
-        _server: Arc<Server>,
+        shutdown: tokio_util::sync::CancellationToken,
         _join: Option<thread::JoinHandle<()>>,
-        stop: Arc<AtomicBool>,
     }
 
     #[cfg(unix)]
@@ -7981,31 +7978,40 @@ mod tests {
                 backoff_hook: Mutex::new(None),
             });
 
-            let server = Arc::new(Server::http("127.0.0.1:0").expect("bind ephemeral serve port"));
-            let port = server.server_addr().to_ip().expect("ip listen addr").port();
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral serve port");
+            std_listener
+                .set_nonblocking(true)
+                .expect("set nonblocking listener");
+            let port = std_listener
+                .local_addr()
+                .expect("listener local addr")
+                .port();
 
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_flag = Arc::clone(&stop);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let shutdown_loop = shutdown.clone();
             let shared_loop = Arc::clone(&shared);
-            let server_loop = Arc::clone(&server);
             let join = thread::spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    match server_loop.recv_timeout(Duration::from_millis(50)) {
-                        Ok(Some(request)) => {
-                            let shared = Arc::clone(&shared_loop);
-                            // handle_http owns the request; keep sequential so the
-                            // single-engine fake daemon never races generate.
-                            if let Err(error) = handle_http(request, shared) {
-                                eprintln!("[task11-harness] HTTP request failed: {error:#}");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("task11 runtime");
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(std_listener)
+                        .expect("tokio listener from std");
+                    if let Err(error) = crate::serve::http::serve_listener_until(
+                        listener,
+                        shared_loop,
+                        shutdown_loop,
+                    )
+                    .await
+                    {
+                        eprintln!("[task11-harness] serve failed: {error:#}");
                     }
-                }
+                });
             });
 
-            // Health probe — proves handle_http path is live.
+            // Health probe — proves production Hyper service path is live.
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(200)) {
@@ -8023,9 +8029,8 @@ mod tests {
                 port,
                 model_name: model_path.display().to_string(),
                 shared,
-                _server: server,
+                shutdown,
                 _join: Some(join),
-                stop,
             }
         }
 
@@ -8109,8 +8114,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for Task11HttpHarness {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            self._server.unblock();
+            self.shutdown.cancel();
             if let Some(join) = self._join.take() {
                 let _ = join.join();
             }
@@ -8426,6 +8430,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn oversized_declared_body_is_rejected_before_body_read() {
+        let harness = Task11HttpHarness::spawn("oversized-content-length");
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", harness.port())).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 8388609\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "oversized declaration was not rejected immediately: {response:?}"
+        );
+    }
+
     /// Silent non-stream client disconnect aborts the correlated daemon txn,
     /// drains done/aborted before Admission releases, then admits a follow-up.
     #[cfg(unix)]
@@ -8538,7 +8568,15 @@ mod tests {
             follow["choices"][0]["message"]["content"],
             "hello from fake daemon"
         );
-        assert_eq!(harness.shared.admission.inflight(), 0);
+        let release_deadline = Instant::now() + Duration::from_millis(500);
+        while harness.shared.admission.inflight() != 0 && Instant::now() < release_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "follow-up admission guard did not release after flushed response"
+        );
     }
 
     /// Connected pre-terminal daemon error keeps non-200 OpenAI error JSON.
