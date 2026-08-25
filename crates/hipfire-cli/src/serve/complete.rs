@@ -413,6 +413,209 @@ fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
     }
 }
 
+/// OpenAI `tool_choice` policy after request validation.
+///
+/// The daemon ignores raw `tool_choice`; the serve gateway projects it into
+/// tools/messages and enforces terminal postconditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolChoicePolicy {
+    /// Absent, JSON null, or `"auto"` — tools unchanged, no extra instruction.
+    Auto,
+    /// `"none"` — do not forward tools or expose structured calls.
+    None,
+    /// `"required"` — tools unchanged; mandate at least one executable call.
+    Required,
+    /// Specific function object — forward only that tool; mandate a matching call.
+    Function(String),
+}
+
+fn tool_schema_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("function")
+        .unwrap_or(tool)
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+/// Parse OpenAI `tool_choice` against the request `tools` array.
+///
+/// Accepts absent/null/`"auto"`, `"none"`, `"required"`, and
+/// `{"type":"function","function":{"name":...}}`. Rejects unknown strings,
+/// malformed objects, required/specific without tools, and a named function
+/// absent from `tools`.
+fn parse_tool_choice_policy(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+) -> Result<ToolChoicePolicy> {
+    let tools_arr = tools.and_then(serde_json::Value::as_array);
+    let has_tools = tools_arr.is_some_and(|arr| !arr.is_empty());
+
+    let Some(choice) = tool_choice else {
+        return Ok(ToolChoicePolicy::Auto);
+    };
+    if choice.is_null() {
+        return Ok(ToolChoicePolicy::Auto);
+    }
+    if let Some(s) = choice.as_str() {
+        return match s {
+            "auto" => Ok(ToolChoicePolicy::Auto),
+            "none" => Ok(ToolChoicePolicy::None),
+            "required" => {
+                if !has_tools {
+                    bail!("tool_choice \"required\" requires a non-empty tools array");
+                }
+                Ok(ToolChoicePolicy::Required)
+            }
+            other => bail!("unsupported tool_choice value: {other}"),
+        };
+    }
+    let Some(obj) = choice.as_object() else {
+        bail!("tool_choice must be a string, null, or function object");
+    };
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("function") => {}
+        Some(other) => bail!("tool_choice object type must be \"function\", got {other}"),
+        None => bail!("tool_choice object requires type \"function\""),
+    }
+    let name = obj
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| anyhow!("tool_choice function object requires function.name"))?;
+    if !has_tools {
+        bail!("tool_choice specific function requires a non-empty tools array");
+    }
+    let present = tools_arr
+        .expect("has_tools")
+        .iter()
+        .any(|tool| tool_schema_name(tool) == Some(name));
+    if !present {
+        bail!("tool_choice function `{name}` is not present in tools");
+    }
+    Ok(ToolChoicePolicy::Function(name.to_owned()))
+}
+
+fn filter_tools_to_function(tools: &serde_json::Value, name: &str) -> serde_json::Value {
+    let filtered = tools
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|tool| tool_schema_name(tool) == Some(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(filtered)
+}
+
+/// Append a concise mandatory-tool instruction to the leading system message,
+/// creating one when absent. Preserves all existing system text.
+fn inject_tool_choice_requirement(messages: &mut serde_json::Value, specific: Option<&str>) {
+    let instruction = match specific {
+        Some(name) => format!("You must call the `{name}` tool."),
+        None => "You must call a tool.".to_owned(),
+    };
+    let Some(arr) = messages.as_array_mut() else {
+        *messages = serde_json::json!([{ "role": "system", "content": instruction }]);
+        return;
+    };
+    if let Some(system) = arr
+        .iter_mut()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+    {
+        let existing = system
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if existing.is_empty() {
+            system["content"] = serde_json::Value::String(instruction);
+        } else {
+            system["content"] = serde_json::Value::String(format!("{existing}\n\n{instruction}"));
+        }
+    } else {
+        arr.insert(
+            0,
+            serde_json::json!({ "role": "system", "content": instruction }),
+        );
+    }
+}
+
+/// Project OpenAI `tool_choice` onto messages and the tools array forwarded to
+/// the daemon. Never forwards raw `tool_choice`.
+///
+/// - `none`: drop tools (no tool parser / template tools section)
+/// - `auto` / absent: preserve tools
+/// - specific function: filter tools to that name
+/// - `required` / specific: inject a short system-level requirement
+fn project_tool_choice(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+    messages: &mut serde_json::Value,
+) -> Result<(ToolChoicePolicy, Option<serde_json::Value>)> {
+    let policy = parse_tool_choice_policy(tool_choice, tools)?;
+    let forwarded = match &policy {
+        ToolChoicePolicy::None => None,
+        ToolChoicePolicy::Auto => tools.cloned(),
+        ToolChoicePolicy::Required => {
+            inject_tool_choice_requirement(messages, None);
+            tools.cloned()
+        }
+        ToolChoicePolicy::Function(name) => {
+            inject_tool_choice_requirement(messages, Some(name));
+            Some(filter_tools_to_function(
+                tools.expect("validated non-empty tools"),
+                name,
+            ))
+        }
+    };
+    Ok((policy, forwarded))
+}
+
+/// Normalize argument types, then enforce tool_choice terminal postconditions.
+///
+/// - `none`: strip all structured calls (and coerce a tool_calls finish to stop)
+/// - `required`: fail closed when zero executable calls
+/// - specific: keep only the named tool; fail closed when none remain
+/// - `auto`: identity beyond argument normalization
+fn finalize_tool_calls_for_choice(
+    policy: &ToolChoicePolicy,
+    tool_calls: &mut Vec<ToolCall>,
+    done: &mut serde_json::Value,
+    body: &serde_json::Value,
+) -> Result<()> {
+    normalize_tool_calls(tool_calls, body);
+    match policy {
+        ToolChoicePolicy::Auto => Ok(()),
+        ToolChoicePolicy::None => {
+            tool_calls.clear();
+            if done
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("tool_calls")
+            {
+                done["finish_reason"] = serde_json::Value::String("stop".into());
+            }
+            Ok(())
+        }
+        ToolChoicePolicy::Required => {
+            if tool_calls.is_empty() {
+                bail!("tool_choice \"required\" produced no tool calls");
+            }
+            Ok(())
+        }
+        ToolChoicePolicy::Function(name) => {
+            tool_calls.retain(|call| call.name == *name);
+            if tool_calls.is_empty() {
+                bail!("tool_choice required tool `{name}` but no matching tool call was produced");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Endpoint adapter kinds known to the serve HTTP surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EndpointAdapterKind {
@@ -1360,7 +1563,7 @@ pub(crate) fn complete_request_attempt(
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
-    let (generate, resolved, engine_clone, reasoning) = {
+    let (generate, resolved, engine_clone, reasoning, tool_choice_policy) = {
         let mut runtime = shared
             .runtime
             .lock()
@@ -1404,6 +1607,11 @@ pub(crate) fn complete_request_attempt(
             normalize_openai_messages(body.get("messages"), include_reasoning_content);
         let default_system = request_string(&resolved, "prompt.system", None)?;
         inject_default_system_message(&mut normalized_messages, default_system.as_deref());
+        let (tool_choice_policy, forwarded_tools) = project_tool_choice(
+            body.get("tool_choice"),
+            body.get("tools"),
+            &mut normalized_messages,
+        )?;
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": request_id(),
@@ -1430,9 +1638,12 @@ pub(crate) fn complete_request_attempt(
         // Validate OpenAI logprobs contract before forwarding; reject rather
         // than silently clamping so callers notice a mismatch.
         validate_logprobs_request(body)?;
+        // Project tools under tool_choice; never forward raw tool_choice (daemon
+        // ignores it). none drops tools so the template/parser stay inactive.
+        if let Some(tools) = forwarded_tools {
+            generate["tools"] = tools;
+        }
         for name in [
-            "tools",
-            "tool_choice",
             "frequency_penalty",
             "stop",
             "reasoning_effort",
@@ -1484,7 +1695,13 @@ pub(crate) fn complete_request_attempt(
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
         }
         let engine_clone = runtime.engine.clone();
-        (generate, resolved, engine_clone, reasoning)
+        (
+            generate,
+            resolved,
+            engine_clone,
+            reasoning,
+            tool_choice_policy,
+        )
     };
     let (id, created) = identity.clone();
     // - first event must be gen_start with matching request id + attempt_id
@@ -1554,7 +1771,14 @@ pub(crate) fn complete_request_attempt(
                         None
                     };
                     let mut tool_calls = fold.executable_tool_calls().to_vec();
-                    normalize_tool_calls(&mut tool_calls, body);
+                    let mut done = fold.done().cloned().unwrap_or(staged);
+                    finalize_tool_calls_for_choice(
+                        &tool_choice_policy,
+                        &mut tool_calls,
+                        &mut done,
+                        body,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
                     Completion {
                         id: id.clone(),
                         created,
@@ -1563,7 +1787,7 @@ pub(crate) fn complete_request_attempt(
                         reasoning_content: fold.reasoning_content().to_owned(),
                         preserve_thinking,
                         tool_calls,
-                        done: fold.done().cloned().unwrap_or(staged),
+                        done,
                         logprobs,
                         reasoning: Some(reasoning.clone()),
                     }
@@ -1584,7 +1808,14 @@ pub(crate) fn complete_request_attempt(
                     } else {
                         Vec::new()
                     };
-                    normalize_tool_calls(&mut tool_calls, body);
+                    let mut done = staged;
+                    finalize_tool_calls_for_choice(
+                        &tool_choice_policy,
+                        &mut tool_calls,
+                        &mut done,
+                        body,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
                     let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
                         Some(logprobs_entries.clone())
                     } else {
@@ -1598,7 +1829,7 @@ pub(crate) fn complete_request_attempt(
                         reasoning_content: legacy_reasoning.clone(),
                         preserve_thinking,
                         tool_calls,
-                        done: staged,
+                        done,
                         logprobs,
                         reasoning: Some(reasoning.clone()),
                     }
@@ -1737,14 +1968,14 @@ pub(crate) fn complete_request_attempt(
     meta.last_activity = Instant::now();
 
     if contract_gate.is_v2() {
-        let done = fold.done().cloned().unwrap_or(done);
+        let mut done = fold.done().cloned().unwrap_or(done);
         let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
             Some(logprobs_entries)
         } else {
             None
         };
         let mut tool_calls = fold.executable_tool_calls().to_vec();
-        normalize_tool_calls(&mut tool_calls, body);
+        finalize_tool_calls_for_choice(&tool_choice_policy, &mut tool_calls, &mut done, body)?;
         return Ok(Completion {
             id,
             created,
@@ -1759,7 +1990,7 @@ pub(crate) fn complete_request_attempt(
         });
     }
 
-    let done = legacy_done.unwrap_or(done);
+    let mut done = legacy_done.unwrap_or(done);
     let finish = done
         .get("finish_reason")
         .and_then(serde_json::Value::as_str);
@@ -1768,7 +1999,7 @@ pub(crate) fn complete_request_attempt(
     } else {
         Vec::new()
     };
-    normalize_tool_calls(&mut tool_calls, body);
+    finalize_tool_calls_for_choice(&tool_choice_policy, &mut tool_calls, &mut done, body)?;
     let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
         Some(logprobs_entries)
     } else {
@@ -5869,5 +6100,291 @@ mod tests {
         normalize_tool_calls(&mut preview_calls, &body);
         normalize_tool_calls(&mut final_calls, &body);
         assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+    }
+
+    fn echo_and_translate_tools() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "translate_text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }
+                }
+            }
+        ])
+    }
+
+    fn calculator_tools() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": { "type": "string" }
+                    }
+                }
+            }
+        }])
+    }
+
+    #[test]
+    fn tool_choice_absent_and_auto_preserve_tools_identity() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([
+            { "role": "system", "content": "base system" },
+            { "role": "user", "content": "hi" }
+        ]);
+        let before = messages.clone();
+
+        let (policy, forwarded) =
+            project_tool_choice(None, Some(&tools), &mut messages).expect("absent");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages, before);
+
+        let mut messages_auto = before.clone();
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("auto")),
+            Some(&tools),
+            &mut messages_auto,
+        )
+        .expect("auto");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages_auto, before);
+
+        let mut messages_null = before.clone();
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::Value::Null),
+            Some(&tools),
+            &mut messages_null,
+        )
+        .expect("null");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages_null, before);
+    }
+
+    #[test]
+    fn tool_choice_none_strips_tools_and_terminal_calls() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("none")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect("none");
+        assert_eq!(policy, ToolChoicePolicy::None);
+        assert!(forwarded.is_none());
+        // no instruction injection for none
+        assert_eq!(messages.as_array().unwrap().len(), 1);
+
+        let body = tool_body(tools);
+        let mut calls = vec![sample_tc("echo", serde_json::json!({"text": "x"}))];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut calls, &mut done, &body).expect("finalize");
+        assert!(calls.is_empty());
+        assert_eq!(done["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_choice_required_injects_instruction_and_keeps_tools() {
+        let tools = calculator_tools();
+        let mut messages = serde_json::json!([
+            { "role": "system", "content": "existing policy" },
+            { "role": "user", "content": "2+2" }
+        ]);
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("required")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect("required");
+        assert_eq!(policy, ToolChoicePolicy::Required);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.starts_with("existing policy"));
+        assert!(system.contains("You must call a tool."));
+    }
+
+    #[test]
+    fn tool_choice_specific_filters_tools_and_names_requirement() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([{ "role": "user", "content": "echo hi" }]);
+        let choice = serde_json::json!({
+            "type": "function",
+            "function": { "name": "echo" }
+        });
+        let (policy, forwarded) =
+            project_tool_choice(Some(&choice), Some(&tools), &mut messages).expect("specific");
+        assert_eq!(policy, ToolChoicePolicy::Function("echo".into()));
+        let forwarded = forwarded.expect("filtered tools");
+        let arr = forwarded.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("You must call the `echo` tool."));
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn tool_choice_rejects_malformed_unknown_and_missing_tool() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([]);
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!("maybe")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("unknown string");
+        assert!(err.to_string().contains("unsupported tool_choice"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({"type": "tool", "function": {"name": "echo"}})),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("bad type");
+        assert!(err.to_string().contains("function"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({"type": "function", "function": {}})),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("missing name");
+        assert!(err.to_string().contains("function.name"));
+
+        let err = project_tool_choice(Some(&serde_json::json!("required")), None, &mut messages)
+            .expect_err("required without tools");
+        assert!(err.to_string().contains("non-empty tools"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({
+                "type": "function",
+                "function": { "name": "missing_tool" }
+            })),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("absent function");
+        assert!(err.to_string().contains("missing_tool"));
+    }
+
+    #[test]
+    fn tool_choice_required_postcondition_fails_without_calls() {
+        let body = tool_body(calculator_tools());
+        let mut calls = Vec::new();
+        let mut done = serde_json::json!({ "finish_reason": "stop" });
+        let err = finalize_tool_calls_for_choice(
+            &ToolChoicePolicy::Required,
+            &mut calls,
+            &mut done,
+            &body,
+        )
+        .expect_err("no-call");
+        assert!(err.to_string().contains("required"));
+    }
+
+    #[test]
+    fn tool_choice_required_allows_parallel_calls() {
+        let body = tool_body(echo_and_translate_tools());
+        let mut calls = vec![
+            sample_tc("echo", serde_json::json!({"text": "a"})),
+            sample_tc("translate_text", serde_json::json!({"text": "b"})),
+        ];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::Required, &mut calls, &mut done, &body)
+            .expect("parallel ok");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(done["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn tool_choice_specific_postcondition_filters_and_fails_closed() {
+        let body = tool_body(echo_and_translate_tools());
+        let policy = ToolChoicePolicy::Function("echo".into());
+
+        // Wrong-only producer output fails closed.
+        let mut wrong = vec![sample_tc(
+            "translate_text",
+            serde_json::json!({"text": "nope"}),
+        )];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        let err = finalize_tool_calls_for_choice(&policy, &mut wrong, &mut done, &body)
+            .expect_err("wrong tool");
+        assert!(err.to_string().contains("echo"));
+
+        // Mixed calls keep only the named tool.
+        let mut mixed = vec![
+            sample_tc("translate_text", serde_json::json!({"text": "x"})),
+            sample_tc("echo", serde_json::json!({"text": "y"})),
+        ];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut mixed, &mut done, &body).expect("filter");
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].name, "echo");
+    }
+
+    #[test]
+    fn tool_choice_streaming_final_policy_parity() {
+        // Preview (commit_ready) and final share finalize_tool_calls_for_choice.
+        let body = tool_body(echo_and_translate_tools());
+        let raw = vec![
+            sample_tc("translate_text", serde_json::json!({"text": "x"})),
+            sample_tc("echo", serde_json::json!({"text": "y"})),
+        ];
+        let policy = ToolChoicePolicy::Function("echo".into());
+
+        let mut preview_calls = raw.clone();
+        let mut preview_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut preview_calls, &mut preview_done, &body)
+            .expect("preview");
+
+        let mut final_calls = raw;
+        let mut final_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut final_calls, &mut final_done, &body)
+            .expect("final");
+
+        assert_eq!(preview_calls.len(), final_calls.len());
+        assert_eq!(preview_calls[0].name, final_calls[0].name);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+        assert_eq!(preview_done, final_done);
+        assert_eq!(preview_calls.len(), 1);
+        assert_eq!(preview_calls[0].name, "echo");
+
+        // none parity: both strip calls and coerce finish_reason.
+        let mut p_calls = vec![sample_tc("echo", serde_json::json!({"text": "z"}))];
+        let mut f_calls = p_calls.clone();
+        let mut p_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        let mut f_done = p_done.clone();
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::None, &mut p_calls, &mut p_done, &body)
+            .unwrap();
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::None, &mut f_calls, &mut f_done, &body)
+            .unwrap();
+        assert!(p_calls.is_empty());
+        assert!(f_calls.is_empty());
+        assert_eq!(p_done, f_done);
+        assert_eq!(p_done["finish_reason"], "stop");
     }
 }
