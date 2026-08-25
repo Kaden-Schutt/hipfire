@@ -2181,12 +2181,15 @@ fn final_logits_per_slot(
     // Kept as an allow-list rather than removed: an unsupported dtype should
     // still fail here with a clear message naming the lm_head, not deep inside
     // the dispatcher.
-    if !matches!(weights.output.gpu_dtype, DType::Q8_0 | DType::MQ4G256) {
+    if !matches!(
+        weights.output.gpu_dtype,
+        DType::Q8_0 | DType::MQ4G256 | DType::MQ4G256V2
+    ) {
         return Err(HipError::new(
             0,
             &format!(
                 "forward_batch_slots: lm_head (weights.output) dtype {:?} is not \
-                 supported by the multi-slot path (expected Q8_0 or MQ4G256)",
+                 supported by the multi-slot path (expected Q8_0, MQ4G256 or MQ4G256V2)",
                 weights.output.gpu_dtype
             ),
         ));
