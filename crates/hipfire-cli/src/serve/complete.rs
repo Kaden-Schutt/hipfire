@@ -248,6 +248,171 @@ pub(crate) fn tool_call_from_legacy_value(value: &serde_json::Value) -> Result<T
     tool_call_from_canonical_value(value)
 }
 
+/// JSON kind label for diagnostic logging (no values).
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn schema_expects(schema: &serde_json::Value, ty: &str) -> bool {
+    if let Some(t) = schema.get("type").and_then(|v| v.as_str()) {
+        return t == ty;
+    }
+    if let Some(arr) = schema.get("type").and_then(|v| v.as_array()) {
+        return arr.iter().any(|v| v.as_str() == Some(ty));
+    }
+    false
+}
+
+fn normalize_value(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+    tool_name: &str,
+    path: &str,
+) {
+    let before_kind = json_kind(value);
+    let mut repaired = false;
+    let mut expected = String::new();
+    match value {
+        serde_json::Value::String(s) => {
+            let owned = s.clone();
+            if schema_expects(schema, "boolean") {
+                let lower = owned.to_ascii_lowercase();
+                if lower == "true" || lower == "false" {
+                    let new_val = serde_json::Value::Bool(lower == "true");
+                    expected = "boolean".to_owned();
+                    *value = new_val;
+                    repaired = true;
+                }
+            } else if schema_expects(schema, "integer") {
+                if let Ok(n) = owned.parse::<i64>() {
+                    // Ensure the whole string was an integer (parse succeeded implies that,
+                    // but reject strings with whitespace which parse would fail anyway).
+                    expected = "integer".to_owned();
+                    *value = serde_json::Value::Number(serde_json::Number::from(n));
+                    repaired = true;
+                }
+            } else if schema_expects(schema, "number") {
+                if let Ok(n) = owned.parse::<i64>() {
+                    expected = "number".to_owned();
+                    *value = serde_json::Value::Number(serde_json::Number::from(n));
+                    repaired = true;
+                } else if let Ok(f) = owned.parse::<f64>() {
+                    if f.is_finite() {
+                        if let Some(num) = serde_json::Number::from_f64(f) {
+                            expected = "number".to_owned();
+                            *value = serde_json::Value::Number(num);
+                            repaired = true;
+                        }
+                    }
+                }
+            } else if schema_expects(schema, "object") {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
+                    if parsed.is_object() {
+                        expected = "object".to_owned();
+                        *value = parsed;
+                        repaired = true;
+                    }
+                }
+            } else if schema_expects(schema, "array") {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
+                    if parsed.is_array() {
+                        expected = "array".to_owned();
+                        *value = parsed;
+                        repaired = true;
+                    }
+                }
+            }
+        }
+        serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Object(_)
+        | serde_json::Value::Array(_) => {
+            if schema_expects(schema, "string") {
+                if let Ok(s) = serde_json::to_string(&*value) {
+                    expected = "string".to_owned();
+                    *value = serde_json::Value::String(s);
+                    repaired = true;
+                }
+            }
+        }
+        serde_json::Value::Null => {}
+    }
+    if repaired {
+        let after_kind = json_kind(value);
+        let display_path = if path.is_empty() { "<root>" } else { path };
+        eprintln!(
+            "[hipfire] tool_args_normalize tool={} path={} expected={} {}->{}",
+            tool_name, display_path, expected, before_kind, after_kind
+        );
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for k in keys {
+                    if let Some(subschema) = props.get(&k) {
+                        if let Some(child) = map.get_mut(&k) {
+                            let child_path = if path.is_empty() {
+                                k.clone()
+                            } else {
+                                format!("{path}.{k}")
+                            };
+                            normalize_value(child, subschema, tool_name, &child_path);
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            if let Some(items_schema) = schema.get("items") {
+                if items_schema.is_object() {
+                    for (idx, elem) in arr.iter_mut().enumerate() {
+                        let child_path = if path.is_empty() {
+                            format!("[{idx}]")
+                        } else {
+                            format!("{path}[{idx}]")
+                        };
+                        normalize_value(elem, items_schema, tool_name, &child_path);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
+    let tools = match body.get("tools").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return,
+    };
+    let mut schema_map: std::collections::HashMap<String, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for t in tools {
+        let func = t.get("function").unwrap_or(t);
+        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+            if let Some(params) = func.get("parameters") {
+                schema_map.insert(name.to_owned(), params);
+            }
+        }
+    }
+    if schema_map.is_empty() {
+        return;
+    }
+    for call in calls.iter_mut() {
+        if let Some(schema) = schema_map.get(&call.name) {
+            normalize_value(&mut call.arguments, schema, &call.name, "");
+        }
+    }
+}
+
 /// Endpoint adapter kinds known to the serve HTTP surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EndpointAdapterKind {
@@ -1388,6 +1553,8 @@ pub(crate) fn complete_request_attempt(
                     } else {
                         None
                     };
+                    let mut tool_calls = fold.executable_tool_calls().to_vec();
+                    normalize_tool_calls(&mut tool_calls, body);
                     Completion {
                         id: id.clone(),
                         created,
@@ -1395,7 +1562,7 @@ pub(crate) fn complete_request_attempt(
                         content: fold.content().to_owned(),
                         reasoning_content: fold.reasoning_content().to_owned(),
                         preserve_thinking,
-                        tool_calls: fold.executable_tool_calls().to_vec(),
+                        tool_calls,
                         done: fold.done().cloned().unwrap_or(staged),
                         logprobs,
                         reasoning: Some(reasoning.clone()),
@@ -1412,11 +1579,12 @@ pub(crate) fn complete_request_attempt(
                     let finish = staged
                         .get("finish_reason")
                         .and_then(serde_json::Value::as_str);
-                    let tool_calls = if finish == Some("tool_calls") {
+                    let mut tool_calls = if finish == Some("tool_calls") {
                         legacy_tool_calls.clone()
                     } else {
                         Vec::new()
                     };
+                    normalize_tool_calls(&mut tool_calls, body);
                     let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
                         Some(logprobs_entries.clone())
                     } else {
@@ -1575,6 +1743,8 @@ pub(crate) fn complete_request_attempt(
         } else {
             None
         };
+        let mut tool_calls = fold.executable_tool_calls().to_vec();
+        normalize_tool_calls(&mut tool_calls, body);
         return Ok(Completion {
             id,
             created,
@@ -1582,7 +1752,7 @@ pub(crate) fn complete_request_attempt(
             content: fold.content().to_owned(),
             reasoning_content: fold.reasoning_content().to_owned(),
             preserve_thinking,
-            tool_calls: fold.executable_tool_calls().to_vec(),
+            tool_calls,
             done,
             logprobs,
             reasoning: Some(reasoning),
@@ -1593,11 +1763,12 @@ pub(crate) fn complete_request_attempt(
     let finish = done
         .get("finish_reason")
         .and_then(serde_json::Value::as_str);
-    let tool_calls = if finish == Some("tool_calls") {
+    let mut tool_calls = if finish == Some("tool_calls") {
         legacy_tool_calls
     } else {
         Vec::new()
     };
+    normalize_tool_calls(&mut tool_calls, body);
     let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
         Some(logprobs_entries)
     } else {
@@ -5355,5 +5526,348 @@ mod tests {
             json2["choices"][0]["logprobs"]["content"][0]["bytes"],
             serde_json::json!([104, 105])
         );
+    }
+
+    fn tool_body(tools: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "tools": tools })
+    }
+
+    #[test]
+    fn tool_normalize_boolean_strings_case_insensitive() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "run",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "background": {"type": "boolean"},
+                        "full": {"type": "boolean"},
+                        "no_agent": {"type": "boolean"},
+                        "replace_all": {"type": "boolean"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "run",
+            serde_json::json!({
+                "background": "True",
+                "full": "TRUE",
+                "no_agent": "False",
+                "replace_all": "false"
+            }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["background"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["full"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["no_agent"], serde_json::json!(false));
+        assert_eq!(calls[0].arguments["replace_all"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn tool_normalize_numeric_strings() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "already": {"type": "integer"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "calc",
+            serde_json::json!({ "count": "42", "ratio": "3.14", "already": 7 }),
+        )];
+        let before_already = calls[0].arguments["already"].clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["count"], serde_json::json!(42));
+        assert!(calls[0].arguments["count"].is_number());
+        assert_eq!(calls[0].arguments["ratio"], serde_json::json!(3.14));
+        assert_eq!(calls[0].arguments["already"], before_already);
+    }
+
+    #[test]
+    fn tool_normalize_json_strings_to_object_array() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "ingest",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "object"},
+                        "tags": {"type": "array"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "ingest",
+            serde_json::json!({ "payload": "{\"a\":1}", "tags": "[1,2,3]" }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["payload"], serde_json::json!({"a":1}));
+        assert_eq!(calls[0].arguments["tags"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn tool_normalize_object_to_compact_string() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "path": {"type": "string"}
+                    }
+                }
+            }
+        }]));
+        let content_obj = serde_json::json!({"text":"hello","x":1});
+        let content_str = serde_json::to_string(&content_obj).unwrap();
+        let mut calls = vec![sample_tc(
+            "write_file",
+            serde_json::json!({ "content": content_obj, "path": "/tmp/a" }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments["content"],
+            serde_json::Value::String(content_str)
+        );
+        assert_eq!(calls[0].arguments["path"], serde_json::json!("/tmp/a"));
+        // also scalar bool/number to string
+        let body2 = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": { "name": "patch", "parameters": { "type": "object", "properties": { "new_string": {"type":"string"} } } }
+        }]));
+        let mut calls2 = vec![sample_tc(
+            "patch",
+            serde_json::json!({ "new_string": {"a":1} }),
+        )];
+        let expected = serde_json::to_string(&serde_json::json!({"a":1})).unwrap();
+        normalize_tool_calls(&mut calls2, &body2);
+        assert_eq!(
+            calls2[0].arguments["new_string"],
+            serde_json::Value::String(expected)
+        );
+    }
+
+    #[test]
+    fn tool_normalize_recurses_into_objects_and_arrays() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "outer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type":"boolean"},
+                                "count": {"type":"integer"}
+                            }
+                        },
+                        "items": {
+                            "type":"array",
+                            "items": {"type":"object","properties":{"flag":{"type":"boolean"}}}
+                        }
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "outer",
+            serde_json::json!({
+                "inner": {"enabled":"True","count":"7","extra":"keep"},
+                "items": [{"flag":"false"},{"flag":true}]
+            }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments["inner"]["enabled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(calls[0].arguments["inner"]["count"], serde_json::json!(7));
+        assert_eq!(
+            calls[0].arguments["inner"]["extra"],
+            serde_json::json!("keep")
+        );
+        assert_eq!(
+            calls[0].arguments["items"][0]["flag"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            calls[0].arguments["items"][1]["flag"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn tool_normalize_idempotent_and_preserves_valid() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"run",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "background":{"type":"boolean"},
+                        "count":{"type":"integer"},
+                        "content":{"type":"string"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "run",
+            serde_json::json!({"background": true, "count": 5, "content": "hello"}),
+        )];
+        let before = calls[0].arguments.clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments, before);
+        // idempotence after repair
+        let mut calls2 = vec![sample_tc(
+            "run",
+            serde_json::json!({"background":"True","count":"5"}),
+        )];
+        normalize_tool_calls(&mut calls2, &body);
+        let after_first = calls2[0].arguments.clone();
+        normalize_tool_calls(&mut calls2, &body);
+        assert_eq!(calls2[0].arguments, after_first);
+    }
+
+    #[test]
+    fn tool_normalize_preserves_unknown_fields_and_no_schema_match() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"known",
+                "parameters":{"type":"object","properties":{"a":{"type":"boolean"}}}
+            }
+        }]));
+        let mut calls = vec![
+            sample_tc(
+                "known",
+                serde_json::json!({"a":"True","unknown":"True","extra":123}),
+            ),
+            sample_tc("unknown_tool", serde_json::json!({"a":"True"})),
+        ];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["a"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["unknown"], serde_json::json!("True"));
+        assert_eq!(calls[0].arguments["extra"], serde_json::json!(123));
+        assert_eq!(calls[1].arguments["a"], serde_json::json!("True"));
+    }
+
+    #[test]
+    fn tool_normalize_invalid_numeric_and_json_not_repaired() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"calc",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "count":{"type":"integer"},
+                        "ratio":{"type":"number"},
+                        "payload":{"type":"object"},
+                        "flag":{"type":"boolean"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "calc",
+            serde_json::json!({
+                "count":"12.3",
+                "ratio":"not-a-number",
+                "payload":"not json {",
+                "flag":"yes"
+            }),
+        )];
+        let before = calls[0].arguments.clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments, before);
+        // ambiguous free text for string field must not be parsed
+        let body2 = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{"name":"write_file","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}
+        }]));
+        let mut calls2 = vec![sample_tc(
+            "write_file",
+            serde_json::json!({"content":"hello world"}),
+        )];
+        let before2 = calls2[0].arguments.clone();
+        normalize_tool_calls(&mut calls2, &body2);
+        assert_eq!(calls2[0].arguments, before2);
+    }
+
+    #[test]
+    fn tool_normalize_parallel_calls_different_schemas() {
+        let body = tool_body(serde_json::json!([
+            {"type":"function","function":{"name":"tool_a","parameters":{"type":"object","properties":{"flag":{"type":"boolean"}}}}},
+            {"type":"function","function":{"name":"tool_b","parameters":{"type":"object","properties":{"flag":{"type":"string"}}}}}
+        ]));
+        let mut calls = vec![
+            sample_tc("tool_a", serde_json::json!({"flag":"True"})),
+            sample_tc("tool_b", serde_json::json!({"flag": true})),
+        ];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["flag"], serde_json::json!(true));
+        // tool_b expects string, true -> "true"
+        assert_eq!(
+            calls[1].arguments["flag"],
+            serde_json::Value::String("true".into())
+        );
+    }
+
+    #[test]
+    fn tool_normalize_preview_final_parity() {
+        // Simulate preview and final both normalizing the same raw calls via same helper.
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"write_file",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "content":{"type":"string"},
+                        "background":{"type":"boolean"}
+                    }
+                }
+            }
+        }]));
+        let raw = sample_tc(
+            "write_file",
+            serde_json::json!({"content": {"a":1}, "background":"True"}),
+        );
+        let mut preview_calls = vec![raw.clone()];
+        let mut final_calls = vec![raw.clone()];
+        normalize_tool_calls(&mut preview_calls, &body);
+        normalize_tool_calls(&mut final_calls, &body);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+        let expected_content = serde_json::to_string(&serde_json::json!({"a":1})).unwrap();
+        assert_eq!(
+            preview_calls[0].arguments["content"],
+            serde_json::Value::String(expected_content)
+        );
+        assert_eq!(
+            preview_calls[0].arguments["background"],
+            serde_json::json!(true)
+        );
+        // idempotent second pass on both
+        normalize_tool_calls(&mut preview_calls, &body);
+        normalize_tool_calls(&mut final_calls, &body);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
     }
 }
