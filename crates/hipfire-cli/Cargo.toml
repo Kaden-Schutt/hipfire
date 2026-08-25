@@ -27,5 +27,5 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", default-features = fals
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tiny_http = "0.12"
+tiny_http = { path = "../../vendor/tiny_http", version = "0.12" }
 ureq = "3"

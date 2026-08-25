@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, sys
+import json, os, select, sys, time
 
 state_epoch = 0
 generate_count = 0
@@ -71,6 +71,7 @@ def scenario_from(req):
         "t11-pure-tool",
         "t11-stop-text",
         "t11-usage",
+        "t11-long-nonstream",
     )
     for tag in tags:
         if tag in blob:
@@ -256,6 +257,68 @@ def handle_generate(req):
     if scenario == "t11-stop-text":
         success_stop(rid, aid)
         return
+
+    if scenario == "t11-long-nonstream":
+        # Delayed generation that stays stdin-responsive so a correlated abort
+        # can land while no further tokens are produced (silent cancel path).
+        ready_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture-ready.log")
+        ready_ev = {"type": "fixture_ready", "id": rid, "attempt_id": aid}
+        try:
+            with open(ready_path, "a") as f:
+                f.write(json.dumps(ready_ev, separators=(",", ":")) + "\n")
+                f.flush()
+        except Exception:
+            pass
+        log_req(ready_ev)
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not readable:
+                continue
+            line = sys.stdin.readline()
+            if not line:
+                return
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            log_req(msg)
+            ty = msg.get("type")
+            if ty == "abort":
+                # Explicit side-channel marker (inbound abort already in requests.log).
+                log_req({
+                    "type": "abort_observed",
+                    "id": msg.get("id"),
+                    "attempt_id": msg.get("attempt_id"),
+                })
+                emit_correlated({"type": "aborted", "reason": "client_cancelled"}, rid, aid)
+                log_req({"type": "daemon_aborted", "id": rid, "attempt_id": aid})
+                # Deliberate drain lag so tests can observe done/aborted before
+                # AdmissionGuard release (inflight must not hit zero early).
+                time.sleep(0.3)
+                emit_correlated({"type": "done", "finish_reason": "aborted"}, rid, aid)
+                log_req({"type": "daemon_done_aborted", "id": rid, "attempt_id": aid})
+                return
+            if ty == "commit":
+                if msg.get("id") != rid or msg.get("attempt_id") != aid:
+                    emit_typed_error(rid, aid, "commit correlation mismatch", cls="internal", retryable=False)
+                    return
+                emit_correlated({
+                    "type": "done",
+                    "finish_reason": "stop",
+                    "prompt_tokens": 3,
+                    "tokens": 4,
+                    "tok_s": 12.0,
+                }, rid, aid)
+                return
+            if ty == "unload":
+                out({"type": "unloaded"})
+                sys.exit(0)
+        # Safety valve if no abort arrives: finish like a normal stop so the
+        # harness cannot hang forever when cancellation is broken.
+        success_stop(rid, aid)
+        return
+
 
     if scenario == "t11-pure-tool":
         pure_calls = [{"name": "read_file", "arguments": {"path": "a.rs"}}]

@@ -22,7 +22,10 @@ use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -1533,6 +1536,7 @@ pub(crate) fn complete_request_attempt(
     attempt_id: u64,
     force_reset: bool,
     latches: &std::cell::RefCell<AttemptLatches>,
+    cancelled: Option<&AtomicBool>,
     event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
@@ -1732,7 +1736,7 @@ pub(crate) fn complete_request_attempt(
     let logprobs_requested = body.get("logprobs").and_then(|v| v.as_bool()) == Some(true);
     let mut logprobs_entries: Vec<serde_json::Value> = Vec::new();
 
-    let gen_result = engine_clone.generate(&generate, |event| {
+    let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
         // Staged terminal: commit_ready carries done fields with type != done.
@@ -1949,7 +1953,11 @@ pub(crate) fn complete_request_attempt(
             }
         }
         Ok(())
-    });
+    };
+    let gen_result = match cancelled {
+        Some(flag) => engine_clone.generate_cancellable(&generate, flag, &mut on_event),
+        None => engine_clone.generate(&generate, &mut on_event),
+    };
     let done = gen_result?;
     let mut meta = shared
         .meta
@@ -2079,6 +2087,7 @@ pub(crate) fn complete_request(
             attempt_id,
             attempt_index > 1,
             &latches,
+            None,
             &mut event_callback,
             &mut terminal_callback,
         );
@@ -2134,6 +2143,141 @@ pub(crate) fn complete_request(
                     hook(shared.retry_backoff);
                 } else {
                     std::thread::sleep(shared.retry_backoff);
+                }
+                guard = match shared.admission.acquire() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Err(error.context("retry aborted: admission re-acquire failed"));
+                    }
+                };
+                attempt_index = attempt_index.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Daemon-backed non-stream completion with cooperative cancellation.
+///
+/// Calls [`hipfire_client::Engine::generate_cancellable`] and never retries
+/// after cancellation. Slot backends keep the existing non-cancellable path:
+/// multi-slot does not yet observe HTTP disconnect tokens.
+pub(crate) fn complete_request_cancellable(
+    shared: &ServeShared,
+    body: &serde_json::Value,
+    guard: AdmissionGuard,
+    request_identity: Option<(String, u64)>,
+    cancelled: &AtomicBool,
+    mut event_callback: impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+    mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
+) -> Result<Completion> {
+    let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+
+    // Slot path: retain existing non-cancellable behavior (no disconnect token).
+    let slot_capable = {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.current_path.is_some()
+            && matches!(
+                runtime.current_reasoning_contract,
+                saddle_core::caps::ReasoningContract::Unsupported
+            )
+    };
+    if slot_capable {
+        if let Some(backend) = shared.slot_engine.clone() {
+            return crate::serve::slots::complete_request_slots(
+                &backend,
+                body,
+                &identity,
+                &mut event_callback,
+                &mut terminal_callback,
+            );
+        }
+    }
+
+    let mut attempt_index = 1u32;
+    let mut guard = guard;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::Error::new(ClientError::Cancelled));
+        }
+        let attempt_id = next_attempt_id();
+        let latches = std::cell::RefCell::new(AttemptLatches::default());
+        let outcome = complete_request_attempt(
+            shared,
+            body,
+            guard,
+            &identity,
+            attempt_id,
+            attempt_index > 1,
+            &latches,
+            Some(cancelled),
+            &mut event_callback,
+            &mut terminal_callback,
+        );
+        let latches = latches.into_inner();
+        match outcome {
+            Ok(completion) => {
+                if attempt_index > 1 {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.retries_succeeded = meta.retries_succeeded.saturating_add(1);
+                }
+                return Ok(completion);
+            }
+            Err(error) => {
+                let was_cancelled = cancelled.load(Ordering::Relaxed)
+                    || error
+                        .downcast_ref::<ClientError>()
+                        .is_some_and(|err| matches!(err, ClientError::Cancelled));
+                if was_cancelled {
+                    return Err(error);
+                }
+                let eligible = {
+                    let runtime = shared
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    runtime.engine.last_retry_reset_eligible() == Some(true)
+                };
+                if decide_retry(
+                    &error,
+                    attempt_id,
+                    &latches,
+                    eligible,
+                    shared.retry_enabled,
+                    attempt_index,
+                ) == RetryDecision::Fail
+                {
+                    return Err(error);
+                }
+                {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.retries_attempted = meta.retries_attempted.saturating_add(1);
+                }
+                eprintln!(
+                    "[hipfire] {}: typed transient daemon failure on attempt {attempt_index}; \
+                     rolling back and retrying once",
+                    identity.0
+                );
+                let hook = shared
+                    .backoff_hook
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(hook) = hook {
+                    hook(shared.retry_backoff);
+                } else {
+                    std::thread::sleep(shared.retry_backoff);
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow::Error::new(ClientError::Cancelled));
                 }
                 guard = match shared.admission.acquire() {
                     Ok(guard) => guard,

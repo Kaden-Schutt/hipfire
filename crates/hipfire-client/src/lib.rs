@@ -14,7 +14,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -576,19 +579,7 @@ impl Engine {
     }
 
     fn recv_control(&self, rx: &mpsc::Receiver<Value>) -> Result<Value> {
-        rx.recv().map_err(|_| {
-            let status = self
-                .inner
-                .child
-                .lock()
-                .unwrap()
-                .try_wait()
-                .ok()
-                .flatten()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".into());
-            ClientError::Closed { status }
-        })
+        rx.recv().map_err(|_| self.recv_closed_error())
     }
 
     pub fn request(&self, message: &Value) -> Result<Value> {
@@ -677,6 +668,32 @@ impl Engine {
         request: &Value,
         mut event: impl FnMut(&Value) -> Result<()>,
     ) -> Result<Value> {
+        self.generate_common(request, None, &mut event)
+    }
+
+    /// Generate with cooperative cancellation via `cancelled`.
+    ///
+    /// The receive loop polls at most every 100ms. Cancellation observed before
+    /// the terminal `commit_ready` callback returns `Ok` (and the matching commit
+    /// is sent) aborts the correlated daemon transaction and drains
+    /// `done/aborted`, returning [`ClientError::Cancelled`]. After a successful
+    /// terminal ack + commit send, further cancellation is ignored while the
+    /// committed `done` drains.
+    pub fn generate_cancellable(
+        &self,
+        request: &Value,
+        cancelled: &AtomicBool,
+        mut event: impl FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
+        self.generate_common(request, Some(cancelled), &mut event)
+    }
+
+    fn generate_common(
+        &self,
+        request: &Value,
+        cancelled: Option<&AtomicBool>,
+        event: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
         let request_id = request
             .get("id")
             .and_then(Value::as_str)
@@ -685,6 +702,9 @@ impl Engine {
             .to_owned();
         let attempt_id = require_attempt_id(request.get("attempt_id"))
             .map_err(|reason| ClientError::Protocol(format!("generate request {reason}")))?;
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(ClientError::Cancelled);
+        }
         let (tx, rx) = mpsc::channel();
         {
             let mut map = self.inner.dispatch.pending.lock().unwrap();
@@ -699,6 +719,16 @@ impl Engine {
             map.insert(key, tx);
         }
         *self.inner.active_attempt_id.lock().unwrap() = Some(attempt_id);
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            self.inner
+                .dispatch
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&(request_id, attempt_id));
+            *self.inner.active_attempt_id.lock().unwrap() = None;
+            return Err(ClientError::Cancelled);
+        }
         let send_res = self.send(request);
         if let Err(err) = send_res {
             self.inner
@@ -710,7 +740,7 @@ impl Engine {
             *self.inner.active_attempt_id.lock().unwrap() = None;
             return Err(err);
         }
-        let res = self.generate_with_rx(&request_id, attempt_id, &rx, &mut event);
+        let res = self.generate_with_rx(&request_id, attempt_id, &rx, cancelled, event);
         self.inner
             .dispatch
             .pending
@@ -726,23 +756,53 @@ impl Engine {
         request_id: &str,
         attempt_id: u64,
         rx: &mpsc::Receiver<Value>,
+        cancelled: Option<&AtomicBool>,
         event: &mut dyn FnMut(&Value) -> Result<()>,
     ) -> Result<Value> {
         loop {
-            let value = match self.recv_control(rx) {
-                Ok(v) => v,
-                Err(err) => {
-                    return Err(err);
-                }
+            let value = match cancelled {
+                Some(flag) => match self.recv_control_cancellable(rx, flag) {
+                    Ok(v) => v,
+                    Err(ClientError::Cancelled) => {
+                        return self.abort_and_drain_with_rx(
+                            request_id,
+                            attempt_id,
+                            rx,
+                            ClientError::Cancelled,
+                        );
+                    }
+                    Err(err) => return Err(err),
+                },
+                None => match self.recv_control(rx) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                },
             };
             if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
                 return Err(err);
             }
 
             let ty = value.get("type").and_then(Value::as_str);
+
+            // Cooperative cancel before any pre-commit event processing. Daemon
+            // terminals (`error`/`done`) have already closed the transaction —
+            // never abort those; process them below.
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                && !matches!(ty, Some("error") | Some("done"))
+            {
+                return self.abort_and_drain_with_rx(
+                    request_id,
+                    attempt_id,
+                    rx,
+                    ClientError::Cancelled,
+                );
+            }
+
             if ty == Some("commit_ready") {
                 match event(&value) {
                     Ok(()) => {
+                        // Terminal callback acknowledged. Commit and drain; ignore
+                        // further cancellation (transaction boundary is past).
                         let commit = serde_json::json!({
                             "type": "commit",
                             "id": request_id,
@@ -799,6 +859,43 @@ impl Engine {
                 _ => {}
             }
         }
+    }
+
+    /// Blocking receive with <=100ms cancellation probes. Returns
+    /// [`ClientError::Cancelled`] when `cancelled` is set during a silent wait.
+    /// Does not allocate in the poll loop.
+    fn recv_control_cancellable(
+        &self,
+        rx: &mpsc::Receiver<Value>,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
+        const POLL: Duration = Duration::from_millis(100);
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ClientError::Cancelled);
+            }
+            match rx.recv_timeout(POLL) {
+                Ok(v) => return Ok(v),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(self.recv_closed_error());
+                }
+            }
+        }
+    }
+
+    fn recv_closed_error(&self) -> ClientError {
+        let status = self
+            .inner
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        ClientError::Closed { status }
     }
 
     fn drain_committed_done_with_rx(
@@ -3287,6 +3384,213 @@ done
             Some("stop")
         );
         drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_cancellable_silence_aborts_within_two_polls() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-can-silence-{}-{}",
+            std::process::id(),
+            "cs"
+        ));
+        let log = root.join("in.log");
+        let daemon = write_fake_daemon(
+            &root,
+            &format!(
+                r#"#!/bin/sh
+LOG="{log}"
+: > "$LOG"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"generate"'*)
+      echo '{{"type":"gen_start","id":"req-can","attempt_id":42}}'
+      ;;
+    *'"abort"'*)
+      echo '{{"type":"aborted","id":"req-can","reason":"client_cancelled","attempt_id":42}}'
+      echo '{{"type":"done","id":"req-can","finish_reason":"aborted","attempt_id":42}}'
+      ;;
+    *'"commit"'*)
+      echo '{{"type":"error","message":"unexpected commit after cancel","class":"internal","retryable":false,"rolled_back":false,"attempt_id":42}}'
+      ;;
+    *'"unload"'*) echo '{{"type":"unloaded"}}'; exit 0 ;;
+  esac
+done
+"#,
+                log = log.display()
+            ),
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_thread = Arc::clone(&cancelled);
+        let start = Instant::now();
+        let mut saw_gen_start = false;
+        let mut callbacks = 0usize;
+        let mut flag_setter: Option<std::thread::JoinHandle<Instant>> = None;
+        let err = engine
+            .generate_cancellable(
+                &serde_json::json!({
+                    "type": "generate",
+                    "id": "req-can",
+                    "attempt_id": 42,
+                    "prompt": "hi"
+                }),
+                &cancelled,
+                |ev| {
+                    callbacks += 1;
+                    if ev.get("type").and_then(|v| v.as_str()) == Some("gen_start") {
+                        saw_gen_start = true;
+                        if flag_setter.is_none() {
+                            let c = Arc::clone(&cancelled_for_thread);
+                            let h = std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(30));
+                                let t = Instant::now();
+                                c.store(true, Ordering::SeqCst);
+                                t
+                            });
+                            flag_setter = Some(h);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        let total_elapsed = start.elapsed();
+        let flag_set = flag_setter
+            .map(|h| h.join().expect("flag setter"))
+            .unwrap_or(start);
+        let cancel_to_return = flag_set.elapsed();
+        assert!(saw_gen_start, "must have seen gen_start before cancel");
+        assert!(
+            matches!(err, ClientError::Cancelled),
+            "silent cancel must return Cancelled, got {err:?}"
+        );
+        assert!(
+            cancel_to_return <= Duration::from_millis(350),
+            "cancel not detected within two polls: {cancel_to_return:?} total {total_elapsed:?}"
+        );
+        assert!(
+            total_elapsed <= Duration::from_secs(2),
+            "should not hang like old blocking generate: {total_elapsed:?}"
+        );
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.lines().any(|l| l.contains(r#""type":"abort""#)
+                && l.contains(r#""id":"req-can""#)
+                && l.contains(r#""attempt_id":42"#)),
+            "abort must carry exact id+attempt_id: {logged}"
+        );
+        assert!(
+            !logged.contains(r#""type":"commit""#),
+            "must not commit after cancel: {logged}"
+        );
+        assert_eq!(
+            engine.active_attempt_id(),
+            None,
+            "active attempt must be cleaned after cancel"
+        );
+        assert!(
+            engine.inner.dispatch.pending.lock().unwrap().is_empty(),
+            "pending map must be empty after cancel"
+        );
+        let _ = callbacks;
+        engine.unload().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_cancellable_commit_ack_ignores_cancel_and_drains_done() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-can-commit-{}-{}",
+            std::process::id(),
+            "cc"
+        ));
+        let log = root.join("in.log");
+        let daemon = write_fake_daemon(
+            &root,
+            &format!(
+                r#"#!/bin/sh
+LOG="{log}"
+: > "$LOG"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"generate"'*)
+      echo '{{"type":"commit_ready","id":"req-com","attempt_id":7,"finish_reason":"stop"}}'
+      ;;
+    *'"commit"'*)
+      echo '{{"type":"done","id":"req-com","attempt_id":7,"finish_reason":"stop"}}'
+      ;;
+    *'"abort"'*) echo 'UNEXPECTED_ABORT' >> "$LOG" ;;
+    *'"unload"'*) echo '{{"type":"unloaded"}}'; exit 0 ;;
+  esac
+done
+"#,
+                log = log.display()
+            ),
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled);
+        let mut saw_ready = false;
+        let result = engine
+            .generate_cancellable(
+                &serde_json::json!({
+                    "type": "generate",
+                    "id": "req-com",
+                    "attempt_id": 7
+                }),
+                &cancelled,
+                |ev| {
+                    if ev.get("type").and_then(|v| v.as_str()) == Some("commit_ready") {
+                        saw_ready = true;
+                        // Set cancelled AFTER callback returns Ok but BEFORE done drains.
+                        // drain_committed_done must ignore it.
+                        cancelled_clone.store(true, Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("commit-ack cancel must be ignored and done drained");
+        assert!(saw_ready, "must have seen commit_ready");
+        assert_eq!(result.get("type").and_then(|v| v.as_str()), Some("done"));
+        assert_eq!(
+            result.get("finish_reason").and_then(|v| v.as_str()),
+            Some("stop")
+        );
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains(r#""type":"commit""#)
+                && logged.contains(r#""id":"req-com""#)
+                && logged.contains(r#""attempt_id":7"#),
+            "commit must be sent with exact correlation: {logged}"
+        );
+        assert!(
+            !logged.contains("UNEXPECTED_ABORT") && !logged.contains(r#""type":"abort""#),
+            "cancellation after commit_ready Ok must not send abort: {logged}"
+        );
+        assert_eq!(
+            engine.active_attempt_id(),
+            None,
+            "active attempt cleaned after committed drain"
+        );
+        assert!(
+            engine.inner.dispatch.pending.lock().unwrap().is_empty(),
+            "pending cleaned after committed drain"
+        );
+        engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

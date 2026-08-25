@@ -8,13 +8,25 @@
 //! framing, SSE acknowledgement, CORS/health endpoints. Isolates `tiny_http`
 //! I/O from business logic.
 
-use anyhow::{bail, Context, Result};
-use std::{io::{Read, Write}, sync::{Arc, mpsc}, thread, time::Duration};
-use tiny_http::{Header, Method, Request, Response, StatusCode};
-use crate::serve::{ServeShared, ServeMeta, is_batch_eligible_request};
-use crate::serve::complete::{self, Completion, complete_request, gate_chat_completions_tools, openai_stream_delta_for_event, openai_stream_terminal_chunks, completion_json};
-use crate::serve::{Admission, AdmissionGuard, AdmissionError};
+use crate::serve::complete::{
+    self, complete_request, complete_request_cancellable, completion_json,
+    gate_chat_completions_tools, openai_stream_delta_for_event, openai_stream_terminal_chunks,
+    Completion,
+};
+use crate::serve::{is_batch_eligible_request, ServeMeta, ServeShared};
+use crate::serve::{Admission, AdmissionError, AdmissionGuard};
 use crate::{list_local_models, unix_timestamp};
+use anyhow::{bail, Context, Result};
+use std::{
+    io::{Read, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::Duration,
+};
+use tiny_http::{Header, Method, Request, Response, StatusCode};
 
 pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
     let path = request
@@ -199,7 +211,10 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     }
 }
 
-pub(crate) fn read_request_json(request: &mut Request, max_bytes: u64) -> Result<serde_json::Value> {
+pub(crate) fn read_request_json(
+    request: &mut Request,
+    max_bytes: u64,
+) -> Result<serde_json::Value> {
     if request
         .headers()
         .iter()
@@ -330,6 +345,12 @@ pub(crate) fn respond_streaming(
 
 /// Non-stream OpenAI completion: stage the full JSON body before commit, then
 /// wait for worker commit+done before EOF. Pre-terminal failures keep error status.
+///
+/// On Unix, while waiting for the terminal body the handler retains `Request` and
+/// polls `response_raw_fd` every ≤200ms. A confirmed client FIN sets a cancel
+/// token, waits for the worker to abort/drain and release admission, then drops
+/// the writer without an automatic 500. After terminal is staged, behavior is
+/// unchanged (200 + ChannelReader). Non-Unix / missing fd keeps the blocking wait.
 pub(crate) fn respond_nonstreaming(
     request: Request,
     shared: Arc<ServeShared>,
@@ -338,6 +359,17 @@ pub(crate) fn respond_nonstreaming(
 ) -> Result<()> {
     let (sender, receiver) = mpsc::channel::<ResponseChunk>();
     let (status_tx, status_rx) = mpsc::channel::<Result<(), String>>();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_worker = cancelled.clone();
+    #[cfg(unix)]
+    let response_fd = request.response_raw_fd();
+    #[cfg(not(unix))]
+    let response_fd: Option<std::os::raw::c_int> = {
+        let _ = &request;
+        None
+    };
+    let watch_disconnect = response_fd.is_some();
+
     thread::spawn(move || {
         // Catch a panic so the client learns WHY. Without this any panic in the
         // request path unwinds, drops `status_tx`, and `status_rx.recv()` below
@@ -353,16 +385,10 @@ pub(crate) fn respond_nonstreaming(
         // channel closed, and every such request became the contentless
         // "generation worker disconnected". Verified by instrumenting all four
         // paths: only `recv-closed` fired.
-        let staged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let staged = Arc::new(AtomicBool::new(false));
         let staged_cb = staged.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let result = complete_request(
-            &shared,
-            &body,
-            guard,
-            None,
-            |_event| Ok(()),
-            |completion| {
+            let terminal = |completion: &Completion| {
                 let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
                     hipfire_client::ClientError::Protocol(format!(
                         "completion json serialize failed: {err}"
@@ -382,51 +408,63 @@ pub(crate) fn respond_nonstreaming(
                     })
                     .map_err(|_| hipfire_client::ClientError::Cancelled)?;
                 // Signal handler that terminal bytes are staged (success headers).
-                staged_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+                staged_cb.store(true, Ordering::SeqCst);
                 let _ = status_tx.send(Ok(()));
                 match ack_rx.recv() {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
                 }
-            },
-        );
-        match result {
-            Ok(_completion) => {
-                if !staged.load(std::sync::atomic::Ordering::SeqCst) {
-                    // Ok with no terminal staged: the generation completed without
-                    // producing a body. Report it rather than closing silently.
-                    let _ = status_tx.send(Err(
-                        "generation completed without a response body".to_string(),
-                    ));
-                }
-                // Terminal already delivered+acked; close body with no post-commit bytes.
-                drop(sender);
-            }
-            Err(error) => {
-                let cancelled = error
-                    .downcast_ref::<hipfire_client::ClientError>()
-                    .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-                if cancelled {
-                    // Tell the handler before leaving. This branch used to `return`
-                    // outright, which dropped `status_tx`, left `status_rx.recv()`
-                    // with a closed channel, and produced the contentless
-                    // "generation worker disconnected" for every cause that mapped
-                    // to Cancelled -- including a daemon that died mid-request. If
-                    // the client really did go away nobody reads this, so sending is
-                    // free; if it did not, the caller finally learns something.
-                            let _ = status_tx.send(Err(error.to_string()));
-                    // Drop without framing — unclean only if bytes already went out.
-                    drop(sender);
-                    return;
-                }
-                // If terminal was never staged, report error status to the handler.
-                let message = error.to_string();
-                if status_tx.send(Err(message)).is_err() {
-                    // Handler already started success body — force unclean close.
+            };
+            let result = if watch_disconnect {
+                complete_request_cancellable(
+                    &shared,
+                    &body,
+                    guard,
+                    None,
+                    &cancelled_worker,
+                    |_event| Ok(()),
+                    terminal,
+                )
+            } else {
+                complete_request(&shared, &body, guard, None, |_event| Ok(()), terminal)
+            };
+            match result {
+                Ok(_completion) => {
+                    if !staged.load(Ordering::SeqCst) {
+                        // Ok with no terminal staged: the generation completed without
+                        // producing a body. Report it rather than closing silently.
+                        let _ = status_tx.send(Err(
+                            "generation completed without a response body".to_string()
+                        ));
+                    }
+                    // Terminal already delivered+acked; close body with no post-commit bytes.
                     drop(sender);
                 }
+                Err(error) => {
+                    let is_cancelled = error
+                        .downcast_ref::<hipfire_client::ClientError>()
+                        .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
+                    if is_cancelled {
+                        // Tell the handler before leaving. This branch used to `return`
+                        // outright, which dropped `status_tx`, left `status_rx.recv()`
+                        // with a closed channel, and produced the contentless
+                        // "generation worker disconnected" for every cause that mapped
+                        // to Cancelled -- including a daemon that died mid-request. If
+                        // the client really did go away nobody reads this, so sending is
+                        // free; if it did not, the caller finally learns something.
+                        let _ = status_tx.send(Err(error.to_string()));
+                        // Drop without framing — unclean only if bytes already went out.
+                        drop(sender);
+                        return;
+                    }
+                    // If terminal was never staged, report error status to the handler.
+                    let message = error.to_string();
+                    if status_tx.send(Err(message)).is_err() {
+                        // Handler already started success body — force unclean close.
+                        drop(sender);
+                    }
+                }
             }
-        }
         }));
         if let Err(payload) = outcome {
             let detail = payload
@@ -440,8 +478,9 @@ pub(crate) fn respond_nonstreaming(
         }
     });
 
-    match status_rx.recv() {
-        Ok(Ok(())) => {
+    let status = wait_nonstream_status(&status_rx, response_fd, &cancelled);
+    match status {
+        NonstreamWait::Ready(Ok(())) => {
             // Terminal body staged — success headers, reader owns JSON + waits for EOF.
             request.respond(Response::new(
                 StatusCode(200),
@@ -454,15 +493,128 @@ pub(crate) fn respond_nonstreaming(
                 None,
             ))?;
         }
-        Ok(Err(message)) => {
+        NonstreamWait::Ready(Err(message)) => {
             request.respond(openai_error(&message, request_error_status(&message)))?;
         }
-        Err(_) => {
-            // Worker died before status — treat as internal failure.
-            request.respond(openai_error("generation worker disconnected", 500))?;
+        NonstreamWait::Disconnected(Ok(Ok(()))) => {
+            // Terminal won the race against disconnect; deliver as usual.
+            request.respond(Response::new(
+                StatusCode(200),
+                vec![
+                    header("Content-Type", "application/json"),
+                    header("Access-Control-Allow-Origin", "*"),
+                ],
+                ChannelReader::new(receiver),
+                None,
+                None,
+            ))?;
+        }
+        NonstreamWait::Disconnected(_) => {
+            // Client gone before terminal ack: wait already drained the worker /
+            // admission guard. Consume the writer without framing a 500.
+            drop(receiver);
+            drop(request.into_writer());
         }
     }
     Ok(())
+}
+
+enum NonstreamWait {
+    Ready(Result<(), String>),
+    /// Disconnect observed before a status was taken; inner is the worker's
+    /// eventual status after cancel (Ok(Ok) means terminal still staged).
+    Disconnected(std::result::Result<Result<(), String>, mpsc::RecvError>),
+}
+
+/// Wait for the generation worker status, optionally probing the response
+/// socket for client FIN every ≤200ms.
+fn wait_nonstream_status(
+    status_rx: &mpsc::Receiver<Result<(), String>>,
+    #[cfg(unix)] response_fd: Option<std::os::fd::RawFd>,
+    #[cfg(not(unix))] response_fd: Option<std::os::raw::c_int>,
+    cancelled: &AtomicBool,
+) -> NonstreamWait {
+    #[cfg(unix)]
+    if let Some(fd) = response_fd {
+        loop {
+            match status_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(status) => return NonstreamWait::Ready(status),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if peer_response_closed(fd) {
+                        cancelled.store(true, Ordering::SeqCst);
+                        // Wait for abort drain + AdmissionGuard release.
+                        return NonstreamWait::Disconnected(status_rx.recv());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return NonstreamWait::Ready(Err("generation worker disconnected".to_string()));
+                }
+            }
+        }
+    }
+
+    // Non-Unix or no capturable fd: retain blocking wait (no disconnect cancel).
+    let _ = response_fd;
+    let _ = cancelled;
+    match status_rx.recv() {
+        Ok(status) => NonstreamWait::Ready(status),
+        Err(_) => NonstreamWait::Ready(Err("generation worker disconnected".to_string())),
+    }
+}
+
+/// Unix helper: true when the response socket has a confirmed peer close.
+///
+/// Uses `poll(POLLIN|POLLHUP|POLLERR|POLLRDHUP)` plus non-consuming
+/// `recv(MSG_PEEK|MSG_DONTWAIT)`. Zero bytes or a hard socket error means
+/// closed; queued data or EAGAIN means still live.
+#[cfg(unix)]
+fn peer_response_closed(fd: std::os::fd::RawFd) -> bool {
+    let mut events = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+    #[cfg(target_os = "linux")]
+    {
+        events |= libc::POLLRDHUP;
+    }
+
+    let mut pfd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        return !matches!(err.raw_os_error(), Some(libc::EINTR));
+    }
+    if n == 0 {
+        return false;
+    }
+    if pfd.revents & libc::POLLNVAL != 0 {
+        return true;
+    }
+    if pfd.revents & events == 0 {
+        return false;
+    }
+
+    let mut buf = [0u8; 1];
+    let nread = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if nread == 0 {
+        return true;
+    }
+    if nread > 0 {
+        return false;
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => false,
+        _ => true,
+    }
 }
 
 pub(crate) fn request_id() -> String {
@@ -579,7 +731,10 @@ pub(crate) fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static HTTP header")
 }
 
-pub(crate) fn json_response(value: serde_json::Value, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn json_response(
+    value: serde_json::Value,
+    status: u16,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
     Response::new(
         StatusCode(status),
@@ -607,7 +762,9 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<std::io::Curs
     )
 }
 
-pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn admission_error_response(
+    error: &AdmissionError,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     openai_error(&error.message, 503).with_header(header(
         "Retry-After",
         &error.retry_after_seconds.to_string(),
@@ -737,7 +894,102 @@ impl Read for ChannelReader {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    mod peer_response_closed_tests {
+        use super::super::peer_response_closed;
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+        use std::time::Duration;
 
+        fn bind_listener() -> TcpListener {
+            TcpListener::bind("127.0.0.1:0").expect("bind loopback")
+        }
 
+        #[test]
+        fn live_idle_returns_false() {
+            let listener = bind_listener();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            // Both ends live, no data, no shutdown — must be false on both sides.
+            assert!(
+                !peer_response_closed(server.as_raw_fd()),
+                "live server fd should be idle"
+            );
+            assert!(
+                !peer_response_closed(client.as_raw_fd()),
+                "live client fd should be idle"
+            );
+        }
 
+        #[test]
+        fn fin_returns_true() {
+            let listener = bind_listener();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            drop(client);
+            // FIN propagation is not instant; poll up to 500ms.
+            let mut closed = false;
+            for _ in 0..10 {
+                if peer_response_closed(server.as_raw_fd()) {
+                    closed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(closed, "server should see FIN after peer close");
+        }
 
+        #[test]
+        fn queued_bytes_not_mistaken_for_fin() {
+            let listener = bind_listener();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).expect("connect");
+            let mut server = listener.accept().expect("accept").0;
+            client.write_all(b"queued").expect("write");
+            client.flush().expect("flush");
+            // Give kernel time to queue.
+            std::thread::sleep(Duration::from_millis(50));
+            // Data queued, not FIN — must remain false.
+            assert!(
+                !peer_response_closed(server.as_raw_fd()),
+                "queued readable bytes must not be mistaken for FIN"
+            );
+            // Consume the queued bytes and prove liveness remains.
+            {
+                use std::io::Read;
+                let mut buf = [0u8; 6];
+                server
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("timeout");
+                let n = server.read(&mut buf).expect("read queued");
+                assert_eq!(n, 6);
+                assert_eq!(&buf, b"queued");
+                // Still live after drain.
+                assert!(
+                    !peer_response_closed(server.as_raw_fd()),
+                    "still live after drain"
+                );
+                assert!(
+                    !peer_response_closed(client.as_raw_fd()),
+                    "client still live"
+                );
+            }
+            // Now close peer and ensure FIN eventually true.
+            drop(client);
+            let mut fin = false;
+            for _ in 0..10 {
+                if peer_response_closed(server.as_raw_fd()) {
+                    fin = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(fin, "server should see FIN after peer close and drain");
+        }
+    }
+}

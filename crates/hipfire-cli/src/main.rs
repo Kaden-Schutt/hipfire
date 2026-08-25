@@ -8298,6 +8298,411 @@ mod tests {
         complete_openai_chat("127.0.0.1", port, body, Duration::from_secs(10))
     }
 
+    /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
+    #[cfg(unix)]
+    fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body_start = text
+            .find("\r\n\r\n")
+            .map(|idx| idx + 4)
+            .or_else(|| text.find("\n\n").map(|idx| idx + 2))
+            .unwrap_or(buf.len());
+        let raw_body = buf.get(body_start..).unwrap_or(&[]);
+        let chunked = text[..body_start]
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        if !chunked {
+            return (status, raw_body.to_vec());
+        }
+        let mut decoded = Vec::new();
+        let mut remaining = raw_body;
+        loop {
+            let Some(line_end) = remaining.windows(2).position(|bytes| bytes == b"\r\n") else {
+                panic!("malformed chunk header");
+            };
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&remaining[..line_end])
+                    .expect("chunk size utf8")
+                    .split(';')
+                    .next()
+                    .expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            remaining = &remaining[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            assert!(remaining.len() >= size + 2, "truncated chunk body");
+            decoded.extend_from_slice(&remaining[..size]);
+            assert_eq!(&remaining[size..size + 2], b"\r\n");
+            remaining = &remaining[size + 2..];
+        }
+        (status, decoded)
+    }
+
+    /// Write a non-stream request and return the live TCP stream without reading status.
+    #[cfg(unix)]
+    fn open_nonstream_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        // Short read timeout so accidental reads fail fast; tests close without status.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    #[cfg(unix)]
+    fn wait_fixture_ready(harness: &Task11HttpHarness, deadline: Instant) -> serde_json::Value {
+        let ready_path = harness.paths.root.join("fixture-ready.log");
+        while Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(&ready_path) {
+                for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        if val.get("type").and_then(|v| v.as_str()) == Some("fixture_ready") {
+                            return val;
+                        }
+                    }
+                }
+            }
+            // Fallback: requests.log also records fixture_ready.
+            if let Some(row) = harness
+                .read_requests_log()
+                .into_iter()
+                .find(|row| row.get("type").and_then(|v| v.as_str()) == Some("fixture_ready"))
+            {
+                return row;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "fixture-ready never appeared; log={:?}",
+            harness.read_requests_log()
+        );
+    }
+
+    /// Silent non-stream client disconnect aborts the correlated daemon txn,
+    /// drains done/aborted before Admission releases, then admits a follow-up.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_client_disconnect_aborts_and_releases_admission() {
+        let harness = Task11HttpHarness::spawn("ns-disconnect-abort");
+        let port = harness.port();
+        let body = harness.base_body("t11-long-nonstream", false);
+
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "precondition: admission idle"
+        );
+
+        let stream = open_nonstream_request(port, &body);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let ready = wait_fixture_ready(&harness, ready_deadline);
+        let gen_id = ready
+            .get("id")
+            .cloned()
+            .expect("fixture_ready carries generate id");
+        let gen_aid = ready
+            .get("attempt_id")
+            .and_then(|v| v.as_u64())
+            .expect("fixture_ready carries attempt_id");
+
+        // Confirm generate is in the wire log with the same correlation pair.
+        let request_log = harness.read_requests_log();
+        let generates = Task11HttpHarness::ops_of_type(&request_log, "generate");
+        assert!(
+            generates.iter().any(|g| {
+                g.get("id") == Some(&gen_id)
+                    && g.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+            }),
+            "generate missing for fixture pair: {:?}",
+            harness.read_requests_log()
+        );
+
+        // Client disconnect without ever reading an HTTP status line.
+        drop(stream);
+
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_abort = false;
+        let mut saw_done_aborted = false;
+        let mut inflight_hit_zero_before_done = false;
+
+        while Instant::now() < poll_deadline {
+            let log = harness.read_requests_log();
+            if !saw_abort {
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            if !saw_done_aborted {
+                saw_done_aborted = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            let inflight = harness.shared.admission.inflight();
+            if inflight == 0 && !saw_done_aborted {
+                inflight_hit_zero_before_done = true;
+            }
+            if saw_abort && saw_done_aborted && inflight == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            saw_abort,
+            "correlated abort{{id,attempt_id}} missing within poll bound; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            saw_done_aborted,
+            "daemon done/aborted marker missing; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            !inflight_hit_zero_before_done,
+            "Admission inflight reached 0 before done/aborted drained"
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must be fully released after abort drain"
+        );
+
+        // No commit may have been sent for the cancelled attempt.
+        let log = harness.read_requests_log();
+        let commits = Task11HttpHarness::ops_of_type(&log, "commit");
+        assert!(
+            commits.iter().all(|c| {
+                !(c.get("id") == Some(&gen_id)
+                    && c.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid))
+            }),
+            "cancelled attempt must not commit: {commits:?}"
+        );
+
+        // Immediate follow-up must admit and return a single JSON success.
+        let follow = complete_nonstream(port, harness.base_body("t11-stop-text", false))
+            .expect("follow-up after cancel must return 200 JSON");
+        assert_eq!(follow["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            follow["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        assert_eq!(harness.shared.admission.inflight(), 0);
+    }
+
+    /// Connected pre-terminal daemon error keeps non-200 OpenAI error JSON.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_connected_error_preserves_status() {
+        let harness = Task11HttpHarness::spawn("ns-connected-err");
+        let port = harness.port();
+        let body = harness.base_body("t15-class-validation", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert!(
+            status >= 400 && status != 200,
+            "preterminal error must keep non-200 status, got {status}"
+        );
+        let text = String::from_utf8_lossy(&raw_body);
+        // Strip optional chunked framing / trailing whitespace for JSON parse.
+        let json_start = text.find('{').expect("OpenAI error JSON object");
+        let json_text = &text[json_start..];
+        let err: serde_json::Value =
+            serde_json::from_str(json_text.trim_end()).expect("OpenAI error JSON");
+        let message = err
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !message.is_empty(),
+            "error.message required in OpenAI error body: {err}"
+        );
+        assert!(
+            err.pointer("/choices").is_none(),
+            "error response must not look like a completion: {err}"
+        );
+        // Exactly one top-level JSON value.
+        let mut it = serde_json::Deserializer::from_str(json_text.trim_end())
+            .into_iter::<serde_json::Value>();
+        let _first = it.next().expect("one value").expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "error body must be exactly one JSON value"
+        );
+    }
+
+    /// Connected non-stream success is exactly one JSON value (no SSE/trailer).
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_success_is_exactly_one_json() {
+        let harness = Task11HttpHarness::spawn("ns-one-json");
+        let port = harness.port();
+        let body = harness.base_body("t11-stop-text", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert_eq!(status, 200, "success status");
+        let text = String::from_utf8_lossy(&raw_body);
+        let json_start = text.find('{').expect("JSON object in body");
+        let json_text = text[json_start..].trim_end();
+        let mut it = serde_json::Deserializer::from_str(json_text).into_iter::<serde_json::Value>();
+        let value = it
+            .next()
+            .expect("exactly one JSON value")
+            .expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "non-stream success must not append a second JSON/SSE value; body={text:?}"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        assert!(
+            !text.contains("data:"),
+            "non-stream body must not carry SSE framing"
+        );
+    }
+
+    /// Close-before terminal → abort and no commit; close-after full JSON → commit, no abort.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_close_before_vs_after_terminal_commit_race() {
+        let harness = Task11HttpHarness::spawn("ns-commit-race");
+        let port = harness.port();
+
+        // --- before terminal: disconnect during long silent generation ---
+        {
+            let body = harness.base_body("t11-long-nonstream", false);
+            let stream = open_nonstream_request(port, &body);
+            let ready = wait_fixture_ready(&harness, Instant::now() + Duration::from_secs(5));
+            let gen_id = ready.get("id").cloned().expect("id");
+            let gen_aid = ready
+                .get("attempt_id")
+                .and_then(|v| v.as_u64())
+                .expect("attempt_id");
+            drop(stream);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut saw_abort = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+                let done = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                });
+                if saw_abort && done && harness.shared.admission.inflight() == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_abort, "close-before-terminal must abort");
+            let log = harness.read_requests_log();
+            assert!(
+                Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .all(|c| c.get("id") != Some(&gen_id)),
+                "close-before-terminal must not commit: {log:?}"
+            );
+        }
+
+        // --- after terminal: full success response consumed; commit, no abort ---
+        {
+            let before_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            let body = harness.base_body("t11-stop-text", false);
+            let (status, raw_body) = raw_nonstream_post(port, &body);
+            assert_eq!(status, 200);
+            let text = String::from_utf8_lossy(&raw_body);
+            let json_start = text.find('{').expect("json");
+            let value: serde_json::Value =
+                serde_json::from_str(text[json_start..].trim_end()).expect("json body");
+            assert_eq!(value["choices"][0]["finish_reason"], "stop");
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut saw_commit = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                // Latest generate should have a matching commit.
+                let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+                let last_gen = generates.last().expect("generate for success path");
+                let gid = last_gen.get("id").cloned();
+                let gaid = last_gen.get("attempt_id").and_then(|v| v.as_u64());
+                saw_commit = Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .any(|c| {
+                        c.get("id") == gid.as_ref()
+                            && c.get("attempt_id").and_then(|v| v.as_u64()) == gaid
+                    });
+                if saw_commit {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_commit, "close-after-terminal must commit");
+            let after_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            assert_eq!(
+                after_aborts, before_aborts,
+                "close-after full JSON must not emit a new abort"
+            );
+        }
+    }
+
     /// Paired stream/nonstream matrix rows for stop, pure-tool, mixed-tool,
     /// two-tools, length-withhold, and usage ordering.
     ///
@@ -8305,6 +8710,8 @@ mod tests {
     /// structured-argument JSON fragment leaking into content/reasoning.
     /// Invalid-producer dirty-marker diagnostics live in a separate test and
     /// must not weaken these valid-path assertions.
+    /// (Matrix body lives with the broader Task11 suite; streaming helpers above
+    /// remain the stable surface for parity checks.)
     #[cfg(unix)]
 
     /// Invalid-producer diagnostic (authority violation): dirty marker token text
@@ -8318,15 +8725,6 @@ mod tests {
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
