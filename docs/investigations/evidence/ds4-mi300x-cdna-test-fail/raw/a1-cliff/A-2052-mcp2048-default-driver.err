@@ -1,0 +1,51 @@
+[feed] label=A-2052-mcp2048-default
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.25s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 75.03s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-A-2052-mcp2048-default","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully d
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":": I'l","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"l prov","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"ide a prod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"uction-grade","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":" te","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"chni","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"cal explan","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"ation of t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"he specif","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"ed inferenc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"e p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"ipeline, s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"truc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"tu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"red as reque","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"sted for ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"a measureme","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"t con","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"tract d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"iscu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"ssio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"n. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"This","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":" cove","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"rs t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-A-2052-mcp2048-default","text":"he end-to-end path for","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-A-2052-mcp2048-default","tokens":32,"tok_s":2.2917711093604525,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20838,"total_ms":34801,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-A-2052-mcp2048-default","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-A-2052-mcp2048-default","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-A-2052-mcp2048-default', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+[daemon-control] received commit for id=g0-A-2052-mcp2048-default attempt_id=1
+[feed] << {"type":"done","id":"g0-A-2052-mcp2048-default","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

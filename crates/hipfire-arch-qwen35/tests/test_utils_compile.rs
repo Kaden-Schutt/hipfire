@@ -16,6 +16,8 @@ use syn::visit::Visit;
 use syn::{Expr, ExprCall, ExprMatch, ExprMethodCall, ImplItemFn, ItemFn};
 
 const QWEN35_SOURCE: &str = include_str!("../src/qwen35.rs");
+const QWEN35_FORWARD_SOURCE: &str = include_str!("../src/qwen35/forward.rs");
+const QWEN35_PREFILL_SOURCE: &str = include_str!("../src/qwen35/prefill.rs");
 const SPECULATIVE_SOURCE: &str = include_str!("../src/speculative.rs");
 const MTP_COMPOSE_SOURCE: &str = include_str!("../src/mtp_compose.rs");
 const MTP_SPEC_SOURCE: &str = include_str!("../src/mtp_spec.rs");
@@ -23,7 +25,7 @@ const MTP_PROBE_SOURCE: &str = include_str!("../src/mtp_probe.rs");
 const MTP_SPECULATOR_SOURCE: &str = include_str!("../src/mtp_speculator.rs");
 const SPEC_IMPL_SOURCE: &str = include_str!("../src/spec_impl.rs");
 const DISPATCH_OPS_SOURCE: &str = include_str!("../../hipfire-dispatch/src/ops/delta_net.rs");
-const TEST_UTILS_SOURCE: &str = include_str!("../src/test_utils.rs");
+const TEST_UTILS_SOURCE: &str = include_str!("support/test_utils.rs");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct InventoryEntry {
@@ -55,11 +57,37 @@ fn classify(
     if source == "speculative.rs" {
         return "speculative-replay";
     }
-    if source != "qwen35.rs" {
+    // The split qwen35 modules (root re-export file, decode forward module,
+    // batched prefill module) share the same lane classification.
+    if !matches!(
+        source,
+        "qwen35.rs" | "qwen35/forward.rs" | "qwen35/prefill.rs"
+    ) {
         return "UNCLASSIFIED";
     }
     if function.contains("multi") {
         return if in_moe_arm { "pp-moe" } else { "pp-dense" };
+    }
+    // Split batched-prefill chunk bodies: the function name carries the
+    // dense-vs-MoE discriminant (`batch_chunk_delta_net_moe` vs `_attn`).
+    if function.contains("batch_chunk") {
+        let in_moe = function.contains("_moe") || in_moe_arm;
+        return if operation.contains("_tree") {
+            if in_moe {
+                "prefill-tree-moe"
+            } else {
+                "prefill-tree-dense"
+            }
+        } else if in_moe {
+            "prefill-moe"
+        } else {
+            "prefill-dense"
+        };
+    }
+    // SuperOp binding bodies (run_attend / run_norm / run_recurrent) on the
+    // default-on lowered decode lane.
+    if function.starts_with("run_") {
+        return "decode-superop";
     }
     if function.contains("prefill") {
         return if operation.contains("_tree") {
@@ -171,9 +199,11 @@ fn discover_inventory(source: &'static str, text: &str) -> Vec<InventoryEntry> {
     records
 }
 
-fn all_sources() -> [(&'static str, &'static str); 8] {
+fn all_sources() -> [(&'static str, &'static str); 10] {
     [
         ("qwen35.rs", QWEN35_SOURCE),
+        ("qwen35/forward.rs", QWEN35_FORWARD_SOURCE),
+        ("qwen35/prefill.rs", QWEN35_PREFILL_SOURCE),
         ("speculative.rs", SPECULATIVE_SOURCE),
         ("mtp_compose.rs", MTP_COMPOSE_SOURCE),
         ("mtp_spec.rs", MTP_SPEC_SOURCE),
@@ -239,6 +269,382 @@ fn expected_inventory() -> Vec<InventoryEntry> {
             "dispatch-ops",
             operation,
             1,
+        );
+    }
+
+    // Speculative replay raw DeltaNet oracle (unchanged seam).
+    for (function, operation) in [
+        ("replay_gdn_inner", "conv1d_silu_split_f32_n"),
+        ("replay_gdn_inner", "fused_qk_l2_norm_scale_f32_batched"),
+        ("replay_gdn_inner", "gated_delta_net_f32_batch_seq"),
+        ("replay_gdn_inner", "gated_delta_net_q4"),
+        ("replay_gdn_inner", "gated_delta_net_q8_batch_seq"),
+        ("replay_gdn_inner", "repeat_interleave_qk_f32_batched"),
+    ] {
+        add_expected(
+            &mut records,
+            "speculative.rs",
+            function,
+            "speculative-replay",
+            operation,
+            1,
+        );
+    }
+
+    // Split decode module: the hand per-token layer loop (dense + MoE arms)
+    // and the default-on SuperOp binding bodies.
+    for (function, class, operation, count) in [
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "fused_sigmoid_alpha_gate_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "conv1d_silu_split_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "fused_qk_l2_norm_scale_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "repeat_interleave_qk_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "gated_delta_net_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "gated_delta_net_q8",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "gated_delta_net_q4",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-dense",
+            "gated_norm_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "fused_sigmoid_alpha_gate_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "conv1d_silu_split_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "fused_qk_l2_norm_scale_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "repeat_interleave_qk_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "gated_delta_net_f32",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "gated_delta_net_q8",
+            1,
+        ),
+        (
+            "forward_scratch_layers",
+            "decode-moe",
+            "gated_delta_net_q4",
+            1,
+        ),
+        ("forward_scratch_layers", "decode-moe", "gated_norm_f32", 1),
+        (
+            "run_attend",
+            "decode-superop",
+            "fused_sigmoid_alpha_gate_f32",
+            1,
+        ),
+        (
+            "run_attend",
+            "decode-superop",
+            "conv1d_silu_split_qknorm_scalar_prep_gfx1100",
+            1,
+        ),
+        (
+            "run_attend",
+            "decode-superop",
+            "conv1d_silu_split_qknorm",
+            1,
+        ),
+        ("run_attend", "decode-superop", "conv1d_silu_split_f32", 1),
+        (
+            "run_attend",
+            "decode-superop",
+            "fused_qk_l2_norm_scale_f32",
+            1,
+        ),
+        (
+            "run_attend",
+            "decode-superop",
+            "repeat_interleave_qk_f32",
+            2,
+        ),
+        (
+            "run_norm",
+            "decode-superop",
+            "gated_norm_rotate_mq_gfx1100",
+            1,
+        ),
+        ("run_norm", "decode-superop", "gated_norm_f32", 1),
+        ("run_recurrent", "decode-superop", "gated_delta_net_f32", 1),
+        (
+            "run_recurrent",
+            "decode-superop",
+            "gated_delta_net_q8_compact",
+            1,
+        ),
+        ("run_recurrent", "decode-superop", "gated_delta_net_q8", 1),
+        ("run_recurrent", "decode-superop", "gated_delta_net_q4", 1),
+    ] {
+        add_expected(
+            &mut records,
+            "qwen35/forward.rs",
+            function,
+            class,
+            operation,
+            count,
+        );
+    }
+
+    // Split prefill module: the batched DeltaNet chunk bodies (dense + MoE).
+    for (function, class, operation, count) in [
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "conv1d_silu_split_f32_independent",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "conv1d_silu_split_f32_independent_masked",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "conv1d_silu_split_f32_n",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "fused_qk_l2_norm_scale_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "fused_qk_l2_norm_scale_interleave_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "fused_sigmoid_alpha_gate_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_delta_net_f32_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_delta_net_f32_chunked",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_delta_net_q4",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_delta_net_q8_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_delta_net_q8_independent",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_delta_net_q8_independent_masked",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-dense",
+            "gated_norm_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-tree-dense",
+            "conv1d_silu_split_tree_f32_n",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-tree-dense",
+            "gated_delta_net_f32_tree_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_attn",
+            "prefill-tree-dense",
+            "gated_delta_net_q8_tree_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "conv1d_silu_split_f32_independent",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "conv1d_silu_split_f32_independent_masked",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "conv1d_silu_split_f32_n",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "fused_qk_l2_norm_scale_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "fused_sigmoid_alpha_gate_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_delta_net_f32_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_delta_net_f32_chunked",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_delta_net_q4",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_delta_net_q8_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_delta_net_q8_independent",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_delta_net_q8_independent_masked",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "gated_norm_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-moe",
+            "repeat_interleave_qk_f32_batched",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-tree-moe",
+            "conv1d_silu_split_tree_f32_n",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-tree-moe",
+            "gated_delta_net_f32_tree_batch_seq",
+            1,
+        ),
+        (
+            "batch_chunk_delta_net_moe",
+            "prefill-tree-moe",
+            "gated_delta_net_q8_tree_batch_seq",
+            1,
+        ),
+    ] {
+        add_expected(
+            &mut records,
+            "qwen35/prefill.rs",
+            function,
+            class,
+            operation,
+            count,
         );
     }
 
@@ -322,23 +728,30 @@ fn expected_inventory() -> Vec<InventoryEntry> {
         ),
         (
             "mtp_spec.rs",
-            "spec_step_mtp_compressed_serial",
+            "mtp_shared_verify_accept_rollback",
             "mtp-decode",
             "qwen35::forward_scratch",
             1,
         ),
         (
             "mtp_spec.rs",
-            "spec_step_mtp_compressed_serial",
+            "mtp_shared_verify_accept_rollback",
             "mtp-prefill",
             "qwen35::forward_prefill_batch",
             1,
         ),
         (
             "mtp_spec.rs",
-            "spec_step_mtp_compressed_serial",
+            "mtp_shared_verify_accept_rollback",
             "mtp-replay",
             "state.trunk_gdn_tape.replay_gdn",
+            1,
+        ),
+        (
+            "mtp_spec.rs",
+            "prefill_trunk_and_mtp_cache_with_boundary",
+            "mtp-prefill",
+            "qwen35::forward_prefill_batch",
             1,
         ),
         (
@@ -523,13 +936,26 @@ fn raw_oracle_is_structurally_independent_of_step_lowering() {
 
 #[test]
 fn qwen35_raw_gate_and_batch_paths_are_step_seams() {
-    assert!(QWEN35_SOURCE.contains("raw_delta_net_gate_prep"));
-    assert!(QWEN35_SOURCE.contains("raw_delta_net_batch_body"));
-    assert!(QWEN35_SOURCE.contains("DeltaNetBatchIntent::NormalPrefill"));
-    assert!(QWEN35_SOURCE.contains("Step::RmsnormBatched"));
-    assert!(QWEN35_SOURCE.contains("Step::FusedQkvzaBatched"));
-    assert!(QWEN35_SOURCE.contains("Step::GemmResidualBatched"));
-    assert!(QWEN35_SOURCE.contains("Step::GivensRotateBatched"));
+    // The raw DeltaNet oracle seams are TEST-ONLY: they live in the support
+    // helper (feature `test-utils`), never in production modules.
+    assert!(TEST_UTILS_SOURCE.contains("raw_delta_net_gate_prep"));
+    assert!(TEST_UTILS_SOURCE.contains("raw_delta_net_batch_body"));
+    assert!(TEST_UTILS_SOURCE.contains("raw_delta_net_decode_body"));
+    assert!(TEST_UTILS_SOURCE.contains("DeltaNetBatchIntent::NormalPrefill"));
+    // Production builds the DeltaNet batch/tree programs through the dispatch
+    // Step surface. The decode module carries the compiler-exhaustive
+    // step-kind label map over every Step variant (incl. the batched DeltaNet
+    // producers RmsnormBatched / FusedQkvzaBatched / GemmResidualBatched),
+    // and the batched prefill module constructs Step programs directly
+    // (GivensRotateBatched in the Paro MoE prefill tail).
+    assert!(QWEN35_FORWARD_SOURCE.contains("Step::RmsnormBatched"));
+    assert!(QWEN35_FORWARD_SOURCE.contains("Step::FusedQkvzaBatched"));
+    assert!(QWEN35_FORWARD_SOURCE.contains("Step::GemmResidualBatched"));
+    assert!(QWEN35_PREFILL_SOURCE.contains("Step::GivensRotateBatched"));
+    // The raw oracle bodies are structurally independent of Step lowering.
+    assert!(!TEST_UTILS_SOURCE.contains("build_delta_net_"));
+    assert!(!TEST_UTILS_SOURCE.contains("execute_steps"));
+    assert!(!TEST_UTILS_SOURCE.contains("Step::"));
 }
 
 #[test]

@@ -50,8 +50,13 @@ typedef int32_t __attribute__((ext_vector_type(4)))  int32x4_t;
 typedef int32_t __attribute__((ext_vector_type(8)))  int32x8_t;
 typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 
+#ifndef MQ2_GROUPED_MMQ_KERNEL_NAME
+#define MQ2_GROUPED_MMQ_KERNEL_NAME \
+    gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151
+#endif
+
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+extern "C" __global__ void MQ2_GROUPED_MMQ_KERNEL_NAME(
     const unsigned long long*  __restrict__ expert_weight_ptrs, // [E]
     const int*                 __restrict__ expert_tile_ids,    // [m_total / 16]
     const int*                 __restrict__ sorted_slot_index,  // [m_total]
@@ -95,6 +100,14 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
         // ── Quantize this lane's 4-entry Lloyd codebook to int8 + scale ──
         // Done ONCE per group (amortized over 256 weights). cb values are the
         // actual dequantized weight levels; index q∈{0,1,2,3} selects cb[q].
+#if defined(MQ2_GROUPED_MMQ_PREQUANT_CODEBOOK)
+        // Micro-screen representation only: the 8-byte group header is
+        // [4 x int8 codebook | f32 scale]. The packed 2-bit indices remain at
+        // gp+8, so traffic and group stride are unchanged. Production MQ2R
+        // dispatch never selects this symbol.
+        const unsigned int cbpack = *reinterpret_cast<const unsigned int*>(gp);
+        const float sc_self = *reinterpret_cast<const float*>(gp + 4);
+#else
         const __half* cbh = reinterpret_cast<const __half*>(gp);
         float cb0 = __half2float(cbh[0]);
         float cb1 = __half2float(cbh[1]);
@@ -103,7 +116,6 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
         float amax = fmaxf(fmaxf(fabsf(cb0), fabsf(cb1)), fmaxf(fabsf(cb2), fabsf(cb3)));
         float sc_self = amax * (1.0f / 127.0f);
         float inv_sc = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
-        // int8 codebook packed little-endian into a u32 for byte-extract LUT.
         int q0 = (int)rintf(cb0 * inv_sc);
         int q1 = (int)rintf(cb1 * inv_sc);
         int q2 = (int)rintf(cb2 * inv_sc);
@@ -112,6 +124,7 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
                             | ((unsigned int)(q1 & 0xFF) << 8)
                             | ((unsigned int)(q2 & 0xFF) << 16)
                             | ((unsigned int)(q3 & 0xFF) << 24);
+#endif
 
         // Broadcast each output row's group scale to the lanes that own it.
         // Output row r = row_start + 2*j + (tid>>4) ⇒ source lane = 2*j + (tid>>4).
@@ -167,12 +180,30 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
                     const unsigned int pk = pk_all[k_off / 16];
 
                     // A operand: 2-bit index → int8 codebook via byte-extract LUT.
+#if defined(MQ2_GROUPED_MMQ_PERM_DECODE)
+                    // Expand each four-pack of 2-bit indices into four byte
+                    // selectors, then let v_perm_b32 perform four LUT lookups.
+                    int32x4_t a_i32;
+                    #pragma unroll
+                    for (int p = 0; p < 4; p++) {
+                        const unsigned int x = (pk >> (8 * p)) & 0xFFu;
+                        const unsigned int sel =
+                            (x & 0x03u)
+                            | ((x & 0x0Cu) << 6)
+                            | ((x & 0x30u) << 12)
+                            | ((x & 0xC0u) << 18);
+                        a_i32[p] = (int)__builtin_amdgcn_perm(
+                            cbpack, cbpack, sel);
+                    }
+#else
                     int8x16_t a_vec;
                     #pragma unroll
                     for (int i = 0; i < 16; i++) {
                         unsigned int q = (pk >> (2 * i)) & 0x3u;
                         a_vec[i] = (int8_t)((cbpack >> (q * 8)) & 0xFFu);
                     }
+                    int32x4_t a_i32 = *(const int32x4_t*)&a_vec;
+#endif
 
                     // B operand: Q8_1 int8 activations.
                     int8x16_t b_vec;
@@ -183,7 +214,6 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
                         b_vec = (int8x16_t){0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
                     }
 
-                    int32x4_t a_i32 = *(const int32x4_t*)&a_vec;
                     int32x4_t b_i32 = *(const int32x4_t*)&b_vec;
 
                     // signed × signed: codebook int8 is signed (Lloyd levels can
@@ -216,7 +246,11 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
 
 #else
 
-extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+#ifndef MQ2_GROUPED_MMQ_KERNEL_NAME
+#define MQ2_GROUPED_MMQ_KERNEL_NAME \
+    gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151
+#endif
+extern "C" __global__ void MQ2_GROUPED_MMQ_KERNEL_NAME(
     const unsigned long long*, const int*, const int*,
     const void*, float*, int, int, int, int, int
 ) {}

@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
+faer = { version = "0.24", default-features = false, features = ["rayon", "std"] }
+libloading = { workspace = true }
 memmap2 = "0.9"
 safetensors.workspace = true
 half.workspace = true
@@ -16,6 +22,7 @@ byteorder = "1"
 rayon = "1"
 libc = "0.2"
 hipfire-reap = { path = "../hipfire-reap" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
@@ -25,3 +32,51 @@ tempfile = "3"
 # integration test lives in-module in reap_overlay.rs (it needs crate-internal
 # write_hfq / quantize_* access that a tests/ target can't reach).
 hipfire-runtime = { path = "../hipfire-runtime" }
+# Test-only: the MQ*-G256-GL codebooks (GL_CB2/GL_CB3) and SoA group sizes are
+# duplicated between this encoder and the runtime (the kernels take the codebook
+# as scalar args; it is NOT stored in the .hfq). `gl_codebooks_match_runtime` /
+# `gl_blob_layout_matches_runtime_constants` in main.rs assert the two copies are
+# identical, so a drift becomes a red test instead of a silent accuracy loss.
+# dev-dependency only — the quantizer still builds and runs with no GPU/ROCm.
+rdna-compute = { path = "../rdna-compute" }
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "deepseek4_dequant_check"
+required-features = ["lab"]
+
+[[example]]
+name = "mq35_vq_fit"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_composable_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_family_mse"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_kld_proxy"
+required-features = ["lab"]
+
+[[example]]
+name = "poly_fit"
+required-features = ["lab"]

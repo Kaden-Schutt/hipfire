@@ -55,11 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace (lib + bins + examples + tests)
         run: cargo build --release --workspace --all-targets --locked
-      - name: Build daemon example (real shipped binary, arch features on)
-        run: >
-          cargo build --release --locked
-          -p hipfire-runtime --example daemon
-          --features arch-qwen35,arch-qwen35-vl,arch-llama,arch-qwen2,arch-deepseek4,arch-dots-ocr
+      - name: Build daemon (real shipped binary, all architectures in)
+        run: cargo build --release --locked -p hipfire-daemon
 
   test:
     name: unit tests (lib, no GPU)
@@ -74,6 +71,35 @@ jobs:
         # tests / examples that dispatch kernels need the self-hosted
         # GPU runner and are intentionally excluded here.
         run: cargo test --lib --workspace --locked
+
+  gates:
+    name: gates (ratchets, layering, registers)
+    runs-on: ubuntu-latest
+    # GPU-free structural gates. Until now every one of these was a script a
+    # human had to remember to run: nothing in CI invoked leanup-ratchets.sh,
+    # check-layering.py, check-arch-dispatch.py, check-crate-maps.py or the
+    # table registers, and the only references to them outside scripts/ were
+    # comments in Cargo.toml. Phase 3A's mandate is "every gate either fails on
+    # regression or is deleted"; a gate nothing runs fails on nothing.
+    #
+    # Not advisory. These assert committed expectations that are green on the
+    # branch that introduces them, so a red here is a real regression, not lint
+    # debt. scripts/gates.sh is the separate GPU/model harness and needs
+    # hardware -- it is deliberately not called from CI.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ratchet-diff resolves the merge base to read the base revision's
+          # thresholds; a shallow clone has no merge base to find.
+          fetch-depth: 0
+      - name: Ratchets, layering, arch dispatch, qt register, bypass ledger
+        run: bash scripts/leanup-ratchets.sh
+      - name: Crate maps match the tree
+        run: python3 scripts/check-crate-maps.py --check
+      - name: No committed expectation was loosened
+        # PR-only: on a push there is no proposed base to compare against.
+        if: github.event_name == 'pull_request'
+        run: bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
 
   supply-chain:
     name: cargo-deny (${{ matrix.checks }})

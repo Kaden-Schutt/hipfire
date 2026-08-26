@@ -31,7 +31,6 @@
 //! Run: cargo run -p hipfire-runtime --release --example fulfill_manifest_probe
 
 use hipfire_hardware::{DeviceMesh, DimKind};
-use hipfire_runtime::config::resolve_mesh;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use hipfire_runtime::weight_manifest::{
@@ -405,7 +404,7 @@ fn main() {
     std::env::set_var("HIPFIRE_EMULATE_GPUS", "2");
     match Gpus::init_uniform(2, N_LAYERS) {
         Ok(gpus2) => {
-            let mesh = resolve_mesh(2, 1, 1, Some(2));
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
             assert!(mesh.has_axis(DimKind::Pp), "expected a Pp mesh");
             check("pp-2-emulated", &mesh, &gpus2);
             // Same 2 ranks, Ep axis: expert-parallel compact-blob placement.

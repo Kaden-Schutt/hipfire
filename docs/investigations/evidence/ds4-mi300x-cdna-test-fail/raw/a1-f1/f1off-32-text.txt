@@ -1,0 +1,1 @@
+The following is a detailed technical briefing for a measurement contract involving a DeepSeek V4 Flash-style Mixture-of-Experts (MoE) model running on

@@ -1,0 +1,44 @@
+{
+  "label": "depth-1024",
+  "text": "I understand you want a rigorous, production-grade technical breakdown for a benchmark fixture targeting a DeepSeek V4 Flash-style MoT model on AMD's MI300",
+  "text_sha256": "b5d8560fb003e9b59f8ea62d1fde11d68bbf424bc8af8b3202e94fd474ecb73d",
+  "prompt": "User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I will use your answer as background for a benchmark fixture that must re-tokenize to exactly 2048 prompt tokens and request 510 greedy generations at temperature zero.\n\nAssistant: Understood. This response is framed as a technical briefing for operators and implementers who must keep the product path honest. The measurement fixture is ordinary batch-1 AR, temperature 0, Q8 KV, a 2048-token prompt, 510 generated tokens, and no speculation of any kind. Nothing below invents alternate routes, draft models, tree verification, or retained PM4 shortcuts as substitutes for the ordinary HIP path.\n\nUser: Start with why prompt bytes matter more than prompt \"text\" in this setting.\n\nAssistant: Benchmarks collapse when two runs believe they share a prompt but do not share bytes. Command substitution that strips a trailing newline, an editor that rewrites line endings, a chat template applied in one arm and omitted in the other, or a Python tokenizer substituted for the embedded HFQ tokenizer will each change token identities even when the glyphs look identical to a human. The contract therefore freezes three artifacts: a deterministic source corpus, a derived exact-N token prefix written with no final LF, and a little-endian u32 token dump produced by the same runtime tokenizer that the daemon will use at load time. MD5 and SHA-256 of the prompt bytes are ledger fields, not optional commentary.\n\nThe source corpus must be revisioned prose or chat, not a random word salad, not a hostname, not a timestamp, and not a single paragraph repeated until the byte budget is met. Degenerate repetition distorts attention patterns and decode timing; a realistic technical discussion exercises a broader mixture of short function words, domain nouns, punctuation, and paragraph structure. The derived fixture is a strict prefix of that corpus at a verified token boundary. If decode-then-re-encode does not reproduce the same ID sequence and the same count, the fixture generator must refuse to write. Fail closed beats a convenient wrong file.\n\nUser: Walk the product path for a single generate request under HIPFIRE_SPECULATION=off and --kv-mode q8.\n\nAssistant: Load resolves the model artifact and its embedded metadata. The metadata carries tokenizer configuration, special tokens, and the chat template digest when present. For a raw prompt fixture measurement, the operator passes the exact fixture bytes as one argument so the client does not rejoin words or append a newline. The daemon builds a generate request with temperature fixed at zero for the bench path, top-p left at a non-sampling setting consistent with greedy selection, and speculation selectors projected to off for dflash, mtp, ngram draft, and dspark. The affirmative AR log marker must appear for every timed request; its absence is a failed run, not a soft warning.\n\nPrefill consumes the full prompt token IDs in production-forward chunks. For DeepSeek V4 Flash class models the forward path includes dense attention regions, mixture-of-experts routed MLPs, and any recurrent or compressor state the architecture defines. Q8 KV encoding stores keys and values at the control precision for gate A and gate B work. The first generated token is conditioned on the entire prompt; each subsequent decode step reads the growing KV cache, runs one token through the stack, samples greedily, and appends the new KV rows. Ordinary AR means tau equals 1.0 with drafter equal to ar: one new token per step, no draft window, no tree, no sidecar head.\n\nUser: What must remain frozen while optimizing prefill or decode on gfx942?\n\nAssistant: Model bytes, tensor formats, expert count, sampling contract, KV mode, and model arithmetic are frozen in gate A. You may not retune scales, change rotation convention, widen experts, or swap MQ4R tensors for a different bit budget to manufacture speed. Device dispatch must fail closed outside the intended architecture: DeepSeek or gfx942 behavior must not bleed into Qwen routes or consumer RDNA defaults. A fast incoherent result is a failure. Locate the first numerical divergence at projection, rotate, logits, KV encode, or recurrent state before chasing downstream symptoms in sampler code or host overhead.\n\nPerformance claims require the product load and forward path, not a kernel microbenchmark alone. Record the exact model identity, prompt path and MD5, token counts, route, binary and code-object hashes, correctness evidence, raw samples, and median with dispersion. ABBA ordering is a",
+  "prompt_sha256": "42d9c990163a0088213aa5c8a44c3e0f2281382d58e6d8cff85c3972d277a4de",
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "done": {
+    "type": "commit_ready",
+    "id": "g0-depth-1024",
+    "tokens": 32,
+    "tok_s": 34.33476394849785,
+    "prompt_tokens": 1019,
+    "prefill_tokens": 1019,
+    "cached_tokens": 0,
+    "prefill_ms": 10141,
+    "total_ms": 11073,
+    "finish_reason": "length",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "aborted",
+    "id": "g0-depth-1024",
+    "reason": "client_cancelled",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 41.082523584365845,
+  "elapsed_load_s": 75.80762505531311,
+  "n_token_events": 29,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}

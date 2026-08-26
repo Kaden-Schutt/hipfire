@@ -1,0 +1,35 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"**Me","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"asure","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"me","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"nt","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" C","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"o","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"ntract","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" f","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"or","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"D","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"eep","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"Seek","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" V4","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" Fl","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"a","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"sh","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"(M","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"oE)","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"on A","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"MD","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"MI3","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"0","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"0X ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"(gfx9","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":"42) –","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-32","text":" Q8 KV, No Speculation","attempt_id":1}
+{"type":"commit_ready","id":"g0-gfx942-route-v1-grouped-32","tokens":32,"tok_s":30.33175355450237,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":13890,"total_ms":14945,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-gfx942-route-v1-grouped-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-gfx942-route-v1-grouped-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

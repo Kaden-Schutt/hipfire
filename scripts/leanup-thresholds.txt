@@ -1,0 +1,96 @@
+# Committed thresholds for scripts/leanup-ratchets.sh.
+#
+# Format:  <metric> <op> <value>
+#   ==  must equal exactly
+#   <=  ceiling; may only decrease
+#
+# A metric with no line here is informational and never fails the run.
+#
+# Lowering a ceiling after an improvement is expected and encouraged. RAISING
+# one requires a sentence in the commit message saying what was traded for it --
+# otherwise the ratchet stops meaning anything, which is precisely the failure
+# this file exists to end. Before 2026-08-16 the script emitted 22 metrics and
+# contained exactly one `exit 1`, guarding `cd`.
+
+# --- decoupling invariants: a nonzero value is a regression, not a trend ---
+daemon_arch_id              == 0
+daemon_arch_refs            == 0
+daemon_modelstate           == 0
+loader_modelstate_code      == 0
+grammar_copies              == 0
+substrate_clean_arch_refs   == 0
+required_features_daemon    == 0
+
+# --- ceilings ---
+# hipfire-daemon/src/main.rs. Was 43,696 as hipfire-runtime/examples/daemon.rs
+# on master; the saddle layering moved it into a crate.
+daemon_lines                <= 3900
+
+# Examples compile on every `cargo build --all-targets`. Archived research
+# probes are gated behind `--features lab`; this is the count still ungated.
+# 28 of these are invoked by scripts or change_gate routes and are meant to stay.
+ungated_examples            <= 32
+
+# --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
+# An arch crate must not depend on anything above the arch band. The band is
+# computed each run, so downward edges to hipfire-dispatch / saddle-core / 
+# hipfire-runtime stay legal and an edge to hipfire-loader / engine / generate /
+# daemon / cli fails the build.
+arch_depends_upward         == 0
+layer_unlisted_crates       == 0
+
+# Arch-key dispatch expressed as a string. A CEILING, not zero: hipfire-generate
+# is the architecture composition root by design, and the daemon keeps a narrow
+# arch_key() == "deepseek4" check because that arch's captured decode graph must
+# be invalidated across reset while gemma4's stays valid. Those have reasons; a
+# thirteenth needs one too.
+arch_key_dispatch           <= 12
+
+# --- quant-type register parity (scripts/check-quant-registry.py) ------------
+# Asserted against docs/quant-formats/qt-register.txt, the committed allocation
+# of qt numbers. All four are invariants rather than ceilings: a table check has
+# no legitimate slack, which is the point of preferring it to a count.
+#
+# The first draft of this gate WAS three counts, including `qt_unregistered <= 10`.
+# That ceiling could not distinguish a deliberate non-passthrough format (qt 22 is
+# an index tensor; 28/29 load via paro.rs; 31-37 via arch loaders) from a genuine
+# omission like cf061b7ed, where qt=40's encoder, GEMV and is_mq arms all landed
+# and the model would not load. Nor could any count see substitution -- delete one
+# justified entry, add an unjustified one, cardinality unchanged, gate green. That
+# is the shape of f00fa8058. Declaring each number's disposition in a table makes
+# both cases mechanical.
+
+# A declared variant missing from the register, or a register row naming no
+# variant. Same UNLISTED/STALE pair check-layering.py applies to crates.
+qt_unlisted                 == 0
+qt_stale                    == 0
+
+# A QuantType the writer can emit but its own parser rejects. qt 38/39 were in
+# exactly this state until this gate was added.
+qt_unparseable              == 0
+
+# A row whose declared disposition contradicts RAW_CODECS -- `passthrough`
+# without a table row, or a non-passthrough disposition with one -- or a name
+# that disagrees with the enum.
+qt_disposition_mismatch     == 0
+
+# --- dispatch-bypass debt ledger (scripts/check-dispatch-bypass.py) ----------
+# Rows live in docs/governance/debt-dispatch-bypass.txt. This is holster's
+# ledger: existing debt is permitted and recorded, new debt fails, and paying
+# down is a one-line edit. The first three are invariants; the last is the
+# objective's progress number and descends as crates migrate.
+
+# A crate with bypass calls and no row, or a row whose crate is gone.
+bypass_unlisted             == 0
+bypass_stale                == 0
+
+# A crate that reached for Gpu::gemv_*/gemm_*/fused_* more than its row allows.
+bypass_regressions          == 0
+
+# Debt paid in the tree but not banked in the table. Asserting this at 0 stops a
+# stale allowance becoming headroom the debt can quietly regrow into.
+bypass_slack                == 0
+
+# Total across all arch crates. Redundant given the rows, kept so the descent is
+# visible in this file's diff. Lower it when you bank a migration.
+bypass_total                <= 216

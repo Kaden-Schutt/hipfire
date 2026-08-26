@@ -1,0 +1,16 @@
+**Measurement Contract: DeepSeV4 Flash (MoE) on AMD MI300X (gfx942) – Batch-1, Q8 KV, No Speculation, 2040/510 Greedy Generation**
+
+This document is a technical specification for a benchmark fixture and measurement methodology. It is not a marketing statement, nor a performance claim. The goal is to establish a reproducible, verifiable, and auditable measurement of a single inference request (batch-1) under a specific, frozen configuration. The target hardware is a single AMD Instinct MI300X (gfx942) running a production-grade inference engine (e.g., a custom HIP-based runtime, or a framework like llama.cpp, vLLM, etc., adapted for this architecture). The model is a hypothetical "DeepSeV4 Flash" style Mixture-of-Experts (MoE) model. The measurement is for a "contract" between the benchmark operator and the system under test (SUT). The following sections detail the exact conditions, constraints, and verification steps required for a valid measurement.
+
+---
+
+### 1. The Frozen Prompt Fixture: Why "Bytes" Over "Text"
+
+The single most critical element for reproducibility is the prompt. The prompt is not a string of text in the traditional sense. It is a sequence of bytes that, when processed by the **exact tokenizer embedded in the model's metadata** (not a Python equivalent, not a re-implemented version), produces a specific sequence of token IDs. The following constraints are non-negotiable:
+
+*   **Source Corpus:** A single, versioned, non-tr piece of prose or chat text. It must not be a single repeated sentence, a random word salad, a hostname, or a timestamp. It should contain a mix of short function words, domain nouns, punctuation, and paragraph structure to exercise a realistic distribution of token types and expert routing patterns.
+*   **Tokenization Fixture Generation:**
+    1.  The `tokenize` function from the model's runtime (e.g., `tokenize_slice`) is used to tokenize the entire source corpus.
+    2. The resulting token ID sequence must have a length >= 2048.
+    3. The first 2048 token IDs are extracted.
+    4. **Round-trip verification:** The 2048 IDs are decoded back to text via the same runtime's `decode` function. This text is then re-tokenized. The resulting ID sequence **must

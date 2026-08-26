@@ -4,17 +4,26 @@
 
 //! hipfire-arch-toy: reference template for new arch crates.
 //!
-//! This crate is **not a real model**. It implements the
-//! [`hipfire_runtime::arch::Architecture`] trait with hardcoded stub
-//! values so a contributor adding a new architecture can copy the
-//! directory as a starting point and have a workspace-clean build
-//! before they wire in real model code.
+//! This crate is **not a real model** and **must never load**. It mirrors
+//! the exact contract a shippable arch crate satisfies:
 //!
-//! See `crates/hipfire-arch-toy/README.md` for what to keep, what to
-//! replace, and rough effort estimates per component. For a full
-//! production reference, read `crates/hipfire-arch-qwen35/`.
+//! 1. [`ToyBundle`] implements [`hipfire_runtime::arch_model::ArchModel`]
+//!    (the arch-agnostic view the loader boxes) — `src/arch_model.rs`.
+//! 2. [`load_toy_bundle`] has the exact signature a loader `Carrier` calls
+//!    (`src/carrier.rs`), with an honestly stubbed body.
+//! 3. [`Toy`] implements the intra-crate bring-up trait
+//!    [`hipfire_runtime::arch::Architecture`] — `src/arch.rs`.
+//!
+//! It is deliberately UNSHIPPABLE: `arch_id` is 0xFF, no `Carrier` in the
+//! loader claims 0xFF, and `load_toy_bundle` always returns `Err`. Copy this
+//! directory, claim a real id, and fill in the bodies — `README.md` is the
+//! step-by-step checklist, verified against the tree.
 
 pub mod arch;
+pub mod arch_model;
+pub mod carrier;
 pub mod toy_model;
 
 pub use arch::Toy;
+pub use arch_model::ToyBundle;
+pub use carrier::load_toy_bundle;

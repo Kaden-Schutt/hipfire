@@ -29,7 +29,7 @@ use hipfire_runtime::gpu_cleanup::{
     RetainedGpuTensor,
 };
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, KvCache, KvCacheExt, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────

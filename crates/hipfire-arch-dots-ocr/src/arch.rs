@@ -24,8 +24,7 @@
 
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2::Qwen2State;
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{Architecture, EosFilterOverrides};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
@@ -68,35 +67,10 @@ impl Architecture for DotsOcr {
 
     // ── Optional overrides ────────────────────────────────────────────
     //
-    // dots.ocr uses a custom (non-ChatML) chat template and a different
-    // primary EOS than the qwen35 default. Both `prompt_frame_overrides`
-    // and `eos_filter_overrides` MUST diverge from defaults — see §2.5
+    // dots.ocr uses a different primary EOS than the qwen35 default.
+    // `eos_filter_overrides` MUST diverge from defaults — see §2.5
     // of the bring-up plan.
 
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        // Layout-JSON output has short repeats (category names, bracket
-        // patterns) but should not exceed the default n-gram threshold.
-        // Tighten only if phase-4 coherence runs trip the default.
-        LoopGuardOverrides::default()
-    }
-
-    fn sampler_overrides(_cfg: &Self::Config) -> SamplerOverrides {
-        // No arch-specific blocked tokens at bring-up.
-        SamplerOverrides::default()
-    }
-
-    fn prompt_frame_overrides(_cfg: &Self::Config) -> PromptFrameOverrides {
-        // dots.ocr's chat template uses `<|user|>...<|endofuser|>` then
-        // `<|assistant|>` — NOT ChatML's `<|im_start|>` / `<|im_end|>`.
-        // The minijinja renderer in `hipfire-runtime` evaluates the
-        // template from HFQ metadata if present, so this override stays
-        // at default (`raw=None`) and the daemon picks up the custom
-        // template via `resolve_chat_template`. Phase 3 verifies the
-        // Jinja path produces the right framing on a smoke prompt; if
-        // not, override `raw=Some(false)` and hand-roll the framing in
-        // the daemon arm.
-        PromptFrameOverrides::default()
-    }
 
     fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
         // Primary EOS for an assistant turn is `<|endofassistant|>`

@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-gemma4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gemma 4 dense text architecture (hybrid sliding/full attention, K=V sharing, sandwich RMSNorm, gelu_pytorch_tanh SwiGLU, partial proportional RoPE, final logit softcap) for hipfire"
+
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+default = ["deltanet"]
+# Gemma 4 full-attention partial-rotate RoPE (rope_partial_halved_f32) lives
+# behind the same deltanet gate as the other rope_partial_* kernels.
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "dump_gemma4_hidden_states"
+required-features = ["lab"]
+
+[[example]]
+name = "hfq4_gemm_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "infer_gemma4_spec"
+required-features = ["lab"]
+
+[[example]]
+name = "prefill_parity_gemma4"
+required-features = ["lab"]
+
+[[example]]
+name = "verify_drafter_gemma4"
+required-features = ["lab"]
+
+[[example]]
+name = "verify_overlap_gemma4"
+required-features = ["lab"]

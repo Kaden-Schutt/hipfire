@@ -1,0 +1,2 @@
+NOTE: previous dump accidentally expanded full tokenizer vocab (38MB). Superseded by 07g-tensor-catalog-parse.txt
+Header layout confirmed from docs/QUANTIZATION.md: magic HFQM, ver, arch_id, n_tensors, metadata_offset, data_offset.

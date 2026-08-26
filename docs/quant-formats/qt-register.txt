@@ -1,0 +1,84 @@
+# hipfire quant-type register — the committed allocation of `.hfq` qt numbers.
+#
+# This file is the SOURCE OF TRUTH for which quant-type numbers exist and what
+# each one's load disposition is. `scripts/check-quant-registry.py` asserts the
+# tree against it, in both directions:
+#
+#   qt_unlisted              a QuantType variant that is not in this table
+#   qt_stale                 a row here that names no QuantType variant
+#   qt_unparseable           a variant `QuantType::from_u8` refuses
+#   qt_disposition_mismatch  a row whose disposition contradicts RAW_CODECS
+#
+# Why a table and not a count. A ceiling like `qt_unregistered <= 10` cannot see
+# substitution: drop one justified entry, add an unjustified one, the count is
+# unchanged and the gate stays green. That is the shape of f00fa8058, where the
+# qt=43 work deleted six match arms while adding its own and the build stayed
+# green. Identity is checked here, not cardinality.
+#
+# Claiming a number means editing THIS file, which makes two branches claiming
+# the same number a merge conflict in forty lines of text rather than a silent
+# overwrite discovered after release.
+#
+# First adjudication, 2026-08-18: PR #597 (BQ1G128) and PR #599 (MQ1G1024GL)
+# both claimed qt=41. Ruled for #597 — MQ1G1024GL was never wired or tested,
+# and BQ1G128 is substantially the same format. qt=41 is reserved for BQ1G128
+# below; #599 must pick another number when it returns from draft.
+#
+# Dispositions
+#   passthrough   uploaded verbatim; MUST have a RAW_CODECS row in
+#                 crates/hipfire-runtime/src/weight_backend.rs
+#   host-decode   widened on the host in dequant_weight_raw; MUST NOT have a row
+#   arch-loaded   an arch crate owns the upload path; MUST NOT have a row
+#   non-weight    not a quantized weight tensor at all
+#   reserved      claimed for work not yet landed; the ONLY disposition exempt
+#                 from the STALE check, so a number can be held before its
+#                 QuantType variant exists. Convert the row when the code lands.
+#
+# Reserved / never reuse: 23, 25, 26, 27 (deliberately unassigned).
+#
+# Format:  <qt>  <name>  <disposition>  [reason — required unless passthrough]
+
+0   Q4F16G64      passthrough
+1   F16           host-decode  decoded on the host in dequant_weight_raw; deliberately not a table row
+2   F32           host-decode  decoded on the host in dequant_weight_raw; deliberately not a table row
+3   Q8F16         passthrough
+4   Q4K           passthrough
+5   Q8HFQ         passthrough
+6   HFQ4G256      passthrough
+7   HFQ4G128      passthrough
+8   HFQ6G256      passthrough
+9   HFQ2G256      passthrough
+10  HFQ2G128      passthrough
+11  HFQ3G256      passthrough
+12  HFQ3G128      passthrough
+13  MQ4G256       passthrough
+14  MQ8G256       passthrough
+15  MQ6G256       passthrough
+16  BF16          host-decode  decoded on the host in dequant_weight_raw; deliberately not a table row
+17  MQ3G256       passthrough
+18  MQ2G256       passthrough
+19  MQ2G256Lloyd  passthrough
+20  MQ3G256Lloyd  passthrough
+21  HFP4G32       passthrough
+22  TidI32        non-weight   index tensor (tid2eid), never a quantized weight
+24  MFP4G32       passthrough
+28  PARO4G128     arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
+29  PARO4G128T    arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
+30  MQ4G256Lloyd  passthrough
+31  MQ5G256       arch-loaded  qwen35 load.rs owns the MQ5 upload path
+32  MFP4G32Lloyd  arch-loaded  qwen35 load.rs owns the MFP4-Lloyd upload path
+33  MFP4G32P      arch-loaded  qwen35 load.rs owns the MFP4-P upload path
+34  MFP4G32E8     arch-loaded  qwen35 load.rs + deepseek4 dense_hfq_dtype own the E8 upload path
+35  MFP4G32E8SOA  arch-loaded  qwen35 load.rs + deepseek4 dense_hfq_dtype own the E8-SoA upload path
+36  MFP3G32E8     arch-loaded  qwen35 load.rs owns the MFP3-E8 upload path
+37  MFP2G32E8     arch-loaded  qwen35 load.rs owns the MFP2-E8 upload path
+38  MQ2G256GL     passthrough
+39  MQ3G256GL     passthrough
+40  TQ2G128       passthrough  PR #597 Bonsai ternary
+41  BQ1G128       passthrough  PR #597 Bonsai 1-bit; won the qt=41 adjudication 2026-08-18
+44  MQ4G256V2     passthrough
+45  MQ4CG256      passthrough
+47  MQ6G256V2     passthrough
+48  MQ5G256V2     passthrough
+49  MQ3G256V2     passthrough
+50  MQ2G256V2     passthrough

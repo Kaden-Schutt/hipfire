@@ -31,7 +31,9 @@
 //! device VRAM split is real there.
 
 use crate::hfq::HfqFile;
-use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights, PrefillScratch};
+use crate::llama::{
+    self, ForwardScratch, KvCache, KvCacheExt, LlamaConfig, LlamaWeights, PrefillScratch,
+};
 use crate::multi_gpu::Gpus;
 use hipfire_hardware::{DeviceMesh, DimKind};
 use rdna_compute::{DType, GpuTensor};
@@ -57,6 +59,70 @@ pub struct PpModel {
     bands: Vec<Range<usize>>,
     dim: usize,
     max_seq: usize,
+}
+
+/// Rollback ownership for `PpModel` construction (Oracle gate-1 blocker 5):
+/// every GPU resource `load_from_hfq_inner` acquires after `Gpus::from_mesh`
+/// becomes owned by this staging guard the moment it exists, so a failure at
+/// any later step frees every allocation on its owning device instead of
+/// leaking. Disarmed on success — the fields are moved into the final
+/// `PpModel`, so no resource is ever both guard-owned and model-owned.
+/// The rollback path and `PpModel::free` share one free-order helper.
+struct PpStaging {
+    gpus: Option<Gpus>,
+    weights: Option<LlamaWeights>,
+    /// Completed per-stage scratches; `Some` once the first stage is done
+    /// (each scratch is pushed the moment it is fully built, so a mid-loop
+    /// failure still frees every completed stage on its device).
+    scratch: Option<Vec<ForwardScratch>>,
+    kv: Option<KvCache>,
+}
+
+impl PpStaging {
+    fn gpus(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staged gpus")
+    }
+    fn gpus_ref(&self) -> &Gpus {
+        self.gpus.as_ref().expect("staged gpus")
+    }
+}
+
+/// Free PP-owned resources in `PpModel::free` order: the per-stage
+/// distributed weights, then the distributed KV cache, then each stage's
+/// scratch on its stage device. `Option` fields let a partially-built
+/// construction (rollback) and a complete model (free) share one path.
+fn free_pp_resources(
+    gpus: &mut Gpus,
+    weights: Option<LlamaWeights>,
+    kv: Option<KvCache>,
+    scratch: Option<Vec<ForwardScratch>>,
+) {
+    if let Some(weights) = weights {
+        weights.free_gpu_multi(gpus);
+    }
+    if let Some(kv) = kv {
+        kv.free_gpu_multi(gpus);
+    }
+    if let Some(scratch) = scratch {
+        for (s, sc) in scratch.into_iter().enumerate() {
+            let g = &mut gpus.devices[s];
+            let _ = g.bind_thread();
+            sc.free_gpu(g);
+        }
+    }
+}
+
+/// Per-device PP teardown shared by `PpModel::free` and construction
+/// rollback: invalidate weight caches + graph state and drain the pool so
+/// the VRAM returns to the system. Stages keep `active_stream = None` (the
+/// sync boundary path), so there is no stream to destroy.
+fn teardown_pp_devices(gpus: &mut Gpus) {
+    for dev in gpus.devices.iter_mut() {
+        let _ = dev.bind_thread();
+        dev.invalidate_weight_caches();
+        dev.invalidate_graph_state();
+        dev.drain_pool();
+    }
 }
 
 impl PpModel {
@@ -116,74 +182,142 @@ impl PpModel {
         let n_layers = config.n_layers;
         let dim = config.dim;
 
-        // `init_uniform` bands layers across stages (layer_to_device via
-        // uniform_split_counts — the same split `mesh.stage_for_layer` uses).
-        let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
+        // ── Construction rollback ownership (Oracle gate-1 blocker 5) ──
+        // After `Gpus::from_mesh`, every acquired GPU resource is owned by
+        // `staged` the moment it exists; a failure anywhere in the fallible
+        // construction below frees every staged resource on its owning
+        // device (free order shared with `PpModel::free`). On success the
+        // fields are moved out (disarm) into the final model — no resource
+        // is ever both guard-owned and model-owned.
+        let mut staged = PpStaging {
+            gpus: None,
+            weights: None,
+            scratch: None,
+            kv: None,
+        };
+        let construction = (|| -> Result<Vec<Range<usize>>, String> {
+            // `init_uniform` bands layers across stages (layer_to_device via
+            // uniform_split_counts — the same split `mesh.stage_for_layer` uses).
+            let gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
+            staged.gpus = Some(gpus);
 
-        // Layer bands from the device mapping (stage s = contiguous run of layers).
-        let mut bands: Vec<Range<usize>> = Vec::with_capacity(pp);
-        {
-            let mut s = 0usize;
-            let mut start = 0usize;
-            for l in 0..n_layers {
-                let d = gpus.device_for_layer(l);
-                if d != s {
-                    bands.push(start..l);
-                    s = d;
-                    start = l;
+            // Layer bands from the device mapping (stage s = contiguous run of
+            // layers).
+            let mut bands: Vec<Range<usize>> = Vec::with_capacity(pp);
+            {
+                let gpus = staged.gpus_ref();
+                let mut s = 0usize;
+                let mut start = 0usize;
+                for l in 0..n_layers {
+                    let d = gpus.device_for_layer(l);
+                    if d != s {
+                        bands.push(start..l);
+                        s = d;
+                        start = l;
+                    }
                 }
+                bands.push(start..n_layers);
             }
-            bands.push(start..n_layers);
-        }
-        if bands.len() != pp {
-            return Err(format!(
-                "PpModel: {} bands for pp={pp} (layer_to_device not contiguous?)",
-                bands.len()
-            ));
-        }
+            if bands.len() != pp {
+                return Err(format!(
+                    "PpModel: {} bands for pp={pp} (layer_to_device not contiguous?)",
+                    bands.len()
+                ));
+            }
 
-        // Per-stage-resident weights: embed on stage 0, final-norm/lm_head on the
-        // output stage, each layer on its band's device (Layout::from_gpus uses
-        // the same device_for_layer mapping as `bands`). The forward reads by
-        // global layer index; each stage only touches its band's (locally
-        // resident) entries.
-        let layout = crate::model_load::Layout::from_gpus(&gpus, n_layers);
-        let weights =
-            crate::hfq::load_weights_hfq_distributed(&hfq, &config, &mut gpus.devices, &layout)
-                .map_err(|e| format!("load_weights: {e:?}"))?;
+            // Per-stage-resident weights: embed on stage 0, final-norm/lm_head on
+            // the output stage, each layer on its band's device (Layout::from_gpus
+            // uses the same device_for_layer mapping as `bands`). The forward
+            // reads by global layer index; each stage only touches its band's
+            // (locally resident) entries.
+            let layout = crate::model_load::Layout::from_gpus(staged.gpus_ref(), n_layers);
+            let weights = crate::hfq::load_weights_hfq_distributed(
+                &hfq,
+                &config,
+                &mut staged.gpus().devices,
+                &layout,
+            )
+            .map_err(|e| format!("load_weights: {e:?}"))?;
+            staged.weights = Some(weights);
 
-        // Per-stage decode scratch (small residual buffers, one set per stage
-        // device).
-        let mut scratch = Vec::with_capacity(pp);
-        for s in 0..pp {
-            let g = &mut gpus.devices[s];
-            g.bind_thread().map_err(|e| format!("bind{s}: {e:?}"))?;
-            scratch.push(
-                ForwardScratch::new_with_max_seq(g, &config, max_seq)
-                    .map_err(|e| format!("scratch{s}: {e:?}"))?,
-            );
-        }
-        // One distributed KV cache: layer l's k/v on device_for_layer(l), global
-        // index. Replaces the prior `pp` full-length caches (pp× → 1× KV).
-        let kv = KvCache::new_gpu_q8_multi(
-            &mut gpus,
-            n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-        )
-        .map_err(|e| format!("kv: {e:?}"))?;
+            // Per-stage decode scratch (small residual buffers, one set per stage
+            // device). Each completed scratch is guard-owned the moment it exists.
+            for s in 0..pp {
+                let g = &mut staged.gpus().devices[s];
+                g.bind_thread().map_err(|e| format!("bind{s}: {e:?}"))?;
+                let sc = ForwardScratch::new_with_max_seq(g, &config, max_seq)
+                    .map_err(|e| format!("scratch{s}: {e:?}"))?;
+                staged
+                    .scratch
+                    .get_or_insert_with(|| Vec::with_capacity(pp))
+                    .push(sc);
+            }
+            // One distributed KV cache: layer l's k/v on device_for_layer(l),
+            // global index. Replaces the prior `pp` full-length caches (pp× → 1×
+            // KV).
+            let kv = KvCache::new_gpu_q8_multi(
+                staged.gpus(),
+                n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+            )
+            .map_err(|e| format!("kv: {e:?}"))?;
+            staged.kv = Some(kv);
 
-        // Peer access for the cross-stage boundary copy — enabled AFTER every
-        // stage's weights + scratch + KV are live. `enable_peer_all` does not
-        // retroactively map allocations made after the enable call (its
-        // documented contract), so calling it earlier would let post-alloc peer
-        // copies silently write nothing on real multi-GPU HW. NB: NO
-        // ensure_rank_streams / active_stream — stages stay on the sync memset +
-        // sync boundary path.
-        gpus.enable_peer_all()
-            .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+            // Test-only fault seam (Oracle gate-1 blocker 5): a deterministic
+            // mid-construction failure AFTER every owned GPU resource is live
+            // (the per-stage distributed weights, every stage's decode scratch,
+            // and the distributed KV cache). The one-shot arm is consumed here,
+            // so at most one construction attempt fails. Compiled out of
+            // production builds;
+            // `tests::failed_construction_reclaims_every_owned_gpu_allocation`
+            // proves every earlier allocation is reclaimed on its owning device.
+            #[cfg(test)]
+            if fault_seam::consume() {
+                return Err("pp_serve fault seam: forced failure after all GPU allocations".into());
+            }
 
+            // Peer access for the cross-stage boundary copy — enabled AFTER every
+            // stage's weights + scratch + KV are live. `enable_peer_all` does not
+            // retroactively map allocations made after the enable call (its
+            // documented contract), so calling it earlier would let post-alloc peer
+            // copies silently write nothing on real multi-GPU HW. NB: NO
+            // ensure_rank_streams / active_stream — stages stay on the sync memset +
+            // sync boundary path.
+            staged
+                .gpus()
+                .enable_peer_all()
+                .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+
+            Ok(bands)
+        })();
+        let bands = match construction {
+            Ok(bands) => bands,
+            Err(e) => {
+                // Rollback: free every staged resource in `PpModel::free`
+                // order on its owning device, invalidate caches/graphs and
+                // drain pools — the GPU is back at the pre-construction state
+                // before the error is returned.
+                if let Some(gpus) = staged.gpus.as_mut() {
+                    free_pp_resources(
+                        gpus,
+                        staged.weights.take(),
+                        staged.kv.take(),
+                        staged.scratch.take(),
+                    );
+                    teardown_pp_devices(gpus);
+                }
+                return Err(e);
+            }
+        };
+
+        // Disarm: move every staged resource into the final model — nothing
+        // is both guard-owned and model-owned after this point.
+        let gpus = staged.gpus.take().expect("staged gpus");
+        let weights = staged.weights.take().expect("staged weights");
+        let scratch = staged.scratch.take().expect("staged scratch");
+        let kv = staged.kv.take().expect("staged kv");
         Ok(PpModel {
             gpus,
             pp,
@@ -433,30 +567,59 @@ impl PpModel {
     /// reclaimed nothing (no freeing `Drop` on `GpuTensor` / `DeviceBuffer` /
     /// `GpuPool`, and `Gpu::drop` only re-binds), so a load/unload cycle leaked
     /// the model.
-    pub fn free(mut self) {
-        // Distributed weights: free each piece on its owning device.
-        self.weights.free_gpu_multi(&mut self.gpus);
-        // Distributed KV: free each layer's k/v on its owning device.
-        self.kv.free_gpu_multi(&mut self.gpus);
-        // Per-stage scratch (stage s on device s).
-        for (s, sc) in self.scratch.into_iter().enumerate() {
-            let g = &mut self.gpus.devices[s];
-            let _ = g.bind_thread();
-            sc.free_gpu(g);
-        }
-        // Actually release the freed buffers back to the system, per device.
-        for dev in self.gpus.devices.iter_mut() {
-            let _ = dev.bind_thread();
-            dev.invalidate_weight_caches();
-            dev.invalidate_graph_state();
-            dev.drain_pool();
-        }
-        // `self.gpus` drops here → tears down stage device contexts.
+    pub fn free(self) {
+        // Same free order the construction rollback uses: distributed weights,
+        // then distributed KV, then per-stage scratch, then the per-device
+        // teardown.
+        let PpModel {
+            gpus,
+            weights,
+            kv,
+            scratch,
+            ..
+        } = self;
+        let mut gpus = gpus;
+        free_pp_resources(&mut gpus, Some(weights), Some(kv), Some(scratch));
+        teardown_pp_devices(&mut gpus);
+        // `gpus` drops here → tears down stage device contexts.
     }
 }
 
 fn herr(e: hip_bridge::HipError) -> String {
     e.to_string()
+}
+
+/// Test-only one-shot fault hook for the PP constructor (compiled out of
+/// production builds). When armed, the next `load_from_hfq_inner` fails
+/// deterministically at the post-allocation seam in the constructor — after
+/// every owned GPU resource is live — and the arm is consumed, so at most one
+/// construction attempt can observe it. Atomic, so full-suite isolation needs
+/// no global lock beyond the tests' own `GPU_TEST_LOCK`.
+#[cfg(test)]
+mod fault_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL_NEXT_LOAD: AtomicBool = AtomicBool::new(false);
+
+    /// Arm the next PP construction to fail at the post-allocation seam.
+    pub fn arm_fail_next_load() {
+        FAIL_NEXT_LOAD.store(true, Ordering::SeqCst);
+    }
+
+    /// One-shot consume: returns true exactly once per arm.
+    pub fn consume() -> bool {
+        FAIL_NEXT_LOAD.swap(false, Ordering::SeqCst)
+    }
+
+    /// True while an arm is pending (tests assert the arm is consumed).
+    pub fn is_armed() -> bool {
+        FAIL_NEXT_LOAD.load(Ordering::SeqCst)
+    }
+
+    /// Clear any pending arm (suite-isolation backstop).
+    pub fn reset() {
+        FAIL_NEXT_LOAD.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -536,5 +699,95 @@ mod tests {
             err.contains("Pp axis with size>=2"),
             "expected pp>=2 error, got: {err}"
         );
+    }
+
+    /// Oracle gate-1 blocker 5 (PP): construction lacks rollback ownership —
+    /// a fallible step after GPU allocations (here: the post-allocation seam
+    /// before `enable_peer_all`) leaks every earlier owned resource. The arm
+    /// fires only after the per-stage distributed weights, every stage's
+    /// decode scratch and the distributed KV cache are live, so a correct
+    /// rollback must free them all on their owning devices. Fails today:
+    /// those allocations stay hipMalloc'd and each device's free VRAM stays
+    /// below the warm baseline. Uses the shared dense-llama fixture + GPU
+    /// helpers from `crate::tp_serve::test_support`.
+    #[test]
+    fn failed_construction_reclaims_every_owned_gpu_allocation() {
+        use crate::tp_serve::test_support;
+        use rdna_compute::Gpu;
+
+        // Same gate as the other GPU tests: skip cleanly on GPU-less CI.
+        if Gpu::init().is_err() {
+            eprintln!("skip: no GPU");
+            return;
+        }
+        let _lock = test_support::GPU_TEST_LOCK.lock().unwrap();
+        let _emulate = test_support::EnvGuard::set("HIPFIRE_EMULATE_GPUS", "2");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = test_support::write_dense_llama_hfq(&dir);
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+
+        // Probe handles for per-device VRAM observation — same mesh/degree as
+        // the constructor's `Gpus`, kept alive across baseline and post-failure
+        // reads so its own context overhead cancels out.
+        let mut probe =
+            Gpus::from_mesh(&mesh, test_support::N_LAYERS).expect("probe Gpus must bind");
+
+        // Warm-up cycle: one successful load + free absorbs one-time driver /
+        // kernel residency, so the measured baseline is stable.
+        {
+            let model = PpModel::load_from_hfq_inner(&hfq, &mesh, test_support::MAX_SEQ)
+                .expect("warm-up PP load must succeed");
+            model.free();
+        }
+        for dev in probe.devices.iter_mut() {
+            dev.drain_pool();
+        }
+        let baseline: Vec<usize> = probe.devices.iter().map(test_support::vram_free).collect();
+
+        // Forced mid-construction failure at the post-allocation seam.
+        fault_seam::reset();
+        fault_seam::arm_fail_next_load();
+        let err = match PpModel::load_from_hfq_inner(&hfq, &mesh, test_support::MAX_SEQ) {
+            Ok(_) => panic!("armed PP fault must fail the construction"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("fault seam"),
+            "expected the post-allocation seam to fail, got: {err}"
+        );
+        assert!(
+            !fault_seam::is_armed(),
+            "fault arm must be one-shot (consumed by the failed construction)"
+        );
+
+        // Every owning device must have reclaimed all earlier allocations.
+        for (d, &base) in baseline.iter().enumerate() {
+            let after = test_support::vram_free(&probe.devices[d]);
+            assert!(
+                base.abs_diff(after) < test_support::VRAM_TOLERANCE,
+                "device {d}: VRAM not reclaimed after failed PP construction \
+                 (Oracle gate-1 blocker 5): baseline={base} after={after} \
+                 delta={} — every owned allocation must be freed on its device",
+                base.saturating_sub(after)
+            );
+        }
+
+        // Success cycle after the failure: the GPU must remain usable and a
+        // full load + free must return VRAM to the same baseline.
+        {
+            let model = PpModel::load_from_hfq_inner(&hfq, &mesh, test_support::MAX_SEQ)
+                .expect("PP load must succeed after the forced failure");
+            model.free();
+        }
+        for (d, &base) in baseline.iter().enumerate() {
+            let after = test_support::vram_free(&probe.devices[d]);
+            assert!(
+                base.abs_diff(after) < test_support::VRAM_TOLERANCE,
+                "device {d}: VRAM not recovered after the post-failure success cycle: \
+                 baseline={base} after={after}"
+            );
+        }
     }
 }

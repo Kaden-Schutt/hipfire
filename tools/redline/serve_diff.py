@@ -22,6 +22,7 @@ from tools.redline.product_bench import (
     backend_config_value,
     collect_route_proof_evidence,
     load_pm4_multiturn_session,
+    sampled_output_parity_errors,
     validate_coherence_route_evidence,
 )
 
@@ -33,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--session", required=True)
-    parser.add_argument("--daemon", default=str(REPO / "target/release/examples/daemon"))
+    parser.add_argument("--daemon", default=str(REPO / "target/release/daemon"))
     parser.add_argument("--cli", default=str(REPO / "target/release/hipfire"))
     parser.add_argument("--device", default="0")
     parser.add_argument("--kv", choices=("q8", "fwht2", "fwht3", "fwht4"), default="q8")
@@ -80,7 +81,6 @@ def _validate_arm(turns: list[dict], rows: object, backend: str, route: dict) ->
     errors.extend(f"{backend}: {error}" for error in route_result["errors"])
     return errors
 
-
 def validate_comparison(
     turns: list[dict],
     hip_rows: object,
@@ -93,22 +93,30 @@ def validate_comparison(
         errors.append(f"session must contain exactly 8 turns, got {len(turns)}")
     errors.extend(_validate_arm(turns, hip_rows, "hip", hip_route))
     errors.extend(_validate_arm(turns, pm4_rows, "auto", pm4_route))
+    # Exact sampled-output parity; substring/semantic checks are health hints only.
+    parity_errors = sampled_output_parity_errors(hip_rows, pm4_rows, label="")
+    errors.extend(parity_errors)
+    # Derive matched_turns from parity result; count turns with no parity error.
     matched = 0
-    if isinstance(hip_rows, list) and isinstance(pm4_rows, list):
-        for index, (hip, pm4) in enumerate(zip(hip_rows, pm4_rows), 1):
-            if not isinstance(hip, dict) or not isinstance(pm4, dict):
-                continue
-            turn_matches = True
-            if hip.get("assistant_content") != pm4.get("assistant_content"):
-                errors.append(f"turn {index}: sampled output differs between HIP and PM4")
-                turn_matches = False
-            if hip.get("ctx") != pm4.get("ctx"):
-                errors.append(f"turn {index}: prompt-token count differs between HIP and PM4")
-                turn_matches = False
-            if hip.get("gen") != pm4.get("gen"):
-                errors.append(f"turn {index}: generated-token count differs between HIP and PM4")
-                turn_matches = False
-            matched += int(turn_matches)
+    if isinstance(hip_rows, list) and isinstance(pm4_rows, list) and len(hip_rows) == len(pm4_rows):
+        if not parity_errors:
+            matched = len(turns) if len(hip_rows) == len(turns) else len(hip_rows)
+        else:
+            import re
+
+            error_turns: set[int] = set()
+            has_non_turn_error = False
+            for msg in parity_errors:
+                m = re.search(r"turn (\d+):", msg)
+                if m:
+                    error_turns.add(int(m.group(1)))
+                else:
+                    has_non_turn_error = True
+            if has_non_turn_error:
+                matched = 0
+            else:
+                total = len(turns) if len(hip_rows) == len(turns) else len(hip_rows)
+                matched = max(0, total - len(error_turns))
     return {
         "valid": not errors,
         "errors": errors,

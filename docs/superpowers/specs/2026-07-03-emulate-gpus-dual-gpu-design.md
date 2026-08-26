@@ -4,6 +4,21 @@
 **Branch:** `feature/parallel-expansion`
 **Status:** design approved, pending spec review
 
+> **SUPERSEDED — historical (2026-08-26 mainline merge).** This design's
+> behavior no longer matches the merged control plane. `HIPFIRE_EMULATE_GPUS`
+> remains env-only **hardware-resolution emulation** (`hipfire-hardware`
+> `resolve_device_ids` aliasing), but it **no longer defaults `tp`**: the
+> `resolve_parallelism` "default mode is TP" precedence was deleted with the
+> pre-merge runtime config, and the daemon parallelizes only on explicit
+> `params.pp` / `params.tp` / `params.ep` (non-legacy loads are preflighted by
+> `hipfire_loader::admit_path`; the legacy non-VL Qwen3.5 HFQ `pp>1` path is
+> exempt and classified before admission). `HIPFIRE_PP` and the TypeScript/Bun CLI
+> (`cli/index.ts`, `buildLoadMessage`) were deleted; the native Rust CLI
+> forwards `serve --tp N` as `params.tp` and has no `--pp`/`--ep` flags.
+> Keep as provenance; current semantics live in
+> [`docs/multi-gpu.md`](../../multi-gpu.md) and
+> [`docs/env-vars.md`](../../env-vars.md).
+
 ## Problem
 
 hipfire's multi-GPU code paths — pipeline-parallel (PP, qwen35 arch 5/6) and

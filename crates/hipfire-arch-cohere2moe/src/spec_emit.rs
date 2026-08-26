@@ -278,7 +278,12 @@ fn to_tool_calls(calls: &[serde_json::Value]) -> Vec<ToolCall> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            Some(ToolCall { name, arguments })
+            Some(ToolCall {
+                id: None,
+                name,
+                arguments,
+                rendered_body: None,
+            })
         })
         .collect()
 }

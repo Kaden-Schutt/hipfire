@@ -67,7 +67,7 @@ if [ "$FAST" -eq 1 ] && [ "$FULL" -eq 1 ]; then
     exit 2
 fi
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 V4F_MODEL="$MODELS_DIR/deepseek-v4-flash.mq2lloyd"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-deepseek4-recall-$(date +%Y%m%d-%H%M%S).md}"
@@ -82,7 +82,7 @@ else
     for src in crates/hipfire-arch-deepseek4/src/arch.rs \
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
                crates/hipfire-arch-deepseek4/src/forward.rs \
-               crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
@@ -92,7 +92,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "coherence-gate-deepseek4-recall: rebuilding daemon..."
-    if ! cargo build --release --example daemon >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "coherence-gate-deepseek4-recall: build failed" >&2
         exit 2
     fi

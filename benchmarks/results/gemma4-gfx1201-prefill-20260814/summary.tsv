@@ -1,0 +1,5 @@
+model	policy	prefill_tok_s_median	ttft_ms_median	decode_tok_s_median	completed	errors
+e2b	off	1365.125	574.190	96.97	30	0
+e2b	auto	2890.540	275.578	95.24	30	0
+e4b	off	989.360	790.524	65.04	30	0
+e4b	auto	1802.975	437.593	64.26	30	0

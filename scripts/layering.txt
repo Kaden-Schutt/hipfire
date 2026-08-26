@@ -1,0 +1,59 @@
+# Committed layer assignment for scripts/check-layering.py.
+#
+# Derived ONCE from the Cargo graph on 2026-08-16, then frozen here. The
+# checker asserts the current graph against THIS file; it does not recompute
+# the ordering from the graph it is checking.
+#
+# That distinction is the whole point. The first version of this check derived
+# the arch band from the graph under test, so adding an upward edge simply
+# moved the band and the check passed -- verified by injecting
+# `hipfire-arch-llama -> hipfire-pflash`, which it did not catch. A check that
+# generates its own expected value validates nothing. Same defect as
+# check-crate-maps.py reporting 296 public items as 0 while --check passed.
+#
+# A crate may depend only on crates with a STRICTLY LOWER layer number.
+# Moving a crate between layers is a deliberate, reviewable edit to this file.
+#
+# Format: <layer> <crate>
+
+ 0 hipfire-atlas
+ 0 hipfire-config
+ 0 hipfire-detect
+ 0 radiowave
+ 0 redline
+ 1 hip-bridge
+ 1 hipfire-client
+ 1 hipfire-registry
+ 1 hsa-bridge
+ 1 redline-rocr
+ 2 hipfire-tui
+ 2 redline-dispatch
+ 3 rdna-compute
+ 5 hipfire-dispatch
+ 4 hipfire-hardware
+ 4 saddle-core
+ 6 hipfire-runtime
+ 7 hipfire-arch-cohere2moe
+ 7 hipfire-arch-gemma4
+ 7 hipfire-arch-llama
+ 7 hipfire-arch-muse-glimmer
+ 7 hipfire-arch-qwen2
+ 7 hipfire-arch-qwen35-vl
+ 7 hipfire-arch-toy
+ 7 hipfire-dispatch-tests
+ 7 hipfire-ds4-parent
+ 7 hipfire-reap
+ 8 hipfire-arch-deepseek4
+ 8 hipfire-arch-dots-ocr
+ 8 hipfire-arch-lfm2moe
+ 8 hipfire-arch-minimax
+ 8 hipfire-arch-qwen35
+ 8 hipfire-quantize
+ 8 saddle-quant
+ 9 hipfire-cli
+ 9 hipfire-loader
+ 9 hipfire-pflash
+10 hipfire-engine
+11 hipfire-generate
+11 saddle-lab
+12 hipfire-daemon

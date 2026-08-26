@@ -310,7 +310,7 @@ def run_adaptive(args, preset, outdir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--daemon", default=str(REPO / "target/release/examples/daemon"))
+    ap.add_argument("--daemon", default=str(REPO / "target/release/daemon"))
     ap.add_argument("--model", default=str(Path("~/.hipfire/models/qwen3.5-9b.mq4").expanduser()))
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--out", default=f"/tmp/vmm-kv-matrix-{int(time.time())}")

@@ -20,7 +20,7 @@
 //! `get(tensor_name_without_dot_weight_suffix, 0)` per MQ4G256 tensor.
 
 use byteorder::{ByteOrder, LittleEndian};
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -154,11 +154,12 @@ impl HessianSidecar {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Hint sequential access: the quantizer walks tensor-by-tensor.
+        // `memmap2::Advice` only exists on unix; on other platforms the hint
+        // is a no-op and the call is compiled out entirely.
         #[cfg(unix)]
         {
-            mmap.advise(Advice::Sequential).ok();
+            mmap.advise(memmap2::Advice::Sequential).ok();
         }
-        let _ = Advice::Sequential; // silence unused on non-unix
 
         if mmap.len() < HEADER_SIZE {
             return Err(HessianError::TruncatedFile {
@@ -334,6 +335,7 @@ impl HessianSidecar {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     /// Build a minimal v1 HFHS file with two tiny tensors for round-trip
@@ -450,5 +452,41 @@ mod tests {
         let sc = HessianSidecar::open(tf.path()).unwrap();
         let ta = sc.get("tA", 0).unwrap();
         HessianSidecar::check_positive_diagonal(&ta).expect("tA has positive diagonal");
+    }
+
+    /// Python `reference_gptq/formats.py` writer → Rust `HessianSidecar` reader.
+    /// Fixture produced by `reference_gptq/make_fixtures.py` from the format contract.
+    #[test]
+    fn python_fixture_hfhs_roundtrip() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("reference_gptq/fixtures/smoke.hfhs");
+        assert!(path.is_file(), "missing fixture {path:?}; run reference_gptq/make_fixtures.py");
+        let sc = HessianSidecar::open(&path).expect("open python HFHS fixture");
+        assert_eq!(sc.n_tensors(), 2);
+
+        let t0 = sc.get("model.layers.0.q_proj", 0).expect("q_proj");
+        assert_eq!(t0.k, 2);
+        assert_eq!(t0.dtype, HessianDtype::F32);
+        assert_eq!(t0.at(0, 0), 1.0);
+        assert_eq!(t0.at(0, 1), 0.25);
+        assert_eq!(t0.at(1, 0), 0.25);
+        assert_eq!(t0.at(1, 1), 2.0);
+
+        let t1 = sc.get("model.layers.1.mlp.down_proj", 3).expect("down_proj expert 3");
+        assert_eq!(t1.k, 3);
+        assert_eq!(t1.dtype, HessianDtype::F32);
+        assert!((t1.at(0, 0) - 3.0).abs() < 1e-6);
+        assert!((t1.at(2, 2) - 5.0).abs() < 1e-6);
+        // Wrong expert → miss
+        assert!(sc.get("model.layers.1.mlp.down_proj", 0).is_none());
+
+        let mut path64 = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path64.push("reference_gptq/fixtures/smoke_f64.hfhs");
+        let sc64 = HessianSidecar::open(&path64).expect("open f64 fixture");
+        let tb = sc64.get("tB", 0).expect("tB");
+        assert_eq!(tb.dtype, HessianDtype::F64);
+        assert_eq!(tb.at(0, 0), 3.0);
+        assert_eq!(tb.at(1, 1), 4.0);
+        assert_eq!(tb.at(2, 2), 5.0);
     }
 }

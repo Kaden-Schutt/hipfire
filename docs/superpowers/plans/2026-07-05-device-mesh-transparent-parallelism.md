@@ -1,5 +1,22 @@
 # Engine-level transparent PP/TP/EP — North-star design + phased roadmap
 
+> **SUPERSEDED — historical (2026-08-26 mainline merge).** This plan's
+> `resolve_mesh` / `resolve_parallelism` routing design and its
+> `HIPFIRE_PP`-via-Bun-CLI text describe the pre-merge feature branch. In the
+> merged mainline both precedence helpers were deleted: non-legacy load
+> requests are preflighted by `hipfire_loader::admit_path`
+> (`daemon_load_plan`; refusals surface before any unload), and only admitted
+> dense TP/PP continues through `load_admitted`, which routes the mesh via
+> `select_load_mesh` (`crates/hipfire-loader/src/lib.rs`; `effective_load_mesh`
+> is the normalized-admission branch), served end-to-end via the MeshCarrier
+> route (`tp_model` / `pp_model`, HFQ-only). EP loads
+> (`load_model_ep_with_kv_mode`), single-device loads
+> (`load_model_with_gemma4_drafter`), and the legacy non-VL Qwen3.5 HFQ
+> `pp>1` exemption keep their own continuations; `params.ep` folds into the
+> admitted parallel request; `HIPFIRE_EMULATE_GPUS` stays env-only emulation
+> with no auto-promotion. Keep as provenance; current semantics live in
+> [`docs/multi-gpu.md`](../../multi-gpu.md).
+
 > Revised after a 3-reviewer adversarial pass (correctness, completeness, phasing). Findings integrated; two reviewer claims rejected with evidence (noted inline); the "maximal transparency" ambition kept but made reachable via explicit prerequisite phases.
 
 > ⚠️ **PIVOT (2026-07-06) — READ `## PIVOT` BELOW FIRST.** The master merge (`5b95cbd3`, 519 commits) landed master's new `dense_forward`→`execute_steps` dense spine (commit `2a41f98f`) and **reverted** this branch's `3a3c60e5` (qwen2 → `run_layer_program_mesh`). The plan's central §1 thesis — "ONE executor = `run_layer_program(mesh, gpus, …)`" on the `SuperOp`/`ForwardBindings` path — is **superseded**: the real universal chokepoint is `execute_steps` (63 call sites vs `run_layer_program`'s ~4 direct, 9 incl. `_ep`/`_mesh`). The new spine is **`execute_steps(mesh, gpus, …)`**. Sections §0a/§0b(crate)/§4(loader)/§5/§6 and the mesh-tree/manifest/safety design **remain valid**; §1, §3's SuperOp framing, and the phase table are re-sequenced in `## PIVOT`. Everything below the PIVOT section is the original design record, kept for provenance.

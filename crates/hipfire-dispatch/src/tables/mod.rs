@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
+pub mod attention_table;
+pub mod fused_qkv_table;
 pub mod gemm_table;
 pub mod gemv_table;
 pub mod moe_table;
 pub mod rotation_table;
-pub mod attention_table;
-pub mod fused_qkv_table;
 
-use std::collections::HashMap;
 use crate::context::DispatchCtx;
-use crate::types::{ArchPredicate, DispatchError, KernelKey, KernelVariant, ShapeInfo, ShapePredicate};
+use crate::types::{
+    ArchPredicate, DispatchError, KernelKey, KernelVariant, ShapeInfo, ShapePredicate,
+};
+use std::collections::HashMap;
 
 /// Kernel registry. Built once via `register`, frozen, read-only thereafter.
 pub struct KernelRegistry {
@@ -19,7 +21,9 @@ pub struct KernelRegistry {
 
 impl KernelRegistry {
     pub fn new() -> Self {
-        Self { table: HashMap::new() }
+        Self {
+            table: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, entry: KernelVariant) {
@@ -37,7 +41,9 @@ impl KernelRegistry {
         ctx: &DispatchCtx,
         shape: Option<&ShapeInfo>,
     ) -> Result<&KernelVariant, DispatchError> {
-        let variants = self.table.get(&key)
+        let variants = self
+            .table
+            .get(&key)
             .ok_or(DispatchError::NotFound { key })?;
 
         for variant in variants {
@@ -107,6 +113,7 @@ impl ArchPredicate {
             Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
             Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
+            Self::IsGfx942 => ctx.arch.is_gfx942(),
         }
     }
 }

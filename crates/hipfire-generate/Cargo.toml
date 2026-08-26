@@ -1,0 +1,51 @@
+[package]
+name = "hipfire-generate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-architecture generation bodies, lifted out of the daemon binary."
+
+# LAYERING — this crate exists to break a specific deadlock, documented in
+# docs/governance/2026-08-15-hipfire-leanup-map.md § 4.
+#
+# The per-architecture generation bodies need BOTH arch types AND the shared
+# daemon machinery. Neither existing layer can host them:
+#
+#   hipfire-loader  has 11 arch deps, but sits BELOW hipfire-engine
+#   hipfire-engine  sits above the loader, but has 0 arch deps by design
+#
+# So they live here, above both:
+#
+#   saddle-core -> hipfire-runtime -> hipfire-loader -> hipfire-engine
+#                  -> hipfire-generate -> hipfire-daemon
+#
+# This is what lets the daemon reach zero arch-crate references while the
+# generation code stays where it can actually see the architectures.
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+rdna-compute = { path = "../rdna-compute" }
+saddle-core = { path = "../saddle-core" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-loader = { path = "../hipfire-loader" }
+hipfire-engine = { path = "../hipfire-engine" }
+hipfire-pflash = { path = "../hipfire-pflash" }
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+
+[features]
+serve-fault-inject = ["hipfire-runtime/serve-fault-inject"]

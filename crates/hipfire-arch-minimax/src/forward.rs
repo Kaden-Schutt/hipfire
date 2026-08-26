@@ -28,17 +28,22 @@
 //! kept OUTSIDE the captured region (token_id is baked into its kernarg).
 
 use crate::minimax::{
-    minimax_single_moe_authority, MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
+    minimax_single_moe_authority, ExpertLoadLayout, MiniMaxConfig, MiniMaxLayerWeights,
+    MiniMaxState, MiniMaxWeights, SingleMoeAuthority,
 };
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::superop::{
+    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
+};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
+use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError, RotationPlan};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
 };
 use hipfire_runtime::moe_plan::{
-    execute_lowered_moe, lower_moe_steps, MoEExecutionKind, MoEExecutionPolicy, MoeExecutionTarget,
-    MoeProgramParts, RoutedMoeStepPhases,
+    execute_lowered_moe, lower_moe_steps, LoweredMoeProgram, MoEExecutionKind, MoEExecutionPolicy,
+    MoeExecutionTarget, MoeProgramParts, RoutedMoeStepPhases,
 };
 use hipfire_runtime::weight_manifest::ExpertGroupPlan;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -53,9 +58,13 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    // Single authority at the PUBLIC entry — BEFORE the embedding lookup: an
+    // EP/TP-loaded model refuses here (layout gate) instead of mutating state.
+    // The borrow is passed into the body (no duplicate/late admission).
+    let authority = minimax_single_moe_authority(weights, cfg)?;
     gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, cfg.hidden_size)
         .map_err(|e| format!("minimax: embed lookup: {e:?}"))?;
-    decode_step_body(cfg, weights, state, gpu, position, None)?;
+    decode_step_body(cfg, weights, state, gpu, position, None, &authority)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("minimax: download logits: {e:?}"))
 }
@@ -74,9 +83,19 @@ pub fn decode_step_capture(
     position: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
+    // Single authority at the PUBLIC entry — before embed (see decode_step).
+    let authority = minimax_single_moe_authority(weights, cfg)?;
     gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, cfg.hidden_size)
         .map_err(|e| format!("minimax: embed lookup: {e:?}"))?;
-    decode_step_body(cfg, weights, state, gpu, position, Some(capture))
+    decode_step_body(
+        cfg,
+        weights,
+        state,
+        gpu,
+        position,
+        Some(capture),
+        &authority,
+    )
 }
 
 /// Decode one token via hipGraph capture/replay. **Opt-in, default OFF**
@@ -109,6 +128,10 @@ pub fn decode_step_with_graph(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    // Single authority at the PUBLIC entry — before embed/pos/stream setup:
+    // an EP/TP-loaded model refuses here (layout gate) instead of mutating
+    // state. The borrow is passed into the captured body.
+    let authority = minimax_single_moe_authority(weights, cfg)?;
     use std::sync::OnceLock;
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env_override = *GRAPH_ENV.get_or_init(|| {
@@ -166,7 +189,7 @@ pub fn decode_step_with_graph(
         gpu.graphs
             .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("minimax begin_graph_capture: {e:?}"))?;
-        decode_step_body(cfg, weights, state, gpu, position, None)?;
+        decode_step_body(cfg, weights, state, gpu, position, None, &authority)?;
         gpu.graphs
             .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("minimax end_graph_capture: {e:?}"))?;
@@ -208,13 +231,10 @@ fn decode_step_body(
     gpu: &mut Gpu,
     position: u32,
     mut capture: Option<&mut [Vec<f32>]>,
+    authority: &SingleMoeAuthority<'_>,
 ) -> Result<(), String> {
-    let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
-    let inter = cfg.intermediate_size;
-    let n_exp = cfg.num_local_experts;
-    let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
     let capture_postattn =
@@ -231,17 +251,13 @@ fn decode_step_body(
             .map_err(|e| format!("minimax: htod pos: {e:?}"))?;
     }
 
-    // Single-rank MoE authority: the common accessor shared with
-    // `forward_batch` — the stable canonical single policy (ONE object per
-    // model — never a per-token reconstruction: a fresh
-    // `MoEExecutionPolicy::single()` carries a fresh mesh epoch, which the
-    // exact-policy cache key would reject) plus the model-owned cached
-    // expert-manifest resolution bound to it. The cache resolves ONCE through
-    // the shared policy-aware resolver (authoritative `MiniMaxM2::weight_manifest`
-    // + policy-aware `expert_group_manifest` specs); every later token
-    // re-checks the exact key and borrows the identical cached plans by layer
-    // — no per-token allocation, no local plan fabrication.
-    let authority = minimax_single_moe_authority(weights, cfg)?;
+    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 (default)
+    // routes the per-layer decode through the super-op executor
+    // (run_layer_program). Skipped when capturing (oracle dumper needs the
+    // hand path).
+    if minimax_forward_lowered_enabled() && capture.is_none() {
+        return decode_step_body_lowered(cfg, weights, state, gpu, position, authority);
+    }
 
     for (l, layer) in weights.layers.iter().enumerate() {
         let ctx = DispatchCtx::new(gpu);
@@ -251,31 +267,12 @@ fn decode_step_body(
             .map_err(|e| format!("minimax L{l}: {e}"))?;
 
         // Per-LAYER QK-norm: RMSNorm over the whole flat q[q_dim]/k[kv_dim]
-        // vector (batch=1), BEFORE head reshape. STEP-004 Inc 5: via
-        // Step::QkNorm with n_groups=1 (the flat form) — dispatches the exact
-        // original rmsnorm_batched kernel.
+        // vector (batch=1), BEFORE head reshape.
         if cfg.use_qk_norm {
-            execute_steps(
-                gpu,
-                &ctx,
-                &[
-                    Step::QkNorm {
-                        x: &state.fa_q,
-                        weight: &layer.q_norm,
-                        n_groups: 1,
-                        head_dim: q_dim,
-                        eps,
-                    },
-                    Step::QkNorm {
-                        x: &state.fa_k,
-                        weight: &layer.k_norm,
-                        n_groups: 1,
-                        head_dim: kv_dim,
-                        eps,
-                    },
-                ],
-            )
-            .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
+            gpu.rmsnorm_batched(&state.fa_q, &layer.q_norm, &state.fa_q, 1, q_dim, eps)
+                .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
+            gpu.rmsnorm_batched(&state.fa_k, &layer.k_norm, &state.fa_k, 1, kv_dim, eps)
+                .map_err(|e| format!("minimax L{l}: k_norm: {e:?}"))?;
         }
 
         // Partial rotate_half RoPE on the first `rotary_dim` of each head.
@@ -352,93 +349,12 @@ fn decode_step_body(
         // Admission pin (shared with forward_batch): the layer-`l` plan must
         // exist, be layer-scoped, and be Single-admitted before the MoE
         // kernels of this layer run; the lowered program then uses that
-        // validated plan.
-        let plan = authority.plan_for_layer(l)?;
-        // ffn_tmp = rmsnorm(h) (plain, feeds the Q8 router); ffn_x_rot =
-        // FWHT(ffn_tmp) (feeds the FWHT-pre-rotated experts). STEP-004 Inc 5:
-        // the norm runs through Step::RmsnormAutomatic (the same rmsnorm_f32
-        // kernel); the FWHT rotate and the router GEMV stay direct — they
-        // live OUTSIDE the routed program (no Step twin for fused
-        // rmsnorm+rotate / the router projection).
-        execute_steps(
-            gpu,
-            &ctx,
-            &[Step::RmsnormAutomatic {
-                x: &state.h,
-                norm_weight: &layer.ffn_norm,
-                x_plain: &state.ffn_tmp,
-                out: &state.ffn_tmp,
-                awq_scale: None,
-                k: hidden,
-                eps,
-                rotation: RotationPlan::None,
-            }],
-        )
-        .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
-        rotate_x_mq_for(
-            gpu,
-            &layer.experts[0].gate_up,
-            &state.ffn_tmp,
-            &state.ffn_x_rot,
-            hidden,
-        )
-        .map_err(|e| format!("minimax L{l}: ffn rotate: {e:?}"))?;
-        weight_gemv(gpu, &layer.router, &state.ffn_tmp, &state.router_logits)
-            .map_err(|e| format!("minimax L{l}: router: {e}"))?;
-
-        // Routed program (sigmoid → bias-aware top-k → gate_up →
-        // silu·mul·rotate → down [+ combine]): built per layer from the shared
-        // Step building blocks (ScoreActivation / MoeRoute / IndexedMoeGemv /
-        // MoeActivation / MoeCombine) and executed through the runtime
-        // lowerer's sealed Single executor. The launch schedule (zeroing /
-        // collective placement) is derived exclusively from the concrete
-        // borrowed steps plus the canonical single policy — the dtype
-        // dispatch that used to live here is now the parts builder's down
-        // classification (expanded+combine vs residual self-combine).
-        let gu_ref = hipfire_dispatch::families::moe::MoeExpertRef {
-            gate_up_ptrs: &layer.expert_gate_up_ptrs,
-            down_ptrs: &layer.expert_down_ptrs,
-            dummy_gate_up: layer.dummy_gate_up.as_ref(),
-            dtype: layer.experts[0].gate_up.gpu_dtype,
-            n_experts: n_exp,
-            expert_m: inter,
-            expert_k: hidden,
-            owned: &[],
-        };
-        let down_ref = hipfire_dispatch::families::moe::MoeExpertRef {
-            gate_up_ptrs: &layer.expert_gate_up_ptrs,
-            down_ptrs: &layer.expert_down_ptrs,
-            dummy_gate_up: layer.dummy_gate_up.as_ref(),
-            dtype: layer.experts[0].down.gpu_dtype,
-            n_experts: n_exp,
-            expert_m: inter,
-            expert_k: hidden,
-            owned: &[],
-        };
-        let inputs = MinimaxMoeInputs {
-            scores: &state.router_logits,
-            gate_bias: &layer.routing_bias,
-            topk_indices: &state.topk_indices,
-            topk_weights: &state.topk_weights,
-            x_rot: &state.ffn_x_rot,
-            gate_batch: &state.gate_batch,
-            up_batch: &state.up_batch,
-            rot_batch: &state.rot_batch,
-            down_expanded: &state.down_expanded,
-            partial: &state.h,
-            // The single-rank axis never admits the int64 down (the lowerer
-            // rejects I64OnNonAdmittedAxis), so the single path is always f32.
-            partial_i64: None,
-            gu_ref: &gu_ref,
-            down_ref: &down_ref,
-            awq_scale: layer.experts[0].down.awq_scale.as_ref(),
-        };
-        let parts = minimax_moe_program(&inputs, k_top, n_exp, inter, hidden, false);
-        let program = lower_moe_steps(plan, authority.policy(), parts)
-            .map_err(|e| format!("minimax L{l}: lower_moe_steps: {e}"))?;
-        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-        execute_lowered_moe(&program, MoeExecutionTarget::Single { gpu, ctx: &ctx })
-            .map_err(|e| format!("minimax L{l}: execute_lowered_moe: {e:?}"))?;
+        // validated plan. The routed program (sigmoid → bias-aware top-k →
+        // gate_up → silu·mul·rotate → down [+ combine]) is built from the
+        // shared Step building blocks and runs through the sealed Single
+        // executor — the same execution the super-op path uses (no second
+        // direct routed execution).
+        minimax_moe_single_step(gpu, cfg, layer, state, l, &state.h, &authority)?;
 
         // Capture post-layer residual (pre final-norm) for the oracle compare.
         if !capture_postattn {
@@ -452,49 +368,25 @@ fn decode_step_body(
     }
     state.n_tokens = seq_len;
 
-    // Final RMSNorm + lm_head (Q8 → plain). STEP-004 Inc 5: via Steps — the
-    // same kernels (rmsnorm_f32 + run_auto GEMV).
-    let w_head = weights.lm_head.dispatch_ref();
-    let ctx = DispatchCtx::new(gpu);
-    execute_steps(
-        gpu,
-        &ctx,
-        &[
-            Step::RmsnormAutomatic {
-                x: &state.h,
-                norm_weight: &weights.final_norm,
-                x_plain: &state.final_norm_buf,
-                out: &state.final_norm_buf,
-                awq_scale: None,
-                k: hidden,
-                eps,
-                rotation: RotationPlan::None,
-            },
-            Step::Gemv {
-                w: &w_head,
-                input: GemvInput::Raw(&state.final_norm_buf),
-                out: &state.logits,
-            },
-        ],
-    )
-    .map_err(|e| format!("minimax: final rmsnorm/lm_head: {e:?}"))?;
+    // Final RMSNorm + lm_head (Q8 → plain).
+    gpu.rmsnorm_f32(&state.h, &weights.final_norm, &state.final_norm_buf, eps)
+        .map_err(|e| format!("minimax: final rmsnorm: {e:?}"))?;
+    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+        .map_err(|e| format!("minimax: lm_head: {e}"))?;
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Phase 3 · Task 7 — MoE program parts + lowered execution (adapter core).
+// #397 Ship 6 — forward-as-pipeline: MiniMax-M2 lowered decode (mechanical reuse).
 //
-// The bespoke per-layer MoE sequencing (the old decode_step_body MoE arm /
-// minimax_ep_moe_step step lists) is replaced by a single shared parts
-// builder over the dispatch crate's Step building blocks (ScoreActivation /
-// MoeRoute / IndexedMoeGemv / MoeActivation / MoeCombine / ConvertI64ToF32),
-// lowered by the runtime lowerer and executed by the sealed executor. The
-// launch schedule (zeroing, i64-vs-f32 collective placement) is derived
-// exclusively from the concrete borrowed steps plus the caller-owned
-// `MoEExecutionPolicy` — never from a locally reconstructed mesh. Family
-// scaling (the FWHT input rotation, the router projection, rmsnorm) lives
-// OUTSIDE the routed program as direct kernels; route_scale = 1.0 (MiniMax
-// applies no routed-scaling factor) is captured inside the MoeRoute step.
+// MiniMax is a standard MoE transformer — every layer is [Attend, Moe] (no conv,
+// no dense, one variant), so it reuses the Attend + Moe super-ops with no new op
+// kind. DEFAULT ON (HIPFIRE_FORWARD_LOWERED, escape hatch =0 for the legacy
+// hand loop) since hipx/gfx1151 byte-parity was validated. The Attend handler
+// mirrors the hand-loop attention arm; the Moe handler runs the SAME sealed
+// manifest-derived program as the hand loop's MoE arm (`minimax_moe_single_step`
+// → `execute_lowered_moe` Single) — the hand route's direct routed kernels
+// were removed with the merge restoration (no second direct routed execution).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// QKV projection (attn-norm folded in) via the canonical `execute_steps`
@@ -639,6 +531,22 @@ fn minimax_attn_block(
     )
     .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 · Task 7 — MoE program parts + lowered execution (adapter core).
+//
+// The bespoke per-layer MoE sequencing (the old decode_step_body MoE arm /
+// minimax_ep_moe_step step lists) is replaced by a single shared parts
+// builder over the dispatch crate's Step building blocks (ScoreActivation /
+// MoeRoute / IndexedMoeGemv / MoeActivation / MoeCombine / ConvertI64ToF32),
+// lowered by the runtime lowerer and executed by the sealed executor. The
+// launch schedule (zeroing, i64-vs-f32 collective placement) is derived
+// exclusively from the concrete borrowed steps plus the caller-owned
+// `MoEExecutionPolicy` — never from a locally reconstructed mesh. Family
+// scaling (the FWHT input rotation, the router projection, rmsnorm) lives
+// OUTSIDE the routed program as direct kernels; route_scale = 1.0 (MiniMax
+// applies no routed-scaling factor) is captured inside the MoeRoute step.
+// ─────────────────────────────────────────────────────────────────────────
 
 /// Borrowed per-rank inputs of one layer's routed MoE program. Production
 /// callers fill these from `MiniMaxState` + `MiniMaxLayerWeights`; the
@@ -852,6 +760,8 @@ pub(crate) fn minimax_moe_program<'a>(
             k_top,
         ),
         execution: minimax_moe_execution_plan(),
+        deferred_combine: false,
+
         ranks: vec![minimax_moe_rank_phases(
             inputs,
             k_top,
@@ -861,6 +771,323 @@ pub(crate) fn minimax_moe_program<'a>(
             use_i64_down,
         )],
     }
+}
+
+/// Single-rank lowered MoE step (ffn-norm folded in): the layer-`l` plan is
+/// borrowed from the shared Single authority (admission pin), the routed
+/// program is built from the shared Step building blocks, lowered by the
+/// runtime lowerer, and executed through its sealed Single executor — the ONE
+/// routed execution of the single-rank decode paths (`decode_step_body`'s
+/// hand loop AND the super-op `run_moe`; the former hand route's direct
+/// kernels were removed with the merge restoration). `partial` is `state.h`
+/// on the decode paths (down/combine accumulate additively into the
+/// residual) or a caller-zeroed per-rank partial on the EP trait path.
+fn minimax_moe_single_step(
+    gpu: &mut Gpu,
+    cfg: &MiniMaxConfig,
+    layer: &MiniMaxLayerWeights,
+    state: &MiniMaxState,
+    l: usize,
+    partial: &GpuTensor,
+    authority: &SingleMoeAuthority<'_>,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let n_exp = cfg.num_local_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let eps = cfg.rms_norm_eps;
+    // Admission pin (shared with forward_batch): the layer-`l` plan must
+    // exist, be layer-scoped, and be Single-admitted before the MoE
+    // kernels of this layer run; the lowered program then uses that
+    // validated plan.
+    let plan = authority.plan_for_layer(l)?;
+    // ffn_tmp = rmsnorm(h) (plain, feeds the Q8 router); ffn_x_rot =
+    // FWHT(ffn_tmp) (feeds the FWHT-pre-rotated experts). The norm runs
+    // through Step::RmsnormAutomatic (the same rmsnorm_f32 kernel); the
+    // FWHT rotate and the router GEMV stay direct — they live OUTSIDE the
+    // routed program (no Step twin for fused rmsnorm+rotate / the router
+    // projection).
+    let ctx = DispatchCtx::new(gpu);
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::RmsnormAutomatic {
+            x: &state.h,
+            norm_weight: &layer.ffn_norm,
+            x_plain: &state.ffn_tmp,
+            out: &state.ffn_tmp,
+            awq_scale: None,
+            k: hidden,
+            eps,
+            rotation: RotationPlan::None,
+        }],
+    )
+    .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
+    rotate_x_mq_for(
+        gpu,
+        &layer.experts[0].gate_up,
+        &state.ffn_tmp,
+        &state.ffn_x_rot,
+        hidden,
+    )
+    .map_err(|e| format!("minimax L{l}: ffn rotate: {e:?}"))?;
+    weight_gemv(gpu, &layer.router, &state.ffn_tmp, &state.router_logits)
+        .map_err(|e| format!("minimax L{l}: router: {e}"))?;
+
+    // Routed program (sigmoid → bias-aware top-k → gate_up →
+    // silu·mul·rotate → down [+ combine]): built per layer from the shared
+    // Step building blocks (ScoreActivation / MoeRoute / IndexedMoeGemv /
+    // MoeActivation / MoeCombine) and executed through the runtime
+    // lowerer's sealed Single executor. The launch schedule (zeroing /
+    // collective placement) is derived exclusively from the concrete
+    // borrowed steps plus the canonical single policy — the dtype dispatch
+    // of the former hand route is now the parts builder's down
+    // classification (expanded+combine vs residual self-combine).
+    let gu_ref = hipfire_dispatch::families::moe::MoeExpertRef {
+        gate_up_ptrs: &layer.expert_gate_up_ptrs,
+        down_ptrs: &layer.expert_down_ptrs,
+        dummy_gate_up: layer.dummy_gate_up.as_ref(),
+        dtype: layer.experts[0].gate_up.gpu_dtype,
+        n_experts: n_exp,
+        expert_m: inter,
+        expert_k: hidden,
+        owned: &[],
+    };
+    let down_ref = hipfire_dispatch::families::moe::MoeExpertRef {
+        gate_up_ptrs: &layer.expert_gate_up_ptrs,
+        down_ptrs: &layer.expert_down_ptrs,
+        dummy_gate_up: layer.dummy_gate_up.as_ref(),
+        dtype: layer.experts[0].down.gpu_dtype,
+        n_experts: n_exp,
+        expert_m: inter,
+        expert_k: hidden,
+        owned: &[],
+    };
+    let inputs = MinimaxMoeInputs {
+        scores: &state.router_logits,
+        gate_bias: &layer.routing_bias,
+        topk_indices: &state.topk_indices,
+        topk_weights: &state.topk_weights,
+        x_rot: &state.ffn_x_rot,
+        gate_batch: &state.gate_batch,
+        up_batch: &state.up_batch,
+        rot_batch: &state.rot_batch,
+        down_expanded: &state.down_expanded,
+        partial,
+        // The single-rank axis never admits the int64 down (the lowerer
+        // rejects I64OnNonAdmittedAxis), so the single path is always f32.
+        partial_i64: None,
+        gu_ref: &gu_ref,
+        down_ref: &down_ref,
+        awq_scale: layer.experts[0].down.awq_scale.as_ref(),
+    };
+    let parts = minimax_moe_program(&inputs, k_top, n_exp, inter, hidden, false);
+    let program = lower_moe_steps(plan, authority.policy(), parts)
+        .map_err(|e| format!("minimax L{l}: lower_moe_steps: {e}"))?;
+    execute_lowered_moe(&program, MoeExecutionTarget::Single { gpu, ctx: &ctx })
+        .map_err(|e| format!("minimax L{l}: execute_lowered_moe: {e:?}"))
+}
+
+/// Per-layer execution context for the lowered decode path (rebuilt each layer).
+struct MinimaxBindings<'a> {
+    cfg: &'a MiniMaxConfig,
+    layer: &'a MiniMaxLayerWeights,
+    state: &'a MiniMaxState,
+    authority: &'a SingleMoeAuthority<'a>,
+    l: usize,
+}
+
+impl<'a> ForwardBindings for MinimaxBindings<'a> {
+    fn run_attend(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        minimax_attn_block(gpu, self.cfg, self.layer, self.state, self.l)
+            .map_err(DispatchError::Hip)
+    }
+    fn run_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        // Sealed Single execution of the manifest-derived routed program
+        // (accumulates into the residual `state.h`).
+        minimax_moe_single_step(
+            gpu,
+            self.cfg,
+            self.layer,
+            self.state,
+            self.l,
+            &self.state.h,
+            self.authority,
+        )
+        .map_err(DispatchError::Hip)
+    }
+    fn run_moe_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        routed_out: &GpuTensor,
+        _skip_shared: bool,
+    ) -> Result<(), DispatchError> {
+        // Trait-contract local compute into the caller-zeroed partial: the
+        // single-rank lowered program carries no collectives, matching
+        // run_layer_program_ep's zero → compute → all-reduce contract.
+        // NOT the production EP path — forward_ep drives the sealed Parallel
+        // executor (minimax_ep_moe_step), which owns zeroing, the i64 down,
+        // and the collectives. MiniMax has no shared expert → the entire MoE
+        // output is routed into `routed_out`; `state.h` (the replicated
+        // attention residual) is added after all-reduce via
+        // ep_add_into_residual. `skip_shared` is irrelevant (no shared expert).
+        minimax_moe_single_step(
+            gpu,
+            self.cfg,
+            self.layer,
+            self.state,
+            self.l,
+            routed_out,
+            self.authority,
+        )
+        .map_err(DispatchError::Hip)
+    }
+    fn ep_add_into_residual(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        gpu.add_inplace_f32(&self.state.h, partial)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+    fn run_proj(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("minimax has no Proj super-op".into()))
+    }
+    fn run_residual_gemv(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(
+            "minimax has no ResidualGemv super-op".into(),
+        ))
+    }
+    fn run_norm(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("minimax has no Norm super-op".into()))
+    }
+    fn run_conv(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("minimax has no Conv super-op".into()))
+    }
+    fn run_recurrent(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(
+            "minimax has no Recurrent super-op".into(),
+        ))
+    }
+    fn run_escape(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        kind: superop::EscapeKind,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(format!(
+            "minimax has no Escape super-op ({kind:?})"
+        )))
+    }
+}
+
+#[inline]
+fn mm_superop(kind: SuperOpKind) -> SuperOp {
+    SuperOp {
+        kind,
+        binding: OpBinding {
+            key: None,
+            weights: Vec::new(),
+            scratch: Vec::new(),
+            flavor: OpFlavor::None,
+        },
+    }
+}
+
+/// MiniMax has ONE layer shape (all layers Attn+MoE) → the same 2-op program for
+/// every layer. Pure → unit-testable.
+fn minimax_lower_program() -> superop::LayerProgram {
+    vec![
+        mm_superop(SuperOpKind::Attend),
+        mm_superop(SuperOpKind::Moe),
+    ]
+}
+
+/// Cached HIPFIRE_FORWARD_LOWERED toggle for minimax. #397 Ship 6: the minimax
+/// lowered decode is **DEFAULT ON** as of 2026-06-07 — hipx/gfx1151 byte-parity
+/// validated (lowered == hand token-text md5 2a46c35e… on the mq2-lloyd tier,
+/// "Paris is the capital of France."). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0`
+/// forces the legacy hand loop (still present in decode_step_body).
+fn minimax_forward_lowered_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+/// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Pos scalar is
+/// already staged by the caller (decode_step_body). Behaviorally equivalent to
+/// the hand loop (validated via FORWARD_LOWERED=0-vs-=1 token-text md5 on hipx).
+fn decode_step_body_lowered(
+    cfg: &MiniMaxConfig,
+    weights: &MiniMaxWeights,
+    state: &mut MiniMaxState,
+    gpu: &mut Gpu,
+    position: u32,
+    authority: &SingleMoeAuthority<'_>,
+) -> Result<(), String> {
+    let eps = cfg.rms_norm_eps;
+    let seq_len = position as usize + 1;
+    let ctx = DispatchCtx::new(gpu);
+    let program = minimax_lower_program();
+    for (l, layer) in weights.layers.iter().enumerate() {
+        let mut bind = MinimaxBindings {
+            cfg,
+            layer,
+            state,
+            authority,
+            l,
+        };
+        superop::run_layer_program(gpu, &ctx, &program, &mut bind)
+            .map_err(|e| format!("minimax L{l}: lowered run_layer_program: {e}"))?;
+    }
+    state.n_tokens = seq_len;
+    gpu.rmsnorm_f32(&state.h, &weights.final_norm, &state.final_norm_buf, eps)
+        .map_err(|e| format!("minimax: final rmsnorm: {e:?}"))?;
+    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+        .map_err(|e| format!("minimax: lm_head: {e}"))
 }
 
 /// True iff every layer's expert gate_up + down dtypes have batched kernels, so
@@ -1034,14 +1261,21 @@ pub fn forward_batch(
     // combination must retain the indexed path rather than failing mid-pass.
     const MOE_BLOCK_M: usize = 16;
     const MOE_GROUPED_GATE: usize = 256;
+    // Grouped admission (decided BEFORE any grouped scratch is allocated):
+    // the grouped WMMA path is the single-device GroupedQuantized family, so
+    // every layer's plan must ADMIT GroupedQuantized (declared by the
+    // manifest only for the grouped-capable 256-expert/top-8 topology) in
+    // addition to the dtype pair check. A plan that admits only
+    // IndexedQuantized forces the indexed path — grouped execution never
+    // runs under an indexed-only manifest declaration.
     let moe_grouped = b >= MOE_GROUPED_GATE
         && gpu.arch_caps.has_wmma()
         && grouped_moe_topology_supported(n_exp, k_top)
-        && weights.layers.iter().all(|layer| {
+        && weights.layers.iter().enumerate().all(|(l, layer)| {
             grouped_moe_dtypes_supported(
                 layer.experts[0].gate_up.gpu_dtype,
                 layer.experts[0].down.gpu_dtype,
-            )
+            ) && authority.plan_for_grouped_layer(l).is_ok()
         });
     // Round the padded-scatter bound UP to a whole number of BLOCK_M tiles.
     // The grouped kernels' grid is ceil(m_total/16) tiles and each tile reads
@@ -1074,9 +1308,15 @@ pub fn forward_batch(
         // Admission pin (shared with `decode_step_body`): the layer-`l` plan
         // must exist, be layer-scoped, and be Single-admitted before any
         // kernel of this layer runs — in particular before the direct
-        // established batched MoE dispatch below. Authority/admission only:
+        // established batched MoE dispatch below. The pin admits the
+        // execution family that will actually run: GroupedQuantized on the
+        // grouped path, IndexedQuantized otherwise. Authority/admission only:
         // the batched kernels themselves are unchanged.
-        authority.plan_for_layer(l)?;
+        if moe_grouped {
+            authority.plan_for_grouped_layer(l)?;
+        } else {
+            authority.plan_for_layer(l)?;
+        }
         // ── Attention (batched, per-row causal via positions) ──────────────
         gpu.rmsnorm_batched(&x, &layer.attn_norm, &tmp, b, hidden, eps)
             .map_err(|e| format!("minimax L{l} batch attn rmsnorm: {e:?}"))?;
@@ -1462,36 +1702,177 @@ pub fn forward_batch(
 // into the per-rank partial. Attention (Q8 KV) is replicated; only the MoE
 // routed sum crosses ranks (peer-direct all-reduce).
 
-/// Lowered EP/TP MoE for ONE layer — the sole parallel path in `forward_ep`
-/// / `forward_tp`.
-///
-/// - **Phase 1** (pre-down): rmsnorm → input FWHT → router GEMV. These have
-///   no bit-identical Step twin (fused rmsnorm+rotate / router GEMV), so they
-///   stay direct arch kernels, producing `ffn_x_rot` / `router_logits` per
-///   rank. The routed program (sigmoid → bias-aware top-K → gate_up →
-///   silu·mul·rotate → down [+ combine / i64 convert]) is deferred to Phase 2.
-/// - **Phase 2** (routed program): the per-rank `MoeProgramParts` — built by
-///   the shared parts builder over the dispatch `Step` building blocks — are
-///   lowered by the runtime lowerer (`lower_moe_steps`) and executed by the
-///   sealed executor (`execute_lowered_moe`). The launch schedule (zeroing,
-///   i64-vs-f32 collective placement) is derived exclusively from the concrete
-///   borrowed steps plus the caller-owned policy and group plan:
-///   - **Lloyd down** (MQ2G256Lloyd / MQ3G256Lloyd): a `DownResidual` step
-///     writes the weighted combine directly into the per-rank partial
-///     (pre-zeroed). With `use_i64_down` + MQ3G256Lloyd, `DownResidualI64`
-///     accumulates the reproducible int64 partial; the finish phase converts
-///     it to f32 after the i64 collective (Tp) or after local zeroing (Ep,
-///     where the FP32 all-reduce lands on the convert). Matches the shipped
-///     M2.7.mq2 path (down=MQ3L) — byte-identical.
-///   - **Non-Lloyd down** (MQ4G256/HFQ4G256/MQ6G256/HFQ6G256): `DownExpanded`
-///     writes per-expert outputs to `down_expanded`, then `MoeCombine`
-///     (`inverse_perm: None`) folds them with `topk_weights` into the
-///     pre-zeroed partial.
-/// - **Phase 3** (residual fold): `state.h += partial` per rank.
-///
-/// Preconditions: every rank has an `active_stream` (`ensure_rank_streams`)
-/// and peer access enabled. The `Gpus` must be bound to `policy.mesh()`
-/// (mesh-identity check inside `execute_lowered_moe`).
+/// Per-rank expert refs (gate_up vs down dtype + EP dummy gate_up) of ONE
+/// layer — CPU-only. `expert_m` uses inter_local (the per-rank intermediate
+/// dim under TP). The mesh entries build every layer's refs up front and
+/// keep them alive for the lowered programs that borrow them.
+fn minimax_moe_rank_expert_refs<'a>(
+    weights_per_rank: &'a [MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    policy: &MoEExecutionPolicy,
+    l: usize,
+) -> Result<
+    Vec<(
+        hipfire_dispatch::families::moe::MoeExpertRef<'a>,
+        hipfire_dispatch::families::moe::MoeExpertRef<'a>,
+    )>,
+    String,
+> {
+    use hipfire_dispatch::families::moe::MoeExpertRef;
+    use hipfire_runtime::multi_gpu::DimKind;
+    let n = weights_per_rank.len();
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let n_exp = cfg.num_local_experts;
+    // TP-of-experts: inter_local = inter / tp. When tp==1 (no Tp axis),
+    // size_of returns 1, inter_local == inter → byte-identical.
+    let tp = policy.mesh().size_of(DimKind::Tp).max(1);
+    let inter_local = inter / tp;
+    let mut refs = Vec::with_capacity(n);
+    for r in 0..n {
+        let layer = &weights_per_rank[r].layers[l];
+        refs.push((
+            MoeExpertRef {
+                gate_up_ptrs: &layer.expert_gate_up_ptrs,
+                down_ptrs: &layer.expert_down_ptrs,
+                dummy_gate_up: layer.dummy_gate_up.as_ref(),
+                dtype: layer.experts[0].gate_up.gpu_dtype,
+                n_experts: n_exp,
+                expert_m: inter_local,
+                expert_k: hidden,
+                owned: &[],
+            },
+            MoeExpertRef {
+                gate_up_ptrs: &layer.expert_gate_up_ptrs,
+                down_ptrs: &layer.expert_down_ptrs,
+                dummy_gate_up: layer.dummy_gate_up.as_ref(),
+                dtype: layer.experts[0].down.gpu_dtype,
+                n_experts: n_exp,
+                expert_m: inter_local,
+                expert_k: hidden,
+                owned: &[],
+            },
+        ));
+    }
+    Ok(refs)
+}
+
+/// CPU-only build + lower of ONE layer's routed program from the shared parts
+/// builder (the per-rank `MinimaxMoeInputs` borrow the pre-built
+/// [`minimax_moe_rank_expert_refs`] refs). Used twice on the mesh entries:
+/// once by the CPU-only pre-validation pass immediately after the aggregate
+/// authority (before any GPU mutation — the lowerer's exact-policy refusals
+/// land there), and once per layer inside the GPU loop (same borrowed inputs
+/// — cannot refuse after the pre-validation succeeded).
+#[allow(clippy::too_many_arguments)]
+fn minimax_moe_lower_layer<'a, 'b>(
+    weights_per_rank: &'a [MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    state_per_rank: &'a [MiniMaxState],
+    partials: &'a [GpuTensor],
+    partials_i64: Option<&'a [GpuTensor]>,
+    policy: &'b MoEExecutionPolicy,
+    group: &'a ExpertGroupPlan,
+    l: usize,
+    use_i64_down: bool,
+    expert_refs: &'a [(
+        hipfire_dispatch::families::moe::MoeExpertRef<'a>,
+        hipfire_dispatch::families::moe::MoeExpertRef<'a>,
+    )],
+) -> Result<LoweredMoeProgram<'b, 'a>, String> {
+    use hipfire_dispatch::families::moe::ExpertExecutionPlan;
+    use hipfire_runtime::multi_gpu::DimKind;
+    let n = weights_per_rank.len();
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let n_exp = cfg.num_local_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let tp = policy.mesh().size_of(DimKind::Tp).max(1);
+    let inter_local = inter / tp;
+    // The i64 down path is keyed on the DOWN dtype (same across ranks — same
+    // recipe): MQ3G256Lloyd + use_i64_down → DownResidualI64 → ConvertI64ToF32.
+    let ddt = weights_per_rank[0].layers[l].experts[0].down.gpu_dtype;
+    let use_i64 = use_i64_down && matches!(ddt, DType::MQ3G256Lloyd);
+    let parts = MoeProgramParts {
+        router: minimax_moe_router_plan(
+            &state_per_rank[0].router_logits,
+            &state_per_rank[0].topk_indices,
+            &state_per_rank[0].topk_weights,
+            k_top,
+        ),
+        execution: ExpertExecutionPlan::IndexedQuantized,
+        deferred_combine: false,
+        ranks: (0..n)
+            .map(|r| {
+                let s = &state_per_rank[r];
+                let layer = &weights_per_rank[r].layers[l];
+                let inputs = MinimaxMoeInputs {
+                    scores: &s.router_logits,
+                    gate_bias: &layer.routing_bias,
+                    topk_indices: &s.topk_indices,
+                    topk_weights: &s.topk_weights,
+                    x_rot: &s.ffn_x_rot,
+                    gate_batch: &s.gate_batch,
+                    up_batch: &s.up_batch,
+                    rot_batch: &s.rot_batch,
+                    down_expanded: &s.down_expanded,
+                    partial: &partials[r],
+                    partial_i64: partials_i64.map(|i64s| &i64s[r]),
+                    gu_ref: &expert_refs[r].0,
+                    down_ref: &expert_refs[r].1,
+                    awq_scale: layer.experts[0].down.awq_scale.as_ref(),
+                };
+                minimax_moe_rank_phases(&inputs, k_top, n_exp, inter_local, hidden, use_i64)
+            })
+            .collect(),
+    };
+    lower_moe_steps(group, policy, parts)
+        .map_err(|e| format!("moe-step L{l}: lower_moe_steps: {e}"))
+}
+
+/// CPU-only pre-validation of ONE layer's routed program — build the parts
+/// and run the lowerer, then DROP everything. The mesh entries run this for
+/// EVERY layer immediately after the aggregate authority, BEFORE any GPU
+/// mutation: an exact-policy refusal (execution identity / step protocol /
+/// executor admission) can never fire after device state was written. The
+/// per-layer loop then re-lowers with the same borrowed inputs (pure CPU) —
+/// which cannot refuse after this pass succeeded.
+#[allow(clippy::too_many_arguments)]
+fn minimax_moe_prevalidate_layer(
+    weights_per_rank: &[MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    state_per_rank: &[MiniMaxState],
+    partials: &[GpuTensor],
+    partials_i64: Option<&[GpuTensor]>,
+    policy: &MoEExecutionPolicy,
+    group: &ExpertGroupPlan,
+    l: usize,
+    use_i64_down: bool,
+) -> Result<(), String> {
+    let refs = minimax_moe_rank_expert_refs(weights_per_rank, cfg, policy, l)?;
+    let _program = minimax_moe_lower_layer(
+        weights_per_rank,
+        cfg,
+        state_per_rank,
+        partials,
+        partials_i64,
+        policy,
+        group,
+        l,
+        use_i64_down,
+        &refs,
+    )?;
+    Ok(())
+}
+
+/// EP (Ship 6 substrate-EP) per-layer MoE step: Phase 1 runs each rank's
+/// pre-down input prep (ffn rmsnorm → FWHT rotate → router GEMV — direct,
+/// input-prep boundary), Phase 2 builds + lowers this layer's routed program
+/// from the shared parts builder (the SAME CPU inputs the entry's
+/// pre-validation pass already refused-or-accepted — it cannot fail here)
+/// and executes it through the sealed Parallel executor, Phase 3 folds the
+/// all-reduced partial into each rank's residual. The zeroing / i64 down /
+/// collectives live inside the sealed executor.
 #[allow(clippy::too_many_arguments)]
 fn minimax_ep_moe_step(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
@@ -1505,51 +1886,9 @@ fn minimax_ep_moe_step(
     group: &ExpertGroupPlan,
     l: usize,
 ) -> Result<(), String> {
-    use hipfire_dispatch::families::moe::{ExpertExecutionPlan, MoeExpertRef};
-    use hipfire_runtime::multi_gpu::DimKind;
     let n = gpus.devices.len();
     let hidden = cfg.hidden_size;
-    let inter = cfg.intermediate_size;
-    let n_exp = cfg.num_local_experts;
-    let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
-    // TP-of-experts: inter_local = inter / tp. When tp==1 (no Tp axis),
-    // size_of returns 1, inter_local == inter → byte-identical.
-    let tp = policy.mesh().size_of(DimKind::Tp).max(1);
-    let inter_local = inter / tp;
-    // Per-rank expert refs (gate_up vs down dtype + EP dummy gate_up), built
-    // before Phase 1 borrows gpus mutably so they outlive the step programs.
-    // expert_m uses inter_local (the per-rank intermediate dim under TP).
-    let gu_refs: Vec<MoeExpertRef> = (0..n)
-        .map(|r| {
-            let layer = &weights_per_rank[r].layers[l];
-            MoeExpertRef {
-                gate_up_ptrs: &layer.expert_gate_up_ptrs,
-                down_ptrs: &layer.expert_down_ptrs,
-                dummy_gate_up: layer.dummy_gate_up.as_ref(),
-                dtype: layer.experts[0].gate_up.gpu_dtype,
-                n_experts: n_exp,
-                expert_m: inter_local,
-                expert_k: hidden,
-                owned: &[],
-            }
-        })
-        .collect();
-    let down_refs: Vec<MoeExpertRef> = (0..n)
-        .map(|r| {
-            let layer = &weights_per_rank[r].layers[l];
-            MoeExpertRef {
-                gate_up_ptrs: &layer.expert_gate_up_ptrs,
-                down_ptrs: &layer.expert_down_ptrs,
-                dummy_gate_up: layer.dummy_gate_up.as_ref(),
-                dtype: layer.experts[0].down.gpu_dtype,
-                n_experts: n_exp,
-                expert_m: inter_local,
-                expert_k: hidden,
-                owned: &[],
-            }
-        })
-        .collect();
 
     // ── Phase 1: per-rank pre-down MoE compute (direct, input-prep boundary) ─
     for r in 0..n {
@@ -1575,42 +1914,19 @@ fn minimax_ep_moe_step(
     // ── Phase 2: lowered routed program (shared parts builder + sealed executor) ─
     // The i64 down path is keyed on the DOWN dtype (same across ranks — same
     // recipe): MQ3G256Lloyd + use_i64_down → DownResidualI64 → ConvertI64ToF32.
-    let ddt = weights_per_rank[0].layers[l].experts[0].down.gpu_dtype;
-    let use_i64 = use_i64_down && matches!(ddt, DType::MQ3G256Lloyd);
-    let parts = MoeProgramParts {
-        router: minimax_moe_router_plan(
-            &state_per_rank[0].router_logits,
-            &state_per_rank[0].topk_indices,
-            &state_per_rank[0].topk_weights,
-            k_top,
-        ),
-        execution: ExpertExecutionPlan::IndexedQuantized,
-        ranks: (0..n)
-            .map(|r| {
-                let s = &state_per_rank[r];
-                let layer = &weights_per_rank[r].layers[l];
-                let inputs = MinimaxMoeInputs {
-                    scores: &s.router_logits,
-                    gate_bias: &layer.routing_bias,
-                    topk_indices: &s.topk_indices,
-                    topk_weights: &s.topk_weights,
-                    x_rot: &s.ffn_x_rot,
-                    gate_batch: &s.gate_batch,
-                    up_batch: &s.up_batch,
-                    rot_batch: &s.rot_batch,
-                    down_expanded: &s.down_expanded,
-                    partial: &partials[r],
-                    partial_i64: partials_i64.map(|i64s| &i64s[r]),
-                    gu_ref: &gu_refs[r],
-                    down_ref: &down_refs[r],
-                    awq_scale: layer.experts[0].down.awq_scale.as_ref(),
-                };
-                minimax_moe_rank_phases(&inputs, k_top, n_exp, inter_local, hidden, use_i64)
-            })
-            .collect(),
-    };
-    let program = lower_moe_steps(group, policy, parts)
-        .map_err(|e| format!("moe-step L{l}: lower_moe_steps: {e}"))?;
+    let refs = minimax_moe_rank_expert_refs(weights_per_rank, cfg, policy, l)?;
+    let program = minimax_moe_lower_layer(
+        weights_per_rank,
+        cfg,
+        state_per_rank,
+        partials,
+        partials_i64,
+        policy,
+        group,
+        l,
+        use_i64_down,
+        &refs,
+    )?;
     execute_lowered_moe(&program, MoeExecutionTarget::Parallel { gpus })
         .map_err(|e| format!("moe-step L{l}: execute_lowered_moe: {e:?}"))?;
 
@@ -1720,6 +2036,115 @@ fn mesh_entry_authority<T>(
     .map_err(|e| format!("minimax {required_kind:?} entry policy: {e}"))
 }
 
+/// Aggregate per-rank load-layout validation — pure CPU, run by BOTH mesh
+/// entries INSIDE the authority acquisition (after the exact kind/mesh/rank
+/// binding checks, BEFORE the rank-0 manifest cache is touched and before any
+/// GPU work): device/weights/state/partial counts agree, every rank's
+/// recorded [`ExpertLoadLayout`] equals the layout the caller policy's
+/// Ep/Tp mesh implies for that rank (kind + width + rank), all ranks hold the
+/// same layer count, and every layer's expert pointer bundles are present
+/// with the expected capacity (plus the EP dummy gate_up presence rule). A
+/// wrong, duplicate, or unsliced rank layout refuses deterministically
+/// instead of running with mismatched experts.
+fn validate_rank_load_layouts(
+    n_devices: usize,
+    n_states: usize,
+    n_partials: usize,
+    n_partials_i64: usize,
+    weights_per_rank: &[MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    policy: &MoEExecutionPolicy,
+    required_kind: MoEExecutionKind,
+) -> Result<(), String> {
+    let n = n_devices;
+    if weights_per_rank.len() != n {
+        return Err(format!(
+            "minimax {required_kind:?}: {n} devices but {} weight sets",
+            weights_per_rank.len()
+        ));
+    }
+    if n_states != n {
+        return Err(format!(
+            "minimax {required_kind:?}: {n} devices but {n_states} states"
+        ));
+    }
+    if n_partials != n {
+        return Err(format!(
+            "minimax {required_kind:?}: {n} devices but {n_partials} partials"
+        ));
+    }
+    if n_partials_i64 != n {
+        return Err(format!(
+            "minimax {required_kind:?}: {n} devices but {n_partials_i64} i64 partials"
+        ));
+    }
+    let width = match required_kind {
+        MoEExecutionKind::Ep => policy
+            .mesh()
+            .size_of(hipfire_runtime::multi_gpu::DimKind::Ep),
+        MoEExecutionKind::Tp => policy
+            .mesh()
+            .size_of(hipfire_runtime::multi_gpu::DimKind::Tp),
+        MoEExecutionKind::Single => {
+            return Err("minimax: validate_rank_load_layouts is mesh-entry only".into());
+        }
+    };
+    let n_layers = weights_per_rank[0].layers.len();
+    for (r, w) in weights_per_rank.iter().enumerate() {
+        // The expected Ep layout carries the manifest-declared Stride
+        // assignment, so a Contiguous (or any other) ownership map refuses
+        // here — mixed Stride/Contiguous rank sets can never duplicate or
+        // omit experts while passing the aggregate checks (the loader also
+        // certifies the stride map at load).
+        let expected = match required_kind {
+            MoEExecutionKind::Ep => ExpertLoadLayout::Ep {
+                width,
+                rank: r,
+                assignment: hipfire_runtime::tp_shard::ExpertAssign::Stride,
+            },
+            MoEExecutionKind::Tp => ExpertLoadLayout::Tp { width, rank: r },
+            MoEExecutionKind::Single => unreachable!(),
+        };
+        if w.expert_layout != expected {
+            return Err(format!(
+                "minimax {required_kind:?} rank {r}: loaded expert layout {:?} does not match \
+                 the policy-required {expected:?} (reload rank {r} with the matching \
+                 shard/tp_slice)",
+                w.expert_layout
+            ));
+        }
+        if w.layers.len() != n_layers {
+            return Err(format!(
+                "minimax {required_kind:?} rank {r}: {} layers != rank 0's {n_layers}",
+                w.layers.len()
+            ));
+        }
+        let want_ptrs = 2 * cfg.num_local_experts;
+        for (l, layer) in w.layers.iter().enumerate() {
+            if layer.expert_gate_up_ptrs.shape[0] != want_ptrs
+                || layer.expert_down_ptrs.shape[0] != want_ptrs
+            {
+                return Err(format!(
+                    "minimax {required_kind:?} rank {r} L{l}: expert pointer bundles \
+                     {:?}/{:?} != expected [{want_ptrs}]",
+                    layer.expert_gate_up_ptrs.shape, layer.expert_down_ptrs.shape
+                ));
+            }
+            // EP shards beyond rank-one must carry the zeroed dummy gate_up for
+            // non-owned experts; TP/Single loads never have one.
+            let expect_dummy = required_kind == MoEExecutionKind::Ep && width > 1;
+            if layer.dummy_gate_up.is_some() != expect_dummy {
+                return Err(format!(
+                    "minimax {required_kind:?} rank {r} L{l}: dummy gate_up presence {} != \
+                     expected {expect_dummy}",
+                    layer.dummy_gate_up.is_some()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
 /// Mirror of qwen35::forward_ep: every rank holds full replicated weights /
 /// state / KV EXCEPT MoE experts (sharded at load). Embeds + stages pos per
@@ -1750,22 +2175,47 @@ pub fn forward_ep(
     // must be the exact Ep kind + mesh/epoch binding of these Gpus, and the
     // authority resolution is acquired only after validation passes (never on
     // refusal) — enforced even when MoE is disabled (no local alternate mesh
-    // model).
+    // model). The acquisition ALSO aggregate-validates every rank's recorded
+    // load layout (counts / layout / layers / bundles) before the rank-0
+    // manifest cache is touched.
     let resolution = mesh_entry_authority(gpus, policy, MoEExecutionKind::Ep, || {
+        validate_rank_load_layouts(
+            gpus.devices.len(),
+            state_per_rank.len(),
+            partials.len(),
+            partials_i64.len(),
+            weights_per_rank,
+            cfg,
+            policy,
+            MoEExecutionKind::Ep,
+        )?;
         weights_per_rank[0]
             .expert_manifest_for_policy(cfg, policy)
             .map_err(|e| format!("forward_ep: expert manifest: {e}"))
     })?;
-    assert_eq!(
-        weights_per_rank.len(),
-        n,
-        "forward_ep: weights_per_rank len"
-    );
-    assert_eq!(state_per_rank.len(), n, "forward_ep: state_per_rank len");
-    assert_eq!(partials.len(), n, "forward_ep: partials len");
-    assert_eq!(partials_i64.len(), n, "forward_ep: partials_i64 len");
     let hidden = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
+
+    // Exact-policy pre-validation: every layer's routed program is built and
+    // lowered NOW (CPU-only, transient — nothing is held), before the first
+    // GPU kernel — a lowerer refusal (execution identity / step protocol /
+    // executor admission) can never fire after device state was mutated. The
+    // per-layer loop then re-lowers each layer with the same borrowed inputs
+    // (pure CPU — cannot refuse after this pass succeeded).
+    let n_layers = weights_per_rank[0].layers.len();
+    for l in 0..n_layers {
+        minimax_moe_prevalidate_layer(
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            Some(partials_i64), // EP i64: DownResidualI64 → ConvertI64ToF32 → AllReduce{Ep}
+            policy,
+            &resolution.plans[l],
+            l,
+            true, // use_i64_down: true → reproducible int64 down per rank
+        )?;
+    }
 
     // 1. Embed + stage pos per rank (replicated, deterministic).
     for r in 0..n {
@@ -1796,7 +2246,6 @@ pub fn forward_ep(
     // reconstruction. Per-layer plans are borrowed by layer from the
     // resolution acquired at entry (identical cached object on every call —
     // no per-token plan allocation).
-    let n_layers = weights_per_rank[0].layers.len();
     for l in 0..n_layers {
         // Attend replicated: every rank holds full weights + full KV → the
         // per-rank attention is a deterministic function of replicated inputs
@@ -1817,7 +2266,8 @@ pub fn forward_ep(
         // Moe all-reduce EP: each rank runs its owned routed experts into a
         // partial (minimax has no shared expert → whole MoE is routed), the
         // partials all-reduce over the Ep group, and each rank folds the reduced
-        // sum into its replicated attention residual `state.h`.
+        // sum into its replicated attention residual `state.h`. The program was
+        // pre-validated (refused-or-accepted) by the CPU-only entry pass.
         minimax_ep_moe_step(
             gpus,
             weights_per_rank,
@@ -1904,22 +2354,47 @@ pub fn forward_tp(
     // must be the exact Tp kind + mesh/epoch binding of these Gpus, and the
     // authority resolution is acquired only after validation passes (never on
     // refusal) — enforced even when MoE is disabled (no local alternate mesh
-    // model).
+    // model). The acquisition ALSO aggregate-validates every rank's recorded
+    // load layout (counts / layout / layers / bundles) before the rank-0
+    // manifest cache is touched.
     let resolution = mesh_entry_authority(gpus, policy, MoEExecutionKind::Tp, || {
+        validate_rank_load_layouts(
+            gpus.devices.len(),
+            state_per_rank.len(),
+            partials.len(),
+            partials_i64.len(),
+            weights_per_rank,
+            cfg,
+            policy,
+            MoEExecutionKind::Tp,
+        )?;
         weights_per_rank[0]
             .expert_manifest_for_policy(cfg, policy)
             .map_err(|e| format!("forward_tp: expert manifest: {e}"))
     })?;
-    assert_eq!(
-        weights_per_rank.len(),
-        n,
-        "forward_tp: weights_per_rank len"
-    );
-    assert_eq!(state_per_rank.len(), n, "forward_tp: state_per_rank len");
-    assert_eq!(partials.len(), n, "forward_tp: partials len");
-    assert_eq!(partials_i64.len(), n, "forward_tp: partials_i64 len");
     let hidden = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
+
+    // Exact-policy pre-validation: every layer's routed program is built and
+    // lowered NOW (CPU-only, transient — nothing is held), before the first
+    // GPU kernel — a lowerer refusal (execution identity / step protocol /
+    // executor admission) can never fire after device state was mutated. The
+    // per-layer loop then re-lowers each layer with the same borrowed inputs
+    // (pure CPU — cannot refuse after this pass succeeded).
+    let n_layers = weights_per_rank[0].layers.len();
+    for l in 0..n_layers {
+        minimax_moe_prevalidate_layer(
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            Some(partials_i64), // i64 scratch buffers for reproducible TP down
+            policy,
+            &resolution.plans[l],
+            l,
+            true, // use_i64_down: always true on the TP path
+        )?;
+    }
 
     // 1. Embed + stage pos per rank (replicated, deterministic).
     for r in 0..n {
@@ -1967,6 +2442,8 @@ pub fn forward_tp(
         // MoE all-reduce Tp: each rank holds all experts with sliced inter/tp weights.
         // int64 down path: DownResidualI64 → AllReduceI64Tp → ConvertI64ToF32.
         // Partition-invariant: tp=1 and tp=2 produce bit-identical f32 outputs.
+        // The program was pre-validated (refused-or-accepted) by the CPU-only
+        // entry pass.
         minimax_ep_moe_step(
             gpus,
             weights_per_rank,
@@ -2011,6 +2488,73 @@ pub fn forward_tp(
         s.n_tokens = position as usize + 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ship6_lower_tests {
+    use super::*;
+    use superop::SuperOpKind::{Attend, Moe};
+
+    // #397 Ship 6 — minimax is one variant (every layer Attn+MoE).
+    #[test]
+    fn minimax_program_is_attend_then_moe() {
+        let kinds: Vec<_> = minimax_lower_program().iter().map(|o| o.kind).collect();
+        assert_eq!(kinds, vec![Attend, Moe]);
+    }
+
+    #[test]
+    fn grouped_moe_accepts_only_implemented_lloyd_pairs() {
+        assert!(grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ2G256Lloyd
+        ));
+        assert!(grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ3G256Lloyd
+        ));
+        assert!(!grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ4G256
+        ));
+        assert!(!grouped_moe_dtypes_supported(
+            DType::MQ4G256,
+            DType::MQ3G256Lloyd
+        ));
+    }
+
+    #[test]
+    fn grouped_moe_accepts_only_minimax_m2_topology() {
+        assert!(grouped_moe_topology_supported(256, 8));
+        assert!(!grouped_moe_topology_supported(16, 8));
+        assert!(!grouped_moe_topology_supported(256, 4));
+    }
+
+    #[test]
+    fn large_batch_accepts_only_minimax_m2_production_topology() {
+        let mut cfg = MiniMaxConfig {
+            vocab_size: 200064,
+            hidden_size: 3072,
+            num_hidden_layers: 62,
+            num_attention_heads: 48,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            intermediate_size: 1536,
+            num_local_experts: 256,
+            num_experts_per_tok: 8,
+            rotary_dim: 64,
+            rope_theta: 5_000_000.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 204800,
+            use_qk_norm: true,
+            use_routing_bias: true,
+            scoring_func: "sigmoid".to_string(),
+            num_mtp_modules: 3,
+            reap_keep: None,
+        };
+        assert!(large_batch_topology_supported(&cfg));
+        cfg.num_local_experts = 16;
+        assert!(!large_batch_topology_supported(&cfg));
+    }
 }
 
 // ─────────────────────────── Phase 3 · Task 7 tests ───────────────────────────
@@ -2139,15 +2683,6 @@ mod tests {
             num_mtp_modules: 0,
             reap_keep: None,
         }
-    }
-
-    /// `resolution_config` with an intermediate dim the projection path must
-    /// refuse under Tp (8/2 = 4 is not a multiple of 256) — a genuine
-    /// resolution failure, used to pin the cached-failure behavior.
-    fn tp_invalid_config() -> MiniMaxConfig {
-        let mut cfg = resolution_config();
-        cfg.intermediate_size = 8;
-        cfg
     }
 
     fn projection_policy(kind: MoEExecutionKind, ranks: usize) -> MoEExecutionPolicy {
@@ -2658,6 +3193,8 @@ mod tests {
                     K_TOP,
                 ),
                 execution: minimax_moe_execution_plan(),
+                deferred_combine: false,
+
                 ranks: (0..case.ranks)
                     .map(|_| {
                         minimax_moe_rank_phases(&inputs, K_TOP, N_EXP, INTER, HIDDEN, case.use_i64)
@@ -2906,6 +3443,8 @@ mod tests {
                 K_TOP,
             ),
             execution: minimax_moe_execution_plan(),
+            deferred_combine: false,
+
             ranks: vec![
                 minimax_moe_rank_phases(&inputs, K_TOP, N_EXP, INTER, HIDDEN, true),
                 minimax_moe_rank_phases(&inputs, K_TOP, N_EXP, INTER, HIDDEN, true),
@@ -3169,57 +3708,230 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grouped_moe_accepts_only_implemented_lloyd_pairs() {
-        assert!(grouped_moe_dtypes_supported(
-            DType::MQ2G256Lloyd,
-            DType::MQ2G256Lloyd
-        ));
-        assert!(grouped_moe_dtypes_supported(
-            DType::MQ2G256Lloyd,
-            DType::MQ3G256Lloyd
-        ));
-        assert!(!grouped_moe_dtypes_supported(
-            DType::MQ2G256Lloyd,
-            DType::MQ4G256
-        ));
-        assert!(!grouped_moe_dtypes_supported(
-            DType::MQ4G256,
-            DType::MQ3G256Lloyd
-        ));
+    // ───────────────── Gate-3 · aggregate rank-load-layout authority ─────────
+    // The mesh entries aggregate-validate EVERY rank's recorded load layout
+    // (counts / layout / layers / bundles) inside the authority acquisition,
+    // before the rank-0 manifest cache and before any GPU work. Synthetic
+    // metadata-only weights (null device buffers — never touched by HIP)
+    // drive the pure CPU validator.
+
+    fn layout_weights(
+        layout: ExpertLoadLayout,
+        n_layers: usize,
+        n_exp: usize,
+        dummy: bool,
+        ptr_bundle_shape: Option<[usize; 2]>,
+    ) -> MiniMaxWeights {
+        MiniMaxWeights::synth_for_layout_test(layout, n_layers, n_exp, dummy, ptr_bundle_shape)
     }
 
     #[test]
-    fn grouped_moe_accepts_only_minimax_m2_topology() {
-        assert!(grouped_moe_topology_supported(256, 8));
-        assert!(!grouped_moe_topology_supported(16, 8));
-        assert!(!grouped_moe_topology_supported(256, 4));
-    }
-
-    #[test]
-    fn large_batch_accepts_only_minimax_m2_production_topology() {
-        let mut cfg = MiniMaxConfig {
-            vocab_size: 200064,
-            hidden_size: 3072,
-            num_hidden_layers: 62,
-            num_attention_heads: 48,
-            num_key_value_heads: 8,
-            head_dim: 128,
-            intermediate_size: 1536,
-            num_local_experts: 256,
-            num_experts_per_tok: 8,
-            rotary_dim: 64,
-            rope_theta: 5_000_000.0,
-            rms_norm_eps: 1e-6,
-            max_position_embeddings: 204800,
-            use_qk_norm: true,
-            use_routing_bias: true,
-            scoring_func: "sigmoid".to_string(),
-            num_mtp_modules: 3,
-            reap_keep: None,
+    fn minimax_rank_layouts_validate_every_rank_before_authority() {
+        let n = 2;
+        let n_exp = 4;
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, n)]);
+        let ep = MoEExecutionPolicy::new(MoEExecutionKind::Ep, mesh.clone()).unwrap();
+        let tp_mesh = DeviceMesh::rect(&[(DimKind::Tp, n)]);
+        let tp = MoEExecutionPolicy::new(MoEExecutionKind::Tp, tp_mesh).unwrap();
+        let ep_weights = |r: usize| {
+            layout_weights(
+                ExpertLoadLayout::Ep {
+                    width: n,
+                    rank: r,
+                    assignment: ExpertAssign::Stride,
+                },
+                1,
+                n_exp,
+                true,
+                None,
+            )
         };
-        assert!(large_batch_topology_supported(&cfg));
-        cfg.num_local_experts = 16;
-        assert!(!large_batch_topology_supported(&cfg));
+        let w = [ep_weights(0), ep_weights(1)];
+        let cfg = resolution_config();
+        // Matching EP layouts (counts / layout / layers / bundles / dummy)
+        // pass the aggregate validation.
+        validate_rank_load_layouts(n, 2, 2, 2, &w, &cfg, &ep, MoEExecutionKind::Ep)
+            .expect("matching EP layouts must pass");
+
+        // A rank with a NON-STRIDE ownership map refuses: the manifest
+        // declares ExpertAssign::Stride, so a Contiguous shard (duplicated /
+        // omitted experts across a mixed rank set) can never pass.
+        let contiguous = [
+            ep_weights(0),
+            layout_weights(
+                ExpertLoadLayout::Ep {
+                    width: n,
+                    rank: 1,
+                    assignment: ExpertAssign::Contiguous,
+                },
+                1,
+                n_exp,
+                true,
+                None,
+            ),
+        ];
+        let err =
+            validate_rank_load_layouts(n, 2, 2, 2, &contiguous, &cfg, &ep, MoEExecutionKind::Ep)
+                .unwrap_err();
+        assert!(
+            err.contains("rank 1") && err.contains("does not match"),
+            "{err}"
+        );
+
+        // A rank loaded with the WRONG layout refuses (duplicate/full slice —
+        // rank 1 recorded as rank 0).
+        let wrong = [
+            ep_weights(0),
+            layout_weights(
+                ExpertLoadLayout::Ep {
+                    width: n,
+                    rank: 0,
+                    assignment: ExpertAssign::Stride,
+                },
+                1,
+                n_exp,
+                true,
+                None,
+            ),
+        ];
+        let err = validate_rank_load_layouts(n, 2, 2, 2, &wrong, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(
+            err.contains("rank 1") && err.contains("does not match"),
+            "{err}"
+        );
+
+        // An unsharded (Single) weight set under an Ep policy refuses.
+        let single = [
+            ep_weights(0),
+            layout_weights(ExpertLoadLayout::Single, 1, n_exp, false, None),
+        ];
+        let err = validate_rank_load_layouts(n, 2, 2, 2, &single, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(
+            err.contains("rank 1") && err.contains("does not match"),
+            "{err}"
+        );
+
+        // TP-loaded weights refuse under an Ep policy (kind mismatch) and
+        // pass under the matching Tp policy.
+        let tp_w = [
+            layout_weights(
+                ExpertLoadLayout::Tp { width: n, rank: 0 },
+                1,
+                n_exp,
+                false,
+                None,
+            ),
+            layout_weights(
+                ExpertLoadLayout::Tp { width: n, rank: 1 },
+                1,
+                n_exp,
+                false,
+                None,
+            ),
+        ];
+        let err = validate_rank_load_layouts(n, 2, 2, 2, &tp_w, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(
+            err.contains("rank 0") && err.contains("does not match"),
+            "{err}"
+        );
+        validate_rank_load_layouts(n, 2, 2, 2, &tp_w, &cfg, &tp, MoEExecutionKind::Tp)
+            .expect("matching Tp layouts must pass");
+
+        // Count mismatches refuse.
+        let err = validate_rank_load_layouts(3, 2, 2, 2, &w, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(err.contains("weight sets"), "{err}");
+        let err = validate_rank_load_layouts(n, 1, 2, 2, &w, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(err.contains("states"), "{err}");
+        let err = validate_rank_load_layouts(n, 2, 1, 2, &w, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(err.contains("partials"), "{err}");
+        let err = validate_rank_load_layouts(n, 2, 2, 1, &w, &cfg, &ep, MoEExecutionKind::Ep)
+            .unwrap_err();
+        assert!(err.contains("i64 partials"), "{err}");
+
+        // Layer-count mismatch refuses.
+        let mismatched = [
+            ep_weights(0),
+            layout_weights(
+                ExpertLoadLayout::Ep {
+                    width: n,
+                    rank: 1,
+                    assignment: ExpertAssign::Stride,
+                },
+                2,
+                n_exp,
+                true,
+                None,
+            ),
+        ];
+        let err =
+            validate_rank_load_layouts(n, 2, 2, 2, &mismatched, &cfg, &ep, MoEExecutionKind::Ep)
+                .unwrap_err();
+        assert!(err.contains("layers"), "{err}");
+
+        // Bundle-shape mismatch refuses.
+        let bad_bundle = [
+            ep_weights(0),
+            layout_weights(
+                ExpertLoadLayout::Ep {
+                    width: n,
+                    rank: 1,
+                    assignment: ExpertAssign::Stride,
+                },
+                1,
+                n_exp,
+                true,
+                Some([2 * n_exp - 1, 2 * n_exp]),
+            ),
+        ];
+        let err =
+            validate_rank_load_layouts(n, 2, 2, 2, &bad_bundle, &cfg, &ep, MoEExecutionKind::Ep)
+                .unwrap_err();
+        assert!(err.contains("pointer bundles"), "{err}");
+
+        // Dummy gate_up presence rule: Ep width>1 requires it; TP forbids it.
+        let no_dummy = [
+            ep_weights(0),
+            layout_weights(
+                ExpertLoadLayout::Ep {
+                    width: n,
+                    rank: 1,
+                    assignment: ExpertAssign::Stride,
+                },
+                1,
+                n_exp,
+                false,
+                None,
+            ),
+        ];
+        let err =
+            validate_rank_load_layouts(n, 2, 2, 2, &no_dummy, &cfg, &ep, MoEExecutionKind::Ep)
+                .unwrap_err();
+        assert!(err.contains("dummy gate_up"), "{err}");
+        let tp_dummy = [
+            layout_weights(
+                ExpertLoadLayout::Tp { width: n, rank: 0 },
+                1,
+                n_exp,
+                true,
+                None,
+            ),
+            layout_weights(
+                ExpertLoadLayout::Tp { width: n, rank: 1 },
+                1,
+                n_exp,
+                false,
+                None,
+            ),
+        ];
+        let err =
+            validate_rank_load_layouts(n, 2, 2, 2, &tp_dummy, &cfg, &tp, MoEExecutionKind::Tp)
+                .unwrap_err();
+        assert!(err.contains("dummy gate_up"), "{err}");
     }
 }

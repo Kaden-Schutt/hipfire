@@ -1,0 +1,33 @@
+=== hostname ===
+7
+=== date -u ===
+Sat Aug  1 12:43:10 PM UTC 2026
+=== rocminfo (gfx/Marketing) ===
+  Marketing Name:          INTEL(R) XEON(R) PLATINUM 8568Y+   
+  Name:                    gfx942                             
+  Marketing Name:          AMD Instinct MI300X VF             
+=== rocm-smi vram ===
+
+
+============================ ROCm System Management Interface ============================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 205822885888
+GPU[0]		: VRAM Total Used Memory (B): 299687936
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+=== rocm-smi pids ===
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID 	PROCESS NAME	GPU(s)	VRAM USED	SDMA USED	CU OCCUPANCY	
+1823	gpuagent    	0     	0        	0        	0           	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+=== whoami/pwd ===
+root
+/root
+=== df scratch ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdc1       5.0T  316G  4.5T   7% /mnt/scratch

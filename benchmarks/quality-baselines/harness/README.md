@@ -14,12 +14,13 @@ KLD references and produce the result tables.
 | `canary.md`             | 11-sequence harness-output reproducibility fixture | sequences populated; expected KLDs land after Step 5's first canary candidate |
 
 The corresponding Rust binaries live at
-`crates/hipfire-runtime/examples/{build_kld_ref,eval_hipfire,eval_gguf,tokenize_slice}.rs`
-and are gated by `required-features` on the example targets in
-`hipfire-runtime/Cargo.toml`. Build with `cargo build --release
---features deltanet --example <name>` for the deltanet-requiring ones
-(eval_hipfire, eval_gguf via the deltanet feature path indirectly —
-build_kld_ref is GPU-free I/O only).
+`crates/hipfire-runtime/examples/{build_kld_ref,eval_hipfire,eval_gguf}.rs`
+(and `crates/saddle-lab/examples/tokenize_slice.rs` for the CPU-only
+tokenizer helper) and are gated by `required-features` on the example
+targets in their respective `Cargo.toml`. Build with
+`cargo build --release --features deltanet --example <name>` for the
+deltanet-requiring ones (eval_hipfire, eval_gguf via the deltanet feature
+path indirectly — build_kld_ref and tokenize_slice are GPU-free).
 
 ## Reference fetch
 
@@ -33,7 +34,7 @@ already have the ref locally.
 1. Make sure the BF16 reference for the model exists. If not, run
    `build_kld_ref` (see plan §"Reference dump methodology") on the
    gfx1151 host (only host with enough UMA RAM for 27B BF16). Upload
-   to `hipfire-models/hipfire-eval-refs` and add an entry to
+   to `hipfire-models/eval-refs` and add an entry to
    `manifest.json` with `sha256`, `hf_repo`, `producer_cmd`,
    `llamacpp_commit`, `slice_md5`, and shape metadata.
 

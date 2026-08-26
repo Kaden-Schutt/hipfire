@@ -238,7 +238,7 @@ def main():
     )
     parser.add_argument("--model", required=True)
     parser.add_argument(
-        "--daemon", default=str(REPO / "target/release/examples/daemon")
+        "--daemon", default=str(REPO / "target/release/daemon")
     )
     parser.add_argument(
         "--out", default=str(REPO / ".redline-work/dispatch-profile.json")

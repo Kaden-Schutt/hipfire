@@ -1,0 +1,14 @@
+[
+  {
+    "genre": "code",
+    "prompt": "Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists into one sorted list without using sorted(). Include a short docstring."
+  },
+  {
+    "genre": "reason",
+    "prompt": "A train goes 60 mph for 2.5 hours, then 40 mph for 1.5 hours. How far did it travel in total? Show your steps and give the final number."
+  },
+  {
+    "genre": "factual",
+    "prompt": "What causes the seasons on Earth? Answer in exactly three sentences."
+  }
+]

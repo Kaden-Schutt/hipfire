@@ -6,51 +6,59 @@ license.workspace = true
 description = "Top-of-DAG model loader / carrier registry for hipfire"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 default = [
     "arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2",
-    "arch-deepseek4", "arch-dots-ocr",
+    "arch-deepseek4",
 ]
 arch-qwen35 = ["dep:hipfire-arch-qwen35"]
 arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
 arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
-arch-dots-ocr = ["dep:hipfire-arch-dots-ocr"]
-# Test-only forwarding for the Qwen35 legacy-vs-dispatch parity seam.
-test-utils = ["arch-qwen35", "hipfire-arch-qwen35/test-utils"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []
-dflash-fault-inject = [
-    "hipfire-runtime/dflash-fault-inject",
-    "hipfire-arch-llama/dflash-fault-inject",
-]
 
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime", features = ["loader-internal"] }
 hip-bridge = { path = "../hip-bridge" }
+saddle-core = { path = "../saddle-core" }
 # Optional arch crate deps — feature-gated.
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", optional = true }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl", optional = true }
 hipfire-arch-llama = { path = "../hipfire-arch-llama", optional = true }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2", optional = true }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }
-hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr", optional = true }
 # Non-optional arch deps — LoadedModel struct references these types.
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 serde_json = "1"
 
-[dev-dependencies]
-tempfile = "3"
-# Test-only: enables rdna_compute::frozen_fault_inject (HIPFIRE_FROZEN_FAIL_FREE)
-# for the retained-backlog GPU tests.
-rdna-compute = { path = "../rdna-compute", features = ["frozen-fault-inject"] }
-
-[[test]]
-name = "qwen35_parity_compile"
-path = "tests/qwen35_parity_compile.rs"
-required-features = ["test-utils"]
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "dspark_qwen3_1window"
+required-features = ["lab"]

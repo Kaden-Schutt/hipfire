@@ -97,7 +97,6 @@ fn selection_from_prompt_read(read: PromptRead, count: usize) -> Result<Option<u
     }
 }
 
-/// Install or repair this machine's hipfire runtime.
 pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Result<()> {
     install_setup_interrupt_handler();
 
@@ -117,10 +116,90 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     let commit = crate::git_output(&source, &["rev-parse", "HEAD"])
         .context("failed to resolve full git HEAD for source checkout")?;
 
+    // Honour explicit --hipcc and --strict-rocm for this run without mutating
+    // process-global env in tests — the pure helpers below take them as params.
+    // For the live installer we also export them so child cargo/hipcc processes
+    // see the same selection.
+    let hipcc_override = args.hipcc.as_deref();
+    let strict = args.strict_rocm || hipfire_config::rocm::is_strict_rocm();
+    if let Some(hipcc) = hipcc_override {
+        if !hipcc.is_file() {
+            bail!(
+                "--hipcc {} does not exist or is not executable; set --hipcc to an executable hipcc/amdclang++ (also HIPFIRE_HIPCC)",
+                hipcc.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(hipcc) {
+                if meta.permissions().mode() & 0o111 == 0 {
+                    bail!("--hipcc {} is not executable", hipcc.display());
+                }
+            }
+        }
+    }
+    // Export for child processes (single-threaded installer, safe).
+    if let Some(hipcc) = hipcc_override {
+        // SAFETY: installer is single-threaded at this point; tests use pure
+        // helpers and do not call setup_command.
+        unsafe { std::env::set_var("HIPFIRE_HIPCC", hipcc) };
+    }
+    if strict {
+        unsafe { std::env::set_var("HIPFIRE_ROCM_STRICT", "1") };
+    }
+
     // --- 4a. Resolve ROCm root (no mutation) ---
-    let rocm_root = resolve_rocm_root(args.rocm_root.as_deref(), args.yes)?;
+    let rocm_root = resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes)?;
     ensure_rocm_complete(&rocm_root)?;
     ensure_not_interrupted()?;
+
+    // Print resolved provenance before any heavy work so a failing install
+    // report always contains it. Uses the same toolchain resolver as
+    // hipfire-rocm-resolve so output stays consistent.
+    {
+        let toolchain = hipfire_config::rocm::resolve_toolchain_for_explicit(
+            Some(&rocm_root),
+            hipcc_override,
+            strict,
+        )
+        .or_else(|_| hipfire_config::rocm::resolve_toolchain());
+        if let Ok(tc) = toolchain {
+            let version = hipfire_config::rocm::version_for_root(&tc.root)
+                .or_else(hipfire_config::rocm::version)
+                .unwrap_or_else(|| "unknown".to_string());
+            let compiler = tc
+                .compiler
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string());
+            let source = tc
+                .compiler_source
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let comp_root = tc
+                .compiler_root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let runtime = hipfire_config::rocm::runtime_library(&tc.root)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string());
+            eprintln!("ROCm root:       {} (version {version})", tc.root.display());
+            eprintln!("HIPCC:           {compiler} (source: {source}, root: {comp_root})");
+            eprintln!("HIP runtime:     {runtime}");
+            for line in hipfire_config::rocm::toolchain_warnings(&tc) {
+                eprintln!("{line}");
+            }
+        } else {
+            // Fallback: at least show the selected root when toolchain
+            // resolution failed (e.g. strict cross-root). The error itself will
+            // already have been printed via ensure_* failures.
+            eprintln!("ROCm root:       {}", rocm_root.display());
+        }
+    }
+
 
     // --- 4b. Resolve GPU arch (no mutation) ---
     let gpu_arch = resolve_gpu_arch(args.gpu_arch.as_deref(), &rocm_root, args.yes)?;
@@ -158,16 +237,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     run_cargo_required(
         &source,
         &rocm_root,
-        &[
-            "build",
-            "--release",
-            "--features",
-            "deltanet",
-            "--example",
-            "daemon",
-            "-p",
-            "hipfire-runtime",
-        ],
+        &["build", "--release", "-p", "hipfire-daemon"],
         "required runtime (daemon) build",
     )?;
     ensure_not_interrupted()?;
@@ -212,7 +282,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         };
 
     install_one(
-        &release.join("examples").join("daemon"),
+        &release.join("daemon"),
         &bin_dir.join("daemon"),
         &mut replacements,
     )?;
@@ -318,6 +388,8 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         "ref": meta_ref,
         "rocm_root": rocm_root.to_string_lossy(),
         "gpu_arch": gpu_arch,
+        "hipcc": hipcc_override.map(|p| p.to_string_lossy().into_owned()),
+        "strict_rocm": strict,
         "profile": profile,
         "installed_at": installed_at,
     });
@@ -340,23 +412,52 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
 }
 
 fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
+    // Env-based wrapper for call sites that do not have explicit hipcc/strict.
+    // The live installer passes them explicitly via resolve_rocm_root_with to
+    // avoid global mutation in tests (see rocm.rs:723-746 pattern).
+    let hipcc = std::env::var_os("HIPFIRE_HIPCC")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let strict = hipfire_config::rocm::is_strict_rocm();
+    resolve_rocm_root_with(explicit, hipcc.as_deref(), strict, yes)
+}
+
+/// Pure form of [`resolve_rocm_root`] with injected hipcc/strict (no env reads).
+///
+/// `hipcc` is the `HIPFIRE_HIPCC` / `--hipcc` override if set, `strict`
+/// mirrors `HIPFIRE_ROCM_STRICT=1` / `--strict-rocm`.
+fn resolve_rocm_root_with(
+    explicit: Option<&Path>,
+    hipcc: Option<&Path>,
+    strict: bool,
+    yes: bool,
+) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        // Preserve exact invalid-root wording with the path as given (before canonicalize).
-        if !root_has_device_compiler(path) {
-            bail!(
-                "ROCm root {} has no usable device compiler; pass --rocm-root PATH",
-                path.display()
-            );
+        // Prefer the toolchain resolver so a libs-only explicit root with a
+        // cross-root compiler is accepted when not strict. Preserve the exact
+        // invalid-root wording with the path as given (before canonicalize).
+        let toolchain = hipfire_config::rocm::resolve_toolchain_for_explicit(Some(path), hipcc, strict);
+        if toolchain.is_ok() {
+            return Ok(canonicalize_or_keep(path));
         }
-        // Valid explicit roots return a canonical absolute path when possible.
-        return Ok(canonicalize_or_keep(path));
+        // No usable compiler even with cross-root/override — hard-fail and
+        // point at both --rocm-root and --hipcc as remedies.
+        let tried = hipfire_config::rocm::resolve_toolchain_for_explicit(Some(path), hipcc, strict)
+            .err()
+            .unwrap_or_else(|| "no device compiler".to_string());
+        bail!(
+            "ROCm root {} has no usable device compiler; pass --rocm-root PATH or --hipcc PATH (HIPFIRE_HIPCC)\n{tried}",
+            path.display()
+        );
     }
 
-    let mut candidates = usable_rocm_roots(hipfire_config::rocm::roots());
+    // Gather candidates that are usable either as coherent SDKs or as
+    // headers+runtime-only roots with an external compiler when not strict.
+    let candidates = usable_rocm_roots_with(hipfire_config::rocm::roots(), hipcc, strict);
 
     let selected = match candidates.len() {
-        0 => bail!("no ROCm installation found; install ROCm or pass --rocm-root PATH"),
-        1 => candidates.remove(0),
+        0 => bail!("no ROCm installation found; install ROCm or pass --rocm-root PATH or --hipcc PATH (HIPFIRE_HIPCC)"),
+        1 => candidates.into_iter().next().unwrap(),
         _ => {
             if io::stdin().is_terminal() && !yes {
                 println!("Multiple ROCm installations found:");
@@ -378,7 +479,7 @@ fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
                     println!("  {}. {}{note}", i + 1, root.display());
                 }
                 let idx = read_numbered_selection(candidates.len(), "ROCm root")?;
-                candidates.remove(idx)
+                candidates.into_iter().nth(idx).unwrap()
             } else {
                 let list = candidates
                     .iter()
@@ -405,9 +506,38 @@ fn canonicalize_or_keep(path: &Path) -> PathBuf {
 /// (e.g. `/opt/rocm/core`, `core-7`, `core-7.14` → one root). Canonicalization
 /// failure keeps the original path rather than discarding a usable candidate.
 fn usable_rocm_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let hipcc = std::env::var_os("HIPFIRE_HIPCC")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let strict = hipfire_config::rocm::is_strict_rocm();
+    usable_rocm_roots_with(roots, hipcc.as_deref(), strict)
+}
+
+/// Pure form of [`usable_rocm_roots`] with injected hipcc/strict.
+fn usable_rocm_roots_with(
+    roots: impl IntoIterator<Item = PathBuf>,
+    hipcc: Option<&Path>,
+    strict: bool,
+) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for root in roots {
-        if !root_has_device_compiler(&root) {
+        // A root is usable if it is coherent, or if it is headers+runtime-only
+        // and a cross-root compiler can be supplied (when not strict).
+        let usable = if root_has_device_compiler(&root) {
+            true
+        } else if !strict && hipfire_config::rocm::is_headers_runtime_only_root(&root) {
+            // Cross-root compiler available via explicit hipcc or via PATH/other roots.
+            if hipcc.is_some_and(|p| p.is_file()) {
+                true
+            } else {
+                // Check PATH / other roots via the toolchain helper — if a
+                // toolchain can be resolved for this root alone, it is usable.
+                hipfire_config::rocm::resolve_toolchain_for_explicit(Some(&root), hipcc, strict).is_ok()
+            }
+        } else {
+            false
+        };
+        if !usable {
             continue;
         }
         let key = canonicalize_or_keep(&root);
@@ -468,7 +598,7 @@ fn ensure_rocm_complete(root: &Path) -> Result<()> {
     for line in hipfire_config::rocm::install_guidance() {
         msg.push_str(&format!("  {line}\n"));
     }
-    msg.push_str("\nTo use a different ROCm install instead: --rocm-root PATH");
+    msg.push_str("\nTo use a different ROCm install instead: --rocm-root PATH or --hipcc PATH (HIPFIRE_HIPCC)");
     bail!(msg)
 }
 

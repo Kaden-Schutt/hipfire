@@ -1,0 +1,8 @@
+build exit=0
+--- tokens=256 exit=0 ---
+WINDOW variant=default e8b=0 B=1024 | 2730.63 ms/call (best 2727.38) | 93.75 tok/s | 256 tokens | pos 0
+--- tokens=1024 exit=0 ---
+WINDOW variant=default e8b=0 B=1024 | 10181.73 ms/call (best 10169.54) | 100.57 tok/s | 1024 tokens | pos 0
+--- tokens=2048 exit=0 ---
+WINDOW variant=default e8b=0 B=1024 | 10387.40 ms/call (best 10369.95) | 98.58 tok/s | 2048 tokens | pos 0
+PREFILLDONE

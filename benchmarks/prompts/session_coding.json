@@ -1,0 +1,10 @@
+[
+  {"content": "I'm building a CLI tool in Rust to dedupe large files by content hash. Sketch the architecture — modules, data flow, and the key crates you'd reach for. Keep it concrete."},
+  {"content": "Good. Now write the core dedupe function with a streaming hasher (blake3) so it handles 100 GB files without loading them into memory. Show the full function."},
+  {"content": "Walk through the memory profile of that function — where the allocations are and whether it could OOM on a 32 GB machine under heavy concurrency."},
+  {"content": "Add parallelism with rayon, but cap concurrency so we don't thrash the disk with too many simultaneous reads. Show the updated code."},
+  {"content": "Switch gears: explain the difference between content-defined chunking (FastCDC) and fixed-size chunking for dedup ratio, and when each wins."},
+  {"content": "Write me a short haiku about deduplication to lighten the mood."},
+  {"content": "Back to the code — what was the FIRST function I asked you to write earlier in this conversation? Refactor it to return a Result<_, std::io::Error> instead of panicking on a read failure.", "expect": ["dedupe", "hash", "Result"]},
+  {"content": "Summarize everything we've built across this whole session and the key design decisions we made along the way.", "expect": ["dedupe", "rayon", "chunk"]}
+]

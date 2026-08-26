@@ -21,6 +21,7 @@ use crate::families::moe::{
     launch_moe_scatter, launch_moe_softmax_topk, launch_qwen_down_indexed,
     launch_qwen_gate_up_indexed, launch_scaled_add_gpu_scalar, launch_score_activation,
     launch_shared_expert_down_body, launch_shared_gate_side, DeepSeekIndexedForm, MoeExpertRef,
+    MoeRouterBackend,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -800,13 +801,20 @@ pub enum Step<'a> {
     /// launches in one step — `softmax_f32(logits)` then
     /// `moe_topk_renorm_k8(logits, topk_indices, topk_weights, n_exp,
     /// norm_topk_prob)` — preserving the legacy launch order. Prefill routing
-    /// stays model-owned (no step).
+    /// stays model-owned (no step). The `backend` is the architecture-
+    /// selected router (see [`MoeRouterBackend`] and
+    /// [`select_moe_router_backend`]): the wave64 fused routers are
+    /// numerically distinct from the generic two-launch route, so the Qwen
+    /// builder encodes the same choice the direct `run_moe_decode` executor
+    /// makes; any non-Qwen caller that emits this step without opting in
+    /// keeps `Default` (the byte-identical generic route).
     MoeSoftmaxTopK {
         logits: &'a GpuTensor,
         topk_indices: &'a GpuTensor,
         topk_weights: &'a GpuTensor,
         n_exp: usize,
         norm_topk_prob: bool,
+        backend: MoeRouterBackend,
     },
     /// Fused gate-side projection (qwen decode, MQ4 gate side): one launch of
     /// `fused_qkvza_hfq4g256` over the single FWHT-rotated `x_rot` writing
@@ -2999,14 +3007,39 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             topk_weights,
             n_exp,
             norm_topk_prob,
-        } => launch_moe_softmax_topk(
-            gpu,
-            logits,
-            topk_indices,
-            topk_weights,
-            *n_exp,
-            *norm_topk_prob,
-        ),
+            backend,
+        } => match backend {
+            // Architecture-selected router backends (encoded by the Qwen
+            // builder via `select_moe_router_backend`, mirroring the direct
+            // `run_moe_decode` rules exactly). `Default` keeps the generic
+            // two-launch route for every non-Qwen caller.
+            MoeRouterBackend::ExactWave64 => gpu
+                .moe_router_softmax_topk_k8_wave64_exact(
+                    logits,
+                    topk_indices,
+                    topk_weights,
+                    *n_exp,
+                    *norm_topk_prob,
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string())),
+            MoeRouterBackend::Wave64 => gpu
+                .moe_router_softmax_topk_k8_wave64(
+                    logits,
+                    topk_indices,
+                    topk_weights,
+                    *n_exp,
+                    *norm_topk_prob,
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string())),
+            MoeRouterBackend::Default => launch_moe_softmax_topk(
+                gpu,
+                logits,
+                topk_indices,
+                topk_weights,
+                *n_exp,
+                *norm_topk_prob,
+            ),
+        },
         Step::MoeFusedSharedGate {
             router,
             shared_expert_gate,
@@ -4148,15 +4181,14 @@ mod tests {
             },
         ];
         // Force the standalone semantics by disabling fusion for this run.
-        let mut unfused_flags =
-            rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100");
+        let mut unfused_flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100");
         unfused_flags.force_unfused = true;
         let unfused_ctx = DispatchCtx {
             arch: rdna_compute::arch_caps::ArchCaps::new(
                 "gfx1100",
-                std::sync::Arc::new(
-                    rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100"),
-                ),
+                std::sync::Arc::new(rdna_compute::feature_flags::FeatureFlags::for_test(
+                    "gfx1100",
+                )),
             ),
             flags: std::sync::Arc::new(unfused_flags),
             resources: crate::resource::ResourceManager::for_test(),

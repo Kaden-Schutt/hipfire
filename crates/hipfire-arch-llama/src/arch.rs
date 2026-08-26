@@ -18,16 +18,12 @@ use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
-use hipfire_runtime::weight_manifest::{
-    PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
-};
-use rdna_compute::DType;
+use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::Gpu;
 
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
-use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::llama::{attention_family, AttnParams, KvTierInputs, KvTierPlan};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
@@ -90,148 +86,6 @@ impl Architecture for Llama {
             .map_err(|e| format!("llama: ForwardScratch::new failed: {e:?}"))
     }
 
-    /// Dense (GQA) weight manifest (device-mesh Phase 2): the standard
-    /// Megatron placement, transcribed from the llama layout. Attention Q/K/V
-    /// are three separate column-parallel projections, O is row-parallel; FFN
-    /// gate/up column-parallel, down row-parallel; norms replicated; embed
-    /// pinned to stage 0; lm_head pinned to the output stage.
-    fn weight_manifest(cfg: &Self::Config) -> Vec<WeightEntry> {
-        use ShardPolicy::*;
-        let (d, ff, hd) = (cfg.dim, cfg.hidden_dim, cfg.head_dim);
-        let (nh, nkv) = (cfg.n_heads, cfg.n_kv_heads);
-        let mut m = Vec::with_capacity(cfg.n_layers * 9 + 3);
-        m.push(WeightEntry::model(
-            "token_embd",
-            vec![cfg.vocab_size, d],
-            DType::F16,
-            Pin(PinTarget::Embed),
-        ));
-        for l in 0..cfg.n_layers {
-            // Q/K/V are three SEPARATE projections in llama, not a packed
-            // fused tensor — so each is a plain column-parallel shard on its
-            // output dim, matching wk/wv below. `FusedQkv` is only for an
-            // actually-fused Q|K|V tensor (there is nothing to cut at K/V
-            // boundaries here). Phase-5 refinement: upgrade all three to a
-            // head-aware policy carrying the GQA q/kv head counts so
-            // `validate_manifest` enforces per-head (not just per-dim)
-            // divisibility.
-            m.push(WeightEntry::layer(
-                "wq",
-                l,
-                vec![nh * hd, d],
-                DType::F16,
-                ColumnShard { axis: 0 },
-            ));
-            m.push(WeightEntry::layer(
-                "wk",
-                l,
-                vec![nkv * hd, d],
-                DType::F16,
-                ColumnShard { axis: 0 },
-            ));
-            m.push(WeightEntry::layer(
-                "wv",
-                l,
-                vec![nkv * hd, d],
-                DType::F16,
-                ColumnShard { axis: 0 },
-            ));
-            m.push(WeightEntry::layer(
-                "wo",
-                l,
-                vec![d, nh * hd],
-                DType::F16,
-                RowShard { axis: 1 },
-            ));
-            m.push(WeightEntry::layer(
-                "ffn_gate",
-                l,
-                vec![ff, d],
-                DType::F16,
-                ColumnShard { axis: 0 },
-            ));
-            m.push(WeightEntry::layer(
-                "ffn_up",
-                l,
-                vec![ff, d],
-                DType::F16,
-                ColumnShard { axis: 0 },
-            ));
-            m.push(WeightEntry::layer(
-                "ffn_down",
-                l,
-                vec![d, ff],
-                DType::F16,
-                RowShard { axis: 1 },
-            ));
-            m.push(WeightEntry::layer(
-                "attn_norm",
-                l,
-                vec![d],
-                DType::F32,
-                Replicate,
-            ));
-            // Qwen3 per-head Q/K RMSNorm (`[head_dim]`); absent on LLaMA/Mistral.
-            if cfg.has_qk_norm {
-                m.push(WeightEntry::layer(
-                    "q_norm",
-                    l,
-                    vec![hd],
-                    DType::F32,
-                    Replicate,
-                ));
-                m.push(WeightEntry::layer(
-                    "k_norm",
-                    l,
-                    vec![hd],
-                    DType::F32,
-                    Replicate,
-                ));
-            }
-            m.push(WeightEntry::layer(
-                "ffn_norm",
-                l,
-                vec![d],
-                DType::F32,
-                Replicate,
-            ));
-        }
-        // Final norm co-locates with lm_head on the last pipeline stage (the
-        // Megatron output convention) — `Pin(Output)`, not `Replicate` (which
-        // would land it on stage 0 and starve the last stage under PP).
-        m.push(WeightEntry::model(
-            "output_norm",
-            vec![d],
-            DType::F32,
-            Pin(PinTarget::Output),
-        ));
-        m.push(WeightEntry::model(
-            "lm_head",
-            vec![cfg.vocab_size, d],
-            DType::F16,
-            Pin(PinTarget::Output),
-        ));
-        m
-    }
-
-    /// State manifest (device-mesh Phase 2): llama is full-attention only, so
-    /// its per-layer state is a KV cache (one [`StateEntry::Kv`] per layer,
-    /// keyed by global layer index, co-resident with the layer's stage under
-    /// PP). The quant mode is a load-time choice, resolved at fulfillment —
-    /// empty here. No recurrent/conv state.
-    fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
-        (0..cfg.n_layers)
-            .map(|l| {
-                StateEntry::new(
-                    StateKind::Kv {
-                        quant: String::new(),
-                    },
-                    l,
-                )
-            })
-            .collect()
-    }
-
     // Optional overrides: defaults from `hipfire_runtime::arch` already
     // assume Qwen3.5 family conventions. LLaMA / Mistral / Qwen3 don't
     // emit `<think>` blocks, but PR 11 keeps the override surface
@@ -290,8 +144,6 @@ impl Llama {
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
         let ctx = DispatchCtx::new(gpu);
-        // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
-        let mesh = DeviceMesh::single();
 
         let n_heads = config.n_heads;
         let n_kv_heads = config.n_kv_heads;
@@ -310,8 +162,7 @@ impl Llama {
             let wrq = layer.wq.dispatch_ref();
             let wrk = layer.wk.dispatch_ref();
             let wrv = layer.wv.dispatch_ref();
-            execute_steps_mesh(
-                &mesh,
+            execute_steps(
                 gpu,
                 &ctx,
                 &[
@@ -436,8 +287,7 @@ impl Llama {
 
             // ── Attention output projection + residual ─────────
             let wro = layer.wo.dispatch_ref();
-            execute_steps_mesh(
-                &mesh,
+            execute_steps(
                 gpu,
                 &ctx,
                 &[Step::GemvResidual {
@@ -454,8 +304,7 @@ impl Llama {
             let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
             let wrg = layer.w_gate.dispatch_ref();
             let wru = layer.w_up.dispatch_ref();
-            execute_steps_mesh(
-                &mesh,
+            execute_steps(
                 gpu,
                 &ctx,
                 &[
@@ -485,8 +334,7 @@ impl Llama {
             // ── SwiGLU + down projection + residual ─────────────
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
             let wrd = layer.w_down.dispatch_ref();
-            execute_steps_mesh(
-                &mesh,
+            execute_steps(
                 gpu,
                 &ctx,
                 &[Step::GemvResidual {
@@ -506,8 +354,7 @@ impl Llama {
             config.norm_eps,
         )?;
         let wr_out = weights.output.dispatch_ref();
-        execute_steps_mesh(
-            &mesh,
+        execute_steps(
             gpu,
             &ctx,
             &[Step::Gemv {

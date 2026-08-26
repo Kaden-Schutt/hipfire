@@ -16,6 +16,7 @@ use hipfire_runtime::gpu_cleanup::{
     free_tensor_retained, free_weight_all_checked, retain_kv_failures, GpuCleanupFailure,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::moe_plan::{select_moe_executor, MoEExecutionPolicy, MoeExecutorKind};
@@ -271,7 +272,19 @@ fn load_norm(
 }
 
 /// Load a MiniMax AWQ shared-scale sidecar (1D F16, length k) → F32 GpuTensor.
-fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+/// `slice = Some((offset, len))` uploads only that rank-local segment of the
+/// sidecar (the TP-of-experts down path: the down weight is row-gathered to
+/// `inter_local` per rank, and the activation kernel reads the scale from
+/// offset 0 with the rank's `inter_local` length — the FULL sidecar would
+/// make ranks > 0 read rank 0's scale segment). `None` uploads the whole
+/// sidecar (Single / EP, and the gate_up scale, whose dim is never sliced).
+fn load_mm_awq_scale(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    k: usize,
+    slice: Option<(usize, usize)>,
+) -> Option<GpuTensor> {
     let (qt, data) = read_tensor(hfq, name).ok()?;
     if qt != 1 {
         return None;
@@ -288,6 +301,19 @@ fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Opti
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
+    let f32_data = match slice {
+        Some((offset, len)) => {
+            if offset + len > f32_data.len() {
+                eprintln!(
+                    "minimax AWQ sidecar {name}: slice {offset}+{len} > {}; skipping",
+                    f32_data.len()
+                );
+                return None;
+            }
+            f32_data[offset..offset + len].to_vec()
+        }
+        None => f32_data,
+    };
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
 }
@@ -443,6 +469,13 @@ pub struct MiniMaxWeights {
     pub final_norm: GpuTensor, // model.norm.weight
     pub lm_head: WeightTensor, // lm_head.weight
     pub layers: Vec<MiniMaxLayerWeights>,
+    /// Load-bound expert layout of THIS rank (recorded at load from the
+    /// `shard`/`tp_slice` arguments). The mesh entries (`forward_ep` /
+    /// `forward_tp`) aggregate-validate every rank's recorded layout against
+    /// the caller policy's Ep/Tp mesh BEFORE any GPU work or authority
+    /// acquisition — a wrong, duplicate, or unsliced rank layout refuses
+    /// deterministically instead of running with mismatched experts.
+    pub expert_layout: ExpertLoadLayout,
     /// Model-owned immutable CPU state: the authoritative policy-aware expert
     /// manifest resolution for the exact key (load-bound manifest config
     /// identity + exact policy) of the model's forward path, cached here.
@@ -451,6 +484,104 @@ pub struct MiniMaxWeights {
     /// and the crate-visible
     /// [`single_policy`](MiniMaxWeights::single_policy).
     expert_manifest_cache: MiniMaxExpertManifestCache,
+}
+
+/// The load-bound expert layout of one `MiniMaxWeights`, recorded by
+/// [`MiniMaxWeights::load`] from its `shard` / `tp_slice` arguments. The
+/// mesh entries require each rank's recorded layout to equal the layout the
+/// caller policy's Ep/Tp mesh implies for that rank (kind + width + rank +
+/// assignment), so a wrong/duplicate/full/mis-assigned slice is refused
+/// before any GPU work. The single-rank authority requires
+/// [`ExpertLoadLayout::Single`] — EP/TP-loaded weights refuse on the
+/// single decode/batch entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertLoadLayout {
+    /// No sharding: this rank holds every expert whole (single-GPU or the
+    /// safetensors path).
+    Single,
+    /// Expert-parallel shard: rank `rank` of `width` owns its stride-assigned
+    /// experts; non-owned expert slots point at the zeroed `dummy_gate_up`.
+    /// `assignment` is the CERTIFIED ownership scheme the shard's
+    /// `expert_to_rank` map implements — MiniMax only admits the
+    /// manifest-declared `Stride` map, so mixed Stride/Contiguous rank sets
+    /// (duplicated/omitted experts) can never pass the aggregate check.
+    Ep {
+        width: usize,
+        rank: usize,
+        assignment: hipfire_runtime::tp_shard::ExpertAssign,
+    },
+    /// TP-of-experts slice: this rank holds ALL experts, column/row-sliced to
+    /// `intermediate / width`.
+    Tp { width: usize, rank: usize },
+}
+
+/// Pure CPU certification of the load-bound expert layout, run at the VERY
+/// start of [`MiniMaxWeights::load`] — before the first GPU upload — so an
+/// invalid shard/slice configuration refuses WITHOUT leaking uploaded
+/// tensors (`GpuTensor` has no Drop). Checks:
+/// - EP: `width >= 1`, `rank < width`, `expert_to_rank` spans EXACTLY all
+///   `n_exp` experts (an empty/short map can never vacuous-`all()` past),
+///   and every expert maps to its manifest-declared Stride owner
+///   (`e % width`) — a Contiguous or otherwise non-stride map refuses.
+/// - TP: `tp >= 1`, `rank < tp` (a zero width would otherwise panic in
+///   `inter / tp` slicing).
+/// GPU-free — directly unit-tested.
+fn certify_expert_layout(
+    shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+    tp_slice: Option<hipfire_runtime::tp_shard::TpExpertSlice>,
+    n_exp: usize,
+) -> Result<ExpertLoadLayout, String> {
+    // TP-of-experts and EP sharding are mutually exclusive: a hybrid config
+    // would run the EP ownership path AND the TP column/row slicing of the
+    // expert loop with a wrong layout. Refused FIRST, before any branch.
+    if shard.is_some() && tp_slice.is_some() {
+        return Err("minimax: TP expert slice + EP sharding are mutually exclusive".into());
+    }
+    if let Some((shard_cfg, rank)) = shard {
+        let width = shard_cfg.tp_size;
+        if width == 0 {
+            return Err("minimax: EP shard width must be >= 1".into());
+        }
+        if rank >= width {
+            return Err(format!("minimax: EP shard rank {rank} >= width {width}"));
+        }
+        if shard_cfg.expert_to_rank.len() != n_exp {
+            return Err(format!(
+                "minimax: EP shard expert_to_rank covers {} experts != {n_exp}",
+                shard_cfg.expert_to_rank.len()
+            ));
+        }
+        for (e, &r) in shard_cfg.expert_to_rank.iter().enumerate() {
+            if r as usize != e % width {
+                return Err(format!(
+                    "minimax: EP load requires the Stride expert assignment (the manifest \
+                     declares ExpertAssign::Stride); expert {e} maps to rank {r}, expected {}",
+                    e % width
+                ));
+            }
+        }
+        Ok(ExpertLoadLayout::Ep {
+            width,
+            rank,
+            assignment: hipfire_runtime::tp_shard::ExpertAssign::Stride,
+        })
+    } else if let Some(ts) = tp_slice {
+        if ts.tp == 0 {
+            return Err("minimax: TpExpertSlice width must be >= 1".into());
+        }
+        if ts.rank >= ts.tp {
+            return Err(format!(
+                "minimax: TpExpertSlice rank {} >= tp {}",
+                ts.rank, ts.tp
+            ));
+        }
+        Ok(ExpertLoadLayout::Tp {
+            width: ts.tp,
+            rank: ts.rank,
+        })
+    } else {
+        Ok(ExpertLoadLayout::Single)
+    }
 }
 
 /// Model-owned immutable CPU cache of the authoritative policy-aware expert
@@ -809,6 +940,31 @@ impl<'a> SingleMoeAuthority<'a> {
     /// established batched MoE dispatch; the sequential path lowers with the
     /// returned plan.
     pub(crate) fn plan_for_layer(&self, l: usize) -> Result<&'a ExpertGroupPlan, String> {
+        self.plan_for_layer_admitting(l, ExpertExecutionIdentity::IndexedQuantized, "indexed")
+    }
+
+    /// The scatter-grouped WMMA admission twin of [`Self::plan_for_layer`]:
+    /// the layer-`l` plan must be layer-scoped, declare `sigmoid_topk`, admit
+    /// [`ExpertExecutionIdentity::GroupedQuantized`] (the batched prefill
+    /// grouped kernels are the single-device grouped quantized family), and
+    /// be Single-admitted. `forward_batch` gates its grouped fast path on
+    /// this BEFORE allocating grouped scratch, and pins it per layer while
+    /// the grouped path is selected — grouped execution never runs under an
+    /// indexed-only manifest declaration.
+    pub(crate) fn plan_for_grouped_layer(&self, l: usize) -> Result<&'a ExpertGroupPlan, String> {
+        self.plan_for_layer_admitting(l, ExpertExecutionIdentity::GroupedQuantized, "grouped")
+    }
+
+    /// Shared admission core of [`Self::plan_for_layer`] /
+    /// [`Self::plan_for_grouped_layer`]: layer coverage + scope, the exact
+    /// `sigmoid_topk` router identity, admission of the REQUIRED execution
+    /// identity, and Single executor admission.
+    fn plan_for_layer_admitting(
+        &self,
+        l: usize,
+        required: ExpertExecutionIdentity,
+        family_label: &str,
+    ) -> Result<&'a ExpertGroupPlan, String> {
         let plan = self.resolution.plans.get(l).ok_or_else(|| {
             format!(
                 "minimax: expert manifest resolution has {} plan(s); layer {l} is out of range",
@@ -827,12 +983,9 @@ impl<'a> SingleMoeAuthority<'a> {
                 plan.router_identity
             ));
         }
-        if !plan
-            .allowed_executions
-            .contains(&ExpertExecutionIdentity::IndexedQuantized)
-        {
+        if !plan.allowed_executions.contains(&required) {
             return Err(format!(
-                "minimax: expert manifest resolution plan[{l}] allowed executions {:?} do not                  admit IndexedQuantized (the direct batched indexed kernels require it)",
+                "minimax: expert manifest resolution plan[{l}] allowed executions {:?} do not                  admit {required:?} (the direct batched {family_label} kernels require it)",
                 plan.allowed_executions
             ));
         }
@@ -849,15 +1002,29 @@ impl<'a> SingleMoeAuthority<'a> {
     }
 }
 
-/// The common Single-authority accessor used by BOTH `decode_step_body` and
+/// The common Single-authority accessor used by the single decode entries and
 /// `forward_batch`: obtains the cache-owned stable `weights.single_policy()`
 /// and `weights.expert_manifest_for_policy(cfg, policy)` (load-bound config /
 /// policy / failure refusal propagated), exposed as the per-layer-validating
 /// [`SingleMoeAuthority`].
+///
+/// LAYOUT GATE: the single-rank authority is only valid for Single-loaded
+/// weights. EP/TP-loaded weights must run through the mesh entries
+/// (`forward_ep` / `forward_tp`) — on the single paths their sharded pointer
+/// tables would be read as if whole (duplicated/omitted experts). The public
+/// single entries acquire this authority BEFORE embed / pos staging / scratch
+/// allocation, so a sharded model refuses without mutating device state.
 pub(crate) fn minimax_single_moe_authority<'a>(
     weights: &'a MiniMaxWeights,
     cfg: &MiniMaxConfig,
 ) -> Result<SingleMoeAuthority<'a>, String> {
+    if weights.expert_layout != ExpertLoadLayout::Single {
+        return Err(format!(
+            "minimax: expert manifest (single): weights were loaded as {:?}; the single-rank \
+             forward requires the Single layout (reload without shard/tp_slice)",
+            weights.expert_layout
+        ));
+    }
     let policy = weights.single_policy();
     let resolution = weights
         .expert_manifest_for_policy(cfg, policy)
@@ -941,10 +1108,13 @@ impl MiniMaxWeights {
         if cfg.reap_keep.is_some() && shard.is_some() {
             return Err("minimax: REAP keep-map + EP sharding are mutually exclusive".into());
         }
-        // TP-of-experts and EP sharding are also mutually exclusive.
-        if tp_slice.is_some() && shard.is_some() {
-            return Err("minimax: TP expert slice + EP sharding are mutually exclusive".into());
-        }
+        // Layout certification BEFORE any GPU upload: an invalid shard/slice
+        // config (rank/width misuse, empty/short expert_to_rank, a
+        // Contiguous or otherwise non-stride ownership map) refuses here,
+        // before any tensor is uploaded (GpuTensor has no Drop — a late
+        // refusal would leak every loaded buffer). The certified layout is
+        // reused in the final struct.
+        let expert_layout = certify_expert_layout(shard, tp_slice, n_exp)?;
         // inter_local: intermediate dim per TP rank. Under TP this is inter/tp;
         // under no TP it equals inter (tp=1, inter_local==inter → byte-identical).
         let inter_local = tp_slice.map(|ts| ts.inter_local(inter)).unwrap_or(inter);
@@ -1179,14 +1349,21 @@ impl MiniMaxWeights {
                 gpu,
                 &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
                 hidden,
+                None,
             );
             if hipfire_config::developer_var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
-                // down-AWQ harmful (shared s_down bad approx); opt-in
+                // down-AWQ harmful (shared s_down bad approx); opt-in. Under
+                // TP-of-experts the down weight is row-gathered to inter_local
+                // per rank, so the sidecar is sliced to the SAME rank-local
+                // segment (rank r * inter_local .. +inter_local); Single/EP
+                // keep the full per-layer scale.
+                let slice = tp_slice.map(|ts| (ts.rank * inter_local, inter_local));
                 down.awq_scale = load_mm_awq_scale(
                     hfq,
                     gpu,
                     &format!("{p}.block_sparse_moe.awq_scale_down.weight"),
                     inter,
+                    slice,
                 );
             }
             if gate_up.awq_scale.is_some() {
@@ -1270,15 +1447,106 @@ impl MiniMaxWeights {
             });
         }
 
+        // The certified layout (validated at the very start of load, before
+        // any GPU upload) is recorded on the weights for the mesh entries'
+        // aggregate validation and the single authority's layout gate.
         Ok(MiniMaxWeights {
             embed,
             final_norm,
             lm_head,
             layers,
+            expert_layout,
             expert_manifest_cache: MiniMaxExpertManifestCache::new(
                 MiniMaxManifestConfigIdentity::from_cfg(cfg),
             ),
         })
+    }
+
+    /// Synthetic metadata-only weights for the mesh-entry layout tests in
+    /// forward.rs: null device buffers (never handed to HIP — the aggregate
+    /// validator inspects only shapes/fields) with the real shapes the
+    /// validator checks (layer count, expert pointer bundles, dummy gate_up
+    /// presence). `ptr_bundle_shape` overrides both pointer-table shapes to
+    /// exercise the bundle-capacity refusal. Test-only.
+    #[cfg(test)]
+    pub(crate) fn synth_for_layout_test(
+        layout: ExpertLoadLayout,
+        n_layers: usize,
+        n_exp: usize,
+        dummy: bool,
+        ptr_bundle_shape: Option<[usize; 2]>,
+    ) -> Self {
+        let t = |n: usize| GpuTensor {
+            shape: vec![n],
+            ..GpuTensor::null_for_test()
+        };
+        let wt = |m: usize, k: usize| WeightTensor {
+            buf: t(m.max(k)),
+            gpu_dtype: DType::MQ2G256Lloyd,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+        let [gu_shape, dn_shape] = ptr_bundle_shape.unwrap_or([2 * n_exp, 2 * n_exp]);
+        let layers = (0..n_layers)
+            .map(|_| MiniMaxLayerWeights {
+                attn_norm: t(n_exp),
+                ffn_norm: t(n_exp),
+                q_norm: t(n_exp),
+                k_norm: t(n_exp),
+                wq: wt(n_exp, n_exp),
+                wk: wt(n_exp, n_exp),
+                wv: wt(n_exp, n_exp),
+                wo: wt(n_exp, n_exp),
+                router: wt(n_exp, n_exp),
+                routing_bias: t(n_exp),
+                experts: vec![MiniMaxExpertWeights {
+                    gate_up: wt(2 * n_exp, n_exp),
+                    down: wt(n_exp, n_exp),
+                }],
+                expert_gate_up_ptrs: GpuTensor {
+                    shape: vec![gu_shape],
+                    ..GpuTensor::null_for_test()
+                },
+                expert_down_ptrs: GpuTensor {
+                    shape: vec![dn_shape],
+                    ..GpuTensor::null_for_test()
+                },
+                dummy_gate_up: dummy.then(|| t(n_exp)),
+            })
+            .collect();
+        let cfg = MiniMaxConfig {
+            vocab_size: 16,
+            hidden_size: 64,
+            num_hidden_layers: n_layers,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 64,
+            intermediate_size: 512,
+            num_local_experts: n_exp,
+            num_experts_per_tok: 2,
+            rotary_dim: 2,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 64,
+            use_qk_norm: true,
+            use_routing_bias: true,
+            scoring_func: "sigmoid".into(),
+            num_mtp_modules: 0,
+            reap_keep: None,
+        };
+        MiniMaxWeights {
+            embed: t(n_exp),
+            final_norm: t(n_exp),
+            lm_head: wt(n_exp, n_exp),
+            layers,
+            expert_layout: layout,
+            expert_manifest_cache: MiniMaxExpertManifestCache::new(
+                MiniMaxManifestConfigIdentity::from_cfg(&cfg),
+            ),
+        }
     }
 }
 
@@ -1447,6 +1715,7 @@ impl MiniMaxWeights {
             final_norm,
             lm_head,
             layers,
+            expert_layout: _,         // pure CPU metadata — nothing to free
             expert_manifest_cache: _, // pure CPU state — nothing to free
         } = self;
         let _ = gpu.free_tensor(embed);
@@ -1467,6 +1736,7 @@ impl MiniMaxWeights {
             final_norm,
             lm_head,
             layers,
+            expert_layout: _,         // pure CPU metadata — nothing to free
             expert_manifest_cache: _, // pure CPU state — nothing to free
         } = self;
         let mut cf = GpuCleanupFailure::empty();
@@ -1735,17 +2005,18 @@ impl MiniMaxState {
             max_seq, // already clamped to MINIMAX_ATTN_LDS_MAX_SEQ above
             physical_cap: None,
         };
-        let kv = hipfire_runtime::llama::KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve(
-                "",
-                &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
-                cfg.head_dim,
+        let kv =
+            <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
+                hipfire_runtime::kv_mode::resolve(
+                    "",
+                    &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
+                    cfg.head_dim,
+                )
+                .mode,
+                hipfire_runtime::llama::KvTarget::Single(gpu),
+                &dims,
             )
-            .mode,
-            hipfire_runtime::llama::KvTarget::Single(gpu),
-            &dims,
-        )
-        .map_err(|e| format!("minimax: kv cache: {e:?}"))?;
+            .map_err(|e| format!("minimax: kv cache: {e:?}"))?;
         let pos_buf = gpu
             .hip
             .malloc(4)
@@ -2166,6 +2437,8 @@ pub fn load_weights_from_safetensors(
         final_norm,
         lm_head,
         layers,
+        // The safetensors path never shards — single-rank layout.
+        expert_layout: ExpertLoadLayout::Single,
         expert_manifest_cache: MiniMaxExpertManifestCache::new(
             MiniMaxManifestConfigIdentity::from_cfg(cfg),
         ),
@@ -2687,5 +2960,156 @@ mod tests {
         let authority = SingleMoeAuthority::new(&single, &grouped);
         let err = authority.plan_for_layer(0).unwrap_err();
         assert!(err.contains("IndexedQuantized"), "got: {err}");
+    }
+
+    #[test]
+    fn grouped_plan_admission_requires_grouped_identity() {
+        // The grouped admission twin (`plan_for_grouped_layer`) requires the
+        // GroupedQuantized identity; the fixture topology (4 experts) declares
+        // indexed-only, so the grouped pin refuses and `forward_batch` falls
+        // back to the indexed path. A plan declaring BOTH identities admits
+        // both pins; grouped-only still refuses the indexed pin.
+        let cfg = test_config_512();
+        let single = MoEExecutionPolicy::single();
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &single);
+        let manifest = MiniMaxM2::weight_manifest(&cfg);
+        let resolution = resolve_expert_manifest_for_policy(&specs, &manifest, &single).unwrap();
+        let authority = SingleMoeAuthority::new(&single, &resolution);
+        let err = authority.plan_for_grouped_layer(0).unwrap_err();
+        assert!(err.contains("GroupedQuantized"), "got: {err}");
+        assert!(authority.plan_for_layer(0).is_ok());
+
+        let mut both = resolution.clone();
+        both.plans[0].allowed_executions = vec![
+            ExpertExecutionIdentity::IndexedQuantized,
+            ExpertExecutionIdentity::GroupedQuantized,
+        ];
+        let both_auth = SingleMoeAuthority::new(&single, &both);
+        assert!(both_auth.plan_for_layer(0).is_ok());
+        assert!(both_auth.plan_for_grouped_layer(0).is_ok());
+
+        let mut grouped_only = resolution.clone();
+        grouped_only.plans[0].allowed_executions = vec![ExpertExecutionIdentity::GroupedQuantized];
+        let g_auth = SingleMoeAuthority::new(&single, &grouped_only);
+        let err = g_auth.plan_for_layer(0).unwrap_err();
+        assert!(err.contains("IndexedQuantized"), "got: {err}");
+        assert!(g_auth.plan_for_grouped_layer(0).is_ok());
+    }
+
+    #[test]
+    fn manifest_admits_grouped_only_for_m2_topology() {
+        // The manifest declares GroupedQuantized ONLY for the grouped-capable
+        // M2 production topology (256 experts / top-8); any other topology
+        // stays indexed-only, so `forward_batch`'s grouped gate can never
+        // admit grouped execution under an indexed-only declaration.
+        let mut cfg = test_config_512();
+        cfg.num_local_experts = 256;
+        cfg.num_experts_per_tok = 8;
+        let single = MoEExecutionPolicy::single();
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &single);
+        assert!(specs[0]
+            .allowed_executions
+            .contains(&ExpertExecutionIdentity::GroupedQuantized));
+        assert!(specs[0]
+            .allowed_executions
+            .contains(&ExpertExecutionIdentity::IndexedQuantized));
+        cfg.num_experts_per_tok = 4;
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &single);
+        assert!(!specs[0]
+            .allowed_executions
+            .contains(&ExpertExecutionIdentity::GroupedQuantized));
+    }
+
+    #[test]
+    fn single_authority_refuses_sharded_layouts() {
+        // The single-rank authority is ONLY valid for Single-loaded weights —
+        // EP/TP-loaded models must run through the mesh entries
+        // (`forward_ep` / `forward_tp`). The layout gate refuses BEFORE the
+        // manifest cache is touched (the public single entries acquire the
+        // authority before embed / pos / allocation).
+        let cfg = test_config_512();
+        let single =
+            MiniMaxWeights::synth_for_layout_test(ExpertLoadLayout::Single, 1, 4, false, None);
+        let ep = MiniMaxWeights::synth_for_layout_test(
+            ExpertLoadLayout::Ep {
+                width: 2,
+                rank: 0,
+                assignment: hipfire_runtime::tp_shard::ExpertAssign::Stride,
+            },
+            1,
+            4,
+            true,
+            None,
+        );
+        let tp = MiniMaxWeights::synth_for_layout_test(
+            ExpertLoadLayout::Tp { width: 2, rank: 0 },
+            1,
+            4,
+            false,
+            None,
+        );
+        // Single layout resolves (the synth constructor's cache identity
+        // matches this fixture config).
+        minimax_single_moe_authority(&single, &cfg)
+            .expect("Single layout must resolve the single authority");
+        // EP/TP layouts refuse with the layout-gate message.
+        let err = minimax_single_moe_authority(&ep, &cfg).unwrap_err();
+        assert!(err.contains("requires the Single layout"), "got: {err}");
+        let err = minimax_single_moe_authority(&tp, &cfg).unwrap_err();
+        assert!(err.contains("requires the Single layout"), "got: {err}");
+    }
+
+    #[test]
+    fn load_layout_certification_refuses_before_upload() {
+        // The pure CPU certification runs at the VERY start of `load`, before
+        // any GPU upload — an invalid shard/slice config refuses without
+        // leaking uploaded tensors (GpuTensor has no Drop).
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig, TpExpertSlice};
+        let stride = ShardConfig::new(2, true, 4, ExpertAssign::Stride).unwrap();
+        // Valid Stride map certifies with the exact layout.
+        assert_eq!(
+            certify_expert_layout(Some((&stride, 1)), None, 4).unwrap(),
+            ExpertLoadLayout::Ep {
+                width: 2,
+                rank: 1,
+                assignment: ExpertAssign::Stride,
+            }
+        );
+        // Contiguous (non-stride) map refuses — mixed Stride/Contiguous rank
+        // sets can never pass the aggregate checks.
+        let contiguous = ShardConfig::new(2, true, 4, ExpertAssign::Contiguous).unwrap();
+        let err = certify_expert_layout(Some((&contiguous, 0)), None, 4).unwrap_err();
+        assert!(err.contains("Stride"), "got: {err}");
+        // EMPTY map refuses (a vacuous all() can never pass).
+        let mut short = ShardConfig::new(2, true, 4, ExpertAssign::Stride).unwrap();
+        short.expert_to_rank.clear();
+        let err = certify_expert_layout(Some((&short, 0)), None, 4).unwrap_err();
+        assert!(err.contains("covers"), "got: {err}");
+        // Rank/width misuse refuses.
+        let err = certify_expert_layout(Some((&stride, 2)), None, 4).unwrap_err();
+        assert!(err.contains("rank"), "got: {err}");
+        // Malformed TP slices refuse (zero width would otherwise panic in
+        // inter/tp slicing).
+        let err =
+            certify_expert_layout(None, Some(TpExpertSlice { tp: 0, rank: 0 }), 4).unwrap_err();
+        assert!(err.contains("width"), "got: {err}");
+        let err =
+            certify_expert_layout(None, Some(TpExpertSlice { tp: 2, rank: 2 }), 4).unwrap_err();
+        assert!(err.contains("rank"), "got: {err}");
+        // Unsharded certifies as Single.
+        assert_eq!(
+            certify_expert_layout(None, None, 4).unwrap(),
+            ExpertLoadLayout::Single
+        );
+        // Hybrid EP shard + TP slice refuses FIRST (mutually exclusive —
+        // otherwise the EP ownership path would run alongside the TP
+        // column/row slicing of the expert loop with a wrong layout).
+        let err = certify_expert_layout(
+            Some((&stride, 0)),
+            Some(TpExpertSlice { tp: 2, rank: 0 }),
+            4,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
     }
 }

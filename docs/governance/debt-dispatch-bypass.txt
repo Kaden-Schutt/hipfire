@@ -1,0 +1,45 @@
+# Debt table — arch crates that reach kernels without the dispatch registry.
+#
+# OBJECTIVE (holster): drive `bypass` to zero, or to a justified core, by
+# migrating each arch crate onto `hipfire_dispatch::KernelRegistry`. Track the
+# programme in its issue; this file is the ledger it draws down.
+#
+# This is a DEBT TABLE, not a purity check. Every row below is known, owned, and
+# allowed to exist. What is not allowed is growth: `scripts/check-dispatch-bypass.py`
+# fails when any crate's count rises above its recorded number, or when a crate
+# appears that is not listed here at all. Paying debt down means editing this file
+# to a smaller number, which is a one-line diff a reviewer can see.
+#
+# Why per-crate and not per-callsite. A table keyed on file:line churns on every
+# unrelated edit and would be abandoned within a week. The crate is the stable
+# identity and it is also the migration unit -- you convert a crate, not a line.
+#
+# Why a table rather than a single ceiling. `dispatch_registry_bypass <= 216`
+# cannot see one crate improving while another regresses, and it cannot see a
+# crate being added. Per-crate rows make both mechanical, and they make the
+# migration order legible: `debt` crates convert cleanly, `partial` crates have
+# to reconcile two routing systems and cost more.
+#
+# status
+#   ok        no bypass calls; fully on the registry
+#   debt      bypass only, zero registry use -- cheapest to convert, no dual system
+#   partial   BOTH bypass and registry in the same crate. The worst state: a new
+#             quant format must be wired into two routing systems that do not know
+#             about each other. qwen35 at 128/255 is the expensive one and should
+#             be migrated LAST, after the pattern is settled on the debt crates.
+#
+# Measured 2026-08-26 after the device-mesh/mainline integration. Baseline total: 216.
+#
+# Format:  <crate>  <status>  <bypass>  <registry>  [note]
+
+hipfire-arch-qwen35        partial   128   255   migrate last; dual system, highest reconciliation cost
+hipfire-arch-deepseek4     debt       19     0   cheapest full conversion; no registry use to reconcile
+hipfire-arch-gemma4        partial    17    15
+hipfire-arch-lfm2moe       partial     9     6   sealed MoE lowered; standard blocks still mixed
+hipfire-arch-minimax       debt        8     0
+hipfire-arch-muse-glimmer  partial    12    30
+hipfire-arch-llama         debt       10     0
+hipfire-arch-dots-ocr      partial     7     4
+hipfire-arch-cohere2moe    debt        2     0
+hipfire-arch-qwen2         debt        2     0
+hipfire-arch-qwen35-vl     debt        2     0

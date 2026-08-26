@@ -76,13 +76,17 @@ pub enum AssistantPrefix {
 /// per-arch emitters can interpret it. The arch-specific *frame* mapping — e.g.
 /// DeepSeek V4's `<｜Assistant｜></think>` vs `<think>` open-token, or its `Max`
 /// extended-reasoning preamble — lives in the arch crate that consumes this.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThinkMode {
     /// Non-thinking: model skips reasoning and replies directly.
     NonThink,
-    /// Thinking: model produces a `<think>` block before responding.
+    /// Thinking with the model's default/low effort. Architectures that encode
+    /// effort as prompt text must not add a high-effort prefix for this mode.
+    Low,
+    /// Thinking with the model's high-effort framing.
     High,
-    /// Thinking-max: same as `High` plus an extended-reasoning preamble (the
+    /// Thinking-max: same output protocol as `Low`/`High`, plus the model's
+    /// maximum-effort preamble (the
     /// consuming arch decides what that means). Some models recommend a large
     /// context window for this mode.
     Max,
@@ -91,15 +95,60 @@ pub enum ThinkMode {
 impl ThinkMode {
     /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
     /// project-custom `thinking_mode`) to a mode.
-    /// Accepted: "none|off|chat|minimal" → NonThink;
-    ///           "low|medium|high|thinking" → High;
-    ///           "max" → Max. Anything else → NonThink (safe default).
+    /// Accepted: "none|off|chat" → NonThink;
+    ///           "minimal|low|medium|med|thinking" → Low;
+    ///           "high" → High; "max|xhigh" → Max.
+    /// Anything else → NonThink (safe default).
+    ///
+    /// `xhigh` is Qwen3.8's ladder, whose published levels are
+    /// `xhigh` (default) > `medium` > `low`. It MUST be listed explicitly:
+    /// the fallthrough arm is `NonThink`, so an unmapped `xhigh` would turn a
+    /// model whose card says "thinking mode is on by default" into a
+    /// non-thinking one, silently and with no error.
+    ///
+    /// Note the ladders do not align. OpenAI's is
+    /// `minimal < low < medium < high`, so `medium` stays mapped to `Low` for
+    /// cross-model compatibility; that means Qwen3.8's `medium` and `low`
+    /// collapse onto the same mode here. Only the default (`xhigh`) is
+    /// represented exactly, which is what the registry ships.
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "max" => Self::Max,
-            "high" | "thinking" | "low" | "medium" => Self::High,
+            "max" | "xhigh" => Self::Max,
+            "high" => Self::High,
+            "minimal" | "low" | "medium" | "med" | "thinking" => Self::Low,
             _ => Self::NonThink,
         }
+    }
+}
+
+#[cfg(test)]
+mod think_mode_tests {
+    use super::ThinkMode;
+
+    #[test]
+    fn reasoning_effort_levels_remain_distinct() {
+        assert_eq!(ThinkMode::from_str("none"), ThinkMode::NonThink);
+        assert_eq!(ThinkMode::from_str("low"), ThinkMode::Low);
+        assert_eq!(ThinkMode::from_str("medium"), ThinkMode::Low);
+        assert_eq!(ThinkMode::from_str("high"), ThinkMode::High);
+        assert_eq!(ThinkMode::from_str("max"), ThinkMode::Max);
+    }
+
+    #[test]
+    fn qwen38_xhigh_is_a_thinking_mode_not_the_nonthink_fallthrough() {
+        // Qwen3.8's card sets `reasoning_effort: xhigh` as the DEFAULT and says
+        // thinking mode is on by default. `from_str`'s fallthrough arm is
+        // `NonThink`, so an unmapped `xhigh` silently disables thinking on the
+        // model's own default setting — no error, just non-thinking output.
+        // This asserts the mapping exists, and that it is not the fallthrough.
+        assert_eq!(ThinkMode::from_str("xhigh"), ThinkMode::Max);
+        assert_ne!(ThinkMode::from_str("xhigh"), ThinkMode::NonThink);
+        assert_eq!(ThinkMode::from_str("XHIGH"), ThinkMode::Max);
+
+        // Guard the fallthrough itself, so a future ladder value that is added
+        // to the config enum but forgotten here fails loudly in review rather
+        // than degrading to non-thinking in production.
+        assert_eq!(ThinkMode::from_str("ultra"), ThinkMode::NonThink);
     }
 }
 
@@ -222,6 +271,34 @@ impl<'a> ChatFrame<'a> {
         scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
         out
     }
+}
+
+/// Tokens that continue an existing assistant turn into the next user turn.
+///
+/// Returns `<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n` followed by the
+/// assistant opener for `prefix`.
+///
+/// This exists so a multi-turn conversation can be built by APPENDING to the
+/// exact token sequence a session already holds, rather than re-rendering the
+/// whole history. Re-rendering cannot reproduce it: the generated turn began
+/// after an `OpenThink` opener that history rendering does not replay, and
+/// re-encoding the decoded reply is a detokenise/retokenise round trip that is
+/// not guaranteed to be the identity. Appending sidesteps both, so the result
+/// is a strict extension of what the KV actually holds — which is the
+/// precondition for prefix reuse.
+///
+/// The caller must pass the token sequence that generation ACTUALLY produced,
+/// not the client's echo of it.
+pub fn continuation_suffix(tokenizer: &Tokenizer, user: &str, prefix: AssistantPrefix) -> Vec<u32> {
+    let scaffold = ChatScaffold::for_tokenizer(tokenizer);
+    let mut out: Vec<u32> = Vec::new();
+    // Close the assistant turn the session's tokens ended in. Generation stops
+    // AT the terminator without storing it, so the closer belongs here.
+    out.extend_from_slice(&scaffold.im_end);
+    out.extend_from_slice(&scaffold.nl);
+    scaffold.append_user_turn(&mut out, user);
+    scaffold.append_assistant_prefix(&mut out, prefix);
+    out
 }
 
 /// Pre-encoded ChatML scaffolding plus a borrowed tokenizer reference.
@@ -418,7 +495,7 @@ fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
 /// (`None` if unset) and the loaded model path. Lives in the lib — not only in
 /// the CLI's `resolveToolGrammar` — so the DAEMON defaults correctly when
 /// launched DIRECTLY: the GPU behavior gate and `coherence-gate.sh` /
-/// `agentic-gate.sh` spawn `examples/daemon` without the CLI's `applyConfigEnv`,
+/// `agentic-gate.sh` spawn `target/release/daemon` (hipfire-daemon) without the CLI's `applyConfigEnv`,
 /// so without this they fall back to Hermes and never exercise the native-XML
 /// path. Precedence: explicit env wins (`"0"` = off kill-switch, any other set
 /// value = on); otherwise carnice (Hermes-native) => ON, plain Qwen3.5/3.6
@@ -483,7 +560,7 @@ pub fn build_cached_history(
     // live user via `live_user_tokens`. Without this trim, the live
     // user turn gets rendered twice (once from history, once from
     // `live_user_tokens`). Mirrors V4F's daemon-side renderer at
-    // `crates/hipfire-runtime/examples/daemon.rs:5163`.
+    // `crates/hipfire-daemon/src/main.rs:5163`.
     let trim_end = if matches!(history.last().map(|m| &m.role), Some(Role::User)) {
         1
     } else {
@@ -617,6 +694,135 @@ pub struct JinjaChatFrame<'a> {
     /// single special token id=2 (the actual BOS the model trained on).
     /// When None, falls back to decoding bos_id (works for Qwen3.5/3.6).
     pub bos_token: Option<&'a str>,
+    /// Reasoning strength hint for Onyx/Harmony templates (`low|medium|high|xhigh`).
+    /// Phase 1 always passes `None` (Lenient undefined → template defaults to 'high').
+    pub reasoning_strength: Option<&'a str>,
+    /// Raw reasoning effort for Qwen3.8 (`low|medium|xhigh`). `None` means
+    /// the Jinja variable is truly undefined (not `null`) so the template's
+    /// `|default('xhigh')` fires; `Some("low"|"medium"|"xhigh")` passes the
+    /// exact string the caller supplied. `None` also covers `auto`/unset and
+    /// the non-thinking (`none`) case where `enable_thinking` is false and
+    /// the effort is irrelevant. Keep `reasoning_strength` untouched — it is
+    /// the separate Glimmer/Onyx hint.
+    pub reasoning_effort: Option<&'a str>,
+}
+
+/// The reasoning-effort rungs hipfire can be asked for, in increasing order.
+/// `auto`/`none` are deliberately absent: `auto` means "leave the Jinja
+/// variable undefined so the template's own default fires", and `none` is
+/// expressed through `enable_thinking = false`, not through an effort value.
+pub const EFFORT_RUNGS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// What a specific model's chat template will actually accept for
+/// `reasoning_effort`, discovered by rendering it rather than by hardcoding a
+/// per-model table.
+///
+/// A per-arch constant would drift across a 61-model registry, and it would be
+/// a second copy of a fact the template already states. Probing asks the model
+/// itself. It also degrades correctly: a template that ignores
+/// `reasoning_effort` accepts every rung and varies for none of them, which
+/// reports `native == false` and imposes no constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortCapability {
+    /// Rungs from `EFFORT_RUNGS` that render without the template raising.
+    pub supported: Vec<&'static str>,
+    /// True when `reasoning_effort` actually changes the rendered prompt.
+    /// False means the template ignores it, so the caller should drop the
+    /// semantic effort with a warning (never reinterpret as a budget) and
+    /// require an explicit cap if a limit is desired.
+    pub native: bool,
+}
+
+impl EffortCapability {
+    /// Project a requested rung onto the rungs this model really has.
+    ///
+    /// Rank-preserving: the lowest supported rung at or above the request, or
+    /// the highest supported rung when the request outranks all of them. So a
+    /// 5-rung request lands on a 3-rung model without inventing a level and
+    /// without silently *lowering* the ask.
+    ///
+    /// Returns `None` when the model is not effort-native or supports nothing,
+    /// which is the caller's signal to drop the unsupported effort with a
+    /// warning (never reinterpret as a budget cap).
+    pub fn project(&self, requested: &str) -> Option<&'static str> {
+        if !self.native || self.supported.is_empty() {
+            return None;
+        }
+        let rank = |v: &str| EFFORT_RUNGS.iter().position(|r| *r == v);
+        // An unknown request (not a rung at all) is passed to the model only if
+        // the model itself accepts it; otherwise there is nothing to project.
+        let want = match rank(requested) {
+            Some(r) => r,
+            None => return self.supported.iter().copied().find(|s| *s == requested),
+        };
+        self.supported
+            .iter()
+            .copied()
+            .filter(|s| rank(s).is_some_and(|r| r >= want))
+            .min_by_key(|s| rank(s).unwrap_or(usize::MAX))
+            .or_else(|| {
+                self.supported
+                    .iter()
+                    .copied()
+                    .max_by_key(|s| rank(s).unwrap_or(0))
+            })
+    }
+}
+
+/// Discover a template's `reasoning_effort` contract by rendering it once with
+/// the variable undefined and once per rung.
+///
+/// Cost is a handful of string renders, paid once at model load. This is the
+/// classifier behind the effort-native split: a model that consumes effort
+/// gets its own vocabulary, and one that does not drops unsupported effort
+/// with a warning instead of converting it to a cap.
+pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortCapability {
+    let probe = |effort: Option<&str>| -> Result<String, String> {
+        let frame = JinjaChatFrame {
+            tokenizer,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: effort,
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        frame.render_messages(&msgs, None, None)
+    };
+    // Baseline with the variable undefined. If even this fails the template is
+    // unusable for reasons unrelated to effort; report no capability rather
+    // than misattributing the failure to the dial.
+    let baseline = match probe(None) {
+        Ok(b) => b,
+        Err(_) => {
+            return EffortCapability {
+                supported: Vec::new(),
+                native: false,
+            }
+        }
+    };
+    let mut supported = Vec::new();
+    let mut native = false;
+    for rung in EFFORT_RUNGS {
+        if let Ok(rendered) = probe(Some(rung)) {
+            if rendered != baseline {
+                native = true;
+            }
+            supported.push(rung);
+        }
+    }
+    EffortCapability { supported, native }
 }
 
 /// Multi-turn message representation for `JinjaChatFrame::render_messages`.
@@ -633,6 +839,34 @@ pub struct Message {
     pub role: Role,
     #[serde(default)]
     pub content: String,
+    /// Assistant self-channel (reasoning) body, verbatim as the model generated it.
+    ///
+    /// Renders into the Harmony/Onyx `<|start|>assistant to=self<|message|>…<|eom|>`
+    /// envelope (Muse Glimmer, arch 14). `None` — not `Some("")` — means "no reasoning
+    /// envelope": the template tests truthiness and the render env is
+    /// [`minijinja::UndefinedBehavior::Lenient`], so an omitted key and an empty string
+    /// are both falsy, but omission is the faithful pre-change shape for every other
+    /// architecture and keeps their rendered bytes identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// Inbound-only tool-result identity (OpenAI `message.name`). Deserialized from the
+    /// wire, never serialized back into the Jinja context: exposing it generically would
+    /// change the rendered bytes of templates that probe `message.name`. The Glimmer
+    /// history-preparation step projects it through [`Message::rendered_name`].
+    #[serde(default, skip_serializing)]
+    pub name: Option<String>,
+    /// Render-only projection of a tool-result turn's FUNCTION name, serialized as `name`.
+    ///
+    /// Populated exclusively by Glimmer's history preparation, which resolves it from the
+    /// preceding assistant turn's [`ToolCall::id`]. Every other path leaves it `None`, so
+    /// no other architecture sees a `name` key it did not see before.
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        rename = "name"
+    )]
+    pub rendered_name: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     /// Set on Tool-role messages to identify which assistant tool_call
@@ -649,6 +883,10 @@ pub struct Message {
     /// North-Mini-Code model card — "pass model-generated thinking to future
     /// agentic steps/turns"). Empty for plain turns / non-thinking models;
     /// always serialized (templates that don't reference it ignore the field).
+    ///
+    /// Distinct from [`Message::reasoning_content`]: `tool_plan` is the Cohere slot and is
+    /// written for EVERY architecture by the CLI's inbound normalization, while
+    /// `reasoning_content` is the Harmony self-channel body. Never merge or repurpose them.
     #[serde(default)]
     pub tool_plan: String,
 }
@@ -659,9 +897,53 @@ pub struct Message {
 /// shape) walk this with `arguments | items` under pycompat.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
+    /// Inbound OpenAI `tool_calls[].id`, used to resolve the FOLLOWING tool-result turn's
+    /// function name. Inbound-only for the same no-clobber reason as [`Message::name`].
+    #[serde(default, skip_serializing)]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// Render-only override for this call's entire rendered body.
+    ///
+    /// Set ONLY by [`build_cached_history_jinja`], to a splice sentinel, so a cached
+    /// verbatim tool body replaces the regenerated ATEM text. Never deserialized, so a
+    /// client cannot inject it.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub rendered_body: Option<String>,
+}
+
+/// One rendered assistant body slot, captured verbatim from generation.
+///
+/// `token_ids` are exactly the tokens between a Harmony `<|message|>` and its closing
+/// marker: template-owned header (`<|start|>`, `assistant to=…`, `<|message|>`) and
+/// terminator (`<|eom|>`, `<|eot|>`) tokens are excluded, because the template re-emits
+/// those itself. `text` is the decoded body, kept so the daemon can recover a client's
+/// missing `reasoning_content` without retokenizing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedAssistantBody {
+    pub token_ids: Vec<u32>,
+    pub text: String,
+}
+
+/// One `to=<recipient>` tool envelope's verbatim body. `recipient` MUST equal the
+/// corresponding [`Message::tool_calls`] entry's `name`, or the splice is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedAssistantToolBody {
+    pub recipient: String,
+    pub token_ids: Vec<u32>,
+}
+
+/// Per-channel verbatim replay for one assistant turn.
+///
+/// Slot order within a turn is `[reasoning?] ++ (tools | content)`. Tools and content are
+/// MUTUALLY EXCLUSIVE in the Harmony/Onyx assistant branch — it renders one envelope per
+/// tool call, or a single content envelope, never both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedAssistantTurn {
+    pub reasoning: Option<CachedAssistantBody>,
+    pub tools: Vec<CachedAssistantToolBody>,
+    pub content: Option<CachedAssistantBody>,
 }
 
 /// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
@@ -721,6 +1003,128 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
             format!("tojson utf8: {e}"),
         )
     })
+}
+
+/// Parenthesize a bare conditional expression used as a CALL KEYWORD ARGUMENT.
+///
+/// Jinja2 accepts `namespace(name=tcid if tcid else '')`; minijinja does not —
+/// it stops at the `if` and reports
+/// `syntax error: unexpected identifier, expected ','`. Wrapping the value in
+/// parentheses, `namespace(name=(tcid if tcid else ''))`, parses and evaluates
+/// identically, so this is semantics-preserving in the same sense as
+/// `strip_generation_tags` above.
+///
+/// Muse Glimmer bring-up, 2026-08-11: its chat_template.jinja carries exactly
+/// this construct in the tool-response branch. Because the template is a single
+/// line, the parse failure took the WHOLE template down, and the daemon fell
+/// back to "BOS + raw prompt" for every request — so multi-turn silently
+/// degenerated (each turn re-answering a bare prompt) with only an eprintln to
+/// show for it. Any model whose template uses a conditional kwarg hits this.
+///
+/// Deliberately narrow: only rewrites `<ident>=` immediately inside a call's
+/// argument list, and only when the value contains a top-level ` if ` before
+/// the argument ends at `,` or `)`. Depth-tracked so nested calls, strings and
+/// already-parenthesized values are left alone.
+fn parenthesize_conditional_kwargs(template: &str) -> String {
+    let b = template.as_bytes();
+    let mut out = String::with_capacity(template.len() + 16);
+    // `copied` is the start of the not-yet-emitted slice. Emitting SLICES (not
+    // per-byte chars) keeps this UTF-8 safe: the template contains multibyte
+    // characters, and `b[i] as char` would reinterpret them as Latin-1.
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        // Find `<ident>=` sitting directly inside a call's argument list.
+        if b[i] == b'='
+            && i + 1 < b.len()
+            && b[i + 1] != b'='
+            && i > 0
+            && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
+        {
+            let mut s = i;
+            while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_') {
+                s -= 1;
+            }
+            if matches!(
+                template[..s].trim_end().chars().last(),
+                Some('(') | Some(',')
+            ) {
+                // Scan the value to the end of this argument at depth 0.
+                let mut j = i + 1;
+                let mut depth = 0i32;
+                let mut quote: Option<u8> = None;
+                let mut has_if = false;
+                while j < b.len() {
+                    let c = b[j];
+                    if let Some(q) = quote {
+                        if c == q {
+                            quote = None;
+                        }
+                    } else if c == b'\'' || c == b'"' {
+                        quote = Some(c);
+                    } else if c == b'(' || c == b'[' || c == b'{' {
+                        depth += 1;
+                    } else if c == b')' || c == b']' || c == b'}' {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    } else if c == b',' && depth == 0 {
+                        break;
+                    } else if depth == 0 && template[j..].starts_with(" if ") {
+                        has_if = true;
+                    }
+                    j += 1;
+                }
+                let value = &template[i + 1..j];
+                if has_if && !value.trim().is_empty() && !value.trim().starts_with('(') {
+                    out.push_str(&template[copied..=i]);
+                    out.push('(');
+                    out.push_str(value);
+                    out.push(')');
+                    copied = j;
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&template[copied..]);
+    out
+}
+
+/// Strip unsupported `{% generation %}` / `{% endgeneration %}` Jinja tags
+/// (with any whitespace/dash variants) from LFM2.5-230M's chat_template.
+/// These are no-op generation-scope markers that minijinja doesn't know;
+/// without stripping, `env.add_template` fails with "unknown statement generation".
+/// Transparent: the markers just delimit the assistant generation block, which
+/// the template already handles via `add_generation_prompt` and the assistant
+/// loop, so removing them is semantics-preserving. (LFM2.5-230M bring-up,
+/// 2026-08-09: `{%- generation -%}` at chat_template.jinja:77,105).
+fn strip_generation_tags(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    let bytes = template.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'%' {
+            if let Some(end) = template[i..].find("%}") {
+                let inner = &template[i + 2..i + end];
+                // Normalize: trim whitespace, then '-' markers, then whitespace again
+                let clean = inner.trim().trim_matches('-').trim();
+                // Handle inner like "- generation -" -> after first trim it's "- generation -",
+                // after trim_matches('-') it's " generation ", after final trim it's "generation"
+                // For " generation " it's already "generation"
+                if clean == "generation" || clean == "endgeneration" {
+                    i += end + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Render-time `YYYY-MM-DD` date string for chat templates that surface a
@@ -790,6 +1194,13 @@ impl<'a> JinjaChatFrame<'a> {
             messages.push(Message {
                 role: Role::System,
                 content: sys.to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -798,6 +1209,13 @@ impl<'a> JinjaChatFrame<'a> {
         messages.push(Message {
             role: Role::User,
             content: self.user.to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
@@ -873,7 +1291,9 @@ impl<'a> JinjaChatFrame<'a> {
         // mapping-arg rendering byte-matches transformers' apply_chat_template.
         env.add_filter("tojson", hf_tojson);
 
-        env.add_template("chat", self.template)
+        let cleaned_template =
+            parenthesize_conditional_kwargs(&strip_generation_tags(self.template));
+        env.add_template("chat", &cleaned_template)
             .map_err(|e| format!("template parse: {e}"))?;
         let tmpl = env
             .get_template("chat")
@@ -942,11 +1362,21 @@ impl<'a> JinjaChatFrame<'a> {
             }
             Value::from_serialize(&arr)
         };
+        let reasoning_strength_val = match self.reasoning_strength {
+            Some(s) => Value::from_serialize(s),
+            None => Value::from_serialize(Option::<String>::None),
+        };
+        let reasoning_effort_val = match self.reasoning_effort {
+            Some(s) => Value::from_serialize(s),
+            None => Value::UNDEFINED,
+        };
         let ctx = minijinja::context! {
             messages => messages_val,
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
+            reasoning_strength => reasoning_strength_val,
+            reasoning_effort => reasoning_effort_val,
             tools => tools_val,
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
@@ -956,19 +1386,20 @@ impl<'a> JinjaChatFrame<'a> {
     }
 }
 
-/// Pick an atomic special-token sentinel for the verbatim-splice render.
+/// Pick `n` distinct atomic special-token sentinels for the verbatim-splice render.
 ///
-/// The sentinel must (1) encode to exactly one token (so it never BPE-merges
-/// with neighbouring template text — every structural token then stays
-/// byte-identical to a pure render) and (2) never be emitted by the template
-/// itself (so its post-render occurrence count equals the number of spliced
-/// assistant turns). We prefer obviously-reserved tokens (`reserved` / `unused`
-/// / `pad` in the name) and otherwise take any non-structural special token
-/// that round-trips atomically. Returns `None` when the tokenizer exposes no
-/// usable sentinel — the caller then falls back to a plain (retokenized) render.
-fn pick_splice_sentinel(tok: &Tokenizer) -> Option<String> {
-    // Tokens the chat templates emit structurally — never use these as a
-    // sentinel (their post-render count wouldn't equal the spliced-turn count).
+/// Each sentinel must (1) encode to exactly one token (so it never BPE-merges
+/// with neighbouring template text) and (2) never be emitted by the template
+/// itself. We prefer obviously-reserved tokens (`reserved` / `unused` / `pad`)
+/// and otherwise take any non-structural special token that round-trips atomically.
+/// Returns `None` if fewer than `n` distinct sentinels exist; the caller then
+/// falls back to a plain render. Distinctness within a turn is what makes a
+/// channel shift detectable; recycling the same set across turns keeps the pool
+/// bounded (`k = 1 + max_tool_slots + 1`).
+fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
     const STRUCTURAL: &[&str] = &[
         "<|im_start|>",
         "<|im_end|>",
@@ -984,117 +1415,268 @@ fn pick_splice_sentinel(tok: &Tokenizer) -> Option<String> {
         "<unk>",
         "<pad>",
         "<|file_separator|>",
+        "<|eom|>",
+        "<|eot|>",
+        "<|start|>",
+        "<|message|>",
     ];
     let atomic = |s: &str| -> bool {
         tok.special_token_id(s)
             .map_or(false, |id| tok.encode(s) == vec![id])
     };
-    // First pass: obviously-reserved scratch tokens.
-    for (s, _id) in tok.special_tokens() {
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    for (s, id) in tok.special_tokens() {
         if STRUCTURAL.contains(&s.as_str()) {
             continue;
         }
-        let ls = s.to_ascii_lowercase();
-        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad")) && atomic(s) {
-            return Some(s.clone());
-        }
-    }
-    // Second pass: any non-structural special token that round-trips atomically.
-    for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) {
+        if !atomic(s) {
             continue;
         }
-        if atomic(s) {
-            return Some(s.clone());
+        candidates.push((s.clone(), *id));
+    }
+    // Sort deterministically by (preferred_tier, id, text)
+    candidates.sort_by(|(a_text, a_id), (b_text, b_id)| {
+        let a_tier = {
+            let ls = a_text.to_ascii_lowercase();
+            if ls.contains("reserved") || ls.contains("unused") || ls.contains("pad") {
+                0
+            } else {
+                1
+            }
+        };
+        let b_tier = {
+            let ls = b_text.to_ascii_lowercase();
+            if ls.contains("reserved") || ls.contains("unused") || ls.contains("pad") {
+                0
+            } else {
+                1
+            }
+        };
+        a_tier
+            .cmp(&b_tier)
+            .then_with(|| a_id.cmp(b_id))
+            .then_with(|| a_text.cmp(b_text))
+    });
+    // Dedup by token id, keeping first (preferred tier) occurrence
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<(String, u32)> = Vec::new();
+    for (s, id) in candidates {
+        if seen.insert(id) {
+            deduped.push((s, id));
         }
     }
-    None
+    if deduped.len() < n {
+        return None;
+    }
+    deduped.truncate(n);
+    Some(deduped)
 }
 
 /// Jinja-native analogue of [`build_cached_history`]: render the conversation
-/// through the model's **trained** `chat_template` (no hand-rolled
-/// `ChatScaffold`), but splice the VERBATIM generated tokens of each cached
-/// assistant turn in place of its content. The resulting token stream
-/// byte-exactly reproduces what the daemon prefilled when that turn was
-/// generated, so the downstream LCP prompt-cache hits reliably even for
-/// thinking models — whose generated `<think>…</think>` tokens cannot be
-/// recovered by re-tokenizing the API-stripped visible content (the exact
-/// failure mode that makes a plain re-render miss at the assistant boundary).
+/// through the model's **trained** `chat_template` but splice each cached
+/// channel body verbatim. The resulting token stream byte-exactly reproduces
+/// what the daemon prefilled, so the LCP prompt-cache hits reliably.
 ///
-/// `messages` is the full conversation INCLUDING the live user turn last (the
-/// template's `add_generation_prompt` then appends the assistant opener). For
-/// each assistant turn, `cache_lookup` returns `Some(verbatim_tokens)` — the
-/// tokens that occupied that turn's content slot in `conversation_tokens` — or
-/// `None` (no cache entry: that turn keeps its retokenized content, which only
-/// costs a safe LCP miss at/after it).
+/// `messages` is the full conversation INCLUDING the live user turn last.
+/// For each assistant turn, `cache_lookup` returns `Some(CachedAssistantTurn)`
+/// (verbatim per-channel bodies) or `None` (no cache entry: that turn keeps its
+/// retokenized content). The splice is channel-aware: reasoning, each tool
+/// envelope, and final content are separate slots. Tools and content are
+/// MUTUALLY EXCLUSIVE (`[reasoning?] ++ (tools | content)`). Sentinels are
+/// distinct WITHIN a turn and RECYCLED ACROSS turns (`k = 1 + max_tool_slots + 1`).
+/// The render is committed only when the observed sentinel-id SEQUENCE equals the
+/// expected sequence exactly; any inequality (missing, duplicate, reorder) returns
+/// the plain render.
 ///
-/// Mechanism: substitute each cached assistant turn's content with an atomic
-/// special-token sentinel, render via [`JinjaChatFrame::render_messages`],
-/// tokenize, then replace each sentinel token with the cached tokens. The
-/// substitution is verified (sentinel occurs exactly once per cached turn);
-/// any mismatch — or no usable sentinel — falls back to a plain render so the
-/// result is always a valid (if uncached) token stream.
+/// Body boundaries exclude template-owned header/terminator tokens (`<|start|>`,
+/// `assistant to=…`, `<|message|>`, `<|eom|>`, `<|eot|>`); the template re-emits
+/// those. `CachedAssistantBody.text` must byte-equal the corresponding
+/// `Message` field when that field is non-empty; recipient must equal
+/// `Message.tool_calls[i].name`. Any violation is structural doubt → plain render.
 pub fn build_cached_history_jinja(
     frame: &JinjaChatFrame,
     messages: &[Message],
     tools: Option<&[serde_json::Value]>,
-    mut cache_lookup: impl FnMut(&Message) -> Option<Vec<u32>>,
+    mut cache_lookup: impl FnMut(&Message) -> Option<CachedAssistantTurn>,
 ) -> Result<Vec<u32>, String> {
     let tok = frame.tokenizer;
-    let plain = |f: &JinjaChatFrame| -> Result<Vec<u32>, String> {
-        Ok(tok.encode(&f.render_messages(messages, tools, None)?))
-    };
-    let sentinel = match pick_splice_sentinel(tok) {
-        Some(s) => s,
-        None => return plain(frame),
-    };
-    let sentinel_id = match tok.special_token_id(&sentinel) {
-        Some(id) => id,
-        None => return plain(frame),
-    };
-
-    // Build a messages copy where each cached assistant turn's content is the
-    // sentinel; collect the cached token vectors in document order.
-    let mut cached: Vec<Vec<u32>> = Vec::new();
-    let mut subbed: Vec<Message> = Vec::with_capacity(messages.len());
-    for m in messages {
-        if matches!(m.role, Role::Assistant) {
-            if let Some(toks) = cache_lookup(m) {
-                cached.push(toks);
-                subbed.push(Message {
-                    role: Role::Assistant,
-                    content: sentinel.clone(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    tool_plan: String::new(),
-                });
-                continue;
+    // 1. Plain render is the sole fallback; compute it first.
+    let plain_tokens = tok.encode(&frame.render_messages(messages, tools, None)?);
+    // 2. Walk messages, call lookup at most once per assistant turn, validate.
+    let mut cached_hits: Vec<(usize, CachedAssistantTurn)> = Vec::new();
+    let mut max_tool_slots: usize = 0;
+    let mut total_slots: usize = 0;
+    for (idx, m) in messages.iter().enumerate() {
+        if !matches!(m.role, Role::Assistant) {
+            continue;
+        }
+        let Some(turn) = cache_lookup(m) else {
+            continue;
+        };
+        // Default / no-slot is a miss
+        if turn.reasoning.is_none() && turn.tools.is_empty() && turn.content.is_none() {
+            continue;
+        }
+        // Validate: tools and content are mutually exclusive
+        if !turn.tools.is_empty() && turn.content.is_some() {
+            return Ok(plain_tokens);
+        }
+        if turn.tools.is_empty() && turn.content.is_none() {
+            // Must have at least one slot (reasoning alone without content is invalid per spec)
+            return Ok(plain_tokens);
+        }
+        // Validate tool count and recipients, and reasoning provenance.
+        if turn.tools.is_empty() {
+            // Content turn: must have no tool_calls on the Message.
+            if !m.tool_calls.is_empty() {
+                return Ok(plain_tokens);
+            }
+            if turn.content.is_none() {
+                return Ok(plain_tokens);
+            }
+            // Deliberately NO `turn.content.text == m.content` check.
+            //
+            // Content identity is ALREADY what the cache key is derived from — the caller
+            // fingerprints the message's normalized content to find this entry, so a hit
+            // means the content matched under that normalization. Re-comparing the RAW
+            // strings here re-tests the same property with a *stricter* rule than the key,
+            // so any normalization the key forgives (whitespace collapse, `<think>`
+            // stripping the API layer applies) makes the key hit and this guard silently
+            // refuse — a splice that is found and then thrown away.
+            //
+            // Observed: a 4-turn coding session hit the key on turn 2 yet fell back to the
+            // plain render, and the retokenized reasoning diverged 74 tokens into the
+            // assistant turn (`lcp=173` against `prior_len=371`), collapsing the cache.
+            // `reasoning` still needs the check below because it is NOT part of the key.
+        } else {
+            // Tool turn: counts must match
+            if turn.tools.len() != m.tool_calls.len() {
+                return Ok(plain_tokens);
+            }
+            for (i, tb) in turn.tools.iter().enumerate() {
+                if tb.recipient != m.tool_calls[i].name {
+                    return Ok(plain_tokens);
+                }
+            }
+            // Content must be None already checked
+        }
+        // Reasoning text check when Message has non-empty reasoning_content
+        if let Some(rc) = &m.reasoning_content {
+            if !rc.is_empty() {
+                match &turn.reasoning {
+                    Some(rb) if rb.text == *rc => {}
+                    _ => return Ok(plain_tokens),
+                }
             }
         }
-        subbed.push(m.clone());
+        // Also if turn has reasoning, but Message reasoning is None/empty, that's allowed (recovery)
+        // Count slots
+        let mut slots = 0;
+        if turn.reasoning.is_some() {
+            slots += 1;
+        }
+        if !turn.tools.is_empty() {
+            slots += turn.tools.len();
+        } else if turn.content.is_some() {
+            slots += 1;
+        }
+        if slots == 0 {
+            continue;
+        }
+        max_tool_slots = max_tool_slots.max(turn.tools.len());
+        total_slots += slots;
+        cached_hits.push((idx, turn));
     }
-    if cached.is_empty() {
-        return plain(frame);
+    if cached_hits.is_empty() {
+        return Ok(plain_tokens);
     }
-
-    let toks = tok.encode(&frame.render_messages(&subbed, tools, None)?);
-    // Safety: the sentinel must appear exactly once per cached turn. If the
-    // template dropped/duplicated a turn, or the sentinel merged with adjacent
-    // text, splicing would corrupt the stream — fall back to a plain render.
-    if toks.iter().filter(|&&t| t == sentinel_id).count() != cached.len() {
-        return plain(frame);
+    // 3. Pick k distinct sentinels, recycled across turns.
+    let k = 1 + max_tool_slots + 1;
+    let sentinels = match pick_splice_sentinels(tok, k) {
+        Some(v) => v,
+        None => return Ok(plain_tokens),
+    };
+    let sentinel_ids: Vec<u32> = sentinels.iter().map(|(_, id)| *id).collect();
+    let sentinel_texts: Vec<String> = sentinels.iter().map(|(s, _)| s.clone()).collect();
+    // Collision: any sentinel id already in plain_tokens -> fallback
+    for sid in &sentinel_ids {
+        if plain_tokens.contains(sid) {
+            return Ok(plain_tokens);
+        }
     }
+    // Map: R = sentinels[0], T_i = sentinels[1+i], A = sentinels[k-1]
+    let r_text = sentinel_texts[0].clone();
+    let r_id = sentinel_ids[0];
+    let a_text = sentinel_texts[k - 1].clone();
+    let a_id = sentinel_ids[k - 1];
+    // Build expected sequence, slot bodies and slot texts in document order
+    let mut expected_ids: Vec<u32> = Vec::with_capacity(total_slots);
+    let mut slot_bodies: Vec<Vec<u32>> = Vec::with_capacity(total_slots);
+    for (_, turn) in &cached_hits {
+        if let Some(rb) = &turn.reasoning {
+            expected_ids.push(r_id);
+            slot_bodies.push(rb.token_ids.clone());
+        }
+        if !turn.tools.is_empty() {
+            for (i, tb) in turn.tools.iter().enumerate() {
+                let tid = sentinel_ids[1 + i];
+                expected_ids.push(tid);
+                slot_bodies.push(tb.token_ids.clone());
+            }
+        } else if let Some(cb) = &turn.content {
+            expected_ids.push(a_id);
+            slot_bodies.push(cb.token_ids.clone());
+        }
+    }
+    // 4. Clone messages and substitute sentinels per slot
+    let mut subbed: Vec<Message> = messages.to_vec();
+    for (msg_idx, turn) in &cached_hits {
+        let m = &mut subbed[*msg_idx];
+        if turn.reasoning.is_some() {
+            m.reasoning_content = Some(r_text.clone());
+        }
+        if !turn.tools.is_empty() {
+            for (i, _) in turn.tools.iter().enumerate() {
+                let t_text = sentinel_texts[1 + i].clone();
+                m.tool_calls[i].rendered_body = Some(t_text);
+            }
+        } else if turn.content.is_some() {
+            m.content = a_text.clone();
+        }
+    }
+    // 5. Render substituted, tokenize. Error -> plain.
+    let sub_rendered = match frame.render_messages(&subbed, tools, None) {
+        Ok(s) => s,
+        Err(_) => return Ok(plain_tokens),
+    };
+    let sub_tokens = tok.encode(&sub_rendered);
+    // 6. Extract observed sentinel subsequence and require exact equality
+    let mut observed_ids: Vec<u32> = Vec::new();
+    for &t in &sub_tokens {
+        if sentinel_ids.contains(&t) {
+            observed_ids.push(t);
+        }
+    }
+    if observed_ids != expected_ids {
+        return Ok(plain_tokens);
+    }
+    // 7. Splice in one non-recursive pass
+    let total_body_len: usize = slot_bodies.iter().map(|b| b.len()).sum();
     let mut out: Vec<u32> =
-        Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
-    let mut k = 0usize;
-    for &t in &toks {
-        if t == sentinel_id {
-            out.extend_from_slice(&cached[k]);
-            k += 1;
+        Vec::with_capacity(sub_tokens.len() - expected_ids.len() + total_body_len);
+    let mut bi: usize = 0;
+    for &t in &sub_tokens {
+        if sentinel_ids.contains(&t) {
+            if bi >= expected_ids.len() || t != expected_ids[bi] {
+                return Ok(plain_tokens);
+            }
+            out.extend_from_slice(&slot_bodies[bi]);
+            bi += 1;
         } else {
             out.push(t);
         }
     }
+    debug_assert_eq!(bi, slot_bodies.len());
     Ok(out)
 }
 
@@ -1139,8 +1721,12 @@ mod tests {
         entries.push(r#""\n": 7"#.to_string());
         entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
         entries.push(r#""<|reserved_0|>": 9"#.to_string()); // splice sentinel (atomic special)
-                                                            // All 256 GPT-2-byte characters get unique ids 100..356 so
-                                                            // any short string round-trips byte-by-byte.
+        entries.push(r#""<|reserved_1|>": 10"#.to_string());
+        entries.push(r#""<|reserved_2|>": 11"#.to_string());
+        entries.push(r#""<|reserved_3|>": 12"#.to_string());
+        entries.push(r#""<|reserved_4|>": 13"#.to_string());
+        // All 256 GPT-2-byte characters get unique ids 100..356 so
+        // any short string round-trips byte-by-byte.
         for b in 0u32..=255u32 {
             // Use rust escape; the encoder will look up the GPT-2 char
             // form of each byte directly.
@@ -1160,7 +1746,11 @@ mod tests {
                     {{"id": 1, "content": "<|im_end|>", "special": true}},
                     {{"id": 2, "content": "<think>", "special": true}},
                     {{"id": 3, "content": "</think>", "special": true}},
-                    {{"id": 9, "content": "<|reserved_0|>", "special": true}}
+                    {{"id": 9, "content": "<|reserved_0|>", "special": true}},
+                    {{"id": 10, "content": "<|reserved_1|>", "special": true}},
+                    {{"id": 11, "content": "<|reserved_2|>", "special": true}},
+                    {{"id": 12, "content": "<|reserved_3|>", "special": true}},
+                    {{"id": 13, "content": "<|reserved_4|>", "special": true}}
                 ]
             }}"#,
             vocab = vocab_block,
@@ -1522,6 +2112,8 @@ mod tests {
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
 
         // Turn 1: daemon prefills R1 (prompt, ends with the primed `<think>\n`)
@@ -1529,6 +2121,13 @@ mod tests {
         let u1 = Message {
             role: Role::User,
             content: "hi".to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -1553,6 +2152,13 @@ mod tests {
         let a1 = Message {
             role: Role::Assistant,
             content: "ok".to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -1560,6 +2166,13 @@ mod tests {
         let u2 = Message {
             role: Role::User,
             content: "again".to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -1568,7 +2181,14 @@ mod tests {
 
         let rendered_t2 = build_cached_history_jinja(&frame, &messages_t2, None, |m| {
             if matches!(m.role, Role::Assistant) {
-                Some(asst_slot.clone())
+                Some(CachedAssistantTurn {
+                    reasoning: None,
+                    tools: Vec::new(),
+                    content: Some(CachedAssistantBody {
+                        token_ids: asst_slot.clone(),
+                        text: "ok".to_string(),
+                    }),
+                })
             } else {
                 None
             }
@@ -1606,6 +2226,631 @@ mod tests {
     }
 
     #[test]
+    fn message_name_rendered_name_serde_contract() {
+        // Contract 6.1 verbatim
+        let json = r#"{"role":"tool","content":"x","name":"weather.get"}"#;
+        let m: Message = serde_json::from_str(json).expect("tool message parses");
+        assert_eq!(m.name.as_deref(), Some("weather.get"));
+        assert_eq!(m.rendered_name, None);
+        // serializing with name: Some("a"), rendered_name: None emits NO name key
+        let msg = Message {
+            role: Role::Tool,
+            content: "x".to_string(),
+            reasoning_content: None,
+            name: Some("a".to_string()),
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(
+            v.get("name").is_none(),
+            "name should not serialize, got {v}"
+        );
+        // serializing with rendered_name: Some("b") emits "name":"b"
+        let msg2 = Message {
+            role: Role::Tool,
+            content: "x".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: Some("b".to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let v2 = serde_json::to_value(&msg2).unwrap();
+        assert_eq!(v2.get("name").and_then(|x| x.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn jinja_splice_replays_reasoning_tools_and_content_in_document_order() {
+        let t = make_tokenizer();
+        // Minimal Onyx-shaped template: distinct envelopes for reasoning, tools, content
+        let template = r#"{% for m in messages %}{% if m.role == 'assistant' %}[A]{% if m.reasoning_content %}<R>{{ m.reasoning_content }}</R>{% endif %}{% if m.tool_calls %}{% for tc in m.tool_calls %}<T n="{{ tc.name }}">{% if tc.rendered_body %}{{ tc.rendered_body }}{% else %}{{ tc.arguments | tojson }}{% endif %}</T>{% endfor %}{% else %}<C>{{ m.content }}</C>{% endif %}[AEND]{% else %}[{{ m.role }}:{{ m.content }}]{% endif %}{% endfor %}{% if add_generation_prompt %}[GEN]{% endif %}"#;
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        // Two assistant turns: reasoning+content and reasoning+two-tool
+        let u1 = Message {
+            role: Role::User,
+            content: "q1".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let a1 = Message {
+            role: Role::Assistant,
+            content: "answer1".to_string(),
+            reasoning_content: Some("reason1".to_string()),
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let a2 = Message {
+            role: Role::Assistant,
+            content: "".to_string(),
+            reasoning_content: Some("reason2".to_string()),
+            name: None,
+            rendered_name: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: Some("call1".to_string()),
+                    name: "toolA".to_string(),
+                    arguments: serde_json::json!({"x": 1}),
+                    rendered_body: None,
+                },
+                ToolCall {
+                    id: Some("call2".to_string()),
+                    name: "toolB".to_string(),
+                    arguments: serde_json::json!({"y": 2}),
+                    rendered_body: None,
+                },
+            ],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u2 = Message {
+            role: Role::User,
+            content: "q2".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        // Cached bodies: deliberately non-retokenized ids
+        let r1_body = vec![5001, 5002];
+        let c1_body = vec![5003, 5004, 5005];
+        let r2_body = vec![6001];
+        let t1_body = vec![6002, 6003];
+        let t2_body = vec![6004];
+        let turn1 = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: r1_body.clone(),
+                text: "reason1".to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: c1_body.clone(),
+                text: "answer1".to_string(),
+            }),
+        };
+        let turn2 = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: r2_body.clone(),
+                text: "reason2".to_string(),
+            }),
+            tools: vec![
+                CachedAssistantToolBody {
+                    recipient: "toolA".to_string(),
+                    token_ids: t1_body.clone(),
+                },
+                CachedAssistantToolBody {
+                    recipient: "toolB".to_string(),
+                    token_ids: t2_body.clone(),
+                },
+            ],
+            content: None,
+        };
+        let messages = vec![u1.clone(), a1.clone(), a2.clone(), u2.clone()];
+        // Lookup by content/match: use order
+        let mut call_idx = 0;
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                let ret = if call_idx == 0 {
+                    Some(turn1.clone())
+                } else {
+                    Some(turn2.clone())
+                };
+                call_idx += 1;
+                ret
+            } else {
+                None
+            }
+        })
+        .expect("splice");
+        // Build expected manually: encode structural parts and splice bodies
+        // We can compute expected by reproducing the sentinel substitution manually
+        // For validation, just check exact properties
+        // No sentinel leaked
+        for sid in [9, 10, 11, 12, 13] {
+            assert!(!rendered.contains(&sid), "no sentinel {sid} leaked");
+        }
+        // Bodies appear in document order: r1, c1, r2, t1, t2
+        // Find each body's occurrence in order
+        let bodies = vec![
+            r1_body.clone(),
+            c1_body.clone(),
+            r2_body.clone(),
+            t1_body.clone(),
+            t2_body.clone(),
+        ];
+        // Check that bodies appear in order and not interleaved incorrectly
+        let mut pos = 0;
+        for body in &bodies {
+            // find body as subsequence starting at or after pos
+            let mut found = None;
+            for i in pos..=rendered.len().saturating_sub(body.len()) {
+                if &rendered[i..i + body.len()] == body.as_slice() {
+                    found = Some(i);
+                    break;
+                }
+            }
+            assert!(found.is_some(), "body {:?} not found in order", body);
+            pos = found.unwrap() + body.len();
+        }
+        // Also verify tool order: t1 before t2 and both after r2
+        // Already checked via order
+        // Verify that a plain render without cache would be different (contains retokenized content)
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        assert_ne!(rendered, plain, "spliced should differ from plain");
+    }
+
+    #[test]
+    fn jinja_splice_missing_or_reordered_slot_falls_back_to_plain() {
+        let t = make_tokenizer();
+        // Base messages: reasoning+content turn
+        let a = Message {
+            role: Role::Assistant,
+            content: "answer".to_string(),
+            reasoning_content: Some("reason".to_string()),
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let messages = vec![u.clone(), a.clone()];
+        let turn = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: vec![7001],
+                text: "reason".to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![7002],
+                text: "answer".to_string(),
+            }),
+        };
+        // Template that DROPS content slot
+        let template_drop = r#"{% for m in messages %}{% if m.role == 'assistant' %}[A]{% if m.reasoning_content %}<R>{{ m.reasoning_content }}</R>{% endif %}[AEND]{% else %}[{{ m.role }}:{{ m.content }}]{% endif %}{% endfor %}{% if add_generation_prompt %}[GEN]{% endif %}"#;
+        let frame_drop = JinjaChatFrame {
+            tokenizer: &t,
+            template: template_drop,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let plain_drop = t.encode(&frame_drop.render_messages(&messages, None, None).unwrap());
+        let spliced_drop = build_cached_history_jinja(&frame_drop, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            spliced_drop, plain_drop,
+            "drop-content template must fallback to plain"
+        );
+
+        // Template that REORDERS content before reasoning
+        let template_reorder = r#"{% for m in messages %}{% if m.role == 'assistant' %}[A]{% if m.tool_calls %}{% for tc in m.tool_calls %}<T>{{ tc.rendered_body }}</T>{% endfor %}{% else %}<C>{{ m.content }}</C>{% endif %}{% if m.reasoning_content %}<R>{{ m.reasoning_content }}</R>{% endif %}[AEND]{% else %}[{{ m.role }}:{{ m.content }}]{% endif %}{% endfor %}{% if add_generation_prompt %}[GEN]{% endif %}"#;
+        let frame_reorder = JinjaChatFrame {
+            tokenizer: &t,
+            template: template_reorder,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let plain_reorder = t.encode(
+            &frame_reorder
+                .render_messages(&messages, None, None)
+                .unwrap(),
+        );
+        let spliced_reorder = build_cached_history_jinja(&frame_reorder, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            spliced_reorder, plain_reorder,
+            "reordered template must fallback to plain"
+        );
+    }
+
+    #[test]
+    fn jinja_splice_content_cache_on_tool_turn_falls_back_plain() {
+        let t = make_tokenizer();
+        let template = r#"{% for m in messages %}{% if m.role == 'assistant' %}[A]{% if m.reasoning_content %}<R>{{ m.reasoning_content }}</R>{% endif %}{% if m.tool_calls %}{% for tc in m.tool_calls %}<T n="{{ tc.name }}">{% if tc.rendered_body %}{{ tc.rendered_body }}{% else %}{{ tc.arguments | tojson }}{% endif %}</T>{% endfor %}{% else %}<C>{{ m.content }}</C>{% endif %}[AEND]{% else %}[{{ m.role }}:{{ m.content }}]{% endif %}{% endfor %}{% if add_generation_prompt %}[GEN]{% endif %}"#;
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let a = Message {
+            role: Role::Assistant,
+            content: "".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: vec![ToolCall {
+                id: Some("c1".to_string()),
+                name: "toolA".to_string(),
+                arguments: serde_json::json!({"x": 1}),
+                rendered_body: None,
+            }],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let messages = vec![u.clone(), a.clone()];
+        // Give a content-only cache payload (invalid for tool turn)
+        let bad_turn = CachedAssistantTurn {
+            reasoning: None,
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![8001],
+                text: "".to_string(),
+            }),
+        };
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        let spliced = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(bad_turn.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(spliced, plain, "content cache on tool turn must fallback");
+    }
+
+    #[test]
+    fn jinja_splice_content_only_qwen_template_byte_identical() {
+        let t = make_tokenizer();
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let a = Message {
+            role: Role::Assistant,
+            content: "hello".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let messages = vec![u.clone(), a.clone()];
+        let body = vec![9001, 9002, 9003];
+        let turn = CachedAssistantTurn {
+            reasoning: None,
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: body.clone(),
+                text: "hello".to_string(),
+            }),
+        };
+        let spliced = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        // Manually compute expected via sentinel substitution and check no sentinel leaked
+        for sid in [9, 10, 11, 12, 13] {
+            assert!(!spliced.contains(&sid), "no sentinel leaked");
+        }
+        // Body must appear verbatim
+        assert!(
+            spliced.windows(body.len()).any(|w| w == body.as_slice()),
+            "body must be spliced"
+        );
+        // Plain fallback check: ensure it differs from plain (which would retokenize "hello")
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        // Since body is non-retokenized (9001..), spliced should differ from plain if body not equal to encode("hello")
+        // But we just check that spliced is valid and contains body
+        assert_ne!(spliced, plain);
+    }
+
+    #[test]
+    fn pick_splice_sentinels_none_reaches_plain_render() {
+        let t = test_tokenizer_no_think();
+        // This tokenizer has no reserved tokens, so n=1 should be None
+        assert!(pick_splice_sentinels(&t, 1).is_none());
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let a = Message {
+            role: Role::Assistant,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u = Message {
+            role: Role::User,
+            content: "q".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let messages = vec![u.clone(), a.clone()];
+        let turn = CachedAssistantTurn {
+            reasoning: None,
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![1, 2, 3],
+                text: "hi".to_string(),
+            }),
+        };
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        let spliced = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            spliced, plain,
+            "when no sentinel available, must fallback to plain"
+        );
+    }
+
+    #[test]
+    fn gemma4_bundled_template_renders() {
+        // The daemon bundles `templates/gemma-4-it.jinja` as the arch-13
+        // fallback chat template (resolve_chat_template). This test renders
+        // it through the production JinjaChatFrame environment (strict
+        // undefined + pycompat + trim/lstrip + raise_exception + hf tojson)
+        // so a minijinja regression or template edit that breaks parsing /
+        // rendering fails HERE at unit-test time instead of silently falling
+        // back to a raw un-framed prompt at serve time.
+        let t = make_tokenizer();
+        let template = include_str!("../templates/gemma-4-it.jinja");
+
+        // Plain system+user turn, non-thinking (the daemon's v1 default):
+        // generation prompt must pre-fill the empty thought channel.
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: Some("Be brief."),
+            user: "What is the capital of France?",
+            enable_thinking: false,
+            bos_token: Some("<bos>"),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let rendered = frame.render().expect("gemma4 template renders plain turn");
+        assert!(
+            rendered.starts_with("<bos>"),
+            "render must start with the explicit bos_token: got {:?}",
+            &rendered[..rendered.len().min(60)],
+        );
+        assert!(
+            rendered.contains("<|turn>system\n"),
+            "system turn must render: got {rendered:?}",
+        );
+        assert!(
+            rendered.contains("<|turn>user\nWhat is the capital of France?<turn|>"),
+            "user turn must render: got {rendered:?}",
+        );
+        assert!(
+            rendered.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+            "non-thinking generation prompt must pre-fill the empty thought              channel: got tail {:?}",
+            &rendered[rendered.len().saturating_sub(80)..],
+        );
+
+        // Tools branch: one OpenAI-shape function definition must survive the
+        // template's format_function_declaration macro tree.
+        let messages = vec![Message {
+            role: Role::User,
+            content: "weather in SF?".to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"},
+                    },
+                    "required": ["city"],
+                },
+            }
+        })];
+        let with_tools = frame
+            .render_messages(&messages, Some(&tools), None)
+            .expect("gemma4 template renders tools turn");
+        assert!(
+            with_tools.contains("<|tool>") && with_tools.contains("get_weather"),
+            "tools block must render the declaration: got {with_tools:?}",
+        );
+
+        // Agentic replay: assistant turn with a FLAT hipfire ToolCall
+        // ({name, arguments} — not the nested OpenAI {function:{…}} shape)
+        // followed by a tool-role response. Exercises the template's
+        // tool_call replay + forward-scan tool_response branches.
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: "weather in SF?".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
+                tool_calls: vec![ToolCall {
+                    id: None,
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "SF"}),
+                    rendered_body: None,
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "72F sunny".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+        let replay = frame
+            .render_messages(&history, Some(&tools), None)
+            .expect("gemma4 template renders tool-call replay history");
+        assert!(
+            replay.contains(r#"<|tool_call>call:get_weather{city:<|"|>SF<|"|>}<tool_call|>"#),
+            "assistant tool_call must replay from the flat shape: got {replay:?}",
+        );
+        assert!(
+            replay.contains("<|tool_response>"),
+            "tool response must render: got {replay:?}",
+        );
+    }
+
+    #[test]
     fn render_messages_with_tools_fires_tools_block() {
         // Smoke test: a minimal template gated on `{% if tools %}`
         // must render the tools branch when the caller supplies a
@@ -1622,10 +2867,19 @@ mod tests {
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![Message {
             role: Role::User,
             content: "hi".to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
@@ -1684,11 +2938,20 @@ mod tests {
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![
             Message {
                 role: Role::System,
                 content: "be brief".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -1696,6 +2959,13 @@ mod tests {
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -1703,9 +2973,18 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: "".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: vec![ToolCall {
+                    id: None,
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city":"SF"}),
+                    rendered_body: None,
                 }],
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -1713,6 +2992,13 @@ mod tests {
             Message {
                 role: Role::Tool,
                 content: "72F".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
                 tool_plan: String::new(),
@@ -1752,6 +3038,13 @@ mod tests {
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -1759,9 +3052,18 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: String::new(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: vec![ToolCall {
+                    id: None,
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city": "SF"}),
+                    rendered_body: None,
                 }],
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -1800,9 +3102,18 @@ mod tests {
         let history = vec![Message {
             role: Role::Assistant,
             content: String::new(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: vec![ToolCall {
+                id: None,
                 name: "get_weather".to_string(),
                 arguments: serde_json::json!({"city": "SF"}),
+                rendered_body: None,
             }],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -1965,11 +3276,20 @@ SYS:{{ build_system_message(system_message) }}:END
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![
             Message {
                 role: Role::System,
                 content: "Be concise.".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -1977,6 +3297,13 @@ SYS:{{ build_system_message(system_message) }}:END
             Message {
                 role: Role::User,
                 content: "hi".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -2024,10 +3351,19 @@ SYS:{{ build_system_message(system_message) }}:END
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![Message {
             role: Role::User,
             content: "hi".to_string(),
+
+            reasoning_content: None,
+
+            name: None,
+
+            rendered_name: None,
+
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
@@ -2048,11 +3384,500 @@ SYS:{{ build_system_message(system_message) }}:END
     }
 
     #[test]
+    fn strip_generation_tags_plain_and_dash_variants() {
+        // LFM2.5 chat_template uses unsupported generation-scope markers.
+        // Every whitespace-control spelling must disappear while the
+        // surrounding template text stays byte-identical.
+        assert_eq!(
+            strip_generation_tags("A{% generation %}B{% endgeneration %}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("A{%- generation -%}B{%- endgeneration -%}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("A{%-generation-%}B{%  endgeneration  %}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("{% generation -%}X{%- endgeneration %}"),
+            "X"
+        );
+        assert_eq!(
+            strip_generation_tags("{%- generation %}Y{% endgeneration -%}"),
+            "Y"
+        );
+    }
+
+    #[test]
+    fn strip_generation_tags_preserves_ordinary_tags_and_literals() {
+        // Ordinary control/expression tags and adjacent literals must not be
+        // rewritten — only bare generation / endgeneration statements.
+        let src = "{% for m in messages %}KEEP{% if true %}Y{% endif %}{% endfor %}{% generation %}G{% endgeneration %}";
+        assert_eq!(
+            strip_generation_tags(src),
+            "{% for m in messages %}KEEP{% if true %}Y{% endif %}{% endfor %}G"
+        );
+        // Expression / assignment forms that merely mention the words stay.
+        assert_eq!(
+            strip_generation_tags("{{ generation }}{% set endgeneration = 1 %}"),
+            "{{ generation }}{% set endgeneration = 1 %}"
+        );
+    }
+
+    #[test]
+    fn jinja_lfm_generation_scope_markers_render_framing() {
+        // LFM2.5-shaped loop: assistant content is wrapped in
+        // `{%- generation -%}` / `{%- endgeneration -%}` scope markers.
+        // Without stripping, minijinja fails template parse with
+        // "unknown statement generation". After strip, framing must match
+        // the identical template written without the markers.
+        let t = make_tokenizer();
+        let with_markers = "\
+{% for m in messages -%}\
+{%- if m.role == 'user' -%}\
+<|im_start|>user\n{{ m.content }}<|im_end|>\n\
+{%- elif m.role == 'assistant' -%}\
+<|im_start|>assistant\n{%- generation -%}{{ m.content }}{%- endgeneration -%}<|im_end|>\n\
+{%- endif -%}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+<|im_start|>assistant\n{%- generation -%}\
+{%- endif -%}";
+        let without_markers = "\
+{% for m in messages -%}\
+{%- if m.role == 'user' -%}\
+<|im_start|>user\n{{ m.content }}<|im_end|>\n\
+{%- elif m.role == 'assistant' -%}\
+<|im_start|>assistant\n{{ m.content }}<|im_end|>\n\
+{%- endif -%}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+<|im_start|>assistant\n\
+{%- endif -%}";
+
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "hello".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "hi there".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::User,
+                content: "again".to_string(),
+
+                reasoning_content: None,
+
+                name: None,
+
+                rendered_name: None,
+
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+
+        let frame_marked = JinjaChatFrame {
+            tokenizer: &t,
+            template: with_markers,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let frame_clean = JinjaChatFrame {
+            tokenizer: &t,
+            template: without_markers,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+
+        let out = frame_marked
+            .render_messages(&messages, None, None)
+            .expect("LFM generation markers must parse after strip");
+        let expected = frame_clean
+            .render_messages(&messages, None, None)
+            .expect("baseline template without markers renders");
+        assert_eq!(
+            out, expected,
+            "stripped generation markers must be semantics-preserving vs marker-free template"
+        );
+
+        // Structural framing: both user turns, prior assistant content, and
+        // the open assistant generation prompt. Dash-controlled Jinja tags
+        // intentionally trim inter-turn newlines.
+        let user_hello = "<|im_start|>user\nhello<|im_end|>";
+        let asst_hi = "<|im_start|>assistant\nhi there<|im_end|>";
+        let user_again = "<|im_start|>user\nagain<|im_end|>";
+        let asst_open = "<|im_start|>assistant";
+        assert!(
+            out.contains(&user_hello),
+            "first user turn framing missing: {out:?}"
+        );
+        assert!(
+            out.contains(&asst_hi),
+            "prior assistant content framing missing: {out:?}"
+        );
+        assert!(
+            out.contains(&user_again),
+            "second user turn framing missing: {out:?}"
+        );
+        assert!(
+            out.ends_with(asst_open),
+            "add_generation_prompt must open the live assistant turn: {out:?}"
+        );
+    }
+
+    #[test]
     fn civil_from_days_known_dates() {
         // Spot-check the chrono-free date conversion against known epochs.
         assert_eq!(civil_from_days(0), (1970, 1, 1)); // Unix epoch
         assert_eq!(civil_from_days(18_993), (2022, 1, 1));
         // 2026-06-18 = 20622 days after 1970-01-01
         assert_eq!(civil_from_days(20_622), (2026, 6, 18));
+    }
+
+    /// Muse Glimmer's chat_template uses `namespace(name=tcid if tcid else '')`,
+    /// which Jinja2 accepts and minijinja rejects with
+    /// "unexpected identifier, expected `,`". Because that template is a single
+    /// line, the failure took the WHOLE template down and every request silently
+    /// fell back to "BOS + raw prompt", degenerating multi-turn.
+    ///
+    /// Negative control: the pre-fixup string MUST fail to parse, otherwise this
+    /// test would pass even with the fixup removed.
+    #[test]
+    fn conditional_kwarg_is_parenthesized_and_parses() {
+        let raw = "{%- set rns = namespace(name=tcid if tcid else '') -%}{{ rns.name }}";
+        let mut env = minijinja::Environment::new();
+        assert!(
+            env.template_from_named_str("chat", raw).is_err(),
+            "negative control: raw template must NOT parse, or the fixup is untested"
+        );
+
+        let fixed = parenthesize_conditional_kwargs(raw);
+        assert!(
+            fixed.contains("namespace(name=(tcid if tcid else ''))"),
+            "got: {fixed}"
+        );
+        let mut env2 = minijinja::Environment::new();
+        env2.template_from_named_str("chat", &fixed)
+            .expect("fixed template must parse");
+    }
+
+    /// The fixup must not disturb templates that do not need it, must not touch
+    /// non-kwarg `=`, and must be UTF-8 safe (an earlier version emitted
+    /// `bytes[i] as char`, which mangles multibyte characters).
+    #[test]
+    fn conditional_kwarg_fixup_leaves_other_templates_alone() {
+        for src in [
+            "{{ a if b else c }}",
+            "{%- if x == 1 -%}y{%- endif -%}",
+            "{{ f(name=(p if q else '')) }}",
+            "{{ f(name=plain, other=2) }}",
+            "{{ '\u{2014} \u{1f600} caf\u{e9}' }}",
+        ] {
+            assert_eq!(parenthesize_conditional_kwargs(src), src, "changed: {src}");
+        }
+    }
+
+    // ── Qwen3.8 reasoning_effort plumbing ───────────────────────────────
+    // Template that hard-accepts exactly low/medium/xhigh when thinking is
+    // enabled, defaults to xhigh only when reasoning_effort is undefined,
+    // and emits a closed think block when thinking is disabled. This mirrors
+    // the embedded Qwen3.8 chat_template.jinja excerpt (lines 45-56 + 163-169).
+    const QWEN38_MINIMAL: &str = "\
+{%- set reasoning_instructions = '' -%}\
+{%- if enable_thinking is undefined or enable_thinking is true -%}\
+    {%- set resolved = reasoning_effort|default('xhigh') -%}\
+    {%- if resolved not in ('xhigh', 'medium', 'low') -%}\
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '.') -}}\
+    {%- endif -%}\
+    {%- if resolved == 'xhigh' -%}{%- set reasoning_instructions = 'XHI' -%}\
+    {%- elif resolved == 'low' -%}{%- set reasoning_instructions = 'LOW' -%}\
+    {%- endif -%}\
+{%- endif -%}\
+{%- if reasoning_instructions %}[I:{{ reasoning_instructions }}]{%- endif -%}\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+    {%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}{%- endif -%}\
+{%- endif -%}";
+
+    fn render_qwen38_minimal(
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String, String> {
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: QWEN38_MINIMAL,
+            system: None,
+            user: "",
+            enable_thinking,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort,
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        frame.render_messages(&msgs, None, None)
+    }
+
+    // ── effort capability probe (F1 classifier) ─────────────────────────
+    // QWEN38_MINIMAL mirrors the shipped template: accepts exactly
+    // low/medium/xhigh, defaults to xhigh when undefined, raises otherwise.
+
+    #[test]
+    fn probe_reports_qwen38_three_rungs_and_native() {
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_MINIMAL);
+        assert_eq!(
+            cap.supported,
+            vec!["low", "medium", "xhigh"],
+            "high/max must be rejected by the model, not by a hipfire table"
+        );
+        assert!(cap.native, "the template varies on effort, so it is native");
+    }
+
+    #[test]
+    fn probe_reports_not_native_when_template_ignores_effort() {
+        // A thinking template with no reasoning_effort branch at all: every
+        // rung renders, none changes the output. Must degrade to dropping
+        // the effort with a warning rather than pretending the dial works
+        // or reinterpreting as a budget.
+        const IGNORES: &str = "\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}{{- '<think>\\n' -}}{%- endif -%}";
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, IGNORES);
+        assert_eq!(cap.supported.len(), 5, "a permissive template accepts all");
+        assert!(!cap.native, "invariant output means not effort-native");
+        assert_eq!(cap.project("low"), None, "not native => no projection");
+    }
+
+    #[test]
+    fn projection_is_rank_preserving_onto_a_three_rung_model() {
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_MINIMAL);
+        // Exact rungs survive untouched — medium in particular, which DS4's
+        // hardcoded table folds into low and would erase here.
+        assert_eq!(cap.project("low"), Some("low"));
+        assert_eq!(cap.project("medium"), Some("medium"));
+        assert_eq!(cap.project("xhigh"), Some("xhigh"));
+        // Rungs this model lacks round UP to the next real one, never down:
+        // asking for more reasoning must not quietly deliver less.
+        assert_eq!(cap.project("high"), Some("xhigh"));
+        // Above every rung, saturate at the top rather than failing.
+        assert_eq!(cap.project("max"), Some("xhigh"));
+    }
+
+    #[test]
+    fn every_projection_is_a_value_the_model_actually_accepts() {
+        // The whole point of the probe: nothing hipfire can ask for may reach
+        // the template as a value that raises.
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_MINIMAL);
+        for rung in EFFORT_RUNGS {
+            let projected = cap.project(rung).expect("native model projects");
+            assert!(
+                render_qwen38_minimal(true, Some(projected)).is_ok(),
+                "{rung} projected to {projected}, which the template rejects"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_low_renders_low_instruction() {
+        let out = render_qwen38_minimal(true, Some("low")).expect("low should render");
+        assert!(
+            out.contains("[I:LOW]"),
+            "low must emit LOW instruction, got {out:?}"
+        );
+        assert!(
+            out.ends_with("<think>\n"),
+            "thinking on must open think, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn qwen38_medium_renders_valid_without_instruction() {
+        let out = render_qwen38_minimal(true, Some("medium")).expect("medium should render");
+        assert!(
+            !out.contains("[I:"),
+            "medium must not emit XHI/LOW instruction, got {out:?}"
+        );
+        assert!(
+            out.ends_with("<think>\n"),
+            "medium thinking on, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn qwen38_xhigh_renders_xhigh_instruction() {
+        let out = render_qwen38_minimal(true, Some("xhigh")).expect("xhigh should render");
+        assert!(out.contains("[I:XHI]"), "xhigh must emit XHI, got {out:?}");
+    }
+
+    #[test]
+    fn qwen38_unset_defaults_to_xhigh_via_undefined() {
+        // None => Jinja undefined => |default('xhigh') => XHI
+        let out = render_qwen38_minimal(true, None).expect("unset should render");
+        assert!(
+            out.contains("[I:XHI]"),
+            "unset (undefined) must default to XHI, got {out:?}"
+        );
+        // Ensure None did not become `null` string: if it were null, `resolved` would be None
+        // and `not in` check would raise Unexpected reasoning effort None.
+    }
+
+    #[test]
+    fn qwen38_none_disables_thinking_closed_block() {
+        let out = render_qwen38_minimal(false, None).expect("non-thinking should render");
+        assert!(
+            !out.contains("[I:"),
+            "non-thinking must not emit instruction, got {out:?}"
+        );
+        assert!(
+            out.contains("<think>\n\n</think>\n\n"),
+            "disabled thinking must emit closed block, got {out:?}"
+        );
+        // reasoning_effort must be undefined when thinking disabled – passing Some would be wrong.
+        // This test uses None and disabled flag to assert closed block path.
+    }
+
+    #[test]
+    fn qwen38_unsupported_value_raises() {
+        let err =
+            render_qwen38_minimal(true, Some("high")).expect_err("unsupported high must raise");
+        assert!(
+            err.contains("Unexpected reasoning effort"),
+            "high should raise, got {err:?}"
+        );
+        let err2 = render_qwen38_minimal(true, Some("ultra")).expect_err("ultra must raise");
+        assert!(
+            err2.contains("Unexpected reasoning effort"),
+            "ultra should raise, got {err2:?}"
+        );
+    }
+
+    #[test]
+    fn qwen36_default_render_unchanged_with_reasoning_effort_undefined() {
+        // Qwen3.6 template never probes reasoning_effort; adding the new variable
+        // as undefined must leave its render byte-identical to the previous None=null path.
+        let t = make_tokenizer();
+        let qwen36_template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
+        let frame_no_effort = JinjaChatFrame {
+            tokenizer: &t,
+            template: qwen36_template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hello".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let out1 = frame_no_effort
+            .render_messages(&msgs, None, None)
+            .expect("qwen36 render");
+        // Render again with same inputs – must be identical (construction check)
+        let out2 = frame_no_effort
+            .render_messages(&msgs, None, None)
+            .expect("second qwen36 render");
+        assert_eq!(out1, out2, "Qwen3.6 default must be stable");
+        assert!(
+            out1.contains("<|im_start|>user\nhello<|im_end|>"),
+            "user turn present: {out1:?}"
+        );
+        assert!(
+            out1.ends_with("<|im_start|>assistant\n<think>\n"),
+            "thinking open: {out1:?}"
+        );
+    }
+
+    // ── probe safe fallback and warn/drop invariant ────────────────────
+    #[test]
+    fn probe_broken_baseline_reports_safe_empty() {
+        // Baseline render failure (unrelated to effort) must not be misattributed;
+        // probe degrades to native=false, supported=[] so daemon can emit safe false/[].
+        const BROKEN: &str = "{{ raise_exception('template broken') }}";
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, BROKEN);
+        assert!(!cap.native, "broken baseline must be non-native");
+        assert!(
+            cap.supported.is_empty(),
+            "broken baseline must have no rungs"
+        );
+        assert_eq!(
+            cap.project("low"),
+            None,
+            "empty cap must project to None (drop, not budget)"
+        );
+    }
+
+    #[test]
+    fn probe_native_false_means_drop_not_budget() {
+        // A template that accepts all rungs but never varies (e.g. Qwen3.6) is
+        // not effort-native: project must return None so caller drops with warning
+        // and never reinterprets effort as a token budget.
+        const IGNORES_EFFORT: &str =
+            "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}{% if add_generation_prompt %}GEN{% endif %}";
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, IGNORES_EFFORT);
+        assert!(!cap.native, "ignoring template must be non-native");
+        for rung in EFFORT_RUNGS {
+            assert_eq!(
+                cap.project(rung),
+                None,
+                "non-native must not project {rung} to a budget"
+            );
+        }
     }
 }

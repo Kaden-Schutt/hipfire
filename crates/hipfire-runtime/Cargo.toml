@@ -6,18 +6,15 @@ license.workspace = true
 description = "Inference orchestrator for RDNA GPUs"
 
 [features]
-# Cargo features for selective architecture inclusion (Phase 2 PR 12).
-#
-# Default keeps today's full-featured behavior: `cargo build --release`
-# produces the same daemon + example surface as before this PR.
-# Downstream library consumers may opt out of any subset of arches, e.g.
-#
-#   [dependencies]
-#   hipfire-runtime = { version = "...", default-features = false,
-#                       features = ["deltanet", "arch-qwen35"] }
-#
-# This trims the resolved dep graph to just the qwen35 arch crate plus
-# the deltanet runtime feature, with all other arch crates absent.
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+# Default is the production surface: `cargo build --release` builds the
+# full daemon + example set. The historical `arch-*` stubs
+# (`arch-qwen35`, `arch-llama`, etc.) were empty features with no
+# `cfg(feature = "arch-*")` gating and no `hipfire-runtime/arch-*`
+# dependents — deleted as dead registration tax. Arch crates are consumed
+# via `[dev-dependencies]` below (cycle-exclusion trick) and via
+# `hipfire-loader` / `hipfire-generate`, not via runtime features.
 #
 # Internal example builds:
 # Each arch crate already lists `hipfire-runtime` in its
@@ -27,28 +24,12 @@ description = "Inference orchestrator for RDNA GPUs"
 # `[dev-dependencies]` of this crate. cargo's resolver excludes the
 # dev-dep edge from the cycle check.
 #
-# Side-effect: when a workspace example is built (via
-# `cargo build --example daemon` etc.), cargo's resolver follows the
-# dev-dep edge in both directions, which activates the `default`
-# feature on `hipfire-runtime` from the dev-dep activation path. That
-# in turn re-activates all `arch-*` features, undoing any
-# `--no-default-features` the user passed for an example build. This
-# is a workspace-internal limitation only; it does NOT affect
-# downstream library consumers, who never enter the dev-dep cycle.
-#
 # Example-target gating uses `required-features` (per `[[example]]`
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
+default = ["deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet", "hipfire-hardware/deltanet"]
-arch-qwen35 = []
-arch-qwen35-vl = []
-arch-llama = []
-arch-qwen2 = []
-arch-deepseek4 = []
-arch-cohere2moe = []
-arch-dots-ocr = []
 # ep-fault-inject: enables the EP partial-load fault-injection knob
 # (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
 # return a synthetic Err after uploading its weights so the staging-guard VRAM
@@ -81,6 +62,7 @@ serve-fault-inject = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+saddle-core = { path = "../saddle-core" }
 hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
@@ -125,14 +107,11 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 tracing = "0.1"
 
-# Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
+# Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
 # optional dev-dependencies AND its cycle checker excludes the dev-dep
 # edge, which is what allows hipfire-runtime to list arch crates here
 # despite each arch crate already depending on hipfire-runtime.
-# Per-arch granularity for downstream consumers comes from the cargo
-# features above and `required-features` on each `[[example]]` block
-# below.
 [dev-dependencies]
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
@@ -143,6 +122,10 @@ hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-pflash = { path = "../hipfire-pflash" }
+hipfire-engine = { path = "../hipfire-engine" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
@@ -150,22 +133,11 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
-# Each example below carries `required-features` listing the cargo
-# features its `use hipfire_arch_*` imports depend on. This documents
-# the per-example arch dependency and gates the example for downstream
-# library consumers (who do not enter the dev-dep cycle and so respect
-# the `--no-default-features` flag faithfully).
-#
-# Examples NOT listed here (bench_q8, probe_wmma, dump_meta, …) do not
-# touch arch crates and build under any feature combination.
-
-[[example]]
-name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
-
-[[example]]
-name = "hfq_split"
-required-features = []
+# Each example below carries `required-features` when it needs a
+# non-default feature (currently only `deltanet`). Arch crates are
+# consumed as dev-dependencies (no `arch-*` feature gating). Examples
+# not listed here (bench_q8, probe_wmma, dump_meta, …) build under any
+# feature combination.
 
 [[example]]
 name = "coherence_probe"
@@ -175,189 +147,22 @@ required-features = []
 name = "ep_decode_parity"
 required-features = ["emulated-ep2-harness"]
 
-[[example]]
-name = "gpus_smoke"
-required-features = []
-
-[[example]]
-name = "infer_qwen35"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "infer_qwen3"
-required-features = ["arch-llama"]
-
-[[example]]
-name = "infer_vl"
-required-features = ["arch-qwen35-vl", "arch-qwen35"]
-
-[[example]]
-name = "infer"
-required-features = ["arch-qwen35", "arch-qwen35-vl"]
-
-[[example]]
-name = "infer_hfq"
-required-features = ["arch-llama"]
-
-[[example]]
-name = "run"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "a3b_load_check"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "a3b_multiturn_oneshot"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "a3b_smoke_forward"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "bench_qwen35_forward"
-required-features = ["arch-qwen35"]
 
 [[example]]
 name = "bench_qwen35_mq4"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "channel_test_mmq"
-required-features = ["arch-qwen35"]
+required-features = []
 
 [[example]]
 name = "dflash_spec_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "mtp_probe_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "mtp_only_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "dump_logits_qwen35"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "dump_qwen35_hidden_states"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "greedy_dump"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "greedy_dump_top5"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "logit_dump"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "pflash_compress_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "pflash_load_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "perplexity"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "pflash_niah_bench"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "probe_argmax_agreement"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_attention_phases"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_bandwidth_fwd"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_deltanet"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_host_vs_gpu"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_qwen35_mq4"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_prefill_qwen35"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "test_inference"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_inferenceQA"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_long_ctx"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_qwen35_load"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_qwen35_loadQA"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_accuracy_sweep"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_decode_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_infer"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_longctx_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_periodic_demo"
-required-features = ["arch-qwen35"]
+required-features = []
 
 [[example]]
 name = "triattn_validate"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "pp_parity"
-required-features = ["arch-qwen35", "deltanet"]
+required-features = []
 
 [[example]]
 name = "pp_parity_chatml"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "pp2_vram_probe"
-required-features = ["arch-qwen35", "deltanet"]
+required-features = ["deltanet"]
 
 # Batched pipeline-parallel prefill parity — llama-family only, no arch/deltanet
 # features (mirrors auto-discovered pp_decode_parity).
@@ -375,61 +180,18 @@ name = "tp_prefill_parity"
 name = "build_kld_ref"
 required-features = []
 
-# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
-# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
-[[example]]
-name = "build_kld_ref_native"
-required-features = ["arch-qwen35", "deltanet"]
-
-# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
-# F32 oracle (dual forward, no ref top-K approx) for parity with
-# llama-perplexity --kl-divergence full-vocab KLD.
-[[example]]
-name = "eval_hipfire_fullvocab"
-required-features = ["arch-qwen35", "deltanet"]
-
-# oracle_xcheck (F1) — dumps per-token F32-oracle logits over real tokens (true
-# fp32 KV) for cross-checking the native bf16/F32 forward against a reference.
-[[example]]
-name = "oracle_xcheck"
-required-features = ["arch-qwen35", "deltanet"]
-
 [[example]]
 name = "eval_hipfire"
-required-features = ["arch-qwen35", "deltanet"]
+required-features = ["deltanet"]
 
 [[example]]
-name = "collect_e8_hessian_native"
-required-features = ["arch-qwen35", "deltanet"]
-
-# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
-# Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
-# eval_hipfire, but the forward path goes through
-# `<Llama as Architecture>` + `hipfire_runtime::llama::*` instead of
-# the qwen35 arch. Per-token scoring only — llama-arch
-# `forward_prefill_batch` doesn't expose the hidden-state capture hook
-# that eval_hipfire's prefill mode relies on.
-[[example]]
-name = "eval_hipfire_llama"
-required-features = ["arch-llama"]
-
-# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
-# No GPU / arch features needed (tokenizer is pure CPU).
-[[example]]
-name = "tokenize_slice"
-required-features = []
+name = "collect_artifacts"
+required-features = ["lab"]
 
 # eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
 # Stdlib only; no GPU / arch features.
 [[example]]
 name = "eval_gguf"
-required-features = []
-
-# imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
-# llama-imatrix for the activation-weighted-LS calibration pipeline.
-# Stdlib only; no GPU / arch features.
-[[example]]
-name = "imatrix_collect"
 required-features = []
 
 # C8 GPU sampler kernel validation — distribution-parity gate for
@@ -439,25 +201,454 @@ required-features = []
 name = "c8_sampler_validate"
 required-features = []
 
-# ─── Tier 1 calibration binaries (foundation scaffolds, 2026-05-19) ────
-#
-# `collect_imatrix` and `collect_hessian` are the hipfire-native
-# replacements for the Tier 2 wrappers above. Both currently ship as
-# `unimplemented!()` scaffolds — argument parsing + module docs only —
-# so that the workspace compiles cleanly while follow-on subagent
-# tasks build the forward pass, on-GPU activation/Hessian reductions,
-# and the GGUF/HFHS-v1 writers on top.
-#
-# Stdlib only at this stage; no GPU / arch features required for the
-# scaffold itself. When the forward pass lands these bins will pick up
-# `required-features = ["arch-qwen35", "arch-llama"]` (or whichever
-# arches the Tier 1 path supports).
+[[example]]
+name = "calib_sweep"
+required-features = ["lab"]
+
+
+
+# ─── Tier 1 calibration binaries ────────────────────────────────────────
+# The native single-load calibration collector is the `collect_artifacts`
+# example (Hessian + imatrix → one HFQM `.calib.hfq`), fronted by
+# `hipfire collect-artifacts` and the daemon `Collect` op. The old
+# `collect_hessian` / `collect_imatrix` scaffolds were removed once the
+# collector + HFQM container superseded them. `hfq` is the HFQ container
+# manipulation tool (list/extract/meta-set/meta-get/rearch).
 [[bin]]
-name = "collect_imatrix"
-path = "src/bin/collect_imatrix.rs"
+name = "hfq"
+path = "src/bin/hfq.rs"
 required-features = []
 
-[[bin]]
-name = "collect_hessian"
-path = "src/bin/collect_hessian.rs"
-required-features = []
+[[test]]
+name = "arch_id_unification"
+path = "tests/arch_id_unification.rs"
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "adaptive_kv_check"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_batched_gemm"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_draft_f16_vs_hfq6g256"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_early_exit"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_q8_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hfq3_mmq_sweep"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hfq4g128"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hfq6_vs_hfq4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hfq_family"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q4lut"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_tp_graph_host_overhead_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_wide"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_wmma_qkvza_hfq3"
+required-features = ["lab"]
+
+[[example]]
+name = "bisect_forward_slots"
+required-features = ["lab"]
+
+[[example]]
+name = "build_kld_ref_native_gemma4"
+required-features = ["lab"]
+
+[[example]]
+name = "build_kld_ref_native_glimmer"
+required-features = ["lab"]
+
+[[example]]
+name = "check_think_tokens"
+required-features = ["lab"]
+
+[[example]]
+name = "ddtree_pq_sim"
+required-features = ["lab"]
+
+[[example]]
+name = "debug_dequant"
+required-features = ["lab"]
+
+[[example]]
+name = "debug_gemma4_attention"
+required-features = ["lab"]
+
+[[example]]
+name = "debug_hfq"
+required-features = ["lab"]
+
+[[example]]
+name = "debug_hfq2"
+required-features = ["lab"]
+
+[[example]]
+name = "debug_minimax_batch"
+required-features = ["lab"]
+
+[[example]]
+name = "dflash_mtp_demo"
+required-features = ["lab"]
+
+[[example]]
+name = "dflash_mtp_tree_demo"
+required-features = ["lab"]
+
+[[example]]
+name = "diag_mq3_lloyd_multiacc"
+required-features = ["lab"]
+
+[[example]]
+name = "diag_mq4_lloyd_multiacc"
+required-features = ["lab"]
+
+[[example]]
+name = "dispatch_floor_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_gfx1201_owner_worker_transport"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_prompt_fixture"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_tp_longctx_capacity"
+required-features = ["lab"]
+
+[[example]]
+name = "dump_embedded_template"
+required-features = ["lab"]
+
+[[example]]
+name = "dump_jinja_render"
+required-features = ["lab"]
+
+[[example]]
+name = "dump_meta"
+required-features = ["lab"]
+
+[[example]]
+name = "encode_prompt"
+required-features = ["lab"]
+
+
+[[example]]
+name = "eval_hipfire_gemma4"
+required-features = ["lab"]
+
+[[example]]
+name = "eval_hipfire_glimmer"
+required-features = ["lab"]
+
+[[example]]
+name = "f16_gemv_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gemma4_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gl_e4m3_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hfq_load_pipeline_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "hfq_manifest"
+required-features = ["lab"]
+
+[[example]]
+name = "hfq_splice_attn"
+required-features = ["lab"]
+
+[[example]]
+name = "inspect_gemma4_hfq"
+required-features = ["lab"]
+
+[[example]]
+name = "jinja_render_dump"
+required-features = ["lab"]
+
+[[example]]
+name = "jinja_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "llama_dflash_hidden_capture"
+required-features = ["lab"]
+
+[[example]]
+name = "llama_lm_head_logits_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "load_gguf"
+required-features = ["lab"]
+
+[[example]]
+name = "measure_launch"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4v2_gemm_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4v2_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "prefill_microbench"
+required-features = ["lab"]
+
+[[example]]
+name = "probe_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "profile_forward"
+required-features = ["lab"]
+
+[[example]]
+name = "profile_layers"
+required-features = ["lab"]
+
+[[example]]
+name = "profile_prefill_deepseek4"
+required-features = ["lab"]
+
+[[example]]
+name = "query_tensor"
+required-features = ["lab"]
+
+[[example]]
+name = "render_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "render_chat_template"
+required-features = ["lab"]
+
+[[example]]
+name = "render_cohere2moe"
+required-features = ["lab"]
+
+[[example]]
+name = "smoke_llama_prefill_batch"
+required-features = ["lab"]
+
+[[example]]
+name = "template_cache_eval"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fused_mfp4g32_e8_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fused_rmsnorm_rotate"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_hfq3g256_residual"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_q4k"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_q4kQA"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq4g256"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq4g256QA"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq6_gemm"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq6g256"
+required-features = ["lab"]
+
+[[example]]
+name = "test_prefix_cache_equivalence"
+required-features = ["lab"]
+
+[[example]]
+name = "test_q4f16"
+required-features = ["lab"]
+
+[[example]]
+name = "test_q4f16QA"
+required-features = ["lab"]
+
+[[example]]
+name = "test_q8kv"
+required-features = ["lab"]
+
+[[example]]
+name = "test_q8kvQA"
+required-features = ["lab"]
+
+[[example]]
+name = "test_serve_concurrent"
+required-features = ["lab"]
+
+[[example]]
+name = "test_swap_equivalence"
+required-features = ["lab"]
+
+[[example]]
+name = "test_swap_roundtrip"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_correctness"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_gate_up_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_gate_up_hfq3"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_gate_up_hfq6_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_ldsstage_gfx11"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_qkv_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_qkv_hfq6_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_qkvza_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_qkvza_hfq3"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_qkvza_hfq6_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_residual_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_wmma_residual_hfq3"
+required-features = ["lab"]
+
+[[example]]
+name = "tp4_cross_device_graph_barrier"
+required-features = ["lab"]
+
+[[example]]
+name = "tp_allreduce_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "triattn_gpu_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "triattn_gpu_parity_asym3"
+required-features = ["lab"]
+
+[[example]]
+name = "triattn_gpu_parity_fwht3"
+required-features = ["lab"]
+
+[[example]]
+name = "triattn_prune_demo"
+required-features = ["lab"]
+
+[[example]]
+name = "verify_hfq3_batched"
+required-features = ["lab"]
+
+[[example]]
+name = "verify_mq_kernel"
+required-features = ["lab"]
+
+[[example]]
+name = "wmma_fa_spike"
+required-features = ["lab"]

@@ -210,6 +210,13 @@ impl Architecture for MiniMaxM2 {
             MoEExecutionKind::Tp => ExpertParallelism::TensorParallel,
             MoEExecutionKind::Ep => ExpertParallelism::ExpertParallel,
         };
+        // The scatter-grouped WMMA kernels (`forward_batch`'s batched-prefill
+        // fast path) exist only for the M2 production topology; the manifest
+        // declares the grouped identity for that topology so the forward's
+        // grouped admission pin can require it. The grouped DTYPE pair
+        // (gate_up MQ2-Lloyd, down MQ2/MQ3-Lloyd) is a load-time property the
+        // manifest cannot see — `forward_batch` gates it separately.
+        let grouped_admitted = cfg.num_local_experts == 256 && cfg.num_experts_per_tok == 8;
         (0..cfg.num_hidden_layers)
             .map(|l| ExpertGroupSpec {
                 group: "moe".into(),
@@ -235,7 +242,14 @@ impl Architecture for MiniMaxM2 {
                 },
                 router: "router".into(),
                 router_identity: "sigmoid_topk".into(),
-                allowed_executions: vec![ExpertExecutionIdentity::IndexedQuantized],
+                allowed_executions: if grouped_admitted {
+                    vec![
+                        ExpertExecutionIdentity::IndexedQuantized,
+                        ExpertExecutionIdentity::GroupedQuantized,
+                    ]
+                } else {
+                    vec![ExpertExecutionIdentity::IndexedQuantized]
+                },
             })
             .collect()
     }

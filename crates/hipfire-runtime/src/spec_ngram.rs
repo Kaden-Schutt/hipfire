@@ -26,7 +26,7 @@
 use crate::ddtree::sample_host_nucleus;
 use crate::spec::{
     accept_greedy_prefix, NgramCache, PldMatcher, PrefillOutcome, SpecAdvance, SpecGrammar,
-    SpecScratch, SpecStep, SpecTarget, Speculator,
+    SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 
@@ -204,9 +204,13 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
             self.scratch = Some(target.new_spec_scratch(gpu, self.block_size)?);
         }
 
-        // Advance the target over the prompt (miss → full) or just the new suffix
-        // (hit → from prefill_start). The central speculative lifecycle already
-        // performed the authoritative miss reset.
+        // Advance the target over the prompt (miss → reset + full) or just the
+        // new suffix (hit → no reset, from prefill_start). The target owns the
+        // chunked/abortable forward; we only need its KV + recurrent state moved.
+        // `spec_advance_cold_start` threads the cache-miss signal so arches with
+        // a numerically distinct cold prefill (cohere2moe batched) can override;
+        // the default forwards the signal as the reset flag (identity with the
+        // plain `spec_advance(..., !cache_hit, ...)` path).
         let start = if cache_hit { prefill_start } else { 0 };
         let adv =
             target.spec_advance_cold_start(gpu, prefill_tokens, start, !cache_hit, abort, None)?;
@@ -353,14 +357,15 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         self.ctx_capacity
     }
 
-    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
         // n-gram drafts are a point mass (no draft distribution), so cactus (the
         // acceptance bump) does not apply. Store temp/top_p/top_k and reset the
         // sampled-verify RNG stream to a fixed seed per request (deterministic
         // given the seed). `step` only takes the sampled path when `samples`.
-        self.sample_temp = temp;
-        self.sample_top_p = top_p;
-        self.sample_top_k = top_k;
+        // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored.
+        self.sample_temp = cfg.temp;
+        self.sample_top_p = cfg.top_p;
+        self.sample_top_k = cfg.top_k;
         self.rng_state = 0x13579BDF;
     }
 

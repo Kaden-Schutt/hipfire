@@ -8,6 +8,8 @@ license.workspace = true
 description = "Cohere2-MoE architecture (North-Mini-Code: parallel block + interleaved sliding/global attention with NoPE on global layers + mean-centered LayerNorm + sigmoid 128-expert MoE, no renorm) for hipfire"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 default = ["deltanet"]
 # Mirrors hipfire-arch-minimax: the shared MoE rotate/silu helpers in
 # hipfire-runtime::llama are deltanet-gated. Cohere2-MoE uses full
@@ -23,3 +25,36 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "analyze_dumps"
+required-features = ["lab"]
+
+[[example]]
+name = "kld_logits"
+required-features = ["lab"]
+
+[[example]]
+name = "longctx_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "parse_config"
+required-features = ["lab"]

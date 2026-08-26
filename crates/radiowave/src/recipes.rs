@@ -15,8 +15,7 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 pub const RECIPE_SCHEMA_VERSION: u32 = 1;
-pub const HIPFIRE_6409_EVIDENCE: &str =
-    "crates/radiowave/tests/artifacts/recipes/hipfire-6409-gfx1201-2026-07-13-radiowave-all-losers-final-u8-aggregate.json";
+pub const HIPFIRE_6409_EVIDENCE: &str = "crates/radiowave/tests/artifacts/recipes/hipfire-6409-gfx1201-2026-07-13-radiowave-all-losers-final-u8-aggregate.json";
 pub const HIPX_PORTABILITY_EVIDENCE: &str =
     "crates/radiowave/tests/artifacts/hipx-portability-2026-07-14.json";
 
@@ -1204,13 +1203,17 @@ mod tests {
         let candidate = RecipeCatalog::builtin_hipfire_6409()
             .select("gfx1151", workload, SelectionMode::Candidates)
             .unwrap();
-        assert!(candidate
-            .candidate_recipes
-            .contains(&"hipfire.cross_lane.wave32_xor_exchange".to_owned()));
-        assert!(candidate
-            .plan
-            .lowerings
-            .contains(&SourceLowering::Wave32XorExchange));
+        assert!(
+            candidate
+                .candidate_recipes
+                .contains(&"hipfire.cross_lane.wave32_xor_exchange".to_owned())
+        );
+        assert!(
+            candidate
+                .plan
+                .lowerings
+                .contains(&SourceLowering::Wave32XorExchange)
+        );
     }
 
     #[test]
@@ -1346,8 +1349,7 @@ mod tests {
                         recipe.id
                     ));
                 }
-                if obj.get("kind").and_then(|v| v.as_str()) != Some("radiowave_recipe_provenance")
-                {
+                if obj.get("kind").and_then(|v| v.as_str()) != Some("radiowave_recipe_provenance") {
                     failures.push(format!(
                         "{}: {artifact} kind must be radiowave_recipe_provenance",
                         recipe.id

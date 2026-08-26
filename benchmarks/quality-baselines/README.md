@@ -94,15 +94,15 @@ benchmarks/quality-baselines/
 
 The producer / candidate-side binaries are Rust examples in
 `crates/hipfire-runtime/examples/` — `build_kld_ref.rs`,
-`eval_hipfire.rs`, `eval_gguf.rs`, `tokenize_slice.rs`. The harness
-reaches into them via plain `cargo run --release --example <name>`
-invocations; nothing in this directory needs to know their paths.
+`eval_hipfire.rs`, `eval_gguf.rs` — and `crates/saddle-lab/examples/`
+— `tokenize_slice.rs` (CPU-only helper). The harness reaches into them via
+plain `cargo run --release -p <crate> --example <name>` invocations.
 
 ## Workflow (overview)
 
 1. **One-time** — generate the slice via `make_slice.sh`, dump BF16
    references on gfx1151 (via `build_kld_ref.rs`), upload to
-   `hipfire-models/hipfire-eval-refs`, fill `manifest.json` with
+   `hipfire-models/eval-refs`, fill `manifest.json` with
    sha256 + `hf_repo` + producer metadata.
 
 2. **Per quant variant** — run `eval_hipfire` (hipfire candidates)

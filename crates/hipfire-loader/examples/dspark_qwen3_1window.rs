@@ -14,7 +14,7 @@
 //!
 //! ```
 //! source scripts/gpu-lock.sh && gpu_acquire dspark-qwen3
-//! cargo build --release -p hipfire-loader --example dspark_qwen3_1window
+//! cargo build --release -p hipfire-loader --example dspark_qwen3_1window --features lab
 //! ./target/release/examples/dspark_qwen3_1window /home/bjoern/.hipfire/models/qwen3-8b.mq4
 //! gpu_release
 //! ```
@@ -44,7 +44,6 @@ fn main() -> Result<(), String> {
         ..Default::default()
     };
 
-    let mesh = hipfire_runtime::config::resolve_mesh(1, 1, 1, None); // single-GPU
     let mut m = hipfire_loader::load_model(
         &target_path,
         max_seq,
@@ -53,8 +52,7 @@ fn main() -> Result<(), String> {
         None, // kv_adaptive_override
         None, // state_quant_override
         &cask,
-        &mesh,
-        None, // pp_bands
+        1, // pp: single-GPU
         spec_cfg,
         &mut gpu,
     )?;

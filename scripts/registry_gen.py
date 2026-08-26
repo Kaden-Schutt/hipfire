@@ -20,8 +20,8 @@ size_gb, unmappable arch_id/quant, alias pointing at a missing tag, or a
 superset violation — aborts with exit 1 and does NOT write output. A broken
 run must never replace a good committed registry.
 
-Namespace probe: every repo in the hipfire-models and schuttdev namespaces
-is enumerated; repos that exist on HF but have no curated entry are listed
+Namespace probe: every repo in the hipfire-models namespace is enumerated;
+repos that exist on HF but have no curated entry are listed
 as warnings (discovery aid), never auto-added — the curated overlay is
 authoritative for what the CLI offers.
 
@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HF_API = "https://huggingface.co"
-PROBE_NAMESPACES = ("hipfire-models", "schuttdev")
+PROBE_NAMESPACES = ("hipfire-models",)
 SCHEMA_VERSION = 1
 # Curated size_gb is a rounded decimal-GB figure; the HF byte count is ground
 # truth. Disagreement beyond this fraction means the curated entry is stale
@@ -58,6 +58,7 @@ SIZE_TOLERANCE = 0.25
 KNOWN_QUANTS = {
     "mq2lloyd",
     "mq2",
+    "mq2r",
     "mq3",
     "mq3p",
     "mq4",
@@ -66,6 +67,11 @@ KNOWN_QUANTS = {
     "mq5",
     "mq6",
     "mfp4",
+    # PrismML Bonsai low-bit: TQ2G128 ternary / BQ1G128 binary. Added with the
+    # filename rename in the same commit -- quant_for() reads the extension and
+    # an unknown one aborts the whole run.
+    "tq2",
+    "bq1",
     "hf4",
     "hf6",
     "q8",
@@ -77,6 +83,8 @@ KNOWN_QUANTS = {
 # entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
 KNOWN_KV_MODES = {
     "auto",
+    "f32",
+    "f16",
     "q8",
     "asym4",
     "asym3",
@@ -104,6 +112,33 @@ RECOMMENDED_BOUNDS = {
     "presence_penalty": (0.0, 2.0, False),
     "repeat_penalty": (0.5, 2.0, False),
 }
+# Mirrors hipfire-config's REASONING_EFFORTS. Includes Qwen3.8's ladder
+# (`low|medium|xhigh`) plus generic OpenAI-style values for other parents.
+REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+# Legacy named cap presets for non-effort-native templates (e.g. Qwen3.6).
+# Absence means uncapped. Effort-native families must omit this field.
+THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
+
+
+def _effort_native_tag(tag: str) -> bool:
+    """True for families whose reasoning is effort-semantic with no registry cap.
+
+    Qwen3.8, DeepSeek V4 Flash (+preview/SKU suffixes), and Muse Glimmer product
+    SKUs. Draft/dflash sidecars are excluded. `thinking_budget` is rejected on
+    these tags; absence means uncapped.
+    """
+    # Strip optional "sampling_profiles.<mode>" suffix used by callers.
+    base = tag.split(" sampling_profiles.", 1)[0]
+    family = base.split(":", 1)[0]
+    if "draft" in base or "dflash" in base:
+        return False
+    if family == "qwen3.8":
+        return True
+    if family in {"deepseek-v4-flash", "deepseek-v4-flash-preview"}:
+        return True
+    if family == "muse-glimmer" or base in {"muse-glimmer", "muse-glimmer:fast"}:
+        return True
+    return False
 
 
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
@@ -111,13 +146,23 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
 
     Mirrors hipfire-registry's recommended-settings bounds. Adds a
     descriptive error per offending key; does not mutate rs (deepcopy already
-    carries it through)."""
+    carries it through).
+
+    Effort-native tags (Qwen3.8 / DeepSeek4 / Muse Glimmer) must not ship
+    `thinking_budget`; absence means uncapped. Legacy non-native models may
+    still set named budget presets.
+    """
     if rs is None:
         return
     if not isinstance(rs, dict):
         errors.append(f"{tag}: recommended_settings must be an object, got {type(rs).__name__}")
         return
-    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt"}
+    allowed = set(RECOMMENDED_BOUNDS) | {
+        "system_prompt",
+        "reasoning_effort",
+        "thinking_budget",
+    }
+    effort_native = _effort_native_tag(tag)
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
@@ -125,6 +170,26 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
         if key == "system_prompt":
             if not isinstance(val, str):
                 errors.append(f"{tag}: recommended_settings.system_prompt must be a string")
+            continue
+        if key == "reasoning_effort":
+            if val not in REASONING_EFFORTS:
+                errors.append(
+                    f"{tag}: recommended_settings.reasoning_effort must be one of "
+                    f"{sorted(REASONING_EFFORTS)}, got {val!r}"
+                )
+            continue
+        if key == "thinking_budget":
+            if effort_native:
+                errors.append(
+                    f"{tag}: thinking_budget is unsupported on effort-native models "
+                    f"(omit the field; absence means uncapped), got {val!r}"
+                )
+                continue
+            if val not in THINKING_BUDGETS:
+                errors.append(
+                    f"{tag}: recommended_settings.thinking_budget must be one of "
+                    f"{sorted(THINKING_BUDGETS)}, got {val!r}"
+                )
             continue
         lo, hi, int_only = RECOMMENDED_BOUNDS[key]
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -151,24 +216,35 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6 dense hybrid (incl. carnice / qwopus finetunes)
-#   6  = Qwen3.5/3.6 MoE / A3B
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus finetunes)
+#   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
+#   14 = Muse Glimmer dense text tower
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
+#   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
+    family = tag.split(":", 1)[0]
+    # Glimmer is checked before the generic dflash rule: its drafter is
+    # muse_glimmer_assistant (23), not the arch-20 sidecar, even though the
+    # filename says dflash.
+    if family == "muse-glimmer":
+        return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
-    family = tag.split(":", 1)[0]
-    if family in ("qwen3.5", "qwen3.6", "qwopus3.6", "carnice", "qwopus"):
+    # Prism ML Bonsai = behaviour-preserving transform of Qwen3.6-27B,
+    # architecture unchanged (dense qwen35).
+    if family == "bonsai":
+        return 5
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
     if family == "qwen3":
         return 1
-    if family == "deepseek-v4-flash":
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return 9
     if family == "minimax" or family.startswith("minimax-"):
         return 10
@@ -184,7 +260,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
 def quant_for(file: str) -> str | None:
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
-    if m:
+    if m and m.group(1) in KNOWN_QUANTS:
+        return m.group(1)
+    # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-pro → quant mq4
+    m = re.search(r"\.(mq\d)(?:-(?:xt|pro))?$", file)
+    if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]
     if ext in KNOWN_QUANTS:
@@ -325,7 +405,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_tool_format {tool_format!r} "
                 f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
-
         # Optional curated recommended_settings (carried verbatim by deepcopy).
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
@@ -349,8 +428,16 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
         repo = entry.get("repo", "")
         if not repo:
-            # Local-only entry (pull short-circuits). Nothing to probe.
-            new_entry.update({"sha256": None, "size_bytes": None})
+            # Local-only entry (pull short-circuits). A campaign artifact may
+            # still carry a curated content identity even though there is no
+            # Hugging Face tree to probe. Preserve it verbatim and validate it
+            # below through the generated registry parser.
+            new_entry.update(
+                {
+                    "sha256": entry.get("sha256"),
+                    "size_bytes": entry.get("size_bytes"),
+                }
+            )
         elif repo in trees:
             tree = trees[repo]
             item = tree.get(entry["file"])

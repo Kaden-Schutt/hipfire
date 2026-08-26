@@ -34,6 +34,19 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements. 2026-08-08 STEP-004 follow-up: an EMULATED-PP correctness bug was root-caused and fixed (`DeltaNetState::new_with_quant_multi` did not wire the error-feedback residual — the recurrence used the stochastic requantization path while the single-GPU ctor wires EF by default; a per-layer hidden-state bisect under `HIPFIRE_EMULATE_GPUS=2` localized the drift to the first state write; `pp_parity` now passes 50/50 under emulation). The fix is hardware-independent and may also bear on the physical token-58 divergence, but HW-003/HW-004 remain BLOCKED and untouched — physical re-validation on distinct GPUs with pinned digests and deterministic mode is still required.
 
+2026-08-26: the device-mesh feature branch merged into mainline with the crate
+split (`hipfire-hardware`, `hipfire-loader`, `hipfire-daemon`,
+`hipfire-generate`). Tracker statuses remain authoritative; the reconciliation
+notes under "Completed Foundation Evidence", COR-001, COR-004, COMP-001, and
+GEN-002 record where pre-merge evidence referenced deleted artifacts (the
+`examples/daemon.rs` example and the TypeScript/Bun CLI), where landed
+controls supersede design text (`resolve_mesh` → `admit_path` preflight;
+dense TP/PP mesh routing via `load_admitted` → `select_load_mesh`, with
+`effective_load_mesh` only as the normalized-admission branch), and where
+merge context re-scopes an open task
+(GEN-002: DeepSeek4 single-GPU is now the merged default route, but its
+acceptance evidence is still owed on that route).
+
 ## Execution Priority
 
 This is the implementation queue. The dependency graph below remains the
@@ -41,7 +54,9 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 1. `STEP-003` — complete as of 2026-08-08 (`9dcb1862a` + increment 2 verification): all DeltaNet recurrent/conv ops run through Steps on the owning device.
 2. `STEP-004` — complete as of 2026-08-08 (commit pending; see `.agent-progress/step-004-inventory.md` for the inventory + parity evidence): every remaining architecture forward path migrated to Step-based dispatch, with justified non-decoder exceptions; LFM2/Cohere2 routed-MoE expert phases now lower through `lower_moe_steps` via new manifest machinery. Gates `AXIS-001` through `AXIS-004`.
-3. `GEN-002` — DeepSeek4 single-GPU fallback (ready; deps COR-002 complete). Independent stream; can proceed alongside STEP-004.
+3. `GEN-002` — DeepSeek4 single-GPU acceptance evidence on the merged
+   mainline route (the single-GPU default itself landed in the 2026-08-26
+   merge; deps COR-002 complete). Independent stream.
 4. `SPEC-001` — unify AR and speculative orchestration (ready; deps COR-001..003 complete). Unblocks `SPEC-002` and `VL-002`.
 5. `VL-001` — shared lifecycle for Qwen35-VL (ready; deps COR-002, COR-003 complete). Independent multimodal stream.
 
@@ -50,6 +65,14 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ## Completed Foundation Evidence
 
 - Hardware and mesh foundation: `ff709bdc` (`hipfire-hardware` extraction), `0b95b89c` (`DeviceMesh`), `5f4b581c` (`resolve_mesh`), and `e66d6f94` (PP stage/band helpers).
+- 2026-08-26 merge reconciliation: the legacy `resolve_mesh` /
+  `resolve_parallelism` precedence helpers were deleted with the pre-merge
+  runtime config. Mesh resolution in the merged mainline flows
+  `hipfire_loader::admit_path` → `AdmittedLoad.admission`, and `load_admitted`
+  routes the mesh through `select_load_mesh` — `effective_load_mesh` applies
+  only to normalized admissions (`crates/hipfire-loader/src/lib.rs`). The
+  `5f4b581c` commit above remains the historical provenance of the pre-merge
+  helper.
 - Manifest and placement foundation: `a6a0acb9` (manifest types), `41b63cdb` (placement), `69c61c05` (collective schedule), plus store-backed llama validation recorded in `.agent-progress/device-mesh-status.md`.
 - Model-parallel ownership: `3e99918c` (owning enums), `8c3d7f85` (TP), `a4211e3c` (dense PP), `a4583dbc` (EP), and `0fe02058` (Qwen35 arch-resident PP).
 - Session/meta collapse: `a7082ee9`, `4b1a2fe8`, `e16e7c01`, `8be7bf63`, and `9c57148d` established `SessionState`, `PersistState`, reset routing, and `ModelMeta` readers.
@@ -196,10 +219,22 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 - **Dependencies:** None
 - **Goal:** Make the configured/load-message `mtp_k` value the deliberate source used by generation, or remove the unsupported knob rather than silently ignoring it.
 - **Acceptance criteria:** `ModelMeta` receives the configured value exactly once; native/spec generation reads that value with documented environment precedence; no stale flat field or self-assignment remains; CLI metadata exposes the setting; tests cover default, configured, and environment-override behavior.
-- **Validation:** Run targeted Rust metadata/generation tests, `cli/config_meta.test.ts`, and searches proving generation no longer bypasses `meta.mtp_k`.
+- **Validation:** Run targeted Rust metadata/generation tests, `cli/config_meta.test.ts`, and searches proving generation no longer bypasses `meta.mtp_k`. (2026-08-26 merge reconciliation: `cli/config_meta.test.ts` referenced the deleted TypeScript CLI; the merged equivalent is the Rust CLI config surface — `hipfire config explain` / `speculation.mtp_k` — plus the loader/runtime metadata tests below.)
 - **Hardware:** None
 - **Completion blockers:** None.
 - **Evidence:** `bun test cli/mtp_k_config.test.ts` (10 passed); `bun test cli/config_meta.test.ts` (1 passed); `nix develop --command bash -lc 'cargo test -p hipfire-loader --lib --locked && cargo test -p hipfire-runtime --example daemon mtp_k_tests --locked'` (13 loader and 15 daemon tests passed); `nix develop --command cargo test --workspace --locked` (passed); `nix develop --command ./scripts/coherence-gate-dflash.sh` (no hard errors; `/tmp/coherence-dflash-20260713-105546.md`); and `nix develop --command bash scripts/coherence-gate-deepseek4-mtp.sh --full` (all six DeepSeek MTP cases passed at K=2 and K=3; `/tmp/coherence-deepseek4-mtp-20260713-113736.md`). Generation reads `ModelMeta::mtp_k`; direct environment values are resolved only during model load.
+
+- 2026-08-26 merge reconciliation for COR-001: the `bun test cli/*.test.ts`
+  commands and `cargo test -p hipfire-runtime --example daemon
+  mtp_k_tests --locked` above ran against pre-merge artifacts — the
+  TypeScript CLI and `crates/hipfire-runtime/examples/daemon.rs` were deleted
+  in the mainline merge (the daemon is now the `daemon` bin of
+  `crates/hipfire-daemon`, which carries no test target). The listed results
+  stand as feature-branch provenance; the merged `mtp_k` surface is
+  `HIPFIRE_MTP_K` / `speculation.mtp_k` through `hipfire-config` and the
+  loader carrier, covered by the `cargo test -p hipfire-loader --lib
+  --locked` / `cargo test -p hipfire-runtime --lib --locked` suites named
+  above.
 
 ### COR-002 Make Reset Total
 
@@ -247,6 +282,13 @@ authoritative constraint; a task is marked `in progress` only when work begins.
   `70dcd063a493af20a519e3afd0f341910b97bfd1af76aba45fe4742aed14fd15`, draft
   `bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70`, sidecar
   `d6cb8026841830cfeb82d2709453aa753f65b5596bfb9cc9c085c808fda6ad22`.
+
+- 2026-08-26 merge reconciliation for COR-004: the `cargo test -p
+  hipfire-runtime --example daemon --locked` (37 passed) command ran against
+  the deleted pre-merge daemon example; the merged `crates/hipfire-daemon`
+  bin carries no test target. The remaining commands above (`cargo test -p
+  hipfire-runtime --lib --locked`, `cargo test -p hipfire-loader --lib
+  --locked`, `serve-multiturn-gate.sh`) are unchanged in the merged tree.
 
 ### COR-005 Transactional LLaMA Spec-Target Loading
 
@@ -322,13 +364,23 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 ### GEN-002 Add DeepSeek4 Single-GPU Fallback
 
-- **Status:** ready
+- **Status:** ready — re-scoped to the merged mainline route (2026-08-26; see evidence)
 - **Dependencies:** COR-002
 - **Goal:** Provide an ordinary single-GPU DeepSeek4 generation path when EP is not selected or available.
 - **Acceptance criteria:** DeepSeek4 selects a single-device ArchDispatch/AR path without constructing EP state; DSML grammar/parser behavior matches the EP path; its adapter implements and proves the COR-002 reset contract; deterministic output, tool calls, and unload are coherent; unsupported model sizes fail explicitly on insufficient VRAM.
 - **Validation:** Run deterministic prose/code/tool-call and multi-turn parity against the accepted DeepSeek4 behavior, COR-002 reset conformance, load/unload, and low-VRAM failure tests.
 - **Hardware:** One supported AMD GPU with enough VRAM for the selected DeepSeek4 fixture.
-- **Evidence:** Pending
+- **Evidence:** Pending for the merged route. 2026-08-26 merge context: the
+  mainline merge shipped single-GPU DeepSeek4 as the production default —
+  `params.deepseek4_compute_placement` defaults to `single`
+  (`crates/hipfire-daemon/src/main.rs`) and the AR route
+  (`hipfire-generate` `select_generation_route` / `generate` →
+  `generate_deepseek4`) serves DeepSeek4 without constructing EP state; EP is
+  entered only on an explicit admitted `tp`/`ep` request (arch 9). The
+  feature-branch acceptance wording (ArchDispatch/AR path) is superseded by
+  the hipfire-generate route; the acceptance evidence itself (DSML parity,
+  COR-002 reset conformance, deterministic prose/code/tool-call and multi-turn
+  behavior, unload, low-VRAM refusal) is still owed against that route.
 
 ### SPEC-001 Unify AR And Speculative Orchestration
 
@@ -713,6 +765,16 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 - **Hardware:** None
 - **Evidence:** Implementation in working tree: `config::validate_parallel_axes` rejects the pair with a `Result<(), String>`, the daemon emits its JSON error envelope before the EP-wins remap, and `preflight_manifest` returns a `FulfillError` for a composed Tp×Ep mesh; `cargo test -p hipfire-runtime --lib config::tests` (11 passed), `cargo test -p hipfire-runtime --example daemon load_rejects_tp_ep_before_ep_wins_remap` (1 passed), `cargo test -p hipfire-runtime --lib weight_store::tests` (12 passed); PR #527 mirror synchronized.
 
+- 2026-08-26 merge reconciliation for COMP-001: `cargo test -p
+  hipfire-runtime --example daemon
+  load_rejects_tp_ep_before_ep_wins_remap` ran against the deleted pre-merge
+  daemon example. The merged enforcement is the admission path:
+  `hipfire_loader::admit_path` / `RawParallelRequest` with the COMP-001
+  policy cell (`crates/hipfire-loader/src/parallel_capability.rs`); the
+  daemon's `daemon_load_plan` surfaces the admission error before any unload.
+  The remaining commands above (`cargo test -p hipfire-runtime --lib
+  config::tests`, `--lib weight_store::tests`) are unchanged.
+
 ### DOC-001 Consolidate Stale Status Documentation
 
 - **Status:** complete
@@ -792,7 +854,7 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 
 - **Physical validation:** HW-001 and HW-002 follow STEP-002; HW-003/HW-006 follow AXIS-001; HW-004 follows GEN-001 for dense and MoE Qwen35 PP; HW-007/HW-011 follow AXIS-002; HW-008/HW-009/HW-010 follow AXIS-003 for planned non-Qwen35 cells including dense LFM2 admission; HW-012/HW-013 follow AXIS-004; HW-005 follows its six aggregate TP reports.
 - **Correctness ownership:** COR-001, COR-003, COR-004, COR-005, and COR-006 initially; COR-002 follows the eviction decision.
-- **Generation/spec:** GEN-002 can proceed alongside SPEC-001; SPEC-002 follows metadata and shared orchestration; SPEC-003 remains deferred by priority; SPEC-004 follows GEN-001, SPEC-002, and SPEC-003 for PP+MTP integration.
+- **Generation/spec:** GEN-002 (DeepSeek4 single-GPU acceptance, re-scoped to the merged default route) can proceed alongside SPEC-001; SPEC-002 follows metadata and shared orchestration; SPEC-003 remains deferred by priority; SPEC-004 follows GEN-001, SPEC-002, and SPEC-003 for PP+MTP integration.
 - **Multimodal:** VL-001 follows only COR-002/COR-003 and can proceed independently of SPEC-001; VL-002 waits for SPEC-001 because it adopts the existing n-gram strategy through shared speculative orchestration.
 - **Execution/placement:** STEP-001 and PAR-001 can start together; STEP-002 and STEP-003 then proceed largely independently before STEP-004; CAP-001 follows PAR-001, and AXIS implementation follows CAP-001 plus its named architecture prerequisites.
 - **Documentation:** DOC-001 can proceed without runtime or hardware work.

@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/rocm-env.sh"
 
 MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
-EXE="target/release/examples/daemon"
+EXE="target/release/daemon"
 ANALYZE="scripts/analyze_daemon_output.py"
 
 SYSTEM=$(python3 -c "import json; print(json.dumps(open('benchmarks/prompts/tool_call_system.txt').read()))")

@@ -39,7 +39,7 @@ hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
 hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
-hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
+hipfire serve --tp 2 -d               # forwards params.tp; admission resolves dense TP (HFQ) or EP (MoE)
 
 hipfire ps                            # daemons / quantize / uploads + port state (Linux)
 hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
@@ -65,7 +65,7 @@ Flags (also accepted by `restart`):
 | `--kv-mode <m>` | Sets `HIPFIRE_KV_MODE` for this run |
 | `--idle-timeout <s>` | Sets `HIPFIRE_IDLE_TIMEOUT` (0..86400) |
 | `--no-prewarm` | Sets `HIPFIRE_NO_PREWARM=1` |
-| `--tp N` | Sets `HIPFIRE_TP` (1..64) for expert-parallel load |
+| `--tp N` | Forwards `params.tp` (1..64) in the load message; admission resolves dense TP for admitted dense HFQ cells or EP for supported MoE cells. No `HIPFIRE_TP` env read — that variable is retired with the pre-merge CLI |
 
 Positional forms: `[model] [host] [port]`, or `host:port` / `[ipv6]:port`.
 Without a model arg, pre-warm uses `HIPFIRE_MODEL` if set, else
@@ -79,7 +79,7 @@ Config and env owners for bind, idle, queue, and body limits:
 1. **Bind + pid record.** Serve writes its numeric pid to
    `~/.hipfire/serve.pid`. `stop` verifies that `/proc/<pid>/cmdline` still
    identifies a native `hipfire serve` process before signaling it.
-2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
+2. **Daemon.** Spawns the Rust `daemon` binary (`crates/hipfire-daemon`) over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
 4. **HTTP.** The native server accepts traffic. Only one generation holds the
@@ -155,9 +155,85 @@ through to per-model / registry / daemon defaults when omitted):
 | `max_tokens` | Generation cap |
 | `stop` | Up to 4 strings, each ≤ 64 chars |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on) |
-| `chat_template_kwargs.enable_thinking` | `false` forces a no-think turn |
+| `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
-| `reasoning.effort` / `reasoning_effort` | `none`…`xhigh` → think budget / framing |
+| `thinking` / `thinking.type` | Mode axis (`on`/`off`, or DeepSeek-style `enabled`/`disabled`). Thinking disabled wins and drops effort/cap with a warning. |
+| `reasoning.effort` / `reasoning_effort` | **Semantic effort only** — prompt strength. Never mapped to a think-token budget. Family ladders differ; unsupported/cross-family values are dropped with a warning (see below). |
+| `reasoning.max_tokens` / `max_think_tokens` | Explicit **integer** think-span cap on Qwen Jinja contracts. `0` or omitted = uncapped. DeepSeek, Gemma, Glimmer, and unsupported contracts drop it with a warning. Independent of effort. |
+| `thinking_budget` / `reasoning.budget` | Legacy **named** cap preset only on non-effort-native Qwen templates that still accept it. Dropped+warned elsewhere. |
+
+### Reasoning request contract
+
+Mode, effort, and cap are three independent axes — full key table and budget
+map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
+
+**Normalization (warn + drop, not silent reinterpretation):**
+
+- Recognizable unsupported or cross-family values are dropped or aliased with
+  `[WARN: INVALID CONFIG]`. Warnings appear in the server log and, on OpenAI
+  responses, under `hipfire.reasoning` / `hipfire.config_warnings` metadata.
+- Malformed types and out-of-range integers remain hard request errors.
+- Effort is **never** converted into a token cap (including on Qwen3.6 and other
+  non-effort-native templates).
+- Qwen3.8 defaults to an uncapped think span unless the request sets a positive
+  integer cap. DeepSeek V4 and Muse Glimmer expose semantic effort but no
+  independent parent-defined cap; cap fields are dropped+warned.
+
+**Examples:**
+
+```bash
+# Qwen3.8 — disable thinking natively (empty closed think block)
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8:27b",
+  "messages": [{"role": "user", "content": "hi"}],
+  "chat_template_kwargs": {"enable_thinking": false}
+}'
+
+# Qwen3.8 — semantic effort only (still uncapped unless max_think_tokens is set)
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8:27b",
+  "messages": [{"role": "user", "content": "plan a refactor"}],
+  "reasoning_effort": "medium"
+}'
+
+# Qwen3.6 — no native effort: effort is dropped+warned; set an explicit cap if wanted
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.6:27b",
+  "messages": [{"role": "user", "content": "hi"}],
+  "reasoning_effort": "low",
+  "max_think_tokens": 2048
+}'
+
+# DeepSeek V4 — mode + effort; medium/xhigh alias to high; no cap from effort
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "deepseek-v4-flash",
+  "messages": [{"role": "user", "content": "hi"}],
+  "thinking": {"type": "enabled"},
+  "reasoning_effort": "high"
+}'
+
+# Gemma4 — boolean thinking (official default off); unsupported effort/cap dropped
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "gemma4:31b",
+  "messages": [{"role": "user", "content": "hi"}],
+  "chat_template_kwargs": {"enable_thinking": true}
+}'
+
+# Muse Glimmer — always reasons via Onyx; strength dial; off is dropped+warned
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "muse-glimmer",
+  "messages": [{"role": "user", "content": "hi"}],
+  "reasoning_effort": "high"
+}'
+```
+
+| Family | Mode | Effort | Cap |
+|---|---|---|---|
+| Qwen3.8 | `enable_thinking=false` → empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`) | Integer only; named budget dropped |
+| Qwen3.6 | on/off | Dropped+warned (never → cap) | Named preset or integer if set |
+| DeepSeek V4 | `thinking.type` enabled/disabled (default on) | `low` \| `high` \| `max` (`medium`/`xhigh`→`high`) | Integer only; default uncapped |
+| Gemma4 | Boolean; default **off** | Dropped+warned | Dropped+warned unless explicit engine integer |
+| Muse Glimmer | Always on (off dropped) | `low` \| `medium` \| `high` \| `xhigh` | Integer only; default uncapped |
 
 When `messages` contains no `system` or `developer` role, the serve layer inserts `prompt.system` from a per-model TOML override or the registry card's `recommended_settings.system_prompt`. A client-supplied system/developer message always wins.
 

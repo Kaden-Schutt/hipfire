@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 PROMPT="A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number."
 MAX_TOKENS=300
@@ -72,7 +72,7 @@ print(''.join(toks).strip()[:60])
 # ── Build daemon if stale ─────────────────────────────────────────────────
 if [ ! -x "$EXE" ]; then
     echo "Building daemon..."
-    cargo build --release --example daemon --features deltanet 2>&1 | tail -3
+ cargo build --release -p hipfire-daemon 2>&1 | tail -3
 fi
 
 echo "=== smoke-dispatch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git rev-parse --short HEAD 2>/dev/null) ==="

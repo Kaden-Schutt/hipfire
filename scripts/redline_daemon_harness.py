@@ -7,7 +7,9 @@
 
 Loads one model once, measures synthetic prefill and single-token decode
 separately, and asks the daemon to delimit/fingerprint exactly one HIP launch
-sequence for each phase. It never enables AQL routing.
+sequence for each phase. The optional DSpark / DFlash2 verify oracles
+additionally lower one isolated fixed-B verify body and compare ordinary HIP,
+captured HIP, and retained PM4 state without installing that route into serving.
 """
 
 import argparse
@@ -100,12 +102,93 @@ def capture_key(row):
     )
 
 
+# Bit-exact fields. A retained-PM4 window that disagrees with the shipping HIP
+# window on any of these is a correctness failure, not a tolerance question.
+DFLASH_EXACT_FIELDS = (
+    "tokens_equal",
+    "argmax_equal",
+    "ring_head_equal",
+    "ring_written_equal",
+    "kv_active_hash_equal",
+    "kv_guard_equal",
+    "pbs_guard_equal",
+    "gdn_frame_equal",
+)
+
+# Arms judged against the `direct_capture_safe` reference. `hip_auto` is the
+# shipping HipGraph path, which replays a frozen Q8 GatedDeltaNet
+# stochastic-rounding frame; its comparison is reported as
+# `direct_capture_safe_vs_hip_auto` for documentation but is NOT a verdict,
+# because the retained route reproduces live frame consumption and the graph
+# does not.
+DFLASH_COMPARED_ARMS = ("recorded_hip", "pm4")
+
+
+def dflash_shadow_failures(shadow):
+    """Every reason this shadow run is not evidence. Empty list == pass.
+
+    Route state alone is never evidence: Ready with zero replays means the
+    prepared IB was never submitted, and a parity table with no windows means
+    nothing was compared.
+    """
+    failures = []
+    route = shadow.get("route") or {}
+    counters = route.get("counters") or {}
+    phase = route.get("phase")
+    replays = int(counters.get("replays") or 0)
+    if phase != "ready":
+        failures.append(f"route phase is {phase!r}, not 'ready' ({route.get('reason')})")
+    if replays == 0:
+        failures.append("replays == 0 (Ready state alone is never evidence)")
+    for name in ("replay_failures", "poison_count", "contract_failures", "prepare_failures"):
+        if int(counters.get(name) or 0) != 0:
+            failures.append(f"counters.{name} == {counters.get(name)}")
+
+    capture = shadow.get("capture") or {}
+    if not capture.get("aql_equals_unique_kernels"):
+        failures.append(
+            f"AQL contracts {capture.get('aql_contracts')} != unique captured kernels"
+        )
+    identity = shadow.get("prepared_identity") or {}
+    if not identity.get("dispatch_equals_launches"):
+        failures.append(
+            f"prepared dispatches {identity.get('dispatch_count')} != "
+            f"captured launches {capture.get('launches')}"
+        )
+    if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
+        failures.append(
+            f"prepared route is not single-queue/single-phase: {identity!r}"
+        )
+
+    windows = ((shadow.get("parity") or {}).get("windows")) or []
+    if not windows:
+        failures.append("parity table has no windows")
+    for window in windows:
+        position = window.get("position")
+        for arm in DFLASH_COMPARED_ARMS:
+            row = window.get(arm) or {}
+            if not row:
+                failures.append(f"position {position}: arm {arm} missing from parity")
+                continue
+            for field in DFLASH_EXACT_FIELDS:
+                if field in row and not row[field]:
+                    failures.append(f"position {position}: {arm}.{field} is false")
+            for field, value in row.items():
+                if isinstance(value, dict) and "max_abs" in value:
+                    if (value.get("max_abs") or 0) != 0 or (value.get("max_rel") or 0) != 0:
+                        failures.append(
+                            f"position {position}: {arm}.{field} diverged "
+                            f"max_abs={value.get('max_abs')} max_rel={value.get('max_rel')}"
+                        )
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--daemon",
-        default=str(REPO / "target/release/examples/daemon"),
+        default=str(REPO / "target/release/daemon"),
     )
     parser.add_argument("--out", default=str(REPO / ".redline-work/redline-daemon-phases.json"))
     parser.add_argument("--log", default=str(REPO / ".redline-work/redline-daemon-phases.log"))
@@ -130,6 +213,17 @@ def main():
         type=int,
         default=1,
         help="consecutive token positions compared by the AQL/HIP/blob parity gate",
+    )
+    parser.add_argument(
+        "--state-quant",
+        choices=("q8", "fp32", "q4"),
+        help=(
+            "DeltaNet state precision for the run. Pass fp32 for any BYTE-PARITY "
+            "claim: Q8 state uses stochastic rounding, which makes a bit-exact "
+            "PM4/HIP path report exact=False and misattributes the failure to the "
+            "lowering (see CLAUDE.md 'Byte-parity validation is meaningless under "
+            "stochastic state'). Omit to keep the daemon default (q8)."
+        ),
     )
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -163,6 +257,41 @@ def main():
         action="store_true",
         help="lower --prefix to one retained PM4 indirect buffer",
     )
+    parser.add_argument(
+        "--dspark-verify-shadow",
+        action="store_true",
+        help=(
+            "run the DSpark verify ordinary-HIP/capture-safe/blob/PM4 state oracle "
+            "instead of the plain-AR phase harness"
+        ),
+    )
+    parser.add_argument(
+        "--dflash-verify-shadow",
+        action="store_true",
+        help=(
+            "run the DFlash2 B=16 ordinary-HIP/capture-safe/blob/PM4 state oracle "
+            "instead of the plain-AR phase harness"
+        ),
+    )
+    parser.add_argument(
+        "--dflash-timing-windows",
+        type=int,
+        default=200,
+        help=(
+            "interleaved HipGraph/PM4 steady-state windows for --dflash-verify-shadow "
+            "(default: 200). Capture/prepare is amortized separately."
+        ),
+    )
+    parser.add_argument(
+        "--draft",
+        help="draft sidecar path (required by --dspark-verify-shadow / --dflash-verify-shadow)",
+    )
+    parser.add_argument(
+        "--verify-batch",
+        type=int,
+        default=3,
+        help="fixed target verify batch for the DSpark shadow (default: 3)",
+    )
     args = parser.parse_args()
 
     model = Path(args.model).expanduser().resolve()
@@ -171,10 +300,26 @@ def main():
         sys.exit(f"model not found: {model}")
     if not daemon_path.is_file():
         sys.exit(f"daemon not found: {daemon_path}")
+    draft = Path(args.draft).expanduser().resolve() if args.draft else None
+    if args.dspark_verify_shadow and (draft is None or not draft.is_file()):
+        sys.exit("--dspark-verify-shadow requires an existing --draft sidecar")
+    if args.dflash_verify_shadow and (draft is None or not draft.is_file()):
+        sys.exit("--dflash-verify-shadow requires an existing --draft sidecar")
+    if args.dspark_verify_shadow and args.dflash_verify_shadow:
+        sys.exit("choose one of --dspark-verify-shadow or --dflash-verify-shadow")
+    if args.dspark_verify_shadow:
+        discovered_draft = model.with_name(f"{model.stem}-dspark{model.suffix}").resolve()
+        if draft != discovered_draft:
+            sys.exit(
+                "DeepSeek4 discovers DSpark only as the sibling "
+                f"{discovered_draft}; --draft resolved to {draft}"
+            )
 
     report = {
         "model": str(model),
         "model_bytes": model.stat().st_size,
+        "draft": str(draft) if draft is not None else None,
+        "draft_bytes": draft.stat().st_size if draft is not None else None,
         "daemon": str(daemon_path),
         "kv_mode": args.kv_mode,
         "automatic_clocks_required": True,
@@ -183,15 +328,26 @@ def main():
     }
     daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode)
     try:
+        load_params = {
+            "max_seq": args.max_seq,
+            "kv_mode": args.kv_mode,
+            "dflash_mode": "on" if args.dflash_verify_shadow else "off",
+            "dspark_mode": "on" if args.dspark_verify_shadow else "off",
+        }
+        # DeepSeek4 discovers `<stem>-dspark.<ext>` itself. Passing the same file
+        # through params.draft would incorrectly enter the Qwen DFlash lm_head
+        # eligibility gate before architecture dispatch. Qwen DFlash *does*
+        # take params.draft.
+        load_body = {
+            **load_params,
+            **({"state_quant": args.state_quant} if args.state_quant else {}),
+            **({"draft": str(draft)} if args.dflash_verify_shadow else {}),
+        }
         loaded = daemon.request(
             {
                 "type": "load",
                 "model": str(model),
-                "params": {
-                    "max_seq": args.max_seq,
-                    "kv_mode": args.kv_mode,
-                    "dflash_mode": "off",
-                },
+                "params": load_body,
             }
         )
         if loaded.get("type") != "loaded":
@@ -202,6 +358,69 @@ def main():
             f"layers={loaded.get('layers')} vocab={loaded.get('vocab')}",
             flush=True,
         )
+
+        if args.dflash_verify_shadow:
+            shadow = daemon.request(
+                {
+                    "type": "redline_dflash_verify_shadow_pm4",
+                    "verify_batch": 16 if args.verify_batch == 3 else args.verify_batch,
+                    "iterations": max(args.shadow_iterations, 4),
+                    "steady_state_windows": args.dflash_timing_windows,
+                }
+            )
+            report["dflash_verify_shadow"] = shadow
+            failures = dflash_shadow_failures(shadow)
+            route = shadow.get("route") or {}
+            counters = route.get("counters") or {}
+            timing = shadow.get("timing") or {}
+            print(
+                f"dflash-verify-shadow: B={shadow.get('verify_batch')} "
+                f"positions={shadow.get('positions')} "
+                f"phase={route.get('phase')} "
+                f"replays={counters.get('replays')} "
+                f"median_delta_ms={timing.get('median_delta_ms')} "
+                f"percent_delta={timing.get('percent_delta')} "
+                f"p95_delta_ms={timing.get('p95_delta_ms')}",
+                flush=True,
+            )
+            report["pass"] = not failures
+            report["dflash_verify_failures"] = failures
+            output = Path(args.out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n")
+            print(f"report={output} pass={report['pass']}", flush=True)
+            for line in failures:
+                print(f"  FAIL {line}", flush=True)
+            if failures:
+                raise SystemExit(
+                    f"dflash-verify-shadow failed {len(failures)} check(s); see {output}"
+                )
+            return
+        if args.dspark_verify_shadow:
+            shadow = daemon.request(
+                {
+                    "type": "redline_dspark_shadow_pm4",
+                    "context_tokens": args.decode_context,
+                    "verify_batch": args.verify_batch,
+                    "iterations": args.shadow_iterations,
+                }
+            )
+            report["dspark_verify_shadow"] = shadow
+            report["pass"] = bool(shadow.get("bit_exact"))
+            print(
+                f"dspark-verify-shadow: B={args.verify_batch} "
+                f"positions={args.shadow_iterations} exact={report['pass']} "
+                f"launches={shadow.get('capture', {}).get('launches')} "
+                f"hash={shadow.get('capture', {}).get('sequence_hash')}",
+                flush=True,
+            )
+            output = Path(args.out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n")
+            print(f"report={output} pass={report['pass']}", flush=True)
+            if not report["pass"]:
+                raise SystemExit(1)
+            return
 
         for tokens in ([] if args.skip_prefill else args.prefill):
             captures = [

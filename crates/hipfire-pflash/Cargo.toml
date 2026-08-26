@@ -1,0 +1,33 @@
+[package]
+name = "hipfire-pflash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PFlash speculative prefill compression — retained legacy research (historical reproduction only)"
+
+[features]
+default = ["deltanet", "arch-qwen35"]
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35/deltanet"]
+arch-qwen35 = []
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+rdna-compute = { path = "../rdna-compute" }
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-config = { path = "../hipfire-config" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[example]]
+name = "pflash_compress_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pflash_load_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pflash_niah_bench"
+required-features = ["arch-qwen35"]

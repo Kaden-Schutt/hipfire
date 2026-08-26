@@ -113,6 +113,7 @@ impl ConfigState {
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
             Some("thinking"),
+            Some("reasoning_effort"),
             Some("thinking_budget"),
             None, // Serve host:port (composite)
         ]
@@ -157,6 +158,7 @@ impl ConfigState {
             self.is_override("prefill_compression"),              // Prefill
             self.is_override("kv_cache"),                         // KV cache
             self.is_override("thinking"),                         // Thinking
+            self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
             self.is_override("host") || self.is_override("port"), // Serve
         ]
@@ -174,6 +176,7 @@ impl ConfigState {
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
             "thinking",            // Thinking
+            "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
             "host",                // Serve
         ]
@@ -236,12 +239,20 @@ impl ConfigState {
                 "Whether reasoning models emit a hidden think block.",
             ),
             (
+                "Reasoning effort",
+                self.values
+                    .get("reasoning_effort")
+                    .cloned()
+                    .unwrap_or_else(|| "auto".into()),
+                "How hard the model is told to think, in its own vocabulary.",
+            ),
+            (
                 "Reasoning budget",
                 self.values
                     .get("thinking_budget")
                     .cloned()
                     .unwrap_or_else(|| "med".into()),
-                "Named <think> token cap (low/med/high/xhigh/max/uncapped).",
+                "A CAP, not a dial — truncates. Prefer effort where the model has one.",
             ),
             (
                 "Serve",
@@ -274,6 +285,28 @@ fn value_to_string(value: &ConfigValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four easy-mode lists are positional: row i in `easy_rows` is edited
+    /// through `easy_keys[i]`, marked by `easy_override_state[i]`, and
+    /// explained by `easy_help_keys[i]`. Nothing but this test stops them
+    /// drifting — adding a row to three of the four silently misattributes
+    /// every row after it.
+    #[test]
+    fn easy_mode_lists_stay_positionally_parallel() {
+        let c = state_with(&[]);
+        let n = c.easy_rows().len();
+        assert_eq!(c.easy_keys().len(), n, "easy_keys drifted from easy_rows");
+        assert_eq!(
+            c.easy_override_state().len(),
+            n,
+            "easy_override_state drifted from easy_rows"
+        );
+        assert_eq!(
+            c.easy_help_keys().len(),
+            n,
+            "easy_help_keys drifted from easy_rows"
+        );
+    }
 
     /// A ConfigState seeded from an explicit value map (defaults overlaid).
     fn state_with(pairs: &[(&str, &str)]) -> ConfigState {

@@ -388,7 +388,7 @@ python3 scripts/redline_daemon_harness.py \
 
 python3 -m tools.redline bench \
   --model "$MODEL" \
-  --daemon target/release/examples/daemon \
+  --daemon target/release/daemon \
   --context 128 --iterations 100 --warmups 3 --runs 10 \
   --transport pm4 --max-seq 2048 \
   --work-dir .redline-work/product \
@@ -778,7 +778,7 @@ HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
 HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
 python3 scripts/redline_daemon_harness.py \
   --model ~/.hipfire/models/lfm2.5-350m.mq4 \
-  --daemon target/release/examples/daemon \
+  --daemon target/release/daemon \
   --kv-mode q8 --skip-prefill --decode-context 127 \
   --capture-repeats 2 --measure-repeats 5 \
   --decode-iterations 4 --shadow-iterations 4 --pm4 \
@@ -803,7 +803,7 @@ HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
 HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
 python3 -m tools.redline bench \
   --model ~/.hipfire/models/lfm2.5-350m.mq4 \
-  --daemon target/release/examples/daemon \
+  --daemon target/release/daemon \
   --context 127 --transport pm4 --kv-mode q8 \
   --dpm-warmup-secs 10 \
   --out .redline-work/lfm-product-pm4-stationary.json
@@ -875,10 +875,10 @@ Prefer paths and symbols over line numbers.
 | Concern | Stable source path and symbols |
 |---|---|
 | Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `mq4r_redline_default` only (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic, no `arch_id` gate). Existing LFM `.mq4` sealed evidence has no automatic selector. |
-| Model-load application and diagnostic handlers | `crates/hipfire-runtime/examples/daemon.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
+| Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`; lowered path under `HIPFIRE_FORWARD_LOWERED`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |
-| LFM generate / spec path | `crates/hipfire-runtime/examples/daemon.rs` — `generate_lfm2moe`; `crates/hipfire-arch-lfm2moe/src/spec_impl.rs` — `Lfm2MoeBundle` / `SpecTarget` |
+| LFM generate / spec path | `crates/hipfire-daemon/src/main.rs` — `generate_lfm2moe`; `crates/hipfire-arch-lfm2moe/src/spec_impl.rs` — `Lfm2MoeBundle` / `SpecTarget` |
 | Controller, tape, lifecycle, routing | `crates/rdna-compute/src/replay.rs` — `ReplayController`; `ReplayState`; `RecordedHipLaunch`; `ReplayGridBinding`; `configure_model_default`; `reset_for_model`; `begin_auto_capture_if_armed`; `finish_capture`; `prepare_linear_aql_prefix`; `prepare_pm4_prefix`; `replay_linear_aql`; `replay_pm4`; `observe_shadow`; `install_prepared_plan`; `should_route_aql`; `should_route_pm4`; `poison` |
 | Central HIP recording and artifact aliases | `crates/rdna-compute/src/dispatch.rs` — `Gpu::replay`; typed HIP launch recording |
 | DAG, identity, ABI, visibility | `crates/redline-dispatch/src/lib.rs` — `Recorder`; `CompiledPlan`; `KernelArtifactIdentity`; `KernargAbi`; `derive_aql_visibility` |

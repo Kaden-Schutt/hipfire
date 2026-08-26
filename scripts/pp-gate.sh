@@ -454,7 +454,7 @@ fi
 export HIP_VISIBLE_DEVICES="$filtered_csv"
 export HIPFIRE_DETERMINISTIC=1
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 EXAMPLES_DIR="./target/release/examples"
 MODEL="${HIPFIRE_PP_GATE_MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -476,7 +476,7 @@ else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs \
                crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/multi_gpu.rs \
-               crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-daemon/src/main.rs \
                crates/hipfire-runtime/examples/pp_parity_chatml.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then rebuild=1; break; fi
@@ -484,8 +484,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "pp-gate: rebuilding..."
-    if ! cargo build --release --features deltanet -p hipfire-runtime \
-            --example daemon --example pp_parity_chatml >&2; then
+    if ! cargo build --release -p hipfire-daemon >&2 || ! cargo build --release --features deltanet -p hipfire-runtime --example pp_parity_chatml >&2; then
         echo "pp-gate: build failed" >&2
         exit 2
     fi

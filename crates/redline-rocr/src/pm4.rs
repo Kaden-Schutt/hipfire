@@ -18,16 +18,15 @@ const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
 
-// GFX12 SET_SH_REG offsets. The gfx12 register headers number COMPUTE
-// registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0; SET_SH_REG retains the
-// architectural 0x200 COMPUTE window used by ROCr's PM4 builders.
+// GC 12.0.x SET_SH_REG offsets used by gfx1200/gfx1201. The register headers
+// number COMPUTE registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0;
+// SET_SH_REG retains the architectural 0x200 COMPUTE window used by ROCr's
+// PM4 builders. GC 12.1 relocates these registers and needs a distinct map.
 const COMPUTE_NUM_THREAD_X: u32 = 0x207;
 const COMPUTE_PGM_LO: u32 = 0x20c;
 const COMPUTE_PGM_RSRC1: u32 = 0x212;
 const COMPUTE_RESOURCE_LIMITS: u32 = 0x215;
-const COMPUTE_TMPRING_SIZE: u32 = 0x216;
-const COMPUTE_PGM_RSRC3_GFX12: u32 = 0x223;
-const COMPUTE_STATIC_THREAD_MGMT_SE0: u32 = 0x230;
+const COMPUTE_PGM_RSRC3_GFX12: u32 = 0x228;
 const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 const LDS_SIZE_MASK: u32 = 0x00ff_8000;
@@ -105,7 +104,7 @@ impl Gfx12Pm4CommandBuffer {
     /// scalar, and vector cache visibility without carrying removed gfx11
     /// GL1/metadata bits into the merged RDNA4 hierarchy.
     pub fn acquire_system_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x1c1d1);
+        self.emit_acquire_gcr(0xc3b1);
     }
 
     /// Return a copy bracketed by GPU-clock writes. The end timestamp follows
@@ -261,10 +260,10 @@ impl Gfx12Pm4CommandBuffer {
             packet3(PACKET3_ACQUIRE_MEM, 7, false),
             0,
             u32::MAX,
-            0xff,
+            0x00ff_ffff,
             0,
             0,
-            4,
+            0x0000_000a,
             gcr_cntl,
         ]);
     }
@@ -314,7 +313,6 @@ impl Gfx12Pm4CommandBuffer {
         );
         self.set_sh_regs(COMPUTE_PGM_RSRC1, &[pm4.compute_pgm_rsrc1, rsrc2]);
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX12, &[pm4.compute_pgm_rsrc3]);
-        self.set_sh_regs(COMPUTE_TMPRING_SIZE, &[0]);
         self.set_sh_regs(
             COMPUTE_NUM_THREAD_X,
             &[
@@ -323,10 +321,10 @@ impl Gfx12Pm4CommandBuffer {
                 u32::from(geometry.workgroup[2]),
             ],
         );
-        // Match ROCr's direct-dispatch template: all waves per SH are allowed
-        // and every shader engine remains eligible.
+        // Match ROCr's direct-dispatch template: all waves per SH are allowed.
+        // TMPRING and STATIC_THREAD_MGMT belong to the queue/MQD; retain KFD's
+        // scratch and CU-affinity state instead of replacing it per dispatch.
         self.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0x3ff]);
-        self.set_sh_regs(COMPUTE_STATIC_THREAD_MGMT_SE0, &[u32::MAX; 4]);
         if needs_kernarg {
             let address = kernarg_address as usize as u64;
             self.set_sh_regs(
@@ -372,10 +370,7 @@ impl Gfx12Pm4CommandBuffer {
 
     fn set_sh_regs(&mut self, first: u32, values: &[u32]) {
         debug_assert!(!values.is_empty());
-        let static_registers = matches!(
-            first,
-            COMPUTE_TMPRING_SIZE | COMPUTE_RESOURCE_LIMITS | COMPUTE_STATIC_THREAD_MGMT_SE0
-        );
+        let static_registers = first == COMPUTE_RESOURCE_LIMITS;
         if !self.cache_dynamic_registers && !static_registers {
             self.emit_set_sh_regs(first, values);
             return;
@@ -672,6 +667,11 @@ mod tests {
     }
 
     #[test]
+    fn gfx120x_program_resource_offset_matches_gc_12_0_headers() {
+        assert_eq!(COMPUTE_PGM_RSRC3_GFX12, 0x228);
+    }
+
+    #[test]
     fn dispatch_initiator_tracks_kernel_descriptor_wave_size() {
         assert_eq!(dispatch_initiator(false), 0x25);
         assert_eq!(dispatch_initiator(true), 0x8025);
@@ -687,9 +687,13 @@ mod tests {
         assert_eq!(commands.dwords()[0], 0xc006_5800);
         assert_eq!(commands.dwords()[7], 0x1c3f1);
         assert_eq!(commands.dwords()[8], 0xc006_5800);
-        assert_eq!(commands.dwords()[15], 0x1c1d1);
+        assert_eq!(commands.dwords()[15], 0xc3b1);
         assert_eq!(commands.dwords()[16], 0xc006_5800);
         assert_eq!(commands.dwords()[23], 0x10180);
+        for base in [8, 16] {
+            assert_eq!(commands.dwords()[base + 3], 0x00ff_ffff);
+            assert_eq!(commands.dwords()[base + 6], 0x0000_000a);
+        }
         assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
     }
 

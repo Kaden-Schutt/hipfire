@@ -1154,7 +1154,7 @@ mod tests {
             (0..gpus.devices.len())
                 .all(|b| a == b || gpus.devices[a].device_id != gpus.devices[b].device_id)
         });
-        let dn = crate::qwen35::DeltaNetState::new_with_quant_multi(
+        let (dn, _la_to_device) = crate::qwen35::DeltaNetState::new_with_quant_multi(
             &mut gpus,
             &cfg,
             crate::qwen35::StateQuant::Q8,
@@ -1172,7 +1172,7 @@ mod tests {
                 );
             }
         }
-        dn.free_gpu_multi(&mut gpus, &cfg);
+        dn.free_gpu_multi(&mut gpus, &_la_to_device);
     }
 
     // ── STEP-002 Task 9: Single expert-group manifest ─────────────────────

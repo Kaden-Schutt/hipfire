@@ -1,0 +1,1 @@
+WINDOW variant=default e8b=0 B=1024 | 10181.73 ms/call (best 10169.54) | 100.57 tok/s | 1024 tokens | pos 0

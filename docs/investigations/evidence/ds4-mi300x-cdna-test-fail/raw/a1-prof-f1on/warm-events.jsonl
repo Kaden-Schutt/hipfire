@@ -1,0 +1,18 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-warm","text":"Here","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" is a prod","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"uction-grade","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" te","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"chni","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"cal explanat","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ion of th","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"e me","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"as","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"urement","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" co","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ntrac","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"t for a single‑batch","attempt_id":1}
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":31.496062992125985,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20788,"total_ms":21297,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-warm","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

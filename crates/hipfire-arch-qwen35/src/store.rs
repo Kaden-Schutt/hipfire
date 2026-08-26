@@ -1340,6 +1340,8 @@ fn typed_moe_ffn(
         expert_shape: None,
         paro_shared: None,
         packed_expert_owners: None,
+        global_expert_dtypes: None,
+        ep_dummy_buffers: Vec::new(),
     }
 }
 
@@ -2157,6 +2159,7 @@ pub(crate) fn assemble_qwen35_weights_inner_with_mode(
         lm_head_aliases_embd,
         moe_resident: None,
         moe_group_plans: std::sync::OnceLock::new(),
+        ep_shard: None,
     })
 }
 
@@ -8310,6 +8313,7 @@ mod tests {
             lm_head_aliases_embd: false,
             moe_resident: None,
             moe_group_plans: std::sync::OnceLock::new(),
+            ep_shard: None,
         };
         let err = match weights.moe_ffn_view(0) {
             Ok(_) => panic!("layer 0 of 0 must be out of range"),
@@ -10826,18 +10830,18 @@ mod tests {
 // whole matrix is executable without hardware.
 
 #[cfg(test)]
-mod frozen_preflight_tests {
+pub(crate) mod frozen_preflight_tests {
     use super::*;
     use crate::arch::Qwen35;
     use hipfire_runtime::arch::Architecture;
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
-    struct HfqFixture {
-        path: PathBuf,
+    pub(crate) struct HfqFixture {
+        pub(crate) path: PathBuf,
     }
 
-    fn moe_config_json() -> serde_json::Value {
+    pub(crate) fn moe_config_json() -> serde_json::Value {
         serde_json::json!({
             "hidden_size": 64,
             "num_hidden_layers": 2,
@@ -10854,7 +10858,7 @@ mod frozen_preflight_tests {
         })
     }
 
-    fn dense_config_json() -> serde_json::Value {
+    pub(crate) fn dense_config_json() -> serde_json::Value {
         serde_json::json!({
             "hidden_size": 64,
             "num_hidden_layers": 2,
@@ -10904,7 +10908,7 @@ mod frozen_preflight_tests {
     /// HFQ quant_type byte; `extra` adds physical tensors verbatim (name,
     /// quant_type, shape) — used for AWQ companions and Paro sidecars;
     /// `drop_logical` removes manifest entries by logical name.
-    fn write_fixture(
+    pub(crate) fn write_fixture(
         arch_id: u32,
         config_json: &serde_json::Value,
         quant_for: &dyn Fn(&str, Option<usize>) -> u8,
@@ -10993,7 +10997,7 @@ mod frozen_preflight_tests {
         preflight_qwen35_frozen(LoaderModelSource::Hfq(hfq), arch, single_device, flags)
     }
 
-    fn eligible_quant(_name: &str, _layer: Option<usize>) -> u8 {
+    pub(crate) fn eligible_quant(_name: &str, _layer: Option<usize>) -> u8 {
         13 // MQ4G256 — the canonical indexed routed dtype
     }
 
@@ -11749,6 +11753,8 @@ mod frozen_preflight_tests {
             LoadCtx {
                 path,
                 max_seq: 2048,
+                deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement::Single,
+                deepseek4_experts_per_token: None,
                 draft_path: None,
                 kv_mode_override: None,
                 kv_backend: KvBackend::default(),
@@ -11762,6 +11768,8 @@ mod frozen_preflight_tests {
                 spec: SpecLoadCfg::default(),
                 kv_physical_cap: None,
                 gpu,
+                gemma4_drafter_path: None,
+                gemma4_draft_len: 3,
             }
         }
 

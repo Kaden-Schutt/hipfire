@@ -412,6 +412,8 @@ pub fn ds4_lower_borrowed_plan<'mesh, 'step>(
         MoeProgramParts {
             router,
             execution: ExpertExecutionPlan::IndexedQuantized,
+            deferred_combine: false,
+
             ranks,
         },
     )
@@ -843,6 +845,14 @@ pub enum Ds4MtpPlanError {
     Unsupported { count: usize },
     /// The cached resolution failed, so no MTP plan exists.
     ResolutionFailed(String),
+    /// `num_nextn_predict_layers == 1` but the loaded weights' MTP slot is
+    /// not routeable (absent or partial). The MAIN-layer authority tolerates
+    /// an absent MTP slot; only the MTP selectors reach this accessor, and
+    /// they must refuse with the typed error.
+    MtpNotRouteable {
+        rank: usize,
+        profile: Ds4RouterProfile,
+    },
 }
 
 impl Ds4PlanCacheEntry {
@@ -900,6 +910,22 @@ impl Ds4PlanCacheEntry {
             0 => Err(Ds4MtpPlanError::Unconfigured),
             count if count > 1 => Err(Ds4MtpPlanError::Unsupported { count }),
             _ => {
+                // The main-layer authority tolerates an absent/partial MTP
+                // slot (recorded in the entry key's per-rank profile matrix);
+                // only the MTP selectors reach this accessor, and a
+                // non-routeable slot is an explicit typed refusal — never a
+                // silent plan borrow.
+                let mtp_idx = self.key.manifest_config.num_hidden_layers;
+                let profile = self
+                    .key
+                    .router_profiles
+                    .first()
+                    .and_then(|profiles| profiles.get(mtp_idx))
+                    .copied()
+                    .unwrap_or(Ds4RouterProfile::Unavailable);
+                if profile != Ds4RouterProfile::BiasAware {
+                    return Err(Ds4MtpPlanError::MtpNotRouteable { rank: 0, profile });
+                }
                 let resolution = self
                     .result
                     .as_ref()
@@ -1186,6 +1212,7 @@ pub fn ds4_graph_refuse_host_fallback(profiles: &[Ds4RouterProfile]) -> Result<(
 ///
 /// Consumed by the forward entries' authority seams (`acquire_moe_authority_*`
 /// in forward.rs) — the single production acquisition point.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ds4_cached_moe_plans<'a>(
     weights_per_rank: &'a [DeepseekV4Weights],
     cfg: &DeepseekV4Config,
@@ -1223,6 +1250,57 @@ pub fn ds4_cached_moe_plans<'a>(
     ds4_cache_cell_moe_plans(&weights_per_rank[0].moe_plan_cache, cfg, policy, &matrix)
 }
 
+/// Main-layer-tolerant aggregate: identical to [`ds4_cached_moe_plans`]
+/// EXCEPT the count-1 MTP slot is not required to be routeable — a config
+/// declaring MTP whose loaded weights carry no MTP layer still resolves the
+/// main layers (plain AR decode / mesh decode). The MTP slot's residency
+/// stays in the entry key, so [`Ds4PlanCacheEntry::mtp_plan`] refuses it
+/// with the typed `MtpNotRouteable` — only the MTP selectors
+/// (`select_mtp_authority_*`) enforce the MTP requirement. Consumed by the
+/// forward authority seams (`acquire_moe_authority_*`).
+pub fn ds4_cached_moe_plans_main<'a>(
+    weights_per_rank: &'a [DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    policy: &MoEExecutionPolicy,
+) -> Result<&'a Ds4PlanCacheEntry, Ds4PlanCacheError> {
+    // 0. Unsupported MTP count is refused at the AGGREGATE boundary, before
+    //    the empty/rank checks (a combined-invalid request reports the MTP
+    //    refusal first).
+    if cfg.num_nextn_predict_layers > 1 {
+        return Err(Ds4PlanCacheError::MtpCountUnsupported {
+            count: cfg.num_nextn_predict_layers,
+        });
+    }
+    // 1. The aggregate must cover exactly the policy's ranks.
+    if weights_per_rank.is_empty() {
+        return Err(Ds4PlanCacheError::EmptyRankProfiles);
+    }
+    let ranks = policy.rank_count();
+    if weights_per_rank.len() != ranks {
+        return Err(Ds4PlanCacheError::RankCountMismatch {
+            expected: ranks,
+            got: weights_per_rank.len(),
+        });
+    }
+    // 2. Derive the complete per-rank residency matrix from the ordered rank
+    //    weights — on EVERY acquisition.
+    let mut matrix = Vec::with_capacity(ranks);
+    for (rank, weights) in weights_per_rank.iter().enumerate() {
+        let profiles = ds4_resident_router_profiles(cfg, weights).map_err(|e| e.at_rank(rank))?;
+        matrix.push(profiles);
+    }
+    // 3. Cell (main-tolerant): full matrix validation minus the MTP
+    //    routeability refusal + complete-key comparison + exactly-once
+    //    resolution on the rank-0 cell.
+    ds4_cache_cell_moe_plans_impl(
+        &weights_per_rank[0].moe_plan_cache,
+        cfg,
+        policy,
+        &matrix,
+        false,
+    )
+}
+
 /// Low-level cache-cell entry (PRIVATE test seam): full matrix validation
 /// plus exactly-once resolution on ONE cell. The aggregate
 /// ([`ds4_cached_moe_plans`]) is the only production caller; it derives the
@@ -1232,11 +1310,29 @@ pub fn ds4_cached_moe_plans<'a>(
 /// directly to prove the concurrency and validation contract on a bare cell.
 ///
 /// Only the aggregate calls this in production (private test seam).
+#[cfg_attr(not(test), allow(dead_code))]
 fn ds4_cache_cell_moe_plans<'a>(
     cache: &'a std::sync::OnceLock<Ds4PlanCacheEntry>,
     cfg: &DeepseekV4Config,
     policy: &MoEExecutionPolicy,
     matrix: &[Vec<Ds4RouterProfile>],
+) -> Result<&'a Ds4PlanCacheEntry, Ds4PlanCacheError> {
+    ds4_cache_cell_moe_plans_impl(cache, cfg, policy, matrix, true)
+}
+
+/// Cell core shared by the strict aggregate ([`ds4_cache_cell_moe_plans`])
+/// and the main-tolerant aggregate ([`ds4_cached_moe_plans_main`]):
+/// `require_mtp_routeable = false` skips the count-1 MTP-slot routeability
+/// refusal so plain AR decode works on configs whose MTP layer is absent;
+/// the MTP slot's residency stays in the entry key and
+/// [`Ds4PlanCacheEntry::mtp_plan`] refuses it with the typed
+/// `MtpNotRouteable`.
+fn ds4_cache_cell_moe_plans_impl<'a>(
+    cache: &'a std::sync::OnceLock<Ds4PlanCacheEntry>,
+    cfg: &DeepseekV4Config,
+    policy: &MoEExecutionPolicy,
+    matrix: &[Vec<Ds4RouterProfile>],
+    require_mtp_routeable: bool,
 ) -> Result<&'a Ds4PlanCacheEntry, Ds4PlanCacheError> {
     // 1. MTP count > 1 is refused before anything else (no manifest
     //    entries/group are ever declared for unsupported counts).
@@ -1267,12 +1363,14 @@ fn ds4_cache_cell_moe_plans<'a>(
             });
         }
     }
-    // 4. count==1: EVERY rank's MTP slot must be genuinely routeable
-    //    BiasAware (expert blobs + complete router data). A missing or
-    //    partial MTP is refused BEFORE any resolution attempt (and before
-    //    the cross-rank agreement check, so the failing RANK is reported)
-    //    and never seeds the cache.
-    if cfg.num_nextn_predict_layers == 1 {
+    // 4. count==1: when the strict aggregate requires it, EVERY rank's MTP
+    //    slot must be genuinely routeable BiasAware (expert blobs + complete
+    //    router data). A missing or partial MTP is refused BEFORE any
+    //    resolution attempt (and before the cross-rank agreement check, so
+    //    the failing RANK is reported) and never seeds the cache. The
+    //    main-tolerant aggregate skips this so plain AR decode works with an
+    //    absent MTP layer; `mtp_plan()` still refuses the slot typed.
+    if require_mtp_routeable && cfg.num_nextn_predict_layers == 1 {
         let mtp_idx = cfg.num_hidden_layers;
         for (rank, profiles) in matrix.iter().enumerate() {
             let profile = profiles[mtp_idx];
@@ -1541,6 +1639,8 @@ mod tests {
             None
         };
         crate::deepseek4::DeepseekV4Weights {
+            // Test fixture: no frozen MQ2R backend (CPU-side plan resolution).
+            mq2r_backend: crate::backend::Mq2rBackend::Portable,
             token_embd: None,
             output_norm: None,
             head: None,
@@ -1550,6 +1650,7 @@ mod tests {
             layers,
             mtp_layer,
             dspark: None,
+            moe_load_layout: crate::deepseek4::Ds4MoeLoadLayout::Single,
             moe_policy: MoEExecutionPolicy::single(),
             moe_plan_cache: std::sync::OnceLock::new(),
             _scaffold: (),
@@ -4000,8 +4101,12 @@ mod tests {
         let err = select_mtp_authority_single(&cfg, &w3, true).unwrap_err();
         assert!(err.contains("MtpNotRouteable"), "{err}");
         // count1 + enabled + cached resolution failure → typed error
-        // (Enabled state with a failed/missing plan must never route).
-        let ranks2 = [test_weights(&cfg), test_weights(&cfg)];
+        // (Enabled state with a failed/missing plan must never route). The
+        // mesh authority first binds the per-rank load layout to the Tp
+        // policy, so the fixture records a matching TP slice load.
+        let mut ranks2 = [test_weights(&cfg), test_weights(&cfg)];
+        ranks2[0].moe_load_layout = crate::deepseek4::Ds4MoeLoadLayout::Tp { tp: 2, rank: 0 };
+        ranks2[1].moe_load_layout = crate::deepseek4::Ds4MoeLoadLayout::Tp { tp: 2, rank: 1 };
         let err = crate::forward::select_mtp_authority_mesh(&ranks2, &cfg, &tp_policy(2), true)
             .unwrap_err();
         assert!(err.contains("ResolutionFailed"), "{err}");
@@ -4381,5 +4486,37 @@ mod tests {
             build_ds4_parallel_program(plan, &policy, router(), vec![phases_view(), phases_view()])
                 .unwrap();
         assert_eq!(program.step_count(0), Some(4));
+    }
+    // ── 45. load-layout binding refuses BEFORE the disable bypass ────────
+    #[test]
+    fn ds4_load_layout_binding_refuses_before_disable_bypass() {
+        use crate::forward::{acquire_moe_authority_mesh, acquire_moe_authority_single};
+        let cfg = tiny_cfg();
+        // EP policy + Single-layout weights → typed load-layout refusal even
+        // with moe_on=false: the layout binding is part of the entry
+        // contract (like the policy-kind binding) — wrong layouts refuse
+        // regardless of the runtime switch, BEFORE any cache lookup.
+        let ranks = [test_weights(&cfg), test_weights(&cfg)];
+        let err = acquire_moe_authority_mesh(&ranks, &cfg, &ep_policy(2), false).unwrap_err();
+        assert!(err.contains("load-layout binding"), "{err}");
+        // Tp policy + Single-layout weights → typed refusal (same contract).
+        let err = acquire_moe_authority_mesh(&ranks, &cfg, &tp_policy(2), false).unwrap_err();
+        assert!(err.contains("load-layout binding"), "{err}");
+        // Matching EP layout passes the binding (still disabled).
+        let mut ep = [test_weights(&cfg), test_weights(&cfg)];
+        ep[0].moe_load_layout = crate::deepseek4::Ds4MoeLoadLayout::Ep {
+            shard_tp: 2,
+            rank: 0,
+        };
+        ep[1].moe_load_layout = crate::deepseek4::Ds4MoeLoadLayout::Ep {
+            shard_tp: 2,
+            rank: 1,
+        };
+        assert!(acquire_moe_authority_mesh(&ep, &cfg, &ep_policy(2), false).is_ok());
+        // Single authority refuses a non-Single layout even when disabled.
+        let mut w = test_weights(&cfg);
+        w.moe_load_layout = crate::deepseek4::Ds4MoeLoadLayout::Tp { tp: 2, rank: 0 };
+        let err = acquire_moe_authority_single(&cfg, &w, false).unwrap_err();
+        assert!(err.contains("requires a Single load layout"), "{err}");
     }
 }

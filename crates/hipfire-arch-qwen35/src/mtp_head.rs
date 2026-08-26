@@ -64,8 +64,8 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
-};
+    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 

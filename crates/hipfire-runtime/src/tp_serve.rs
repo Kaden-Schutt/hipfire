@@ -20,7 +20,7 @@
 //! multi-turn KV reuse).
 
 use crate::hfq::HfqFile;
-use crate::llama::{self, KvCache, LlamaConfig, LlamaWeights};
+use crate::llama::{self, KvCache, KvCacheExt, LlamaConfig, LlamaWeights};
 use crate::multi_gpu::Gpus;
 use crate::weight_manifest::{ShardPolicy, WeightEntry};
 use crate::weight_store::{fulfill_manifest, WeightHandle, WeightStore};
@@ -54,6 +54,217 @@ struct TpRank {
     kv: KvCache,
     /// Per layer: (attn_norm, ffn_norm, q_norm, k_norm), all F32, replicated.
     norms: Vec<(GpuTensor, GpuTensor, GpuTensor, GpuTensor)>,
+}
+
+/// Rollback ownership for `TpModel` construction (Oracle gate-1 blocker 5):
+/// every GPU resource `load_from_hfq_inner` acquires after `Gpus::from_mesh`
+/// becomes owned by this staging guard the moment it exists, so a failure at
+/// any later step frees every allocation on its owning device instead of
+/// leaking. Disarmed on success — the fields are moved into the final
+/// `TpModel`, so no resource is ever both guard-owned and model-owned.
+/// The rollback path and `TpModel::free` share one free-order helper.
+struct TpStaging {
+    /// Rank→device map (set before any rank resource can exist, so a rollback
+    /// with completed ranks or rank-0 weights always has a valid group).
+    group: Option<Vec<usize>>,
+    gpus: Option<Gpus>,
+    weights: Option<LlamaWeights>,
+    store: Option<WeightStore>,
+    /// Completed ranks, each pushed the moment it is fully built.
+    ranks: Option<Vec<TpRank>>,
+    /// The rank currently being built — owned from its first allocation, so a
+    /// mid-rank failure frees the partial set on the rank's device.
+    cur: RankBuild,
+}
+
+/// Partial per-rank construction buffer. Every tensor / norm / `pos_buf` /
+/// KV becomes guard-owned the moment its allocation succeeds; `finish_rank`
+/// moves them into a `TpRank` (disarm) only after the whole rank is built.
+#[derive(Default)]
+struct RankBuild {
+    dev: Option<usize>,
+    /// x, tmp, x_rot, q, k, v, attn, o, gate, up, hidden, fo, partials — in
+    /// `TpRank` field order.
+    tensors: Vec<GpuTensor>,
+    /// 4 per layer: (attn_norm, ffn_norm, q_norm, k_norm).
+    norms: Vec<GpuTensor>,
+    pos_buf: Option<DeviceBuffer>,
+    kv: Option<KvCache>,
+}
+
+impl TpStaging {
+    fn gpus(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staged gpus")
+    }
+    fn gpus_ref(&self) -> &Gpus {
+        self.gpus.as_ref().expect("staged gpus")
+    }
+    fn begin_rank(&mut self, dev: usize) {
+        self.cur = RankBuild {
+            dev: Some(dev),
+            ..RankBuild::default()
+        };
+    }
+    /// Adopt a completed per-rank KV cache into the in-flight rank.
+    fn rank_kv(&mut self, kv: KvCache) {
+        self.cur.kv = Some(kv);
+    }
+    /// Upload one replicated norm weight and adopt it into the in-flight rank.
+    fn rank_norm(&mut self, dev: usize, vals: &[f32]) -> Result<(), String> {
+        let g = &self.gpus_ref().devices[dev];
+        let t = up_f32(g, vals)?;
+        self.cur.norms.push(t);
+        Ok(())
+    }
+    /// Allocate a rank scratch tensor and adopt it into the in-flight rank.
+    fn rank_alloc(
+        &mut self,
+        dev: usize,
+        shape: &[usize],
+        dtype: DType,
+        what: &str,
+    ) -> Result<(), String> {
+        let g = &mut self.gpus().devices[dev];
+        let t = g
+            .alloc_tensor(shape, dtype)
+            .map_err(|e| format!("{what}: {e:?}"))?;
+        self.cur.tensors.push(t);
+        Ok(())
+    }
+    /// Allocate the rank's `pos_buf` and adopt it into the in-flight rank.
+    fn rank_pos(&mut self, dev: usize) -> Result<(), String> {
+        let g = &mut self.gpus().devices[dev];
+        let b = g.hip.malloc(4).map_err(|e| format!("pos_buf: {e:?}"))?;
+        self.cur.pos_buf = Some(b);
+        Ok(())
+    }
+    /// Disarm the in-flight rank: move every adopted piece into a `TpRank`.
+    fn finish_rank(&mut self) -> TpRank {
+        let cur = std::mem::take(&mut self.cur);
+        let mut tensors = cur.tensors.into_iter();
+        let mut next = || tensors.next().expect("rank tensor order");
+        let mut norms: Vec<(GpuTensor, GpuTensor, GpuTensor, GpuTensor)> =
+            Vec::with_capacity(cur.norms.len() / 4);
+        let mut n = cur.norms.into_iter();
+        while let (Some(a), Some(f), Some(q), Some(k)) = (n.next(), n.next(), n.next(), n.next()) {
+            norms.push((a, f, q, k));
+        }
+        TpRank {
+            x: next(),
+            tmp: next(),
+            x_rot: next(),
+            q: next(),
+            k: next(),
+            v: next(),
+            attn: next(),
+            o: next(),
+            gate: next(),
+            up: next(),
+            hidden: next(),
+            fo: next(),
+            partials: next(),
+            pos_buf: cur.pos_buf.expect("rank pos_buf"),
+            kv: cur.kv.expect("rank kv"),
+            norms,
+        }
+    }
+}
+
+/// Upload F32 weights as a raw-byte GPU tensor (replicated norms).
+fn up_f32(g: &Gpu, v: &[f32]) -> Result<GpuTensor, String> {
+    let b: Vec<u8> = v.iter().flat_map(|f| f.to_ne_bytes()).collect();
+    g.upload_raw(&b, &[v.len()])
+        .map_err(|e| format!("norm upload: {e:?}"))
+}
+
+/// Free TP-owned resources in `TpModel::free` order: the in-flight rank (if
+/// any) on its recorded device, then each completed rank's buffers + norms +
+/// pos_buf + KV on its rank's device, then the sharded store across devices,
+/// then rank-0's full weights. `Option` fields let a partially-built
+/// construction (rollback) and a complete model (free) share one path.
+fn free_tp_resources(
+    gpus: &mut Gpus,
+    group: &[usize],
+    ranks: Vec<TpRank>,
+    cur: RankBuild,
+    store: Option<WeightStore>,
+    weights: Option<LlamaWeights>,
+) {
+    // In-flight rank: partial tensors/norms/pos_buf/KV on its own device.
+    if let Some(dev) = cur.dev {
+        let g = &mut gpus.devices[dev];
+        let _ = g.bind_thread();
+        for t in cur.tensors {
+            let _ = g.free_tensor(t);
+        }
+        for t in cur.norms {
+            let _ = g.free_tensor(t);
+        }
+        if let Some(b) = cur.pos_buf {
+            let _ = g.hip.free(b);
+        }
+        if let Some(kv) = cur.kv {
+            let _ = kv.free_gpu(g);
+        }
+    }
+    // Completed ranks, each on its rank's device.
+    for (r, rank) in ranks.into_iter().enumerate() {
+        let g = &mut gpus.devices[group[r]];
+        let _ = g.bind_thread();
+        for t in [
+            rank.x,
+            rank.tmp,
+            rank.x_rot,
+            rank.q,
+            rank.k,
+            rank.v,
+            rank.attn,
+            rank.o,
+            rank.gate,
+            rank.up,
+            rank.hidden,
+            rank.fo,
+            rank.partials,
+        ] {
+            let _ = g.free_tensor(t);
+        }
+        for (a, f, q, k) in rank.norms {
+            let _ = g.free_tensor(a);
+            let _ = g.free_tensor(f);
+            let _ = g.free_tensor(q);
+            let _ = g.free_tensor(k);
+        }
+        let _ = g.hip.free(rank.pos_buf);
+        let _ = rank.kv.free_gpu(g);
+    }
+    if let Some(store) = store {
+        store.free_all(gpus);
+    }
+    if let Some(weights) = weights {
+        let g = &mut gpus.devices[group[0]];
+        let _ = g.bind_thread();
+        weights.free_gpu(g);
+    }
+}
+
+/// Per-device TP teardown shared by `TpModel::free` and construction
+/// rollback: invalidate weight caches + graph state, drain the pool so the
+/// VRAM returns to the system, and destroy the per-device stream `load`
+/// created (`active_stream = Some`). Nothing else tears that stream down, so
+/// skipping it leaks a HIP stream (and its driver-side command buffer).
+fn teardown_tp_devices(gpus: &mut Gpus) {
+    if let Err(error) = gpus.free_peer_reduce_scratch() {
+        eprintln!("TP teardown: failed to free peer-reduce scratch: {error}");
+    }
+    for dev in gpus.devices.iter_mut() {
+        let _ = dev.bind_thread();
+        dev.invalidate_weight_caches();
+        dev.invalidate_graph_state();
+        dev.drain_pool();
+        if let Some(s) = dev.active_stream.take() {
+            let _ = dev.hip.stream_destroy(s);
+        }
+    }
 }
 
 /// A dense llama model loaded tensor-parallel and ready to serve.
@@ -170,100 +381,183 @@ impl TpModel {
             }
         }
 
-        let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
-        for dev in gpus.devices.iter_mut() {
-            dev.bind_thread().map_err(|e| format!("bind: {e:?}"))?;
-            let s = dev
-                .hip
-                .stream_create()
-                .map_err(|e| format!("stream_create: {e:?}"))?;
-            dev.active_stream = Some(s);
-        }
-
-        // Whole weights on rank 0 (embed / final-norm / lm_head + F32 norm source).
-        let weights = {
-            let g = &mut gpus.devices[0];
-            g.bind_thread().map_err(|e| format!("bind0: {e:?}"))?;
-            crate::hfq::load_weights_hfq(&hfq, &config, g)
-                .map_err(|e| format!("load_weights: {e:?}"))?
-        };
-        let qkv_rot = dtype_rotation_plan(weights.layers[0].wq.gpu_dtype);
-        let ffn_rot = dtype_rotation_plan(weights.layers[0].w_gate.gpu_dtype);
-
-        // Store→forward bridge: shard every layer's quant weights (uses the
-        // caller-provided mesh — no internal reconstruction).
-        let store = build_store(&hfq, &config, mesh, &gpus)?;
-
-        // Per-layer replicated norm CPU copies (download once from rank 0).
-        let norms_cpu: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..n_layers)
-            .map(|l| {
-                let g = &gpus.devices[0];
-                let lw = &weights.layers[l];
-                (
-                    g.download_f32(&lw.attn_norm).unwrap(),
-                    g.download_f32(&lw.ffn_norm).unwrap(),
-                    g.download_f32(lw.q_norm.as_ref().unwrap()).unwrap(),
-                    g.download_f32(lw.k_norm.as_ref().unwrap()).unwrap(),
-                )
-            })
-            .collect();
-
-        let group = mesh.group_along(DimKind::Tp, &mesh.coord_of(0));
+        // ── Construction rollback ownership (Oracle gate-1 blocker 5) ──
+        // After `Gpus::from_mesh`, every acquired GPU resource is owned by
+        // `staged` the moment it exists; a failure anywhere in the fallible
+        // construction below frees every staged resource on its owning
+        // device (free order shared with `TpModel::free`). On success the
+        // fields are moved out (disarm) into the final model — no resource
+        // is ever both guard-owned and model-owned.
         let (hpr, kvpr) = (nh / tp, nkv / tp);
         let (q_dim_r, kv_dim_r, inter_r) = (hpr * hd, kvpr * hd, ff / tp);
         let x_rot_cap = d.max(ff);
         let phys_cap = max_seq;
         let chunks = phys_cap.div_ceil(128);
-
-        let up_f32 = |g: &Gpu, v: &[f32]| {
-            let b: Vec<u8> = v.iter().flat_map(|f| f.to_ne_bytes()).collect();
-            g.upload_raw(&b, &[v.len()]).unwrap()
+        let mut staged = TpStaging {
+            group: None,
+            gpus: None,
+            weights: None,
+            store: None,
+            ranks: None,
+            cur: RankBuild::default(),
         };
-        let mut ranks = Vec::with_capacity(tp);
-        for &dev in &group {
-            let g = &mut gpus.devices[dev];
-            g.bind_thread().map_err(|e| format!("bind{dev}: {e:?}"))?;
-            let kv = KvCache::new_gpu_q8(g, n_layers, kvpr, hd, phys_cap)
-                .map_err(|e| format!("kv: {e:?}"))?;
-            let norms = norms_cpu
-                .iter()
-                .map(|(a, f, q, k)| (up_f32(g, a), up_f32(g, f), up_f32(g, q), up_f32(g, k)))
-                .collect();
-            ranks.push(TpRank {
-                x: g.alloc_tensor(&[d], DType::F32).unwrap(),
-                tmp: g.alloc_tensor(&[d], DType::F32).unwrap(),
-                x_rot: g.alloc_tensor(&[x_rot_cap], DType::F32).unwrap(),
-                q: g.alloc_tensor(&[q_dim_r], DType::F32).unwrap(),
-                k: g.alloc_tensor(&[kv_dim_r], DType::F32).unwrap(),
-                v: g.alloc_tensor(&[kv_dim_r], DType::F32).unwrap(),
-                attn: g.alloc_tensor(&[q_dim_r], DType::F32).unwrap(),
-                o: g.alloc_tensor(&[d], DType::F32).unwrap(),
-                gate: g.alloc_tensor(&[inter_r], DType::F32).unwrap(),
-                up: g.alloc_tensor(&[inter_r], DType::F32).unwrap(),
-                hidden: g.alloc_tensor(&[inter_r], DType::F32).unwrap(),
-                fo: g.alloc_tensor(&[d], DType::F32).unwrap(),
-                partials: g
-                    .alloc_tensor(&[hpr * chunks * (2 + hd)], DType::F32)
-                    .unwrap(),
-                pos_buf: g.hip.malloc(4).unwrap(),
-                kv,
-                norms,
-            });
-        }
+        let construction = (|| -> Result<(RotationPlan, RotationPlan), String> {
+            // `Gpus` is staged BEFORE the stream loop so a mid-stream failure
+            // leaves the already-created streams owned by the guard (rollback
+            // destroys them via `teardown_tp_devices`).
+            let gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
+            staged.gpus = Some(gpus);
+            for dev in staged.gpus().devices.iter_mut() {
+                dev.bind_thread().map_err(|e| format!("bind: {e:?}"))?;
+                let s = dev
+                    .hip
+                    .stream_create()
+                    .map_err(|e| format!("stream_create: {e:?}"))?;
+                dev.active_stream = Some(s);
+            }
 
-        // Peer access for the cross-rank all-reduce peer copies — enabled AFTER
-        // all weights (rank-0 full + sharded store) + KV + per-rank scratch are
-        // live. `enable_peer_all` does not retroactively map allocations made
-        // after the enable call (its documented contract), so calling it earlier
-        // would let the all-reduce peer copies silently write nothing on real
-        // multi-GPU HW.
-        gpus.enable_peer_all()
-            .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+            // Rank→device map (pure mesh lookup; staged before any rank
+            // resource can exist, so a rollback with completed ranks or
+            // rank-0 weights always knows each rank's device).
+            let group = mesh.group_along(DimKind::Tp, &mesh.coord_of(0));
+            staged.group = Some(group.clone());
+
+            // Whole weights on rank 0 (embed / final-norm / lm_head + F32 norm source).
+            let weights = {
+                let g = &mut staged.gpus().devices[0];
+                g.bind_thread().map_err(|e| format!("bind0: {e:?}"))?;
+                crate::hfq::load_weights_hfq(&hfq, &config, g)
+                    .map_err(|e| format!("load_weights: {e:?}"))?
+            };
+            let qkv_rot = dtype_rotation_plan(weights.layers[0].wq.gpu_dtype);
+            let ffn_rot = dtype_rotation_plan(weights.layers[0].w_gate.gpu_dtype);
+            staged.weights = Some(weights);
+
+            // Store→forward bridge: shard every layer's quant weights (uses the
+            // caller-provided mesh — no internal reconstruction).
+            let store = build_store(&hfq, &config, mesh, staged.gpus_ref())?;
+            staged.store = Some(store);
+
+            // Per-layer replicated norm CPU copies (download once from rank 0).
+            let norms_cpu: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..n_layers)
+                .map(
+                    |l| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+                        let g = &staged.gpus_ref().devices[0];
+                        let lw = &staged.weights.as_ref().expect("staged weights").layers[l];
+                        Ok((
+                            g.download_f32(&lw.attn_norm).map_err(herr)?,
+                            g.download_f32(&lw.ffn_norm).map_err(herr)?,
+                            g.download_f32(
+                                lw.q_norm
+                                    .as_ref()
+                                    .ok_or_else(|| format!("layer {l}: q_norm missing"))?,
+                            )
+                            .map_err(herr)?,
+                            g.download_f32(
+                                lw.k_norm
+                                    .as_ref()
+                                    .ok_or_else(|| format!("layer {l}: k_norm missing"))?,
+                            )
+                            .map_err(herr)?,
+                        ))
+                    },
+                )
+                .collect::<Result<_, _>>()?;
+
+            for &dev in &group {
+                staged.begin_rank(dev);
+                {
+                    let g = &mut staged.gpus().devices[dev];
+                    g.bind_thread().map_err(|e| format!("bind{dev}: {e:?}"))?;
+                    let kv = KvCache::new_gpu_q8(g, n_layers, kvpr, hd, phys_cap)
+                        .map_err(|e| format!("kv: {e:?}"))?;
+                    staged.rank_kv(kv);
+                }
+                for (a, f, q, k) in &norms_cpu {
+                    staged.rank_norm(dev, a)?;
+                    staged.rank_norm(dev, f)?;
+                    staged.rank_norm(dev, q)?;
+                    staged.rank_norm(dev, k)?;
+                }
+                staged.rank_alloc(dev, &[d], DType::F32, "x")?;
+                staged.rank_alloc(dev, &[d], DType::F32, "tmp")?;
+                staged.rank_alloc(dev, &[x_rot_cap], DType::F32, "x_rot")?;
+                staged.rank_alloc(dev, &[q_dim_r], DType::F32, "q")?;
+                staged.rank_alloc(dev, &[kv_dim_r], DType::F32, "k")?;
+                staged.rank_alloc(dev, &[kv_dim_r], DType::F32, "v")?;
+                staged.rank_alloc(dev, &[q_dim_r], DType::F32, "attn")?;
+                staged.rank_alloc(dev, &[d], DType::F32, "o")?;
+                staged.rank_alloc(dev, &[inter_r], DType::F32, "gate")?;
+                staged.rank_alloc(dev, &[inter_r], DType::F32, "up")?;
+                staged.rank_alloc(dev, &[inter_r], DType::F32, "hidden")?;
+                staged.rank_alloc(dev, &[d], DType::F32, "fo")?;
+                staged.rank_alloc(dev, &[hpr * chunks * (2 + hd)], DType::F32, "partials")?;
+                staged.rank_pos(dev)?;
+                let rank = staged.finish_rank();
+                staged
+                    .ranks
+                    .get_or_insert_with(|| Vec::with_capacity(tp))
+                    .push(rank);
+            }
+
+            // Test-only fault seam (Oracle gate-1 blocker 5): a deterministic
+            // mid-construction failure AFTER every owned GPU resource is live
+            // (per-device streams, rank-0 full weights, the sharded store, and all
+            // per-rank KV + scratch). The one-shot arm is consumed here, so at most
+            // one construction attempt fails. Compiled out of production builds;
+            // `tests::failed_construction_reclaims_every_owned_gpu_allocation`
+            // proves every earlier allocation is reclaimed on its owning device.
+            #[cfg(test)]
+            if fault_seam::consume() {
+                return Err("tp_serve fault seam: forced failure after all GPU allocations".into());
+            }
+
+            // Peer access for the cross-rank all-reduce peer copies — enabled AFTER
+            // all weights (rank-0 full + sharded store) + KV + per-rank scratch are
+            // live. `enable_peer_all` does not retroactively map allocations made
+            // after the enable call (its documented contract), so calling it earlier
+            // would let the all-reduce peer copies silently write nothing on real
+            // multi-GPU HW.
+            staged
+                .gpus()
+                .enable_peer_all()
+                .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+
+            Ok((qkv_rot, ffn_rot))
+        })();
+        let (qkv_rot, ffn_rot) = match construction {
+            Ok(parts) => parts,
+            Err(e) => {
+                // Rollback: free every staged resource in `TpModel::free`
+                // order on its owning device, destroy the per-device streams,
+                // invalidate caches/graphs and drain pools — the GPU is back
+                // at the pre-construction state before the error is returned.
+                if let Some(gpus) = staged.gpus.as_mut() {
+                    free_tp_resources(
+                        gpus,
+                        staged.group.as_deref().unwrap_or(&[]),
+                        staged.ranks.take().unwrap_or_default(),
+                        std::mem::take(&mut staged.cur),
+                        staged.store.take(),
+                        staged.weights.take(),
+                    );
+                    teardown_tp_devices(gpus);
+                }
+                return Err(e);
+            }
+        };
 
         let mut collectives: Vec<TpCollective> = (0..16).map(|_| TpCollective::None).collect();
         collectives[8] = TpCollective::AllReduceOut { dim: d };
         collectives[14] = TpCollective::AllReduceOut { dim: d };
 
+        // Disarm: move every staged resource into the final model — nothing
+        // is both guard-owned and model-owned after this point.
+        let gpus = staged.gpus.take().expect("staged gpus");
+        let group = staged.group.take().expect("staged group");
+        let weights = staged.weights.take().expect("staged weights");
+        let store = staged.store.take().expect("staged store");
+        let ranks = staged.ranks.take().expect("staged ranks");
         Ok(TpModel {
             gpus,
             mesh: mesh.clone(),
@@ -859,60 +1153,29 @@ impl TpModel {
     /// and `Gpu::drop` only re-binds the device — so every load/unload cycle
     /// leaked the whole model. This mirrors the EP unload path in the loader:
     /// typed frees → `drain_pool` → drop `Gpus`.
-    pub fn free(mut self) {
-        // Per-rank buffers + norms + pos_buf + KV, each on its own rank device.
-        for (r, rank) in self.ranks.into_iter().enumerate() {
-            let g = &mut self.gpus.devices[self.group[r]];
-            let _ = g.bind_thread();
-            for t in [
-                rank.x,
-                rank.tmp,
-                rank.x_rot,
-                rank.q,
-                rank.k,
-                rank.v,
-                rank.attn,
-                rank.o,
-                rank.gate,
-                rank.up,
-                rank.hidden,
-                rank.fo,
-                rank.partials,
-            ] {
-                let _ = g.free_tensor(t);
-            }
-            for (a, f, q, k) in rank.norms {
-                let _ = g.free_tensor(a);
-                let _ = g.free_tensor(f);
-                let _ = g.free_tensor(q);
-                let _ = g.free_tensor(k);
-            }
-            let _ = g.hip.free(rank.pos_buf);
-            rank.kv.free_gpu(g);
-        }
-        // Sharded quant weights (spans every device).
-        self.store.free_all(&self.gpus);
-        // Rank-0 full weights (embed / lm_head / final-norm + F32 norm source).
-        {
-            let g = &mut self.gpus.devices[self.group[0]];
-            let _ = g.bind_thread();
-            self.weights.free_gpu(g);
-        }
-        // Actually release the freed buffers back to the system, per device.
-        for dev in self.gpus.devices.iter_mut() {
-            let _ = dev.bind_thread();
-            dev.invalidate_weight_caches();
-            dev.invalidate_graph_state();
-            dev.drain_pool();
-            // Destroy the per-device stream `load` created (active_stream = Some).
-            // Nothing else tears it down, so skipping it leaks a HIP stream (and
-            // its driver-side command buffer) every load/unload cycle — the TP
-            // residual PP (active_stream = None) never had.
-            if let Some(s) = dev.active_stream.take() {
-                let _ = dev.hip.stream_destroy(s);
-            }
-        }
-        // `self.gpus` drops here → tears down device contexts.
+    pub fn free(self) {
+        // Same free order the construction rollback uses: per-rank buffers +
+        // norms + pos_buf + KV on each rank's device, then the sharded store,
+        // then rank-0's full weights, then the per-device teardown.
+        let TpModel {
+            gpus,
+            group,
+            ranks,
+            store,
+            weights,
+            ..
+        } = self;
+        let mut gpus = gpus;
+        free_tp_resources(
+            &mut gpus,
+            &group,
+            ranks,
+            RankBuild::default(),
+            Some(store),
+            Some(weights),
+        );
+        teardown_tp_devices(&mut gpus);
+        // `gpus` drops here → tears down device contexts.
     }
 }
 
@@ -1035,6 +1298,234 @@ fn resident_l<'a>(store: &'a WeightStore, name: &str, layer: usize, dev: usize) 
 }
 fn leak<'a>(w: WeightRef<'a>) -> &'a WeightRef<'a> {
     Box::leak(Box::new(w))
+}
+
+/// Test-only one-shot fault hook for the TP constructor (compiled out of
+/// production builds). When armed, the next `load_from_hfq_inner` fails
+/// deterministically at the post-allocation seam in the constructor — after
+/// every owned GPU resource is live — and the arm is consumed, so at most one
+/// construction attempt can observe it. Atomic, so full-suite isolation needs
+/// no global lock beyond the tests' own `GPU_TEST_LOCK`.
+#[cfg(test)]
+mod fault_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL_NEXT_LOAD: AtomicBool = AtomicBool::new(false);
+
+    /// Arm the next TP construction to fail at the post-allocation seam.
+    pub fn arm_fail_next_load() {
+        FAIL_NEXT_LOAD.store(true, Ordering::SeqCst);
+    }
+
+    /// One-shot consume: returns true exactly once per arm.
+    pub fn consume() -> bool {
+        FAIL_NEXT_LOAD.swap(false, Ordering::SeqCst)
+    }
+
+    /// True while an arm is pending (tests assert the arm is consumed).
+    pub fn is_armed() -> bool {
+        FAIL_NEXT_LOAD.load(Ordering::SeqCst)
+    }
+
+    /// Clear any pending arm (suite-isolation backstop).
+    pub fn reset() {
+        FAIL_NEXT_LOAD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Shared GPU observation helpers for the TP/PP construction-rollback tests
+/// (`pp_serve.rs` reaches this via `crate::tp_serve::test_support`). Compiled
+/// out of production builds.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use rdna_compute::Gpu;
+    use std::io::Write;
+
+    /// Serializes the TP/PP rollback tests: device binding, VRAM state and the
+    /// `HIPFIRE_EMULATE_GPUS` env var are process-global, so the two tests
+    /// (and any future sibling) must not interleave (same pattern as the
+    /// per-module `GPU_TEST_LOCK`s elsewhere in the workspace).
+    pub static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// VRAM recovery tolerance in bytes — matches the qwen35 rollback tests
+    /// (64 MiB) so driver/allocator noise cannot flip the assertion.
+    pub const VRAM_TOLERANCE: usize = 64 * 1024 * 1024;
+
+    /// Restores an env var to its prior state on drop (the same guard pattern
+    /// as `hipfire-hardware`'s `EnvVarGuard`).
+    pub struct EnvGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        pub fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(prior) => std::env::set_var(self.key, prior),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Free VRAM in bytes on `gpu`'s physical device.
+    pub fn vram_free(gpu: &Gpu) -> usize {
+        gpu.hip.get_vram_info().expect("hipMemGetInfo").0
+    }
+
+    /// Dense llama fixture dims. Chosen so a mid-construction leak exceeds
+    /// `VRAM_TOLERANCE` on EVERY owning device for both TP(2) and PP(2)
+    /// meshes: each layer's weights are ~23 MiB, so PP(2) leaks ~92 MiB per
+    /// stage device and TP(2) leaks rank-0 weights + both sharded stores
+    /// (~184 MiB per emulated/physical device under `HIPFIRE_EMULATE_GPUS`).
+    /// Divisibility: q_dim=2048, kv_dim=512, ff=2048 are all %2==0 and their
+    /// tp-shards are %256==0 (MQ4G256 row-shard group alignment).
+    pub const DIM: usize = 512;
+    pub const FF: usize = 2048;
+    pub const N_HEADS: usize = 32;
+    pub const N_KV_HEADS: usize = 8;
+    pub const HEAD_DIM: usize = 64;
+    pub const N_LAYERS: usize = 8;
+    pub const VOCAB: usize = 64;
+    pub const MAX_SEQ: usize = 64;
+
+    /// Write a minimal dense llama-family HFQ (arch_id 0, qk-norm'd config)
+    /// with real-sized zero payloads for every tensor the TP/PP constructors
+    /// read: MQ4G256 (qt 13, 4 B/element passthrough) projections and F16
+    /// (qt 1) norms/embedding/lm_head. Payload bytes are never inspected
+    /// before forward, so zero data loads identically to a real model.
+    pub fn write_dense_llama_hfq(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let config_json = serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": DIM,
+            "intermediate_size": FF,
+            "num_hidden_layers": N_LAYERS,
+            "num_attention_heads": N_HEADS,
+            "num_key_value_heads": N_KV_HEADS,
+            "head_dim": HEAD_DIM,
+            "vocab_size": VOCAB,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 2048,
+            "rope_theta": 1_000_000.0,
+        });
+        let metadata = serde_json::json!({ "config": config_json }).to_string();
+
+        let q_dim = N_HEADS * HEAD_DIM;
+        let kv_dim = N_KV_HEADS * HEAD_DIM;
+        let mut tensors: Vec<(String, u8, Vec<u32>, usize)> = Vec::new();
+        let mut push = |name: String, qt: u8, shape: Vec<u32>| {
+            let elems = shape.iter().map(|&d| d as usize).product::<usize>();
+            let elem_bytes = if qt == 1 { 2 } else { 4 };
+            tensors.push((name, qt, shape, elems * elem_bytes));
+        };
+        // Model-level tensors (F16 host-decoded to F32 by the loader).
+        push(
+            "model.embed_tokens.weight".into(),
+            1,
+            vec![VOCAB as u32, DIM as u32],
+        );
+        push("model.norm.weight".into(), 1, vec![DIM as u32]);
+        push("lm_head.weight".into(), 1, vec![VOCAB as u32, DIM as u32]);
+        for l in 0..N_LAYERS {
+            push(
+                format!("model.layers.{l}.input_layernorm.weight"),
+                1,
+                vec![DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.self_attn.q_proj.weight"),
+                13,
+                vec![q_dim as u32, DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.self_attn.k_proj.weight"),
+                13,
+                vec![kv_dim as u32, DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.self_attn.v_proj.weight"),
+                13,
+                vec![kv_dim as u32, DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.self_attn.o_proj.weight"),
+                13,
+                vec![DIM as u32, q_dim as u32],
+            );
+            push(
+                format!("model.layers.{l}.self_attn.q_norm.weight"),
+                1,
+                vec![HEAD_DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.self_attn.k_norm.weight"),
+                1,
+                vec![HEAD_DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.post_attention_layernorm.weight"),
+                1,
+                vec![DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.mlp.gate_proj.weight"),
+                13,
+                vec![FF as u32, DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.mlp.up_proj.weight"),
+                13,
+                vec![FF as u32, DIM as u32],
+            );
+            push(
+                format!("model.layers.{l}.mlp.down_proj.weight"),
+                13,
+                vec![DIM as u32, FF as u32],
+            );
+        }
+
+        // Index: u32 count, then per tensor (name_len u16, name, qt u8, ndim
+        // u8, shape u32×ndim, group_size u32, data_size u64). The header's
+        // `data_offset` MUST be the first payload's start — `HfqFile` derives
+        // every payload offset cumulatively from it — so it is
+        // 32 (header) + metadata + index, with payloads written immediately
+        // after the index (no padding; the parser does not require any).
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        for (name, qt, shape, data_size) in &tensors {
+            idx.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            idx.extend_from_slice(name.as_bytes());
+            idx.push(*qt);
+            idx.push(shape.len() as u8);
+            for d in shape {
+                idx.extend_from_slice(&d.to_le_bytes());
+            }
+            idx.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            idx.extend_from_slice(&(*data_size as u64).to_le_bytes());
+        }
+        let data_offset = 32u64 + metadata.len() as u64 + idx.len() as u64;
+
+        let path = dir.path().join("dense-llama-tp-pp.hfq");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // arch_id 0 (llama-family)
+        f.write_all(&(tensors.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&32u64.to_le_bytes()).unwrap(); // metadata_offset
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(metadata.as_bytes()).unwrap();
+        f.write_all(&idx).unwrap();
+        for (_, _, _, data_size) in &tensors {
+            f.write_all(&vec![0u8; *data_size]).unwrap();
+        }
+        f.flush().unwrap();
+        path
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1310,5 +1801,90 @@ mod tests {
             err.contains("qk-norm"),
             "expected qk-norm error for no-q_norm model, got: {err}"
         );
+    }
+
+    /// Oracle gate-1 blocker 5 (TP): construction lacks rollback ownership —
+    /// a fallible step after GPU allocations (here: the post-allocation seam
+    /// before `enable_peer_all`) leaks every earlier owned resource. The arm
+    /// fires only after all of rank-0's full weights, the sharded store and
+    /// every rank's KV + scratch are live, so a correct rollback must free
+    /// them all on their owning devices. Fails today: those allocations stay
+    /// hipMalloc'd and each device's free VRAM stays below the warm baseline.
+    #[test]
+    fn failed_construction_reclaims_every_owned_gpu_allocation() {
+        // Same gate as the other GPU tests: skip cleanly on GPU-less CI.
+        if Gpu::init().is_err() {
+            eprintln!("skip: no GPU");
+            return;
+        }
+        let _lock = test_support::GPU_TEST_LOCK.lock().unwrap();
+        let _emulate = test_support::EnvGuard::set("HIPFIRE_EMULATE_GPUS", "2");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = test_support::write_dense_llama_hfq(&dir);
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+
+        // Probe handles for per-device VRAM observation — same mesh/degree as
+        // the constructor's `Gpus`, kept alive across baseline and post-failure
+        // reads so its own context overhead cancels out.
+        let mut probe =
+            Gpus::from_mesh(&mesh, test_support::N_LAYERS).expect("probe Gpus must bind");
+
+        // Warm-up cycle: one successful load + free absorbs one-time driver /
+        // kernel residency, so the measured baseline is stable.
+        {
+            let model = TpModel::load_from_hfq_inner(&hfq, &mesh, test_support::MAX_SEQ)
+                .expect("warm-up TP load must succeed");
+            model.free();
+        }
+        for dev in probe.devices.iter_mut() {
+            dev.drain_pool();
+        }
+        let baseline: Vec<usize> = probe.devices.iter().map(test_support::vram_free).collect();
+
+        // Forced mid-construction failure at the post-allocation seam.
+        fault_seam::reset();
+        fault_seam::arm_fail_next_load();
+        let err = match TpModel::load_from_hfq_inner(&hfq, &mesh, test_support::MAX_SEQ) {
+            Ok(_) => panic!("armed TP fault must fail the construction"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("fault seam"),
+            "expected the post-allocation seam to fail, got: {err}"
+        );
+        assert!(
+            !fault_seam::is_armed(),
+            "fault arm must be one-shot (consumed by the failed construction)"
+        );
+
+        // Every owning device must have reclaimed all earlier allocations.
+        for (d, &base) in baseline.iter().enumerate() {
+            let after = test_support::vram_free(&probe.devices[d]);
+            assert!(
+                base.abs_diff(after) < test_support::VRAM_TOLERANCE,
+                "device {d}: VRAM not reclaimed after failed TP construction \
+                 (Oracle gate-1 blocker 5): baseline={base} after={after} \
+                 delta={} — every owned allocation must be freed on its device",
+                base.saturating_sub(after)
+            );
+        }
+
+        // Success cycle after the failure: the GPU must remain usable and a
+        // full load + free must return VRAM to the same baseline.
+        {
+            let model = TpModel::load_from_hfq_inner(&hfq, &mesh, test_support::MAX_SEQ)
+                .expect("TP load must succeed after the forced failure");
+            model.free();
+        }
+        for (d, &base) in baseline.iter().enumerate() {
+            let after = test_support::vram_free(&probe.devices[d]);
+            assert!(
+                base.abs_diff(after) < test_support::VRAM_TOLERANCE,
+                "device {d}: VRAM not recovered after the post-failure success cycle: \
+                 baseline={base} after={after}"
+            );
+        }
     }
 }

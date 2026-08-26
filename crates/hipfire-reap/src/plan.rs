@@ -7,6 +7,9 @@ pub struct QuantOverride {
     pub role: Role,
     /// Only meaningful for `Role::RoutedExperts`; empty ⇒ whole role at this layer.
     pub experts: Vec<u32>,
+    /// Optional exact tensor-name allowlist. Empty means the whole role (subject
+    /// to `experts`); non-empty narrows the override to these names only.
+    pub tensors: Vec<String>,
     pub tier: String,
 }
 
@@ -216,6 +219,37 @@ impl ReapPlan {
                         "reap: quant_override[{i}] lists experts but role is not routed_experts"
                     ));
                 }
+                let tensors: Vec<String> = if let Some(a) = o["tensors"].as_array() {
+                    let layer_tok = format!("layers.{layer}.");
+                    let global_role = matches!(role, Role::LmHead | Role::Embed);
+                    let mut seen = std::collections::HashSet::with_capacity(a.len());
+                    a.iter()
+                        .enumerate()
+                        .map(|(j, x)| {
+                            let name = x.as_str().ok_or_else(|| {
+                                format!("reap: quant_override[{i}] tensors[{j}] not a string")
+                            })?;
+                            if name.is_empty() {
+                                return Err(format!(
+                                    "reap: quant_override[{i}] tensors[{j}] is empty"
+                                ));
+                            }
+                            if !global_role && !name.contains(&layer_tok) {
+                                return Err(format!(
+                                    "reap: quant_override[{i}] tensor '{name}' does not belong to layer {layer}"
+                                ));
+                            }
+                            if !seen.insert(name) {
+                                return Err(format!(
+                                    "reap: quant_override[{i}] has duplicate tensor '{name}'"
+                                ));
+                            }
+                            Ok(name.to_string())
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                } else {
+                    Vec::new()
+                };
                 let tier = o["tier"]
                     .as_str()
                     .ok_or_else(|| format!("reap: quant_override[{i}] missing tier"))?
@@ -224,6 +258,7 @@ impl ReapPlan {
                     layer,
                     role,
                     experts,
+                    tensors,
                     tier,
                 });
             }
@@ -427,13 +462,18 @@ mod tests {
         let d = write_plan(
             r#"{"original_experts":4,"num_layers":2,
                 "keep":{"per_layer":[[0,2,3],[1,2,3]]},
-                "quant_overrides":[{"layer":1,"role":"routed_experts","experts":[2],"tier":"mq3lloyd"}]}"#,
+                "quant_overrides":[{"layer":1,"role":"routed_experts","experts":[2],
+                "tensors":["layers.1.ffn.experts.2.w1.weight"],"tier":"mq3lloyd"}]}"#,
         );
         let p = ReapPlan::load(d.path().to_str().unwrap(), 2, 4).unwrap();
         assert_eq!(p.kept_per_layer(), 3);
         assert_eq!(p.keep.as_ref().unwrap()[0], vec![0, 2, 3]);
         assert_eq!(p.quant_overrides.len(), 1);
         assert_eq!(p.quant_overrides[0].tier, "mq3lloyd");
+        assert_eq!(
+            p.quant_overrides[0].tensors,
+            vec!["layers.1.ffn.experts.2.w1.weight"]
+        );
     }
 
     #[test]
@@ -468,6 +508,40 @@ mod tests {
         );
         let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
         assert!(err.contains("not an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_exact_tensor_from_wrong_layer() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":2,
+                "quant_overrides":[{"layer":0,"role":"attention",
+                "tensors":["layers.1.attn.wq_b.weight"],"tier":"mfp4e8soa"}]}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 2, 4).unwrap_err();
+        assert!(err.contains("does not belong to layer 0"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_exact_tensor() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":1,
+                "quant_overrides":[{"layer":0,"role":"attention",
+                "tensors":["layers.0.attn.wq_b.weight","layers.0.attn.wq_b.weight"],
+                "tier":"mfp4e8soa"}]}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("duplicate tensor"), "got: {err}");
+    }
+
+    #[test]
+    fn global_head_allowlist_does_not_require_layer_token() {
+        let d = write_plan(
+            r#"{"original_experts":256,"num_layers":43,
+                "quant_overrides":[{"layer":0,"role":"lm_head",
+                "tensors":["head.weight"],"tier":"mfp4e8soa"}]}"#,
+        );
+        let plan = ReapPlan::load_unchecked(d.path().to_str().unwrap()).unwrap();
+        assert_eq!(plan.quant_overrides[0].tensors, ["head.weight"]);
     }
 
     #[test]

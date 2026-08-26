@@ -303,6 +303,10 @@ impl Lfm2MoeConfig {
             .filter(|&&t| t == MixerKind::Conv)
             .count()
     }
+    /// Dense-only models have `num_experts == 0` (Lfm2ForCausalLM).
+    pub fn is_dense(&self) -> bool {
+        self.num_experts == 0
+    }
 }
 
 /// Parse Lfm2MoeConfig from a `&dyn ModelSource` (safetensors or HFQ wrapper).

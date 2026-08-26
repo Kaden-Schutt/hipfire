@@ -10,53 +10,41 @@
 //! grammar `ToolSchema` list from the request's raw tool JSON internally (that
 //! JSON→schema extraction also used to live in the daemon).
 //!
-//! The sealed [`OpenAssistantTurn`] is the single byte/stop/visible authority:
-//! user stop sequences are quarantined byte-level (split across tokens),
-//! `<think>` spans are stripped from the visible projection, and the consuming
-//! seal owns text, tool calls, replay tokens, and diagnostics. On top of that
-//! core the emitter tracks the beta producer surface the daemon's terminal
-//! lowering reads: the full committed token stream (`streamed_tokens`), the
-//! decoded-EOT verdict (token-id EOT or a byte-fragmented `<|im_end|>` /
-//! `<|endoftext|>` marker completing inside the quarantine), and the unclosed
-//! think verdict at finish.
+//! Client-visible text and structured tool calls are owned by the runtime
+//! [`ToolOutputRouter`]: EosFilter-emitted UTF-8 is routed incrementally;
+//! protocol markers never enter `ClientEvent::Token`; complete calls are held
+//! on [`FinishSummary`] until the daemon wrapper classifies a tool-safe terminal.
 
 use crate::grammar;
-use hipfire_runtime::emit_text::currently_in_think;
+use hipfire_runtime::emit_text::{
+    currently_in_think, ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteEvent,
+};
+use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::prompt_frame::AssistantPrefix;
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, StopReason,
 };
-use hipfire_runtime::spec_transcript::OpenAssistantTurn;
 use hipfire_runtime::tokenizer::Tokenizer;
-
-/// Decoded byte forms of the protocol EOT markers. They join the user stop
-/// sequences in the turn's quarantine so a marker split across token
-/// boundaries is detected byte-level (suppressed from visible, latches
-/// `decoded_eot`) — mirroring beta's EosFilter `stop_at` list.
-const PROTOCOL_EOT_MARKERS: [&[u8]; 2] = [b"<|im_end|>", b"<|endoftext|>"];
 
 pub struct Qwen35Emit<'a> {
     tokenizer: &'a Tokenizer,
-    /// The sole owner of raw bytes, stop quarantine, visible projection, and
-    /// the sealed turn result. No parallel token or transcript heuristic is
-    /// allowed here.
-    turn: OpenAssistantTurn,
-    /// Raw bytes used only for the existing think-budget guard. This is not a
-    /// second output transcript: the sealed turn remains authoritative for all
-    /// client-visible text and tools.
-    think_scan: Vec<u8>,
+    filter: EosFilter,
+    /// Index into the freshly-decoded byte stream past which bytes have not yet
+    /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
+    bytes_fed_to_filter: usize,
     /// Every committed token in order, for byte decoding + the cache-store the
-    /// daemon does after the loop (exposed via [`SpecEmit::streamed_tokens`]).
+    /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
     streamed_tokens: Vec<u32>,
-    /// Latched when a decoded EOT was observed: a semantic EOS token id, or a
-    /// byte-level `<|im_end|>` / `<|endoftext|>` marker completing in the turn
-    /// quarantine. Carried onto [`FinishSummary::decoded_eot`] so the daemon's
-    /// terminal lowering need not re-decode the token stream.
-    decoded_eot: bool,
-    /// User stop sequences from the request (also fed to the turn quarantine).
-    /// Kept for distinguishing a user-stop byte-stop from a protocol EOT
-    /// byte-stop when the quarantine fires.
-    stop: Vec<String>,
+    /// Incremental tool-protocol authority. Fed only EosFilter-emitted UTF-8.
+    router: ToolOutputRouter,
+    /// Incremental reasoning/content authority, upstream of tool routing.
+    think_router: ThinkOutputRouter,
+    /// Classifier-authorized visible prose accumulated this turn (cache fp).
+    visible_acc: String,
+    /// Latched when the router fails closed mid-stream or at finish.
+    router_malformed: bool,
+    /// Filter saw a decoded stop marker (`stop_at`) this turn.
+    filter_stopped: bool,
     grammar_active: bool,
     grammar_matcher: grammar::Matcher,
     /// Set when a committed token violated the grammar; the daemon reads it via
@@ -64,6 +52,7 @@ pub struct Qwen35Emit<'a> {
     grammar_violated: bool,
     eos_token: u32,
     im_end_token: Option<u32>,
+    stop: Vec<String>,
     max_think_tokens: usize,
     open_think_prefix: bool,
     think_count: usize,
@@ -71,10 +60,6 @@ pub struct Qwen35Emit<'a> {
     /// Think-budget force-close continuation drained by `take_forced` so the
     /// target advances over `</think>` and continues into visible output.
     forced: Vec<u32>,
-    /// Number of queued continuation tokens still being fed back through
-    /// `observe`. They must update grammar/filter state but must not re-trigger
-    /// the think budget before the close has drained.
-    forced_remaining: usize,
     /// Prevent an endlessly re-opened reasoning span from being force-closed
     /// repeatedly. A second cap hit hard-stops through `ThinkCap`.
     think_force_closed: bool,
@@ -84,7 +69,19 @@ pub struct Qwen35Emit<'a> {
 }
 
 fn think_continuation_text() -> String {
-    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
+    hipfire_config::developer_var("HIPFIRE_THINK_CONTINUATION")
+        .unwrap_or_else(|_| "</think>\n\n".to_string())
+}
+
+/// EosFilter config for the Qwen DFlash/spec semantic-v2 producer. EosFilter
+/// owns UTF-8/EOT filtering; ThinkOutputRouter owns think-channel routing.
+fn qwen_dflash_eos_filter_config() -> EosFilterConfig {
+    EosFilterConfig {
+        strip_think: false,
+        started_in_think: false,
+        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
+        holdback_prefixes: Vec::new(),
+    }
 }
 
 impl<'a> Qwen35Emit<'a> {
@@ -94,6 +91,7 @@ impl<'a> Qwen35Emit<'a> {
     /// drives. The JSON→schema extraction mirrors the daemon's old
     /// `tool_schemas_dflash` builder.
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
             .map(|arr| {
@@ -124,133 +122,181 @@ impl<'a> Qwen35Emit<'a> {
             })
             .unwrap_or_default();
         let grammar_active = !tool_schemas.is_empty();
-        // The turn's byte quarantine holds user stop sequences AND the decoded
-        // protocol EOT markers. User stops are quarantined byte-level so a
-        // marker split across tokens is held/suppressed exactly like beta's
-        // EosFilter does for its `stop_at` list; protocol EOT bytes complete to
-        // a decoded-EOT verdict instead of a plain StopSequence.
-        let mut stop_markers: Vec<Vec<u8>> = ctx
-            .stop
-            .iter()
-            .filter(|stop| !stop.is_empty())
-            .map(|stop| stop.as_bytes().to_vec())
-            .collect();
-        for marker in PROTOCOL_EOT_MARKERS {
-            stop_markers.push(marker.to_vec());
-        }
-        let turn = OpenAssistantTurn::new_with_reasoning_open(
-            stop_markers.iter().map(Vec::as_slice),
-            matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink),
-        );
+        let open_think_prefix = matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink);
         Box::new(Self {
             tokenizer: ctx.tokenizer,
-            turn,
-            think_scan: Vec::new(),
+            filter: EosFilter::new(qwen_dflash_eos_filter_config()),
+            bytes_fed_to_filter: 0,
             streamed_tokens: Vec::new(),
-            decoded_eot: false,
-            stop: ctx.stop,
+            router: if tool_protocol_enabled {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            },
+            think_router: ThinkOutputRouter::new(open_think_prefix),
+            visible_acc: String::new(),
+            router_malformed: false,
+            filter_stopped: false,
             grammar_active,
-            grammar_matcher: grammar::Matcher::new(tool_schemas),
+            grammar_matcher: grammar::Matcher::with_config(
+                tool_schemas,
+                crate::grammar_config::resolve_qwen35_grammar_config(),
+            ),
             grammar_violated: false,
             eos_token: ctx.eos,
             im_end_token: ctx.im_end,
+            stop: ctx.stop,
             max_think_tokens: ctx.max_think,
-            open_think_prefix: matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink),
+            open_think_prefix,
             think_count: 0,
             prev_in_think: false,
             forced: Vec::new(),
-            forced_remaining: 0,
             think_force_closed: false,
             generated_hint: 0,
         })
     }
 
-    /// Admit one target token to the sealed-turn owner. Terminal tokens are
-    /// owned stops and never become wire diagnostics.
-    fn semantic_stop(&self, token: u32) -> bool {
-        token == self.eos_token
-            || self.im_end_token == Some(token)
-            || self.tokenizer.is_terminator(token)
-    }
-
-    /// Whether the most recent byte-stop (turn quarantine `Stop`) was a
-    /// protocol EOT marker rather than a user stop sequence. The turn's
-    /// quarantine stops at the EARLIEST complete marker in stream order, so
-    /// comparing the earliest EOT-marker position against the earliest user
-    /// stop position identifies which one fired.
-    fn stopped_on_eot(&self) -> bool {
-        let raw = std::str::from_utf8(&self.think_scan).unwrap_or("");
-        let eot_pos = PROTOCOL_EOT_MARKERS
-            .iter()
-            .filter_map(|m| raw.find(std::str::from_utf8(m).expect("EOT markers are UTF-8")))
-            .min();
-        let user_pos = self
-            .stop
-            .iter()
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| raw.find(s.as_str()))
-            .min();
-        match (eot_pos, user_pos) {
-            (Some(e), Some(u)) => e < u,
-            (Some(_), None) => true,
-            _ => false,
+    /// Route one content chunk. Visible prose becomes
+    /// `ClientEvent::Token`; complete tool calls stay buffered in the router
+    /// until [`SpecEmit::finish`]. Malformed protocol latches fail-closed.
+    fn route_content_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
+        if text.is_empty() || self.router_malformed {
+            return;
+        }
+        match self.router.push(text) {
+            Ok(evs) => {
+                for ev in evs {
+                    match ev {
+                        ToolRouteEvent::VisibleText(vt) => {
+                            self.visible_acc.push_str(vt.as_str());
+                            events.push(ClientEvent::Token(vt.into_string()));
+                        }
+                        ToolRouteEvent::ToolCall(_) => {
+                            // Buffered in router; released only on tool-safe finish.
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                self.router_malformed = true;
+            }
         }
     }
 
-    /// Admit one committed token to the sealed-turn owner and the committed
-    /// stream. Returns `(events, stopped, generation_advanced)`.
-    ///
-    /// * Post-stop tokens return empty events and `stopped` (the sealed turn
-    ///   is terminal; nothing further is committed).
-    /// * A semantic EOS token id is committed to the stream (the daemon trims
-    ///   the trailing `im_end` from the cache body), stops the turn, and
-    ///   latches `decoded_eot`.
-    /// * A byte-stop (user stop or protocol EOT marker completing inside the
-    ///   quarantine) is NOT committed: the marker-completing token carries no
-    ///   Committed event and no visible bytes.
-    /// * Otherwise the token is committed: `Committed` + think-stripped,
-    ///   marker-free visible `Token` events.
-    fn admit(&mut self, token: u32) -> (Vec<ClientEvent>, bool, bool) {
+    /// Route classified reasoning/content events. Content continues through
+    /// the tool protocol router; reasoning bypasses it and is never cached as
+    /// visible prose.
+    fn route_think_events(
+        &mut self,
+        channel_events: Vec<ThinkRouteEvent>,
+        events: &mut Vec<ClientEvent>,
+    ) {
+        for channel_event in channel_events {
+            if self.router_malformed {
+                continue;
+            }
+            match channel_event {
+                ThinkRouteEvent::Reasoning(text) => {
+                    events.push(ClientEvent::Reasoning(text));
+                }
+                ThinkRouteEvent::Content(text) => self.route_content_text(&text, events),
+            }
+        }
+    }
+
+    /// Route one EosFilter-emitted UTF-8 chunk through reasoning classification.
+    fn route_filter_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        let mut channel_events = Vec::new();
+        self.think_router.push_into(text, &mut channel_events);
+        self.route_think_events(channel_events, events);
+    }
+
+    /// Apply one filter observe step into the semantic router.
+    fn apply_filter_action(&mut self, action: FilterAction, events: &mut Vec<ClientEvent>) {
+        match action {
+            FilterAction::Emit(text_bytes) => {
+                let text = std::str::from_utf8(&text_bytes).unwrap_or("");
+                self.route_filter_text(text, events);
+            }
+            FilterAction::EmitAndStop(text_bytes) => {
+                let text = std::str::from_utf8(&text_bytes).unwrap_or("");
+                self.route_filter_text(text, events);
+                self.filter_stopped = true;
+            }
+            FilterAction::Stop => {
+                self.filter_stopped = true;
+            }
+            FilterAction::Hold => {}
+        }
+    }
+
+    /// Push a committed token, run it through the byte filter + router, and
+    /// return the `Committed` + (optional) visible `Token` events — the shared
+    /// tail of `begin`'s first-token emit and `observe`'s per-token emit.
+    fn push_and_filter(&mut self, token: u32) -> Vec<ClientEvent> {
         let mut events = Vec::new();
-        if self.turn.stopped() {
-            return (events, true, false);
-        }
-        // Semantic EOS is an owner stop.  Do not decode it through the
-        // transcript: otherwise a tokenizer whose EOS text is ordinary bytes
-        // can leak those bytes when the request has no user stop markers.
-        // The EOS token id is still committed so the daemon's cache body
-        // trims it exactly like beta's push_and_filter stream.
-        if self.semantic_stop(token) {
-            self.streamed_tokens.push(token);
-            events.push(ClientEvent::Committed {
-                id: token,
-                idx: self.streamed_tokens.len() - 1,
-            });
-            self.decoded_eot = true;
-            self.turn.stop();
-            return (events, true, false);
-        }
-        let raw = self.tokenizer.decode_bytes(&[token]);
-        let delta = self.turn.observe(token, &raw);
-        self.think_scan.extend_from_slice(&raw);
-        if delta.stopped {
-            // Byte-stop: the marker-completing token is not committed (its
-            // bytes are the marker + discarded post-marker payload). The stop
-            // reason is resolved by the caller via `stopped_on_eot`.
-            return (events, true, false);
-        }
         self.streamed_tokens.push(token);
         events.push(ClientEvent::Committed {
             id: token,
             idx: self.streamed_tokens.len() - 1,
         });
-        if !delta.bytes.is_empty() {
-            let text = std::str::from_utf8(&delta.bytes)
-                .expect("OpenAssistantTurn emits valid UTF-8")
-                .to_string();
-            events.push(ClientEvent::Token(text));
+        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
+        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
+        self.bytes_fed_to_filter = all_bytes.len();
+        let action = self.filter.observe(new_bytes);
+        self.apply_filter_action(action, &mut events);
+        events
+    }
+
+    /// Drain pending EOT-prefix prose, then finalize partial think markers.
+    fn drain_pending_into_router(&mut self, events: &mut Vec<ClientEvent>) {
+        let pending = self.filter.flush_pending();
+        if !pending.is_empty() {
+            let text = std::str::from_utf8(&pending).unwrap_or("");
+            self.route_filter_text(text, events);
         }
-        (events, false, true)
+
+        let mut channel_events = Vec::new();
+        self.think_router.finish_into(&mut channel_events);
+        self.route_think_events(channel_events, events);
+    }
+
+    /// Whether a streamed token id is a decoded EOT / terminator.
+    fn token_is_eot(&self, token: u32) -> bool {
+        token == self.eos_token
+            || self.im_end_token == Some(token)
+            || self.tokenizer.is_terminator(token)
+    }
+
+    /// User stop-sequence match against the decoded streamed suffix.
+    /// Shared by `begin` (first token) and `observe` (later tokens).
+    fn matches_stop_sequence(&self) -> bool {
+        if self.stop.is_empty() {
+            return false;
+        }
+        let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
+        self.stop
+            .iter()
+            .any(|s| decoded_suffix.ends_with(s.as_str()))
+    }
+
+    /// True when this turn ended on a decoded EOT (token id or filter stop_at).
+    pub fn decoded_eot(&self) -> bool {
+        self.filter_stopped
+            || self
+                .streamed_tokens
+                .last()
+                .copied()
+                .map(|t| self.token_is_eot(t))
+                .unwrap_or(false)
+    }
+
+    /// Producer-authorized visible text for asst-turn cache fingerprinting.
+    pub fn visible_text(&self) -> &str {
+        &self.visible_acc
     }
 }
 
@@ -258,54 +304,29 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     fn begin(&mut self, first_token: u32) -> EmitOutcome {
         // First-token emit (committed + filtered token), then seed the grammar
         // matcher with the first token's text. Mirrors generate_dflash 4452-4489.
-        // The first token is ALWAYS committed (daemon: "stop still commits the
-        // raw first token") so `spec_outcome_seed_committable` stays true even
-        // when it immediately completes a stop marker.
-        self.streamed_tokens.push(first_token);
-        let mut events = vec![ClientEvent::Committed {
-            id: first_token,
-            idx: self.streamed_tokens.len() - 1,
-        }];
-        if self.grammar_active && !self.semantic_stop(first_token) {
+        let events = self.push_and_filter(first_token);
+        if self.grammar_active {
             let text = self.tokenizer.decode(&[first_token]);
             self.grammar_matcher.advance(&text);
         }
         // First-token EOS guard: if the prefill's first token is itself a
         // terminator we must NOT enter the spec loop (the inline `while
         // !first_token_is_eos`). Surface as a stop so the caller skips the loop.
-        let first_token_is_eos = self.semantic_stop(first_token);
-        if first_token_is_eos {
-            self.decoded_eot = true;
-            self.turn.stop();
+        // Same precedence as `observe`: EOT token id, then filter stop_at, then
+        // user stop-sequence — so generate_spec never enters spec.step.
+        if self.token_is_eot(first_token) || self.filter_stopped {
             return EmitOutcome {
                 events,
                 generation_advanced: false,
                 stop: Some(StopReason::Eos),
             };
         }
-        let raw = self.tokenizer.decode_bytes(&[first_token]);
-        let delta = self.turn.observe(first_token, &raw);
-        self.think_scan.extend_from_slice(&raw);
-        if delta.stopped {
-            let eot = self.stopped_on_eot();
-            if eot {
-                self.decoded_eot = true;
-            }
+        if self.matches_stop_sequence() {
             return EmitOutcome {
                 events,
                 generation_advanced: false,
-                stop: Some(if eot {
-                    StopReason::Eos
-                } else {
-                    StopReason::StopSequence
-                }),
+                stop: Some(StopReason::StopSequence),
             };
-        }
-        if !delta.bytes.is_empty() {
-            let text = std::str::from_utf8(&delta.bytes)
-                .expect("OpenAssistantTurn emits valid UTF-8")
-                .to_string();
-            events.push(ClientEvent::Token(text));
         }
         EmitOutcome {
             events,
@@ -315,27 +336,6 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     }
 
     fn observe(&mut self, token: u32) -> EmitOutcome {
-        // The owner is terminal after a stop. Preserve the explicit generation
-        // advancement event, but do not run grammar or any other side effect.
-        if self.turn.stopped() {
-            return EmitOutcome {
-                events: Vec::new(),
-                generation_advanced: false,
-                stop: Some(StopReason::StopSequence),
-            };
-        }
-
-        // Semantic EOS is resolved before grammar or byte projection.  The
-        // owner, not the marker filter, decides when the turn ends.
-        if self.semantic_stop(token) {
-            let (events, _, generation_advanced) = self.admit(token);
-            return EmitOutcome {
-                events,
-                generation_advanced,
-                stop: Some(StopReason::Eos),
-            };
-        }
-
         // Grammar pre-check (POST-acceptance, before emit). A rejected token is
         // NOT emitted; treat as a grammar violation → stop. Mirrors 4565-4584.
         if self.grammar_active {
@@ -362,44 +362,41 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             }
         }
 
-        // Admit the token (committed + sealed-turn projection).
-        let (events, stopped, generation_advanced) = self.admit(token);
-        let draining_forced = self.forced_remaining > 0;
-        if draining_forced {
-            self.forced_remaining -= 1;
-        }
+        // Emit the token (committed + filtered + routed).
+        let mut events = self.push_and_filter(token);
 
-        if stopped {
-            // Byte-stop (semantic EOS was handled above): a protocol EOT
-            // marker completing in the quarantine is Eos, a user stop
-            // sequence is StopSequence.
-            let eot = self.stopped_on_eot();
-            if eot {
-                self.decoded_eot = true;
-            }
+        // EOS check (token id). Mirrors 4608-4612.
+        if self.token_is_eot(token) {
             return EmitOutcome {
                 events,
-                generation_advanced,
-                stop: Some(if eot {
-                    StopReason::Eos
-                } else {
-                    StopReason::StopSequence
-                }),
+                generation_advanced: false,
+                stop: Some(StopReason::Eos),
+            };
+        }
+        // Filter-decoded stop marker (byte form of im_end / endoftext).
+        if self.filter_stopped {
+            return EmitOutcome {
+                events,
+                generation_advanced: false,
+                stop: Some(StopReason::Eos),
+            };
+        }
+
+        // User stop-sequence match against the decoded suffix. Mirrors 4622-4628.
+        if self.matches_stop_sequence() {
+            return EmitOutcome {
+                events,
+                generation_advanced: false,
+                stop: Some(StopReason::StopSequence),
             };
         }
 
         // max_think_tokens enforcement. Mirrors 4632-4664.
         if self.max_think_tokens > 0 {
-            let raw_str = std::str::from_utf8(&self.think_scan).unwrap_or("");
+            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(raw_str, self.open_think_prefix);
             if in_think && !self.prev_in_think {
-                if self.think_force_closed && !draining_forced {
-                    return EmitOutcome {
-                        events,
-                        generation_advanced,
-                        stop: Some(StopReason::ThinkCap),
-                    };
-                }
                 self.think_count = 0;
             }
             if in_think {
@@ -408,27 +405,20 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             self.prev_in_think = in_think;
 
             if in_think && self.think_count >= self.max_think_tokens {
-                if draining_forced {
-                    return EmitOutcome {
-                        events,
-                        generation_advanced,
-                        stop: None,
-                    };
-                }
                 if !self.think_force_closed {
                     self.forced = self.tokenizer.encode(&think_continuation_text());
-                    self.forced_remaining = self.forced.len();
                     self.think_force_closed = true;
                     return EmitOutcome {
                         events,
-                        generation_advanced,
+                        generation_advanced: true,
                         stop: None,
                     };
                 }
                 // A pathological re-open after the injected close hard-stops.
+                // Do not push raw "</think>\n" as a Token; surface stop only.
                 return EmitOutcome {
                     events,
-                    generation_advanced,
+                    generation_advanced: true,
                     stop: Some(StopReason::ThinkCap),
                 };
             }
@@ -436,68 +426,97 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         EmitOutcome {
             events,
-            generation_advanced,
+            generation_advanced: true,
             stop: None,
         }
     }
 
-    fn finish(self: Box<Self>) -> FinishSummary {
-        // The consuming seal is the only source for terminal bytes and tools.
+    fn finish(mut self: Box<Self>) -> FinishSummary {
+        // Drain filter pending, then finalize the incremental router. Structured
+        // ToolCalls are held on FinishSummary for the wrapper — generate_spec
+        // must NOT render them before length/malformed/open-think is known.
         let mut events = Vec::new();
-        let finalized = self.turn.seal();
-        // Unclosed think at finish is a nonretryable unsafe terminal (beta's
-        // `filter.in_think()` verdict, computed from the same raw stream).
-        let raw_str = std::str::from_utf8(&self.think_scan).unwrap_or("");
-        let open_think = currently_in_think(raw_str, self.open_think_prefix);
+        self.drain_pending_into_router(&mut events);
+        let open_think = self.think_router.in_think();
+        let decoded_eot = self.decoded_eot();
+
         if open_think {
+            // Unsafe terminal: drop pending (already flushed/dropped), no calls,
+            // no safe stop. Daemon emits error-only (no done/cache).
+            let _ = self.router.finish();
             return FinishSummary {
                 events: Vec::new(),
                 finish_reason: "open_think",
                 tool_calls: 0,
-                finalized: Some(finalized),
+                finalized: None,
                 visible_text: String::new(),
                 decoded_eot: false,
                 open_think: true,
             };
         }
-        // Token-ID diagnostics are published only after the consuming seal;
-        // no held marker prefix or post-stop token can reach the wire.
-        events.extend(
-            finalized
-                .diagnostic_tokens()
-                .iter()
-                .enumerate()
-                .map(|(idx, &id)| ClientEvent::Committed { id, idx }),
-        );
-        if !finalized.terminal_delta().bytes.is_empty() {
-            let text = std::str::from_utf8(&finalized.terminal_delta().bytes)
-                .expect("OpenAssistantTurn emits valid UTF-8")
-                .to_string();
-            events.push(ClientEvent::Token(text));
+
+        if self.router_malformed || self.router.is_malformed() {
+            let _ = self.router.finish();
+            return FinishSummary {
+                events,
+                finish_reason: "malformed_protocol",
+                tool_calls: 0,
+                finalized: None,
+                visible_text: std::mem::take(&mut self.visible_acc),
+                decoded_eot,
+                open_think: false,
+            };
         }
-        let emit_tool_calls = finalized.tool_calls().to_vec();
-        let tool_calls = emit_tool_calls.len();
-        let finish_reason = if !emit_tool_calls.is_empty() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        if !emit_tool_calls.is_empty() {
-            events.push(ClientEvent::ToolCalls(emit_tool_calls));
-        }
-        let visible_text = finalized.text().to_string();
-        let decoded_eot = self.decoded_eot
-            || PROTOCOL_EOT_MARKERS.iter().any(|m| {
-                raw_str.contains(std::str::from_utf8(m).expect("EOT markers are UTF-8"))
-            });
-        FinishSummary {
-            events,
-            finish_reason,
-            tool_calls,
-            finalized: Some(finalized),
-            visible_text,
-            decoded_eot,
-            open_think: false,
+
+        let buffered_before = self.router.tool_calls().to_vec();
+        match self.router.finish() {
+            Err(_) => FinishSummary {
+                events,
+                finish_reason: "malformed_protocol",
+                tool_calls: 0,
+                finalized: None,
+                visible_text: std::mem::take(&mut self.visible_acc),
+                decoded_eot,
+                open_think: false,
+            },
+            Ok(evs) => {
+                let mut finished_calls = buffered_before;
+                for ev in evs {
+                    match ev {
+                        ToolRouteEvent::VisibleText(vt) => {
+                            self.visible_acc.push_str(vt.as_str());
+                            events.push(ClientEvent::Token(vt.into_string()));
+                        }
+                        ToolRouteEvent::ToolCall(tc) => {
+                            finished_calls.push(tc);
+                        }
+                    }
+                }
+                let visible_text = std::mem::take(&mut self.visible_acc);
+                if !finished_calls.is_empty() {
+                    let n = finished_calls.len();
+                    events.push(ClientEvent::ToolCalls(finished_calls));
+                    FinishSummary {
+                        events,
+                        finish_reason: "tool_calls",
+                        tool_calls: n,
+                        finalized: None,
+                        visible_text,
+                        decoded_eot,
+                        open_think: false,
+                    }
+                } else {
+                    FinishSummary {
+                        events,
+                        finish_reason: "stop",
+                        tool_calls: 0,
+                        finalized: None,
+                        visible_text,
+                        decoded_eot,
+                        open_think: false,
+                    }
+                }
+            }
         }
     }
 
@@ -513,9 +532,9 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         self.grammar_violated
     }
 
-    /// Emitter-authoritative decoded EOT (token id and/or byte marker).
     fn decoded_eot(&self) -> bool {
-        self.decoded_eot
+        // Prefer the inherent helper (token id + filter stop_at).
+        Qwen35Emit::decoded_eot(self)
     }
 
     /// Hint the emitter of the daemon's current `generated` count so the
@@ -529,337 +548,14 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     }
 }
 
+// ── Deterministic non-GPU producer tests ────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hipfire_runtime::prompt_frame::ToolCall;
     use hipfire_runtime::spec::SpecEmit;
     use hipfire_runtime::tokenizer::Tokenizer;
-
-    fn tokenizer() -> Tokenizer {
-        Tokenizer::from_hf_json(
-            r#"{
-                "model": {
-                    "vocab": {
-                        "<think>": 0,
-                        "a": 1,
-                        "b": 2,
-                        "<": 3,
-                        "/": 4,
-                        "t": 5,
-                        "h": 6,
-                        "i": 7,
-                        "n": 8,
-                        "k": 9,
-                        ">": 10,
-                        "\\n": 11,
-                        "<|endoftext|>": 12,
-                        "<stop>": 13,
-                        "<|im_end|>": 14,
-                        "<tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>": 15,
-                        "<think>reason</think>answer": 16,
-                        "safe<st": 17,
-                        "op>tail": 18,
-                        "<|im_end|>ordinary": 19
-                    },
-                    "merges": []
-                },
-                "added_tokens": [
-                    {"id": 12, "content": "<|endoftext|>", "special": true},
-                    {"id": 14, "content": "<|im_end|>", "special": true}
-                ]
-            }"#,
-        )
-        .expect("test tokenizer")
-    }
-
-    #[test]
-    fn first_think_cap_drains_close_then_reopened_think_stops() {
-        let tokenizer = tokenizer();
-        let ctx = SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: Vec::new(),
-            max_think: 2,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        };
-        let mut emit = Qwen35Emit::from_ctx(ctx);
-
-        emit.begin(0);
-        assert!(emit.observe(1).stop.is_none());
-        assert!(emit.observe(2).stop.is_none());
-        let forced = emit.take_forced();
-        assert_eq!(forced, tokenizer.encode(&think_continuation_text()));
-        assert!(!forced.is_empty());
-
-        for &token in &forced {
-            let outcome = emit.observe(token);
-            assert!(outcome.stop.is_none());
-            assert!(outcome.generation_advanced);
-        }
-        assert_eq!(emit.observe(0).stop, Some(StopReason::ThinkCap));
-    }
-
-    #[test]
-    fn from_ctx_preserves_think_visibility_and_wires_stop_markers() {
-        let tokenizer = tokenizer();
-        let make_emit = || {
-            Qwen35Emit::from_ctx(SpecEmitCtx {
-                tokenizer: &tokenizer,
-                eos: 12,
-                im_end: Some(14),
-                tools: None,
-                stop: vec!["<stop>".into()],
-                max_think: 0,
-                max_tokens: 64,
-                assistant_prefix: AssistantPrefix::Plain,
-                think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-                decoded_vocab: None,
-            })
-        };
-        let mut emit = make_emit();
-
-        let visible: Vec<String> = emit
-            .begin(16)
-            .events
-            .into_iter()
-            .filter_map(|event| match event {
-                ClientEvent::Token(text) => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(visible.concat(), "answer");
-
-        let stop = make_emit().begin(13);
-        assert_eq!(stop.stop, Some(StopReason::StopSequence));
-        assert!(!stop
-            .events
-            .iter()
-            .any(|event| { matches!(event, ClientEvent::Token(text) if text.contains("<stop>")) }));
-
-        let im_end = make_emit().begin(14);
-        assert_eq!(im_end.stop, Some(StopReason::Eos));
-        assert!(!im_end.events.iter().any(|event| {
-            matches!(event, ClientEvent::Token(text) if text.contains("<|im_end|>"))
-        }));
-
-        // A decoded protocol EOT marker is a byte-level stop even inside an
-        // ordinary-looking token: the marker completes in the turn quarantine
-        // and latches decoded EOT (beta's EosFilter `stop_at` semantics).
-        let protocol_prefix = make_emit().begin(19);
-        assert_eq!(protocol_prefix.stop, Some(StopReason::Eos));
-        assert!(protocol_prefix.events.iter().all(|event| {
-            !matches!(event, ClientEvent::Token(text) if text.contains("<|im_end|>"))
-        }));
-    }
-
-    #[test]
-    fn stop_tool_call_suppresses_visible_output_and_tool_calls() {
-        let tokenizer = tokenizer();
-        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: vec!["<tool_call>".into()],
-            max_think: 0,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-        let outcome = emit.begin(15);
-        assert_eq!(outcome.stop, Some(StopReason::StopSequence));
-        assert!(!outcome
-            .events
-            .iter()
-            .any(|event| { matches!(event, ClientEvent::Token(_) | ClientEvent::ToolCalls(_)) }));
-        let post_stop = emit.observe(1);
-        assert_eq!(post_stop.stop, Some(StopReason::StopSequence));
-        assert!(post_stop.events.is_empty());
-        assert!(!post_stop.generation_advanced);
-        let summary = emit.finish();
-        assert_eq!(summary.tool_calls, 0);
-        assert!(!summary
-            .events
-            .iter()
-            .any(|event| matches!(event, ClientEvent::ToolCalls(_))));
-    }
-
-    #[test]
-    fn tool_calls_before_stop_are_extracted_from_safe_transcript() {
-        let tokenizer = tokenizer();
-        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: vec!["<stop>".into()],
-            max_think: 0,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-        assert!(emit.begin(15).stop.is_none());
-        assert_eq!(emit.observe(13).stop, Some(StopReason::StopSequence));
-        let summary = emit.finish();
-        assert_eq!(summary.tool_calls, 1);
-        assert!(summary.events.iter().any(|event| {
-            matches!(event, ClientEvent::ToolCalls(calls) if calls.len() == 1 && calls[0].name == "bash")
-        }));
-    }
-
-    #[test]
-    fn split_stop_marker_is_quarantined_by_the_turn_owner() {
-        let tokenizer = tokenizer();
-        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: vec!["<stop>".into()],
-            max_think: 0,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-        let first = emit.begin(17);
-        assert!(first.stop.is_none());
-        assert!(first
-            .events
-            .iter()
-            .any(|event| { matches!(event, ClientEvent::Token(text) if text == "safe") }));
-        let second = emit.observe(18);
-        assert_eq!(second.stop, Some(StopReason::StopSequence));
-        assert!(!second
-            .events
-            .iter()
-            .any(|event| { matches!(event, ClientEvent::Token(text) if text.contains("<stop>")) }));
-        let summary = emit.finish();
-        assert!(!summary
-            .events
-            .iter()
-            .any(|event| { matches!(event, ClientEvent::Token(text) if text.contains("<stop>")) }));
-    }
-
-    #[test]
-    fn semantic_eos_precedes_filter_stop_and_still_suppresses_marker() {
-        let tokenizer = tokenizer();
-        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: Vec::new(),
-            max_think: 0,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-        assert!(emit.begin(1).stop.is_none());
-        let outcome = emit.observe(12);
-        assert_eq!(outcome.stop, Some(StopReason::Eos));
-        assert!(!outcome.events.iter().any(|event| {
-            matches!(event, ClientEvent::Token(text) if text.contains("<|endoftext|>"))
-        }));
-    }
-
-    #[test]
-    fn semantic_eos_seals_trailing_partial_user_stop_prefix() {
-        let tokenizer = tokenizer();
-        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: vec!["<stop>".into()],
-            max_think: 0,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-        assert!(emit.begin(17).stop.is_none());
-        assert_eq!(emit.observe(12).stop, Some(StopReason::Eos));
-
-        let summary = emit.finish();
-        let finalized = summary.finalized.expect("Qwen seal");
-        assert_eq!(finalized.text(), "safe<st");
-        assert_eq!(finalized.terminal_delta().bytes, b"<st");
-        assert_eq!(finalized.replay_tokens(), Some([17].as_slice()));
-    }
-
-    #[test]
-    fn sealed_owner_exposes_exact_replay_and_only_sealed_diagnostics() {
-        let mut aligned = OpenAssistantTurn::new([b"<stop>".as_slice()]);
-        aligned.observe(21, b"hello ");
-        aligned.observe(22, b"world");
-        let finalized = aligned.seal();
-        assert_eq!(finalized.replay_tokens(), Some([21, 22].as_slice()));
-        assert_eq!(finalized.diagnostic_tokens(), [21, 22].as_slice());
-
-        let mut cut = OpenAssistantTurn::new([b"<stop>".as_slice()]);
-        cut.observe(31, b"hello<stop>");
-        cut.observe(32, b"post-stop-tool-payload");
-        let finalized = cut.seal();
-        assert_eq!(finalized.replay_tokens(), None);
-        assert!(finalized.diagnostic_tokens().is_empty());
-
-        let mut aligned = OpenAssistantTurn::new([b"<stop>".as_slice()]);
-        aligned.observe(21, b"hello");
-        aligned.observe(22, b"<stop>");
-        let finalized = aligned.seal();
-        assert_eq!(finalized.replay_tokens(), Some([21].as_slice()));
-        assert_eq!(finalized.diagnostic_tokens(), [21].as_slice());
-    }
-
-    #[test]
-    fn post_stop_tool_payload_is_absent_from_wire_tools_and_replay() {
-        let tokenizer = tokenizer();
-        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
-            tokenizer: &tokenizer,
-            eos: 12,
-            im_end: None,
-            tools: None,
-            stop: vec!["<stop>".into()],
-            max_think: 0,
-            max_tokens: 64,
-            assistant_prefix: AssistantPrefix::Plain,
-            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-        assert!(emit.begin(17).generation_advanced);
-        let stopped = emit.observe(18);
-        assert_eq!(stopped.stop, Some(StopReason::StopSequence));
-        assert!(!stopped.generation_advanced);
-        assert!(emit.observe(15).events.is_empty());
-        let summary = emit.finish();
-        let finalized = summary.finalized.expect("Qwen seal");
-        assert_eq!(finalized.text(), "safe");
-        assert!(finalized.tool_calls().is_empty());
-        assert!(finalized.replay_tokens().is_none());
-        assert!(finalized.diagnostic_tokens().is_empty());
-        assert!(!summary
-            .events
-            .iter()
-            .any(|event| { matches!(event, ClientEvent::Committed { id: 15, .. }) }));
-    }
-
-    // ── Beta producer-surface tests (streamed tokens / decoded EOT) ───────
 
     fn json_escape(s: &str) -> String {
         let mut out = String::new();
@@ -940,7 +636,7 @@ mod tests {
             tokenizer: tok,
             eos: 9,
             im_end: Some(1),
-            tools: None,
+            tools: Some(&[]),
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -986,6 +682,16 @@ mod tests {
         s
     }
 
+    fn reasoning_text(events: &[ClientEvent]) -> String {
+        let mut s = String::new();
+        for ev in events {
+            if let ClientEvent::Reasoning(t) = ev {
+                s.push_str(t);
+            }
+        }
+        s
+    }
+
     fn held_calls(finish: &FinishSummary) -> Vec<ToolCall> {
         finish
             .events
@@ -995,6 +701,10 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    fn hermes_call(name: &str, args: &str) -> String {
+        format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>")
     }
 
     #[test]
@@ -1009,24 +719,62 @@ mod tests {
     }
 
     #[test]
-    fn raw_committed_once_per_token_including_markers() {
-        // Tools are not grammar-active here (tools: None), so the raw
-        // tool-call marker tokens are ordinary committed bytes — each appears
-        // exactly once as a Committed event with a sequential idx.
-        let body = "x<tool_call>{}</tool_call>";
-        let (stream, _, raw) = drive_text(body);
-        let committed: Vec<_> = stream
-            .iter()
-            .filter_map(|ev| match ev {
-                ClientEvent::Committed { id, idx } => Some((*id, *idx)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(committed.len(), raw.len());
-        for (i, (id, idx)) in committed.iter().enumerate() {
-            assert_eq!(*idx, i);
-            assert_eq!(*id, raw[i]);
-        }
+    fn valid_hermes_call_held_on_finish() {
+        let body = format!("Sure.{}", hermes_call("get_weather", r#"{"city":"SF"}"#));
+        let (stream, finish, raw) = drive_text(&body);
+        assert!(!raw.is_empty());
+        assert_eq!(tokens_text(&stream), "Sure.");
+        assert!(!tokens_text(&stream).contains("<tool_call>"));
+        assert!(!tokens_text(&stream).contains("get_weather"));
+        assert_eq!(finish.finish_reason, "tool_calls");
+        assert_eq!(finish.tool_calls, 1);
+        let calls = held_calls(&finish);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn multiple_calls_and_surrounding_prose() {
+        let body = format!(
+            "A{}B{}",
+            hermes_call("alpha", r#"{}"#),
+            hermes_call("beta", r#"{"x":1}"#)
+        );
+        let (stream, finish, _) = drive_text(&body);
+        assert_eq!(tokens_text(&stream), "AB");
+        assert_eq!(finish.finish_reason, "tool_calls");
+        assert_eq!(finish.tool_calls, 2);
+        let names: Vec<_> = held_calls(&finish).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn marker_split_across_tokens_never_leaks() {
+        let body = hermes_call("t", r#"{}"#);
+        let (stream, finish, _) = drive_text(&body);
+        let visible = tokens_text(&stream);
+        assert!(!visible.contains("<tool_call>"));
+        assert!(!visible.contains("</tool_call>"));
+        assert!(!visible.contains("\"name\""));
+        assert_eq!(finish.finish_reason, "tool_calls");
+        assert_eq!(finish.tool_calls, 1);
+    }
+
+    #[test]
+    fn malformed_unclosed_span_is_fail_closed() {
+        let (stream, finish, _) = drive_text("pre<tool_call>{\"name\":\"x\"");
+        assert!(!tokens_text(&stream).contains("<tool_call>"));
+        assert_eq!(finish.finish_reason, "malformed_protocol");
+        assert_eq!(finish.tool_calls, 0);
+        assert!(held_calls(&finish).is_empty());
+    }
+
+    #[test]
+    fn malformed_empty_body_is_fail_closed() {
+        let (stream, finish, _) = drive_text("x<tool_call></tool_call>");
+        assert!(!tokens_text(&stream).contains("<tool_call>"));
+        assert_eq!(finish.finish_reason, "malformed_protocol");
+        assert_eq!(finish.tool_calls, 0);
     }
 
     #[test]
@@ -1037,6 +785,7 @@ mod tests {
         assert!(!visible.contains("<think>"));
         assert!(!visible.contains("secret"));
         assert!(visible.contains("answer"));
+        assert_eq!(reasoning_text(&stream), "secret");
         assert_eq!(finish.finish_reason, "stop");
     }
 
@@ -1069,46 +818,33 @@ mod tests {
         let finish = emit.finish();
         assert_eq!(finish.finish_reason, "stop");
         assert_eq!(finish.tool_calls, 0);
-        assert!(finish.decoded_eot, "token-id EOT must latch decoded_eot");
     }
 
     #[test]
-    fn split_decoded_eot_across_tokens_latches_and_suppresses_marker() {
-        // Byte-fragment the <|im_end|> marker across tokens (100+b map).
-        let marker = b"<|im_end|>";
-        let mut ids: Vec<u32> = Vec::new();
-        ids.push(100 + b'h' as u32);
-        ids.push(100 + b'i' as u32);
-        let mid = marker.len() / 2;
-        for &b in &marker[..mid] {
-            ids.push(100 + b as u32);
+    fn raw_committed_once_per_token_including_markers() {
+        let body = format!("x{}", hermes_call("t", r#"{}"#));
+        let (stream, _, raw) = drive_text(&body);
+        let committed: Vec<_> = stream
+            .iter()
+            .filter_map(|ev| match ev {
+                ClientEvent::Committed { id, idx } => Some((*id, *idx)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(committed.len(), raw.len());
+        for (i, (id, idx)) in committed.iter().enumerate() {
+            assert_eq!(*idx, i);
+            assert_eq!(*id, raw[i]);
         }
-        for &b in &marker[mid..] {
-            ids.push(100 + b as u32);
-        }
-        let tok = test_tokenizer();
-        let mut emit = make_emit(&tok);
-        let mut stream = Vec::new();
-        let mut first = true;
-        for id in &ids {
-            let outcome = if first {
-                first = false;
-                emit.begin(*id)
-            } else {
-                emit.observe(*id)
-            };
-            stream.extend(outcome.events);
-            if outcome.stop.is_some() {
-                break;
-            }
-        }
-        let visible = tokens_text(&stream);
-        assert!(!visible.contains("<|im_end|>"), "marker bytes suppressed");
-        assert!(visible.contains("hi"));
-        let finish = emit.finish();
-        assert!(finish.decoded_eot, "split EOT must latch decoded_eot");
-        assert_eq!(finish.finish_reason, "stop");
+    }
+
+    #[test]
+    fn finish_does_not_use_whole_output_extraction_authority() {
+        let open = "<tool_call>{\"name\": \"recovered\", \"arguments\": {}}";
+        let (_stream, finish, _) = drive_text(open);
+        assert_eq!(finish.finish_reason, "malformed_protocol");
         assert_eq!(finish.tool_calls, 0);
+        assert!(held_calls(&finish).is_empty());
     }
 
     #[test]
@@ -1183,5 +919,14 @@ mod tests {
         }
         assert!(saw_stop, "multi-token stop must still fire via observe");
         assert!(n > 1, "multi-token stop must not only hit begin");
+    }
+
+    #[test]
+    fn filter_config_matches_ar_semantic_v2() {
+        let cfg = qwen_dflash_eos_filter_config();
+        assert!(!cfg.strip_think);
+        assert!(!cfg.started_in_think);
+        assert!(cfg.stop_at.iter().any(|s| s == b"<|im_end|>"));
+        assert!(cfg.stop_at.iter().any(|s| s == b"<|endoftext|>"));
     }
 }

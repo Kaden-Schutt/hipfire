@@ -215,6 +215,8 @@ fn lower_err(
         MoeProgramParts {
             router,
             execution: ExpertExecutionPlan::IndexedQuantized,
+            deferred_combine: false,
+
             ranks: vec![i64_rank(), i64_rank()],
         },
     )

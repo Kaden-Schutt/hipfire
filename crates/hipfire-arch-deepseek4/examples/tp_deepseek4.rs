@@ -652,7 +652,7 @@ fn main() {
                 .expect("load_weights sg");
 
             let max_batch_sg = hipfire_runtime::llama::PREFILL_MAX_BATCH.min(prompt_ids.len());
-            let pbs_sg = PrefillBatchScratch::new(&mut gpus_sg.devices[0], &cfg, max_batch_sg)
+            let mut pbs_sg = PrefillBatchScratch::new(&mut gpus_sg.devices[0], &cfg, max_batch_sg)
                 .expect("PrefillBatchScratch sg");
             let mut state_sg = DeepseekV4State::new(&cfg).expect("state sg");
 
@@ -663,7 +663,7 @@ fn main() {
                 &mut gpus_sg.devices[0],
                 &prompt_ids,
                 0,
-                &pbs_sg,
+                &mut pbs_sg,
             )
             .expect("forward_prefill_batch_chunked sg");
 

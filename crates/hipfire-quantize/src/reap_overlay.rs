@@ -5,11 +5,21 @@
 //!   * `quantize_to_format` — tier-name → existing `quantize_*` encoder dispatch.
 //!   * `reap_override_for`   — arch-aware tensor-name → override-tier resolver.
 
-use crate::{
-    gen_fwht_signs, quantize_hfq4g256, quantize_hfq6g256, quantize_mq2g256_lloyd,
-    quantize_mq3g256_lloyd, quantize_mq4g256, quantize_mq4g256_lloyd, quantize_mq6g256,
-    quantize_q8f16, HfqTensor, QuantType,
+use crate::hfq::{HfqTensor, QuantType};
+use crate::quant_e8::{
+    load_ds4_head_importance, load_hessian_blocks, quantize_mfp4g32_e8_2d,
+    quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d,
+    quantize_mfp4g32_e8_soa_lsq_2d,
 };
+use crate::quant_fwht::{
+    gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq5g256v2, quantize_mq6g256,
+    quantize_mq6g256v2,
+};
+use crate::quant_mq::{
+    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq2g256v2, quantize_mq3g256_lloyd,
+    quantize_mq3g256v2, quantize_mq4g256_lloyd,
+};
+use crate::quant_q4::quantize_q8f16;
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
 
 /// Quantize one tensor's f32 data to the named tier, returning the HFQ tensor.
@@ -48,6 +58,70 @@ pub fn quantize_to_format(
                 quantize_mq6g256(f32_data, &s1, &s2),
             )
         }
+        "mq6v2" | "mq6g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq6v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq6v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ6G256V2,
+                256,
+                quantize_mq6g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq5v2" | "mq5g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq5v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq5v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ5G256V2,
+                256,
+                quantize_mq5g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq3v2" | "mq3g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq3v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq3v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ3G256V2,
+                256,
+                quantize_mq3g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq2v2" | "mq2g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq2v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq2v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ2G256V2,
+                256,
+                quantize_mq2g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
         "mq2lloyd" | "mq2g256lloyd" => {
             let (s1, s2) = signs();
             (
@@ -72,10 +146,82 @@ pub fn quantize_to_format(
                 quantize_mq4g256_lloyd(f32_data, &s1, &s2),
             )
         }
+        "mfp4e8" | "mfp4g32e8" => {
+            let &[m, k] = shape else {
+                return Err(format!("reap: MFP4-E8 requires rank-2 tensor {name}"));
+            };
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP4G32E8,
+                32,
+                quantize_mfp4g32_e8_2d(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mfp4e8soa" | "mfp4g32e8soa" => {
+            let &[m, k] = shape else {
+                return Err(format!("reap: MFP4-E8-SoA requires rank-2 tensor {name}"));
+            };
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP4G32E8SOA,
+                32,
+                quantize_mfp4g32_e8_soa_2d(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mfp4e8soa-lsq" | "mfp4g32e8soa-lsq" => {
+            let &[m, k] = shape else {
+                return Err(format!(
+                    "reap: MFP4-E8-SoA-LSQ requires rank-2 tensor {name}"
+                ));
+            };
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP4G32E8SOA,
+                32,
+                quantize_mfp4g32_e8_soa_lsq_2d(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mfp4e8soa-awls" | "mfp4g32e8soa-awls" => {
+            let &[m, k] = shape else {
+                return Err(format!(
+                    "reap: MFP4-E8-SoA-AWLS requires rank-2 tensor {name}"
+                ));
+            };
+            let importance = load_ds4_head_importance(k)?;
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP4G32E8SOA,
+                32,
+                quantize_mfp4g32_e8_soa_awls_2d(f32_data, m, k, &s1, &s2, &importance),
+            )
+        }
+        "mfp4e8soa-gptq" | "mfp4g32e8soa-gptq" => {
+            let &[m, k] = shape else {
+                return Err(format!(
+                    "reap: MFP4-E8-SoA-GPTQ requires rank-2 tensor {name}"
+                ));
+            };
+            let hessian_dir = std::env::var("HIPFIRE_E8_HESSIAN_DIR")
+                .map_err(|_| "mfp4e8soa-gptq requires HIPFIRE_E8_HESSIAN_DIR".to_string())?;
+            let h_blocks = load_hessian_blocks(std::path::Path::new(&hessian_dir), name);
+            if h_blocks.len() != k / 256 {
+                return Err(format!(
+                    "reap: GPTQ Hessian for {name} has {} blocks, expected {}",
+                    h_blocks.len(),
+                    k / 256
+                ));
+            }
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP4G32E8SOA,
+                32,
+                quantize_mfp4g32_e8_soa_gptq_2d(f32_data, m, k, &s1, &s2, &h_blocks),
+            )
+        }
         other => {
             return Err(format!(
                 "reap: unsupported overlay tier '{other}' for {name}"
-            ))
+            ));
         }
     };
     Ok(HfqTensor {
@@ -290,9 +436,18 @@ pub fn bake_layer_of(name: &str) -> Option<usize> {
 
 fn tensor_matches(name: &str, arch: ReapArch, ov: &QuantOverride) -> bool {
     // Layer gate: the name must reference `ov.layer`. All four arches embed the
-    // layer index as `.layers.{L}.` or `layers.{L}.`.
+    // layer index as `.layers.{L}.` or `layers.{L}.`. Global embedding and
+    // output-head weights use a conventional layer value in the plan but have
+    // no layer token in their tensor name.
     let layer_tok = format!("layers.{}.", ov.layer);
-    if !name.contains(&layer_tok) {
+    if !matches!(ov.role, Role::LmHead | Role::Embed) && !name.contains(&layer_tok) {
+        return false;
+    }
+    // Quant-surgery plans may narrow a broad semantic role (for example,
+    // attention) to one exact projection. Apply this before the role matcher
+    // so rank-1 norms and unrelated auxiliary matrices never leak into an E8
+    // overlay merely because their names share `.attn.`.
+    if !ov.tensors.is_empty() && !ov.tensors.iter().any(|tensor| tensor == name) {
         return false;
     }
     match ov.role {
@@ -321,8 +476,14 @@ fn tensor_matches(name: &str, arch: ReapArch, ov: &QuantOverride) -> bool {
                 || name.contains(".gate.tid2eid")
         }
         Role::SharedExpert => name.contains(".shared_expert") || name.contains(".shared_experts"),
-        Role::LmHead => name.contains("lm_head") || name.contains("output.weight"),
-        Role::Embed => name.contains("embed_tokens") || name.contains("tok_embeddings"),
+        Role::LmHead => {
+            name == "head.weight" || name.contains("lm_head") || name.contains("output.weight")
+        }
+        Role::Embed => {
+            name == "embed.weight"
+                || name.contains("embed_tokens")
+                || name.contains("tok_embeddings")
+        }
     }
 }
 
@@ -366,6 +527,17 @@ mod tests {
             err.contains("unsupported overlay tier 'bogus'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_dense_only_anchored_lloyd_tier() {
+        for format in ["mq2lloyd-anchored", "mq2lloyd_anchored"] {
+            let err = quantize_to_format("x", format, &[0.0; 256], &[1, 256]).unwrap_err();
+            assert!(
+                err.contains(&format!("unsupported overlay tier '{format}'")),
+                "got: {err}"
+            );
+        }
     }
 }
 
@@ -470,6 +642,44 @@ mod resolve_tests {
                 ReapArch::Qwen35,
                 &p
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_tensor_allowlist_narrows_attention_role() {
+        let p = plan_with(
+            r#"{"original_experts":256,"num_layers":43,
+            "quant_overrides":[{"layer":21,"role":"attention",
+            "tensors":["layers.21.attn.wq_b.weight"],"tier":"mfp4e8soa"}]}"#,
+        );
+        assert_eq!(
+            reap_override_for("layers.21.attn.wq_b.weight", ReapArch::Deepseek4, &p),
+            Some("mfp4e8soa")
+        );
+        assert_eq!(
+            reap_override_for("layers.21.attn.wo_b.weight", ReapArch::Deepseek4, &p),
+            None
+        );
+        assert_eq!(
+            reap_override_for("layers.21.attn.q_norm.weight", ReapArch::Deepseek4, &p),
+            None
+        );
+    }
+
+    #[test]
+    fn ds4_global_head_exact_allowlist_matches() {
+        let p = plan_with(
+            r#"{"original_experts":256,"num_layers":43,
+            "quant_overrides":[{"layer":0,"role":"lm_head",
+            "tensors":["head.weight"],"tier":"mfp4e8soa"}]}"#,
+        );
+        assert_eq!(
+            reap_override_for("head.weight", ReapArch::Deepseek4, &p),
+            Some("mfp4e8soa")
+        );
+        assert_eq!(
+            reap_override_for("embed.weight", ReapArch::Deepseek4, &p),
             None
         );
     }
@@ -618,7 +828,7 @@ mod prune_tests {
 #[cfg(test)]
 mod bake_finalize_tests {
     use super::*;
-    use crate::patch_expert_count_metadata;
+    use crate::hfq::patch_expert_count_metadata;
     use hipfire_reap::gather::gather_rows;
 
     #[test]
@@ -754,16 +964,10 @@ mod bake_finalize_tests {
 #[cfg(test)]
 mod integ {
     use super::*;
-    use crate::{quantize_hfq4g256, write_hfq};
+    use crate::hfq::write_hfq;
+    use crate::quant_fwht::quantize_hfq4g256;
     use hipfire_reap::plan::ReapPlan;
     use hipfire_runtime::hfq::HfqFile;
-    use std::sync::Mutex;
-
-    // `HfqFile::open` READS the process-global `HIPFIRE_REAP_PLAN` env var on
-    // every call. The end-to-end test below sets it before `open`, so it must
-    // serialize against any other test in this module that calls `open` (none
-    // today, but keep the guard to mirror SP3 T2's hipfire-runtime test).
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn plan_layer0_expert0_hfq4(dir: &std::path::Path) -> ReapPlan {
         std::fs::write(
@@ -784,12 +988,6 @@ mod integ {
 
     #[test]
     fn build_overlay_selects_and_byte_matches_then_round_trips() {
-        // This test calls `HfqFile::open`, which reads the process-global
-        // `HIPFIRE_REAP_PLAN`. Serialize against `sp4_overlay_to_sp3_load_end_to_end`
-        // (which sets/removes that env var) so a concurrent set can't leak a stray
-        // overlay into this `open` (was a latent flake before SP4b T2 added tests
-        // that perturbed scheduling).
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let arch = ReapArch::Deepseek4;
         let d = tempfile::tempdir().unwrap();
         let plan = plan_layer0_expert0_hfq4(d.path());
@@ -859,16 +1057,13 @@ mod integ {
         );
     }
 
-    /// SP3 Task 3: full SP4-overlay → SP3-load round trip on REAL HFQ
-    /// containers. Build a base (expert + attention tensors, both Q8F16),
-    /// build an overlay that re-quantizes ONLY the expert tensor to HFQ4G256,
-    /// point `HIPFIRE_REAP_PLAN` at the overlay dir, then `HfqFile::open` the
-    /// base and assert: overlay attached, expert resolves to the overlay's
-    /// HFQ4G256 bytes, attention falls through to base Q8F16.
+    /// Full SP4-overlay → SP3-load round trip on real HFQ containers.
+    /// Build a base (expert + attention tensors, both Q8F16), build an overlay
+    /// that re-quantizes only the expert tensor to HFQ4G256, attach it through
+    /// the runtime's production splice API, and assert overlay-first lookup plus
+    /// base fallback. Runtime separately tests process-policy auto-discovery.
     #[test]
     fn sp4_overlay_to_sp3_load_end_to_end() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
         let exp_name = "layers.0.ffn.experts.0.w1.weight";
         let attn_name = "layers.0.self_attn.q_proj.weight";
         // [2, 256] = 512 f32 (multiple of the 256 group for the HFQ4G256 tier).
@@ -904,9 +1099,13 @@ mod integ {
         // Capture everything we need while the guard is held; remove the env var
         // immediately after `open` (before any assert can unwind) so a failure
         // can't leak the var to a concurrent `open`.
-        std::env::set_var("HIPFIRE_REAP_PLAN", plan_dir.path());
-        let f = HfqFile::open(&base_path).unwrap();
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        // Inject the plan rather than set_var + open: process config is a
+        // start-time OnceLock snapshot, so a set_var here is invisible unless
+        // this test happens to be the first in the process to read config.
+        // That made this an order-dependent failure (reproducible on master
+        // with `cargo test -p hipfire-quantize --bin hipfire-quantize
+        // reap_overlay`).
+        let f = HfqFile::open_with_reap_plan(&base_path, Some(plan_dir.path())).unwrap();
 
         // Overlay auto-attached (arch_id 9 matches; expert name is a base subset).
         assert!(

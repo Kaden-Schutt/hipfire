@@ -64,6 +64,8 @@ __global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
     const float rms = rsqrtf(sdata[0] / (float)HD + eps);
     const float normed = v * weight[tid] * rms;
     out[tid] = normed;
+    // Lagging waves still read sdata[0] as the sum of squares; rsqrtf of the negative value written below returns NaN.
+    __syncthreads();
     sdata[tid] = normed;
     __syncthreads();
 

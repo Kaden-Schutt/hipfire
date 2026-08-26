@@ -11,6 +11,7 @@ mod ffi;
 mod kernarg;
 mod rccl;
 mod rocblas;
+mod rocsolver;
 mod vmm;
 
 pub use error::{
@@ -21,11 +22,16 @@ pub use ffi::launch_counters;
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
-    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
+pub use rocsolver::{
+    RocblasDiagonal, RocblasFill, Rocsolver, RocsolverError, RocsolverResult,
+    ROCSOLVER_STATUS_SUCCESS,
+};
 pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
 
 /// Re-export memory copy direction for callers.

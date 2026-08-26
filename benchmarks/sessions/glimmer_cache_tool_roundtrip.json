@@ -1,0 +1,96 @@
+{
+  "schema": "glimmer-cache-tool-roundtrip-v1",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "weather.get_forecast",
+        "description": "Get weather forecast for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string"
+            },
+            "options": {
+              "type": "object",
+              "properties": {
+                "units": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "required": [
+                "units",
+                "days"
+              ],
+              "additionalProperties": false
+            },
+            "include_alerts": {
+              "type": "boolean"
+            },
+            "fallback": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "location",
+            "options",
+            "include_alerts",
+            "fallback"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "turns": [
+    {
+      "role": "user",
+      "content_file": "benchmarks/prompts/glimmer_cache_gate_seed.txt",
+      "step": "normal",
+      "expect": [
+        "READY"
+      ]
+    },
+    {
+      "role": "user",
+      "content_file": "benchmarks/prompts/glimmer_cache_gate_tool.txt",
+      "step": "tool_call",
+      "expect_tool_call": {
+        "name": "weather.get_forecast",
+        "arguments": {
+          "location": "Paris",
+          "options": {
+            "units": "celsius",
+            "days": [
+              1,
+              2
+            ]
+          },
+          "include_alerts": true,
+          "fallback": null
+        }
+      }
+    },
+    {
+      "role": "tool",
+      "content": "{\"location\":\"Paris\",\"units\":\"celsius\",\"days\":[{\"day\":1,\"high\":18},{\"day\":2,\"high\":20}],\"alerts\":[],\"fallback_used\":null}",
+      "step": "tool_followup",
+      "expect": [
+        "Paris",
+        "18",
+        "20"
+      ]
+    }
+  ],
+  "tool_result_content": "{\"location\":\"Paris\",\"units\":\"celsius\",\"days\":[{\"day\":1,\"high\":18},{\"day\":2,\"high\":20}],\"alerts\":[],\"fallback_used\":null}"
+}

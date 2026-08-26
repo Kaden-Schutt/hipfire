@@ -23,14 +23,26 @@
 // fragment, so each cache byte is converted once per 16 queries instead of
 // once per query as in the scalar kernel.
 //
-// Grid:  [ceil(batch_size / M_TILE), n_heads]
+// Grid:  [ceil(batch_size / M_TILE), n_heads] in legacy (single-slot) mode, or
+//        [n_tiles, n_heads] in multi-slot mode, where n_tiles = tile_slot.len()
+//        from crates/rdna-compute/src/kv_slots.rs::build_tiles(_, M_TILE).
 // Block: 32 threads (one wave32).
 //
 // LDS (head_dim=256): Q 16×256 f16 = 8192 | V^T 256×18 f16 = 9216
 //                     | S 16×18 f16 = 576 | m,l,alpha 16×3 f32 = 192
 //                     ≈ 18.0 KB → 3 workgroups/CU.
+//
+// Multi-slot descriptor plumbing mirrors attention_q8_0_flash_prefill.hip
+// exactly (same ABI, same "positions[] is authoritative, never desc.seq_len"
+// rule, same single-shared-slab-offset constraint: this kernel is Q8_0-only,
+// so K and V share a stride and a slot occupies the same offset in both
+// arenas — only kv_offset_for_k (i.e. desc.k_base) is ever read here,
+// deliberately, to avoid keeping a second runtime-unknown 64-bit base live
+// across the K/V loop (see that file's Task 6 commit for the 23-VGPR/25%-
+// occupancy cost this was found to have).
 
 #include <hip/hip_runtime.h>
+#include "kv_slot_desc.h"
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -62,7 +74,11 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     int n_kv_heads,
     int head_dim,
     int batch_size,
-    float scale_attn
+    float scale_attn,
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ tile_slot,         // [n_tiles] or nullptr = legacy
+    const int* __restrict__ tile_row0,         // [n_tiles] or nullptr = legacy
+    const int* __restrict__ tile_qbase         // [n_tiles] or nullptr = legacy
 ) {
 #if FIXED_HEAD_DIM
     if (head_dim != FIXED_HEAD_DIM) return;
@@ -71,8 +87,24 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     const int h      = blockIdx.y;
     if (h >= n_heads) return;
 
-    const int q_base = q_tile * M_TILE;
+    const int slot = (tile_slot != nullptr) ? tile_slot[q_tile] : 0;
+    // Slot-relative row: ABI-reserved, unread here — positions[] already
+    // carries each row's own absolute causal position, indexed by qbase
+    // like q/out (see kv_slot_desc.h and the scalar kernel's identical
+    // comment).
+    const int row0 = (tile_row0 != nullptr) ? tile_row0[q_tile] : (q_tile * M_TILE);
+    (void)row0;
+    // Global flat row, for indexing q/out/positions. Conflating this with
+    // row0 leaves slot 0 correct and every later slot reading the wrong
+    // query.
+    const int q_base = (tile_qbase != nullptr) ? tile_qbase[q_tile] : (q_tile * M_TILE);
     if (q_base >= batch_size) return;
+
+    // `desc` supplies only the K/V slab BASE ADDRESS — positions[] stays
+    // authoritative for the causal bound below. In legacy mode k_base ==
+    // v_base == 0, so kv_offset_for_k degenerates to the original
+    // `pos * row_stride` addressing and output is bitwise identical.
+    const KvSlotDesc desc = (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
 
     const int lane    = threadIdx.x & 31;
     const int half    = lane & 15;   // 0..15 — row within A / col within C
@@ -104,7 +136,20 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     float*    l_lds   = m_lds + M_TILE;                             // [M_TILE]
     float*    a_lds   = l_lds + M_TILE;                             // [M_TILE]
 
-    const int rows = min(M_TILE, batch_size - q_base);
+    // Rows present in this tile. In legacy (single-slot) mode a tile can only
+    // be ragged if it is the batch's last tile, so `batch_size - q_base`
+    // bounds it correctly. In multi-slot mode a tile can ALSO be ragged
+    // because its OWNING SLOT ends before a full M_TILE rows — build_tiles
+    // never lets a tile span a slot boundary, and slots lay out contiguously
+    // in the flat row space q/out use, so the boundary where this tile's
+    // valid rows end is exactly the NEXT tile's q_base (or batch_size, for
+    // the last tile in the whole launch). See
+    // attention_q8_0_flash_prefill.hip's identical comment.
+    int rows_end = batch_size;
+    if (tile_qbase != nullptr && (q_tile + 1) < (int)gridDim.x) {
+        rows_end = tile_qbase[q_tile + 1];
+    }
+    const int rows = min(M_TILE, rows_end - q_base);
 
     // ── Stage Q tile (f16) ──────────────────────────────────────────────
     for (int i = lane; i < M_TILE * head_dim; i += 32) {
@@ -151,8 +196,12 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         {
             const int my_k = kt + half;
             const bool k_ok = (half < t_len);
+            // ONE shared slab offset (kv_offset_for_k, i.e. desc.k_base) for
+            // both K and V, deliberately — see the file header comment and
+            // attention_q8_0_flash_prefill.hip's identical note. v_base MUST
+            // equal k_base for this kernel's descriptors.
             const unsigned char* kb =
-                k_ok ? (k_cache + (size_t)my_k * row_stride + kv_blk * 34) : nullptr;
+                k_ok ? (k_cache + kv_offset_for_k(desc, my_k, row_stride) + kv_blk * 34) : nullptr;
 
             for (int dc = 0; dc < d_chunks; ++dc) {
                 const int d0 = dc * 16;
@@ -229,7 +278,7 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         const int v_off = 2 + (d_lo & 31);          // byte offset within block
         for (int kr = 0; kr < N_TILE; ++kr) {
             if (kr < t_len) {
-                const unsigned char* vb = v_cache + (size_t)(kt + kr) * row_stride
+                const unsigned char* vb = v_cache + kv_offset_for_k(desc, kt + kr, row_stride)
                                         + kv_blk * 34 + v_blk * 34;
                 const float vs = (float)*((const _Float16*)vb);
                 for (int e = 0; e < dpl; ++e)

@@ -91,51 +91,33 @@ impl Deepseek4MtpDrafter {
     }
 }
 
-impl Deepseek4MtpDrafter {
-    fn mtp_prefill_native(
+impl MtpDrafter for Deepseek4MtpDrafter {
+    fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
+        _prompt_tokens: &[u32],
         fill_tokens: &[u32],
         start_pos: usize,
         cache_hit: bool,
-        abort: &dyn Fn() -> bool,
-    ) -> Result<Option<u32>, String> {
+        _abort: &dyn Fn() -> bool,
+    ) -> Result<u32, String> {
         // Cold start: reset recurrent state (n_tokens → 0, mtp_last_hidden → None).
         // DeepseekV4State::reset() does no GPU work.
         if !cache_hit {
             target.reset_recurrent(gpu)?;
         }
-        let bundle = Self::bundle(target)?;
-        self.mtp_prefill_with_abort(gpu, bundle, fill_tokens, start_pos, cache_hit, abort)
-    }
-}
 
-impl Deepseek4MtpDrafter {
-    fn mtp_prefill_with_abort(
-        &mut self,
-        gpu: &mut Gpu,
-        bundle: &mut Deepseek4Bundle,
-        fill_tokens: &[u32],
-        start_pos: usize,
-        _cache_hit: bool,
-        abort: &dyn Fn() -> bool,
-    ) -> Result<Option<u32>, String> {
-        if abort() {
-            return Ok(None);
-        }
+        let bundle = Self::bundle(target)?;
         let Deepseek4Bundle {
             config,
             weights,
             state,
             ..
         } = bundle;
-        if abort() {
-            return Ok(None);
-        }
 
-        // Lazily build the PBS. Sized identically to the loader's deepseek4_pbs
-        // (carriers.rs:645-649): HIPFIRE_DEEPSEEK4_PP_BATCH, default 1024.
+        // Lazily build the PBS. Sized identically to Deepseek4Bundle.pbs
+        // (carriers.rs deepseek4 load): HIPFIRE_DEEPSEEK4_PP_BATCH, default 1024.
         if self.pbs.is_none() {
             let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
                 .ok()
@@ -146,12 +128,9 @@ impl Deepseek4MtpDrafter {
                     .map_err(|e| format!("Deepseek4MtpDrafter: alloc PrefillBatchScratch: {e}"))?,
             );
         }
-        let pbs = self.pbs.as_ref().expect("just built");
-        if abort() {
-            return Ok(None);
-        }
+        let pbs = self.pbs.as_mut().expect("just built");
 
-        let logits = crate::forward::prefill_with_mtp_fill_abortable(
+        let logits = crate::forward::prefill_with_mtp_fill(
             config,
             weights,
             state,
@@ -159,55 +138,10 @@ impl Deepseek4MtpDrafter {
             pbs,
             fill_tokens,
             start_pos as u32,
-            abort,
         )
         .map_err(|e| format!("mtp prefill: {e}"))?;
-        let Some(logits) = logits else {
-            return Ok(None);
-        };
-        if abort() {
-            return Ok(None);
-        }
 
-        let first_token = logits_argmax(&logits) as u32;
-        if abort() {
-            Ok(None)
-        } else {
-            Ok(Some(first_token))
-        }
-    }
-}
-
-impl MtpDrafter for Deepseek4MtpDrafter {
-    fn mtp_prefill(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        fill_tokens: &[u32],
-        start_pos: usize,
-        cache_hit: bool,
-    ) -> Result<u32, String> {
-        fn never() -> bool {
-            false
-        }
-        self.mtp_prefill_native(gpu, target, fill_tokens, start_pos, cache_hit, &never)
-            .map(|token| token.expect("non-abortable deepseek4 MTP prefill aborted"))
-    }
-
-    fn mtp_prefill_abortable(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        fill_tokens: &[u32],
-        start_pos: usize,
-        cache_hit: bool,
-        abort: Option<&dyn Fn() -> bool>,
-    ) -> Result<Option<u32>, String> {
-        fn never() -> bool {
-            false
-        }
-        let abort = abort.unwrap_or(&never);
-        self.mtp_prefill_native(gpu, target, fill_tokens, start_pos, cache_hit, abort)
+        Ok(logits_argmax(&logits) as u32)
     }
 
     fn mtp_step(
@@ -216,13 +150,14 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        _emitted: &[u32],
         k: usize,
         _eos: u32,
         grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
         let pbs = self
             .pbs
-            .as_ref()
+            .as_mut()
             .ok_or("Deepseek4MtpDrafter: mtp_step called before mtp_prefill")?;
 
         // Per-call k from MtpSpeculator is authoritative (already max_emit-clamped).
@@ -336,7 +271,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
                     .map_err(|e| format!("Deepseek4MtpDrafter forced: alloc PBS: {e}"))?,
             );
         }
-        let pbs = self.pbs.as_ref().expect("just built");
+        let pbs = self.pbs.as_mut().expect("just built");
         crate::forward::prefill_with_mtp_fill(
             config,
             weights,
@@ -385,17 +320,4 @@ pub fn build_deepseek4_mtp_speculator(max_n: usize, ctx_capacity: usize) -> Box<
         max_n,
         ctx_capacity,
     )))
-}
-
-// ── Send-bound assertions ──────────────────────────────────────────────
-#[cfg(test)]
-mod send_assertions {
-    use hipfire_runtime::spec::MtpSpeculator;
-
-    fn _assert_send<T: Send>() {}
-
-    #[test]
-    fn mtp_speculator_deepseek4_is_send() {
-        _assert_send::<MtpSpeculator<super::Deepseek4MtpDrafter>>();
-    }
 }

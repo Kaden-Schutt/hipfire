@@ -59,8 +59,8 @@ use crate::dflash::{draft_forward, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama;
 use crate::spec::{
-    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecScratch, SpecStep,
-    SpecTarget, Speculator,
+    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch,
+    SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -132,18 +132,33 @@ impl GenericDflashConstructionStage {
 #[cfg(feature = "dflash-fault-inject")]
 mod generic_dflash_fault_inject {
     use super::GenericDflashConstructionStage;
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    /// Serializes armings: held for the WHOLE `with_fault` closure so exactly
+    /// one armed sequence is live at a time. The lock is NOT reentrant — a
+    /// nested `with_fault` on the same thread is not supported (deadlock,
+    /// same contract as before poison recovery).
     static LOCK: Mutex<()> = Mutex::new(());
     static STAGE: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATION_TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
     static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+    // True only on the thread that armed the current fault. Boundary checks
+    // run on whatever thread the real constructor executes on, so the armed
+    // stage/count is consumed ONLY by the guard owner's construction — an
+    // unrelated constructor running on another thread must pass without
+    // reading or incrementing the armed sequence.
+    thread_local! {
+        static OWNED: Cell<bool> = Cell::new(false);
+    }
+
     struct Reset;
 
     impl Drop for Reset {
         fn drop(&mut self) {
+            OWNED.with(|owned| owned.set(false));
             STAGE.store(0, Ordering::SeqCst);
             ALLOCATION_TARGET.store(usize::MAX, Ordering::SeqCst);
             ALLOCATION_COUNT.store(0, Ordering::SeqCst);
@@ -151,7 +166,11 @@ mod generic_dflash_fault_inject {
     }
 
     pub(super) fn with_fault<T>(stage: GenericDflashConstructionStage, f: impl FnOnce() -> T) -> T {
-        let _lock = LOCK.lock().expect("generic DFlash fault lock poisoned");
+        // Poison recovery: a panicking closure unwinds while the lock is
+        // still held, so the mutex is marked poisoned. The next arming must
+        // recover the guard (`into_inner`) instead of panicking again — the
+        // documented unwind-reset contract includes subsequent re-arming.
+        let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         STAGE.store(stage.code(), Ordering::SeqCst);
         ALLOCATION_TARGET.store(
             match stage {
@@ -168,11 +187,24 @@ mod generic_dflash_fault_inject {
             Ordering::SeqCst,
         );
         ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+        OWNED.with(|owned| owned.set(true));
+        // `Reset` clears owner + stage + count on return AND on unwind
+        // (success, error, and panic). The lock stays held until the closure
+        // returns, preserving the serialized single-armed-sequence contract.
         let _reset = Reset;
         f()
     }
 
+    fn is_owner() -> bool {
+        OWNED.with(|owned| owned.get())
+    }
+
     pub(super) fn after_stage(stage: GenericDflashConstructionStage) -> Result<(), String> {
+        // Non-owner threads must not observe or consume an armed fault: an
+        // unrelated constructor elsewhere in the process passes untouched.
+        if !is_owner() {
+            return Ok(());
+        }
         if matches!(
             stage,
             GenericDflashConstructionStage::VerifyScratchAllocation(_)
@@ -193,6 +225,11 @@ mod generic_dflash_fault_inject {
     }
 
     pub(super) fn after_allocation(stage: GenericDflashConstructionStage) -> Result<(), String> {
+        // Non-owner threads must pass without reading or incrementing the
+        // armed allocation count.
+        if !is_owner() {
+            return Ok(());
+        }
         if STAGE.load(Ordering::SeqCst) == stage.code()
             && ALLOCATION_COUNT.fetch_add(1, Ordering::SeqCst)
                 == ALLOCATION_TARGET.load(Ordering::SeqCst)
@@ -306,10 +343,14 @@ pub struct GenericDflashSpeculator {
     rng_state: u64,
     /// Per-request temperature from [`Speculator::set_sampling`]. Used only for
     /// the post-prefill first-token draw (`step` receives `temp` as an argument).
-    /// Default 0 → historical greedy argmax. top_p/top_k/cactus are accepted by
-    /// `set_sampling` for API parity with qwen35 but the shipped chain path is
-    /// temperature-only via [`naive_sample_chain`] (same as later verify/bonus).
+    /// Default 0 → historical greedy argmax.
     sample_temp: f32,
+    /// Per-request nucleus/top-k truncation from [`Speculator::set_sampling`].
+    /// Defaults `1.0` / `0` (disabled) so a speculator whose `set_sampling` is
+    /// never called behaves exactly as today — byte-identical draws via the
+    /// `top_k == 0 && top_p >= 0.999` fast path in [`crate::ddtree::naive_sample_chain`].
+    sample_top_p: f32,
+    sample_top_k: usize,
 }
 
 /// Constructor-local owner for generic DFlash resources. GPU buffers have no
@@ -355,8 +396,13 @@ impl GenericDflashStaging {
             ctx_capacity,
             tree,
             rng_state: 0x13579BDF,
-            // Greedy until a request calls `set_sampling`.
+            // Greedy until a request calls `set_sampling`. Truncation defaults
+            // disabled (top_p=1.0, top_k=0) so behaviour is byte-identical
+            // until the caller opts in — matches the `1.0, 0` callers pass in
+            // tests.
             sample_temp: 0.0,
+            sample_top_p: 1.0,
+            sample_top_k: 0,
         })
     }
 }
@@ -413,8 +459,15 @@ impl GenericDflashSpeculator {
             )?;
             debug_assert_eq!(logits.len(), vocab);
             // Empty drafts → single bonus draw at row 0 (distribution-exact).
-            let (accepted, bonus) =
-                naive_sample_chain(&logits, &[], vocab, temp, &mut self.rng_state);
+            let (accepted, bonus) = naive_sample_chain(
+                &logits,
+                &[],
+                vocab,
+                temp,
+                self.sample_top_p,
+                self.sample_top_k,
+                &mut self.rng_state,
+            );
             debug_assert_eq!(
                 accepted, 0,
                 "empty-draft naive_sample_chain accepts nothing"
@@ -780,10 +833,10 @@ impl Speculator for GenericDflashSpeculator {
         }
 
         // Advance the target AND capture its residual hidden into the cumulative
-        // host buffer in one pass. The daemon's central cache-miss lifecycle has
-        // already performed the authoritative total reset. Capture only fires
+        // host buffer in one pass. `reset = !cache_hit` zeroes the target's KV
+        // (and recurrent, for arches that have it) on a miss. Capture only fires
         // when the target's `dflash_extract_layers()` is `Some` (set at build).
-        let adv = target.spec_advance_cold_start(
+        let adv = target.spec_advance(
             gpu,
             fill_tokens,
             start_pos,
@@ -824,6 +877,8 @@ impl Speculator for GenericDflashSpeculator {
                         &[],
                         vocab,
                         self.sample_temp,
+                        self.sample_top_p,
+                        self.sample_top_k,
                         &mut self.rng_state,
                     );
                     debug_assert_eq!(
@@ -989,8 +1044,15 @@ impl Speculator for GenericDflashSpeculator {
             // token per row, accepts the matching draft prefix, and returns the
             // bonus at the divergence position. All emitted tokens are genuine
             // target draws → distribution-exact.
-            let (accepted, bonus) =
-                naive_sample_chain(&logits_per_pos, &drafts, vocab, temp, &mut self.rng_state);
+            let (accepted, bonus) = naive_sample_chain(
+                &logits_per_pos,
+                &drafts,
+                vocab,
+                temp,
+                self.sample_top_p,
+                self.sample_top_k,
+                &mut self.rng_state,
+            );
             // Pre-commit budget: emit = accepted + 1 ≤ max_emit. With b ≤ max_emit
             // this is defensive; if it binds, keep the walk's own boundary draw
             // (drafts[max_accept] — matched, since accepted > max_accept), never argmax.
@@ -1063,27 +1125,6 @@ impl Speculator for GenericDflashSpeculator {
             ne,
             h,
             max_emit,
-        )
-    }
-
-    fn advance_forced(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        tokens: &[u32],
-        position: usize,
-        abort: &dyn Fn() -> bool,
-    ) -> Result<SpecAdvance, String> {
-        // Forced continuations become normal draft context for the following
-        // window, so capture their target-hidden rows rather than advancing only
-        // the target KV/recurrent state.
-        target.spec_advance(
-            gpu,
-            tokens,
-            position,
-            false,
-            abort,
-            Some(&mut self.target_hidden_host),
         )
     }
 
@@ -1199,13 +1240,23 @@ impl Speculator for GenericDflashSpeculator {
         false
     }
 
-    fn set_sampling(&mut self, temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {
-        // Store temp for the post-prefill first-token draw. Re-seed RNG to the
-        // same fixed value qwen35 uses per request so sampled runs are
-        // deterministic given seed; greedy does not consume it. top_p/top_k are
-        // accepted for Speculator API parity — chain verify remains temperature-
-        // only via `naive_sample_chain` (identical to later step/bonus draws).
-        self.sample_temp = temp;
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        // Store temp + truncation policy for the post-prefill first-token draw and
+        // every subsequent chain verify / bonus draw. The chain verify now applies
+        // the same temp -> top-k -> nucleus truncation as the AR sampler
+        // (`sample_host_nucleus`), via `naive_sample_chain`'s `top_p`/`top_k`
+        // arguments. Previously `top_p`/`top_k` were discarded here, so a caller
+        // requesting top_p/top_k with generic DFlash on was silently sampling the
+        // UNTRUNCATED softmax while believing truncation was applied.
+        // Blast radius: generic-DFlash targets loaded via LlamaCarrier (arch ids
+        // 0/1). Qwen35's own `DflashSpeculator` (`hipfire-arch-qwen35`) stores and
+        // plumbs all three correctly and is not affected.
+        // Re-seed RNG to the same fixed value qwen35 uses per request so sampled
+        // runs are deterministic given seed; greedy does not consume it.
+        // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored.
+        self.sample_temp = cfg.temp;
+        self.sample_top_p = cfg.top_p;
+        self.sample_top_k = cfg.top_k;
         self.rng_state = 0x13579BDF;
     }
 
@@ -1529,7 +1580,7 @@ mod tests {
 
         let mut rng = 0xDEAD_BEEF_u64;
         let (accepted, bonus) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, &mut rng);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(accepted, 0, "empty-draft chain accepts nothing");
         assert_eq!(
             bonus, last_argmax,
@@ -1544,7 +1595,7 @@ mod tests {
         assert_eq!(crate::llama::argmax(&tied), 1);
         let mut rng_tie = 1u64;
         let (_, tbonus) =
-            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, &mut rng_tie);
+            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, 1.0, 0, &mut rng_tie);
         assert_eq!(tbonus, 1);
         assert_eq!(rng_tie, 1);
 
@@ -1573,7 +1624,7 @@ mod tests {
 
         let mut rng_a = seed;
         let (acc_a, tok_a) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_a);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_a);
         assert_eq!(acc_a, 0, "first-token empty-draft never accepts drafts");
         assert!(
             (tok_a as usize) < vocab,
@@ -1585,7 +1636,7 @@ mod tests {
         // Same seed → identical draw and identical post-state (deterministic).
         let mut rng_b = seed;
         let (acc_b, tok_b) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_b);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_b);
         assert_eq!(acc_b, 0);
         assert_eq!(tok_b, tok_a);
         assert_eq!(rng_b, rng_a);
@@ -1594,15 +1645,303 @@ mod tests {
         // Later step_one_token / chain verify continue from this rng_state.
         let mut rng_c = rng_a;
         let (_acc_c, _tok_c) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_c);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_c);
         assert_ne!(rng_c, rng_a, "second draw continues the RNG stream");
 
         // temp≈0 branch remains last_argmax / llama::argmax (byte-identical).
         let last_argmax = crate::llama::argmax(&logits);
         assert_eq!(last_argmax, 1);
         let mut rng_g = seed;
-        let (_, gbonus) = crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, &mut rng_g);
+        let (_, gbonus) =
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
         assert_eq!(gbonus, last_argmax);
         assert_eq!(rng_g, seed, "greedy first token must not advance rng");
+    }
+
+    // ── dflash-fault-inject: stage + indexed-allocation contract ──────────
+    //
+    // The seam API restored from the feature branch:
+    // `with_generic_dflash_construction_fault` arms exactly one
+    // `GenericDflashConstructionStage`; `generic_dflash_construction_boundary`
+    // faults only that stage (indexed allocation stages pass through), and
+    // `generic_dflash_allocation_boundary` faults exactly at the armed
+    // zero-based allocation index. The helper owns a global lock + atomics, so
+    // each arming is serialized and self-cleaning: the guard resets on return
+    // AND on unwind. `build_generic_dflash_speculator` checks DraftWeights /
+    // DraftScratch / VerifyScratch right after each staged allocation is
+    // adopted, so a faulted build returns Err with every GPU buffer freed.
+
+    /// Armed fault fails the selected construction stage, passes every other
+    /// stage, and never faults an indexed stage's construction boundary.
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    fn construction_fault_fires_only_for_selected_stage() {
+        // Every non-indexed stage is checked both as the armed stage (faults)
+        // and as a bystander (passes) against a distinct armed stage.
+        let pairs = [
+            (
+                GenericDflashConstructionStage::DraftWeights,
+                GenericDflashConstructionStage::DraftScratch,
+            ),
+            (
+                GenericDflashConstructionStage::DraftScratch,
+                GenericDflashConstructionStage::VerifyScratch,
+            ),
+            (
+                GenericDflashConstructionStage::VerifyScratch,
+                GenericDflashConstructionStage::TargetWeights,
+            ),
+            (
+                GenericDflashConstructionStage::TargetWeights,
+                GenericDflashConstructionStage::TargetKv,
+            ),
+            (
+                GenericDflashConstructionStage::TargetKv,
+                GenericDflashConstructionStage::DraftWeights,
+            ),
+        ];
+        for (selected, other) in pairs {
+            with_generic_dflash_construction_fault(selected, || {
+                let err = generic_dflash_construction_boundary(selected)
+                    .expect_err("selected stage must fault");
+                assert!(
+                    err.contains(selected.label()),
+                    "error {err:?} should name the selected stage"
+                );
+                assert!(
+                    generic_dflash_construction_boundary(other).is_ok(),
+                    "non-selected stage must pass"
+                );
+            });
+        }
+        // Indexed allocation stages are not construction boundaries: arming one
+        // leaves every construction boundary a pass-through.
+        with_generic_dflash_construction_fault(
+            GenericDflashConstructionStage::TargetWeightsAllocation(3),
+            || {
+                assert!(generic_dflash_construction_boundary(
+                    GenericDflashConstructionStage::TargetWeightsAllocation(3)
+                )
+                .is_ok());
+            },
+        );
+    }
+
+    /// Run `calls` allocation boundaries against the armed `stage`; returns
+    /// each call's outcome in order.
+    #[cfg(feature = "dflash-fault-inject")]
+    fn allocation_outcomes(
+        stage: GenericDflashConstructionStage,
+        calls: usize,
+    ) -> Vec<Result<(), String>> {
+        with_generic_dflash_construction_fault(stage, || {
+            (0..calls)
+                .map(|_| generic_dflash_allocation_boundary(stage))
+                .collect()
+        })
+    }
+
+    /// The indexed allocation fault fires exactly at the armed zero-based
+    /// allocation — once — and replays identically (deterministic).
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    fn allocation_fault_fires_exactly_at_requested_zero_based_index() {
+        let indexed_stages = [
+            GenericDflashConstructionStage::VerifyScratchAllocation(2),
+            GenericDflashConstructionStage::TargetWeightsAllocation(2),
+            GenericDflashConstructionStage::TargetKvAllocation(2),
+            GenericDflashConstructionStage::ParoWeightUpload(2),
+            GenericDflashConstructionStage::DsparkAllocation(2),
+            GenericDflashConstructionStage::AwqScaleUpload(2),
+            GenericDflashConstructionStage::F32KvAllocation(2),
+            GenericDflashConstructionStage::QwenAuxAllocation(2),
+        ];
+        for stage in indexed_stages {
+            let outcomes = allocation_outcomes(stage, 4);
+            assert!(outcomes[0].is_ok(), "{} call 0 must pass", stage.label());
+            assert!(outcomes[1].is_ok(), "{} call 1 must pass", stage.label());
+            assert!(outcomes[2].is_err(), "{} call 2 must fault", stage.label());
+            assert!(
+                outcomes[3].is_ok(),
+                "{} call 3 passes after firing",
+                stage.label()
+            );
+            // Deterministic: a fresh arming reproduces the same trace.
+            assert_eq!(outcomes, allocation_outcomes(stage, 4));
+        }
+        // Index 0 faults on the very first allocation call.
+        let outcomes = allocation_outcomes(GenericDflashConstructionStage::ParoWeightUpload(0), 1);
+        assert!(outcomes[0].is_err(), "index 0 must fault on the first call");
+        // The fault error names the stage.
+        let outcomes = allocation_outcomes(GenericDflashConstructionStage::AwqScaleUpload(1), 2);
+        assert!(outcomes[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("AWQ scale upload"));
+    }
+
+    /// An armed allocation fault never fires other stages or other indices,
+    /// and a non-indexed fault never leaks into allocation boundaries.
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    fn allocation_fault_is_isolated_to_armed_stage_and_index() {
+        with_generic_dflash_construction_fault(
+            GenericDflashConstructionStage::ParoWeightUpload(1),
+            || {
+                // Different stage: passes and does not consume the armed count.
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::TargetWeightsAllocation(1)
+                )
+                .is_ok());
+                // Same stage, wrong index: passes (count is now 1).
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::ParoWeightUpload(0)
+                )
+                .is_ok());
+                // Same stage, armed index: fires on its second zero-based call.
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::ParoWeightUpload(1)
+                )
+                .is_err());
+            },
+        );
+        // A stage fault never fires allocation boundaries.
+        with_generic_dflash_construction_fault(
+            GenericDflashConstructionStage::DraftWeights,
+            || {
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::ParoWeightUpload(0)
+                )
+                .is_ok());
+            },
+        );
+    }
+
+    /// The fault guard resets after the closure returns: the same boundary is
+    /// disarmed for the next construction.
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    fn fault_guard_resets_after_closure() {
+        with_generic_dflash_construction_fault(
+            GenericDflashConstructionStage::DraftWeights,
+            || {
+                assert!(generic_dflash_construction_boundary(
+                    GenericDflashConstructionStage::DraftWeights
+                )
+                .is_err());
+            },
+        );
+        assert!(
+            generic_dflash_construction_boundary(GenericDflashConstructionStage::DraftWeights)
+                .is_ok()
+        );
+
+        with_generic_dflash_construction_fault(
+            GenericDflashConstructionStage::AwqScaleUpload(0),
+            || {
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::AwqScaleUpload(0)
+                )
+                .is_err());
+            },
+        );
+        assert!(generic_dflash_allocation_boundary(
+            GenericDflashConstructionStage::AwqScaleUpload(0)
+        )
+        .is_ok());
+    }
+
+    /// The guard is Drop-based: it resets even when the closure unwinds, so a
+    /// panicking construction cannot poison later fault-free runs.
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    fn fault_guard_resets_after_panicking_closure() {
+        let outcome = std::panic::catch_unwind(|| {
+            with_generic_dflash_construction_fault(
+                GenericDflashConstructionStage::TargetKv,
+                || {
+                    // Fire once, then unwind mid-construction.
+                    let _ = generic_dflash_construction_boundary(
+                        GenericDflashConstructionStage::TargetKv,
+                    );
+                    panic!("simulated construction failure inside the fault guard");
+                },
+            );
+        });
+        assert!(outcome.is_err(), "the simulated fault must unwind");
+        // The guard reset on unwind: the boundary is disarmed afterwards.
+        assert!(
+            generic_dflash_construction_boundary(GenericDflashConstructionStage::TargetKv).is_ok()
+        );
+        // POST-PANIC RE-ARM: the unwind poisoned the serialization lock while
+        // it was held. Re-arming must recover the poisoned guard (not panic
+        // again) and fire the same boundary deterministically.
+        with_generic_dflash_construction_fault(GenericDflashConstructionStage::TargetKv, || {
+            assert!(
+                generic_dflash_construction_boundary(GenericDflashConstructionStage::TargetKv)
+                    .is_err(),
+                "re-armed fault must fire after the panicking closure"
+            );
+        });
+        assert!(
+            generic_dflash_construction_boundary(GenericDflashConstructionStage::TargetKv).is_ok()
+        );
+    }
+
+    /// Only the thread that armed the fault may consume it: an unrelated
+    /// constructor running on another thread passes every boundary without
+    /// reading or incrementing the armed sequence, and the owner's armed
+    /// index still fires at its exact zero-based call.
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    fn armed_fault_is_consumed_only_by_the_guard_owner_thread() {
+        use std::sync::mpsc;
+
+        with_generic_dflash_construction_fault(
+            GenericDflashConstructionStage::AwqScaleUpload(1),
+            || {
+                let (tx, rx) = mpsc::channel();
+                let other = std::thread::spawn(move || {
+                    // Same stage code, same armed index: a non-owner thread
+                    // must still pass and must not consume the armed count.
+                    let allocation_outcomes: Vec<bool> = (0..4)
+                        .map(|_| {
+                            generic_dflash_allocation_boundary(
+                                GenericDflashConstructionStage::AwqScaleUpload(0),
+                            )
+                            .is_ok()
+                        })
+                        .collect();
+                    // Construction boundaries are likewise invisible off-thread.
+                    let stage_outcome = generic_dflash_construction_boundary(
+                        GenericDflashConstructionStage::DraftWeights,
+                    )
+                    .is_ok();
+                    tx.send((allocation_outcomes, stage_outcome)).unwrap();
+                });
+                // Owner-thread consumption is unaffected by the concurrent
+                // non-owner calls: call 0 passes, call 1 (the armed index)
+                // fires — exactly once, regardless of interleaving.
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::AwqScaleUpload(0)
+                )
+                .is_ok());
+                assert!(generic_dflash_allocation_boundary(
+                    GenericDflashConstructionStage::AwqScaleUpload(1)
+                )
+                .is_err());
+                let (allocation_outcomes, stage_outcome) = rx.recv().unwrap();
+                other.join().unwrap();
+                assert!(
+                    allocation_outcomes.iter().all(|&ok| ok),
+                    "non-owner thread must pass every allocation boundary without \
+                     consuming the armed count: {allocation_outcomes:?}"
+                );
+                assert!(
+                    stage_outcome,
+                    "non-owner thread must pass construction boundaries untouched"
+                );
+            },
+        );
     }
 }

@@ -128,6 +128,13 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
     // and all three dead tail bodies while retaining the exact base-kernel
     // load and FMA order. The host dispatch enforces K==2048.
     const int groups_per_row = 8;
+#elif defined(HIPFIRE_GLIMMER_QKVG_K6656)
+    // Muse Glimmer AR decode fused Q+K+V+attention_gate path: exact shape is
+    // q=4096, k=256, v=256, attention_gate=4096, K=6656 (26 groups, quads=6,
+    // tail=2). Host enforces those dimensions and owns routing to this
+    // specialization; arithmetic (accumulator ownership, FMA order, tail
+    // placement, reduction tree) stays identical to the generic template.
+    const int groups_per_row = 26;
 #else
     const int groups_per_row = K / 256;
 #endif

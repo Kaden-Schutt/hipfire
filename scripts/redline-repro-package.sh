@@ -185,7 +185,7 @@ cmd_capture() {
 
   rocm-smi --showallinfo > "$stage/gpu.txt" 2>&1 || amd-smi static > "$stage/gpu.txt" 2>&1 || echo unavailable > "$stage/gpu.txt"
 
-  "$PY" - "$stage" "$arch" "$stamp" "target/release/examples/daemon" "$SCHEMA_VERSION" <<'PYCAP'
+  "$PY" - "$stage" "$arch" "$stamp" "target/release/daemon" "$SCHEMA_VERSION" <<'PYCAP'
 import hashlib, json, pathlib, subprocess, sys
 
 stage, arch, stamp, daemon, schema = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
@@ -271,7 +271,7 @@ do_verify() {
   local local_commit; local_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
   "$PY" - "$dir" "$local_arch" "$local_rocm" "$local_hipcc" "$local_codegen" \
-        "$local_commit" "target/release/examples/daemon" \
+        "$local_commit" "target/release/daemon" \
         "${HIPFIRE_KERNEL_CACHE:-.hipfire_kernels}" <<'PYVER'
 import hashlib, json, os, pathlib, sys
 

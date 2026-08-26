@@ -1,5 +1,14 @@
 # HIPFIRE_EMULATE_GPUS Dual-GPU Emulation Implementation Plan
 
+> **SUPERSEDED — historical (2026-08-26 mainline merge).** Implementation plan
+> for the pre-merge `feature/parallel-expansion` behavior. The merged mainline
+> keeps `HIPFIRE_EMULATE_GPUS` as env-only hardware-resolution emulation
+> **without** the `resolve_parallelism` default-to-TP promotion, deleted
+> `HIPFIRE_PP` and the TypeScript/Bun CLI, and routes parallelism through
+> `hipfire_loader::admit_path` with explicit `params.pp` / `params.tp` /
+> `params.ep`. See [`docs/multi-gpu.md`](../../multi-gpu.md) for current
+> semantics; this file is provenance only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a debug env var `HIPFIRE_EMULATE_GPUS=N` that makes hipfire treat the single physical gfx1151 as N logical GPUs (all aliased to device 0), so the multi-GPU paths (TP/EP by default, PP opt-in) run on one card, driven from the CLI.

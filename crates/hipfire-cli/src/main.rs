@@ -23,6 +23,7 @@ use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
+use saddle_core::caps::ReasoningContract;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -42,17 +43,23 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod bench_concurrency;
+mod serve;
 mod setup;
+use crate::serve::complete::next_attempt_id;
+use crate::serve::http::request_id;
+use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
 use setup::setup_command;
 
-const MODEL_SUFFIXES: &[&str] = &[
+pub(crate) const MODEL_SUFFIXES: &[&str] = &[
     ".hf4",
     ".hf6",
     ".hfq",
     ".mq2",
     ".mq2lloyd",
+    ".mq2r",
+    ".mq2rxt",
     ".mq3",
     ".mq3p",
     ".mq4",
@@ -75,14 +82,13 @@ const BUILD_TARGET: &str = env!("HIPFIRE_BUILD_TARGET");
     about = "LLM inference for AMD GPUs",
     long_about = "Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime."
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands {
-    /// Read and edit typed TOML configuration.
+pub(crate) enum Commands {
     Config(ConfigArgs),
     /// Inspect or refresh the signed-model-registry migration surface.
     Registry(RegistryArgs),
@@ -213,6 +219,14 @@ struct SetupArgs {
     source: PathBuf,
     #[arg(long, value_name = "PATH")]
     rocm_root: Option<PathBuf>,
+    /// Explicit device compiler (hipcc/amdclang++) when it lives in a different
+    /// prefix than the runtime. Also set via HIPFIRE_HIPCC.
+    #[arg(long, value_name = "PATH")]
+    hipcc: Option<PathBuf>,
+    /// Disable cross-root compiler fallback; require the compiler under the
+    /// selected root. Also set via HIPFIRE_ROCM_STRICT=1.
+    #[arg(long)]
+    strict_rocm: bool,
     #[arg(long, value_name = "ARCH")]
     gpu_arch: Option<String>,
     /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
@@ -315,7 +329,7 @@ struct ListArgs {
 }
 
 #[derive(Args, Debug)]
-struct PullArgs {
+pub(crate) struct PullArgs {
     model: String,
     /// Replace an existing target after downloading and verifying a new copy.
     #[arg(long)]
@@ -405,8 +419,8 @@ struct ChatArgs {
     no_color: bool,
 }
 
-#[derive(Args, Debug)]
-struct BenchArgs {
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BenchArgs {
     model: String,
     #[arg(long, default_value_t = 5)]
     runs: usize,
@@ -432,6 +446,9 @@ struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
+    /// Generated tokens per standard-bench measurement run.
+    #[arg(long, default_value_t = 128)]
+    max_tokens: usize,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -444,6 +461,26 @@ struct BenchArgs {
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
+    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
+    #[arg(long = "spec")]
+    speculation: Option<String>,
+    /// Let the model think during the benchmark. Off by default: a reasoning
+    /// model cannot close its `<think>` span inside the benchmark's token
+    /// budget, and the daemon fails such a turn closed as a validation error.
+    /// Pair this with `--max-tokens` large enough for the span to close.
+    #[arg(long = "reasoning-on")]
+    reasoning_on: bool,
+    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
+    /// on its single-stream path, unchanged.
+    #[arg(long)]
+    concurrency: Option<String>,
+    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
+    /// daemon baseline), batch (beta continuous batching), or both.
+    #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
+    backend: String,
+    /// Which workload arm to run: stateless, multiturn, or both.
+    #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
+    workload: String,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -511,7 +548,7 @@ struct SidecarArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-struct ServeArgs {
+pub(crate) struct ServeArgs {
     /// Optional model, host, host:port, and/or port in legacy-compatible order.
     #[arg(value_name = "MODEL_HOST_OR_PORT", num_args = 0..=3)]
     positionals: Vec<String>,
@@ -533,16 +570,21 @@ struct ServeArgs {
     /// Idle model-unload timeout in seconds; zero disables eviction.
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
     idle_timeout: Option<u64>,
-    /// Expert-parallel degree.
+    /// Parallel degree (dense TP for admitted carriers, or supported MoE expert parallelism).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
+    /// Accepted range: 1–64, matching the loader/scheduler lane ceiling
+    /// (`hipfire_loader::batch_staging::CONTINUOUS_BATCH_MAX_LANES`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    continuous_batch_size: Option<u64>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
 }
 
 #[derive(Args, Debug, Clone, Copy)]
-struct StopArgs {
+pub(crate) struct StopArgs {
     /// Port to free when --force or --all is used.
     port: Option<u16>,
     /// Reap orphan daemon processes and free the configured port.
@@ -554,7 +596,7 @@ struct StopArgs {
 }
 
 #[derive(Clone, Debug)]
-struct Paths {
+pub(crate) struct Paths {
     root: PathBuf,
     models: PathBuf,
     config: ConfigPaths,
@@ -582,7 +624,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 fn run() -> Result<()> {
     let cli = Cli::parse_from(env::args_os().map(|argument| {
         if argument == "-md" {
@@ -611,16 +652,18 @@ fn run() -> Result<()> {
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
         Some(Commands::Chat(args)) => chat_command(&paths, args),
-        Some(Commands::Serve(args)) => serve_command(&paths, args),
-        Some(Commands::Stop(args)) => stop_command(&paths, args),
+        Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
+        Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
         Some(Commands::Restart(args)) => {
             let port = args.positionals.iter().find_map(|value| {
-                value
-                    .parse::<u16>()
-                    .ok()
-                    .or_else(|| parse_host_port(value).ok().flatten().map(|(_, port)| port))
+                value.parse::<u16>().ok().or_else(|| {
+                    crate::serve::parse_host_port(value)
+                        .ok()
+                        .flatten()
+                        .map(|(_, port)| port)
+                })
             });
-            let _ = stop_command(
+            let _ = crate::serve::stop_command(
                 &paths,
                 StopArgs {
                     port,
@@ -628,7 +671,7 @@ fn run() -> Result<()> {
                     all: false,
                 },
             );
-            serve_command(&paths, args)
+            crate::serve::serve_command(&paths, args)
         }
     }
 }
@@ -1236,7 +1279,7 @@ fn model_config_command(
     }
 }
 
-fn resolved_global(
+pub(crate) fn resolved_global(
     paths: &Paths,
     include_env: bool,
 ) -> Result<(hipfire_config::LoadedConfig, hipfire_config::ResolvedConfig)> {
@@ -1460,7 +1503,7 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
+pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
     let mut candidates = local_model_paths(paths)?;
     if let Ok(catalog) = load_catalog(&paths.config) {
         candidates.extend(
@@ -1503,7 +1546,7 @@ fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalMo
     Ok(models)
 }
 
-fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
+pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(&paths.models) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1539,7 +1582,7 @@ fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(models)
 }
 
-fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
+pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
@@ -1597,7 +1640,7 @@ fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     Ok(())
 }
 
-fn artifact_url(entry: &ModelEntry, file: &str) -> String {
+pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
@@ -1609,7 +1652,7 @@ fn artifact_url(entry: &ModelEntry, file: &str) -> String {
     )
 }
 
-fn download_verified(
+pub(crate) fn download_verified(
     url: &str,
     destination: &Path,
     expected_sha256: Option<&str>,
@@ -1830,8 +1873,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
     let configured_max_tokens = config_u64(&resolved, "generation.max_tokens")?;
     let max_tokens = args.max_tokens.unwrap_or(configured_max_tokens);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     let temperature = request_f64(&resolved, "generation.temperature", args.temp)?;
     let top_p = request_f64(&resolved, "generation.top_p", args.top_p)?;
@@ -1890,9 +1933,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
 
     let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!(
-            "daemon binary not found; build `cargo build --release --features deltanet -p hipfire-runtime --example daemon`"
-        )
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
@@ -1920,7 +1961,17 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         }
     }
     if let Some(window) = args.draft_max {
-        apply_draft_max(&mut params, window, args.speculation.as_deref())?;
+        if !(1..=32).contains(&window) {
+            bail!("--draft-max must be between 1 and 32");
+        }
+        match args.speculation.as_deref().unwrap_or("auto") {
+            "ngram" => params["ngram_k"] = serde_json::json!(window),
+            "mtp" => params["mtp_k"] = serde_json::json!(window),
+            _ => {
+                params["mtp_k"] = serde_json::json!(window);
+                params["ngram_k"] = serde_json::json!(window);
+            }
+        }
     }
     if let Some(value) = args.dspark_conf_threshold {
         params["dspark_conf_threshold"] = serde_json::json!(value);
@@ -1951,9 +2002,15 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut request = serde_json::json!({
         "type": "generate",
         "id": "run",
-        "attempt_id": next_attempt_id(),
         "prompt": prompt,
         "max_tokens": max_tokens,
+        // `Engine::generate` rejects a request without `attempt_id`
+        // (hipfire-client lib.rs:557 -> "generate request missing attempt_id"),
+        // and `hipfire run` never set one, so EVERY `hipfire run` failed with a
+        // daemon protocol error. `run` is a one-shot, non-retrying caller, so a
+        // literal 1 is correct — same as `bench_generate_request` (main.rs:6407).
+        // The retrying serve path threads a real counter instead (main.rs:4234).
+        "attempt_id": 1,
     });
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
@@ -1967,7 +2024,33 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     if let Some(image) = args.image {
         request["image"] = serde_json::Value::String(image.display().to_string());
     }
-    apply_reasoning_request(&resolved, &mut request)?;
+    let contract = loaded
+        .get("reasoning_contract")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ReasoningContract::from_wire_name)
+        .unwrap_or(ReasoningContract::Unsupported);
+    let effort_native = loaded
+        .get("reasoning_effort_native")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let supported_efforts = loaded
+        .get("reasoning_efforts")
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(|string| string.to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let _ = apply_http_reasoning_request(
+        &serde_json::json!({}),
+        &resolved,
+        &mut request,
+        contract,
+        effort_native,
+        &supported_efforts,
+    )?;
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
@@ -2102,8 +2185,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     let max_tokens = args
         .max_tokens
         .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     if let Some(value) = args.temp {
         if !(0.0..=2.0).contains(&value) {
@@ -2126,6 +2209,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_backend: None,
             idle_timeout: None,
             tp: None,
+            continuous_batch_size: None,
             foreground_child: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
@@ -2172,7 +2256,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         }
         print!("assistant> ");
         std::io::stdout().flush()?;
-        let mut assistant = String::new();
+        let mut assistant_reasoning = String::new();
+        let mut assistant_content = String::new();
         let result = stream_openai_chat(
             client_host,
             port,
@@ -2180,8 +2265,13 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             Duration::from_secs(60 * 60),
             |event| {
                 match event {
-                    OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
-                        assistant.push_str(&text);
+                    OpenAiSseEvent::Reasoning { text } => {
+                        assistant_reasoning.push_str(&text);
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                    OpenAiSseEvent::Content { text } => {
+                        assistant_content.push_str(&text);
                         print!("{text}");
                         std::io::stdout().flush()?;
                     }
@@ -2200,3403 +2290,18 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             messages.pop();
             return Err(error.into());
         }
-        messages.push(serde_json::json!({ "role": "assistant", "content": assistant }));
+        let mut assistant_msg =
+            serde_json::json!({ "role": "assistant", "content": assistant_content });
+        if !assistant_reasoning.is_empty() {
+            assistant_msg["reasoning_content"] = serde_json::Value::String(assistant_reasoning);
+        }
+        messages.push(assistant_msg);
     }
     let _ = args.no_color;
     Ok(())
 }
 
-#[derive(Debug)]
-struct ServeMeta {
-    current_model: Option<String>,
-    loading_model: Option<String>,
-    instance_token: String,
-    requests_served: u64,
-    retries_attempted: u64,
-    retries_succeeded: u64,
-    recent_tok_s: Option<f64>,
-    started: Instant,
-    last_activity: Instant,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct ServePidRecord {
-    pid: u32,
-    #[serde(default)]
-    start_time: Option<u64>,
-    #[serde(default)]
-    port: Option<u16>,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(skip)]
-    legacy: bool,
-}
-
-struct ServeRuntime {
-    engine: Engine,
-    paths: Paths,
-    registry: RegistryV1,
-    current_path: Option<PathBuf>,
-    current_max_seq: u64,
-    cache_capable: bool,
-    kv_override: Option<String>,
-    kv_backend_override: Option<String>,
-    tp: Option<u64>,
-}
-
-struct ServeShared {
-    runtime: Mutex<ServeRuntime>,
-    meta: Mutex<ServeMeta>,
-    max_request_bytes: u64,
-    admission: Arc<Admission>,
-    idle_timeout: Duration,
-    retry_enabled: bool,
-    retry_backoff: Duration,
-    /// Test seam: when set, invoked instead of `thread::sleep` during retry backoff.
-    backoff_hook: Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>,
-}
-
-#[derive(Debug)]
-struct Completion {
-    id: String,
-    created: u64,
-    model: String,
-    content: String,
-    reasoning_content: String,
-    preserve_thinking: bool,
-    tool_calls: Vec<ToolCall>,
-    done: serde_json::Value,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ThinkFragment {
-    Content(String),
-    Reasoning(String),
-}
-
-#[derive(Debug, Default)]
-struct ThinkChannelRouter {
-    in_think: bool,
-    pending: String,
-    strip_answer_newlines: bool,
-    semantic_split: bool,
-    semantic_pending: String,
-    semantic_reasoning: Option<bool>,
-}
-
-impl ThinkChannelRouter {
-    fn set_started_in_think(&mut self, started: bool) {
-        self.in_think = started;
-    }
-
-    fn push(&mut self, text: &str) -> Vec<ThinkFragment> {
-        if self.semantic_split {
-            return self.push_semantic(text, false);
-        }
-        self.pending.push_str(text);
-        self.drain(false)
-    }
-
-    fn push_semantic(&mut self, text: &str, reasoning: bool) -> Vec<ThinkFragment> {
-        let mut out = if self.pending.is_empty() {
-            Vec::new()
-        } else {
-            self.drain(true)
-        };
-        self.semantic_split = true;
-        if self.semantic_reasoning != Some(reasoning) {
-            out.extend(self.drain_semantic(true));
-            self.semantic_reasoning = Some(reasoning);
-        }
-        self.semantic_pending.push_str(text);
-        out.extend(self.drain_semantic(false));
-        out
-    }
-
-    fn finish(&mut self) -> Vec<ThinkFragment> {
-        let mut out = self.drain(true);
-        out.extend(self.drain_semantic(true));
-        out
-    }
-
-    fn drain(&mut self, flush: bool) -> Vec<ThinkFragment> {
-        const OPEN: &str = "<think>";
-        const CLOSE: &str = "</think>";
-        let mut out = Vec::new();
-        loop {
-            if let Some((index, marker)) = next_control_marker(&self.pending) {
-                let before = self.pending[..index].to_owned();
-                self.emit(before, &mut out);
-                self.pending.drain(..index + marker.len());
-                match marker {
-                    OPEN => self.in_think = true,
-                    CLOSE => {
-                        self.in_think = false;
-                        self.strip_answer_newlines = true;
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            let held = if flush {
-                0
-            } else {
-                longest_control_prefix_suffix(&self.pending)
-            };
-            let emit_len = self.pending.len().saturating_sub(held);
-            if emit_len > 0 {
-                let text = self.pending[..emit_len].to_owned();
-                self.pending.drain(..emit_len);
-                self.emit(text, &mut out);
-            }
-            break;
-        }
-        out
-    }
-
-    fn drain_semantic(&mut self, flush: bool) -> Vec<ThinkFragment> {
-        let mut out = Vec::new();
-        loop {
-            if let Some((index, marker)) = next_control_marker(&self.semantic_pending) {
-                let before = self.semantic_pending[..index].to_owned();
-                self.emit_semantic(before, &mut out);
-                self.semantic_pending.drain(..index + marker.len());
-                continue;
-            }
-            let held = if flush {
-                0
-            } else {
-                longest_control_prefix_suffix(&self.semantic_pending)
-            };
-            let emit_len = self.semantic_pending.len().saturating_sub(held);
-            if emit_len > 0 {
-                let text = self.semantic_pending[..emit_len].to_owned();
-                self.semantic_pending.drain(..emit_len);
-                self.emit_semantic(text, &mut out);
-            }
-            break;
-        }
-        out
-    }
-
-    fn emit(&mut self, mut text: String, out: &mut Vec<ThinkFragment>) {
-        if !self.in_think && self.strip_answer_newlines {
-            let trimmed = text.trim_start_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                return;
-            }
-            text = trimmed.to_owned();
-            self.strip_answer_newlines = false;
-        }
-        if text.is_empty() {
-            return;
-        }
-        if self.in_think {
-            out.push(ThinkFragment::Reasoning(text));
-        } else {
-            out.push(ThinkFragment::Content(text));
-        }
-    }
-
-    fn emit_semantic(&self, text: String, out: &mut Vec<ThinkFragment>) {
-        if text.is_empty() {
-            return;
-        }
-        if self.semantic_reasoning == Some(true) {
-            out.push(ThinkFragment::Reasoning(text));
-        } else {
-            out.push(ThinkFragment::Content(text));
-        }
-    }
-}
-
-const OUTPUT_CONTROL_MARKERS: &[&str] = &[
-    "<think>",
-    "</think>",
-    "<|im_end|>",
-    "<|endoftext|>",
-    "<|end_of_text|>",
-    "<|eot_id|>",
-];
-
-fn next_control_marker(text: &str) -> Option<(usize, &'static str)> {
-    OUTPUT_CONTROL_MARKERS
-        .iter()
-        .filter_map(|marker| text.find(marker).map(|index| (index, *marker)))
-        .min_by_key(|(index, _)| *index)
-}
-
-fn longest_control_prefix_suffix(text: &str) -> usize {
-    OUTPUT_CONTROL_MARKERS
-        .iter()
-        .map(|marker| {
-            let max = text.len().min(marker.len().saturating_sub(1));
-            (1..=max)
-                .rev()
-                .find(|&len| text.ends_with(&marker[..len]))
-                .unwrap_or(0)
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-#[derive(Debug, Default)]
-struct AdmissionState {
-    busy: bool,
-    queued: usize,
-}
-
-#[derive(Debug)]
-struct Admission {
-    state: Mutex<AdmissionState>,
-    available: Condvar,
-    max_queue: usize,
-    timeout: Duration,
-}
-
-#[derive(Debug)]
-struct AdmissionError {
-    message: String,
-    retry_after_seconds: u64,
-}
-
-impl std::fmt::Display for AdmissionError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for AdmissionError {}
-
-#[derive(Debug)]
-struct AdmissionGuard {
-    admission: Arc<Admission>,
-}
-
-impl Admission {
-    fn new(max_queue: usize, timeout: Duration) -> Self {
-        Self {
-            state: Mutex::new(AdmissionState::default()),
-            available: Condvar::new(),
-            max_queue,
-            timeout,
-        }
-    }
-
-    fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.busy {
-            state.busy = true;
-            return Ok(AdmissionGuard {
-                admission: Arc::clone(self),
-            });
-        }
-        if self.max_queue != 0 && state.queued >= self.max_queue {
-            return Err(AdmissionError {
-                message: format!(
-                    "serve queue full (depth {}/{})",
-                    state.queued, self.max_queue
-                ),
-                retry_after_seconds: self.retry_after_seconds(),
-            });
-        }
-        state.queued = state.queued.saturating_add(1);
-        let started = Instant::now();
-        loop {
-            if self.timeout.is_zero() {
-                state = self
-                    .available
-                    .wait(state)
-                    .unwrap_or_else(|error| error.into_inner());
-            } else {
-                let remaining = self.timeout.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
-                    state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
-                }
-                let (next, wait) = self
-                    .available
-                    .wait_timeout(state, remaining)
-                    .unwrap_or_else(|error| error.into_inner());
-                state = next;
-                if wait.timed_out() && state.busy {
-                    state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
-                }
-            }
-            if !state.busy {
-                state.queued = state.queued.saturating_sub(1);
-                state.busy = true;
-                return Ok(AdmissionGuard {
-                    admission: Arc::clone(self),
-                });
-            }
-        }
-    }
-
-    fn inflight(&self) -> usize {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        usize::from(state.busy) + state.queued
-    }
-
-    fn retry_after_seconds(&self) -> u64 {
-        if self.timeout.is_zero() {
-            1
-        } else {
-            self.timeout.as_secs().max(1)
-        }
-    }
-}
-
-impl Drop for AdmissionGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .admission
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        state.busy = false;
-        self.admission.available.notify_one();
-    }
-}
-
-fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
-    let (_, resolved) = resolved_global(paths, true)?;
-    let default_host = config_string(&resolved, "serve.host")?;
-    let default_port = config_u64(&resolved, "serve.port")? as u16;
-    let (host, port, positional_model) =
-        resolve_serve_positionals(paths, &args.positionals, &default_host, default_port)?;
-    if let Some(positional_model) = positional_model {
-        if args
-            .model
-            .as_ref()
-            .is_some_and(|model| model != &positional_model)
-        {
-            bail!("serve model specified more than once");
-        }
-        args.model = Some(positional_model);
-    }
-    if args.detach && !args.foreground_child {
-        return detach_serve(paths, &args, &host, port);
-    }
-    serve_foreground(paths, &args, &host, port, resolved)
-}
-
-fn resolve_serve_positionals(
-    paths: &Paths,
-    values: &[String],
-    default_host: &str,
-    default_port: u16,
-) -> Result<(String, u16, Option<String>)> {
-    let registry = load_registry(&paths.registry).registry;
-    let mut host = None;
-    let mut port = None;
-    let mut model = None;
-    for value in values {
-        if let Ok(value_port) = value.parse::<u16>() {
-            if port.replace(value_port).is_some() {
-                bail!("serve port specified more than once");
-            }
-            continue;
-        }
-        if let Some((value_host, value_port)) = parse_host_port(value)? {
-            if host.replace(value_host).is_some() || port.replace(value_port).is_some() {
-                bail!("serve bind specified more than once");
-            }
-            continue;
-        }
-        let is_model =
-            registry.model(value).is_some() || find_model_path(paths, &registry, value).is_some();
-        if is_model && model.is_none() {
-            model = Some(value.clone());
-        } else if host.replace(value.clone()).is_some() {
-            bail!("serve host specified more than once");
-        }
-    }
-    Ok((
-        host.unwrap_or_else(|| default_host.to_owned()),
-        port.unwrap_or(default_port),
-        model,
-    ))
-}
-
-fn parse_host_port(value: &str) -> Result<Option<(String, u16)>> {
-    if let Some(stripped) = value.strip_prefix('[') {
-        if let Some((host, port)) = stripped.split_once("]:") {
-            return Ok(Some((
-                host.to_owned(),
-                port.parse().context("invalid serve port")?,
-            )));
-        }
-    }
-    if value.matches(':').count() == 1 {
-        if let Some((host, port)) = value.rsplit_once(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                return Ok(Some((host.to_owned(), port)));
-            }
-        }
-    }
-    Ok(None)
-}
-
-#[cfg(test)]
-fn parse_bind(
-    address: Option<&str>,
-    port: Option<u16>,
-    default_host: &str,
-    default_port: u16,
-) -> Result<(String, u16)> {
-    let Some(address) = address else {
-        return Ok((default_host.to_owned(), port.unwrap_or(default_port)));
-    };
-    if let Ok(port_only) = address.parse::<u16>() {
-        return Ok((default_host.to_owned(), port_only));
-    }
-    if let Some(stripped) = address.strip_prefix('[') {
-        if let Some((host, port_text)) = stripped.split_once("]:") {
-            return Ok((
-                host.to_owned(),
-                port_text.parse().context("invalid serve port")?,
-            ));
-        }
-    }
-    if address.matches(':').count() == 1 {
-        if let Some((host, port_text)) = address.rsplit_once(':') {
-            if let Ok(parsed) = port_text.parse::<u16>() {
-                return Ok((host.to_owned(), parsed));
-            }
-        }
-    }
-    Ok((address.to_owned(), port.unwrap_or(default_port)))
-}
-
-fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Result<()> {
-    fs::create_dir_all(&paths.root)?;
-    let log_path = paths.root.join("serve.log");
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open {}", log_path.display()))?;
-    let executable = env::current_exe().context("failed to resolve native hipfire binary")?;
-    let mut command = Command::new(executable);
-    command
-        .arg("serve")
-        .arg(host)
-        .arg(port.to_string())
-        .arg("--foreground-child")
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    if args.no_prewarm {
-        command.arg("--no-prewarm");
-    }
-    if let Some(model) = &args.model {
-        command.arg("--model").arg(model);
-    }
-    if let Some(mode) = &args.kv_mode {
-        command.arg("--kv-mode").arg(mode);
-    }
-    if let Some(backend) = &args.kv_backend {
-        command.arg("--kv-backend").arg(backend);
-    }
-    if let Some(seconds) = args.idle_timeout {
-        command.arg("--idle-timeout").arg(seconds.to_string());
-    }
-    if let Some(tp) = args.tp {
-        command.arg("--tp").arg(tp.to_string());
-    }
-    let mut child = command.spawn().context("failed to detach native serve")?;
-    let probe_host = match host {
-        "0.0.0.0" => "127.0.0.1",
-        "::" => "::1",
-        other => other,
-    };
-    for _ in 0..600 {
-        if let Some(status) = child.try_wait()? {
-            bail!(
-                "native serve exited before readiness ({status}); see {}",
-                log_path.display()
-            );
-        }
-        if health_ready(probe_host, port) {
-            println!(
-                "hipfire serve running at http://{}:{} (PID {}, log {})",
-                host,
-                port,
-                child.id(),
-                log_path.display()
-            );
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    bail!(
-        "native serve did not become ready within 60s; PID {}, see {}",
-        child.id(),
-        log_path.display()
-    )
-}
-
-fn health_ready(host: &str, port: u16) -> bool {
-    let url = if host.contains(':') {
-        format!("http://[{host}]:{port}/health")
-    } else {
-        format!("http://{host}:{port}/health")
-    };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(100)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    agent
-        .get(&url)
-        .call()
-        .is_ok_and(|response| response.status().is_success())
-}
-
-fn serve_foreground(
-    paths: &Paths,
-    args: &ServeArgs,
-    host: &str,
-    port: u16,
-    global: hipfire_config::ResolvedConfig,
-) -> Result<()> {
-    let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
-    let registry = load_registry(&paths.registry).registry;
-    let process_config = hipfire_config::ProcessConfig::from_resolved(&global)?;
-    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
-    engine.ping()?;
-    let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
-    let max_queue = config_u64(&global, "serve.max_queue")? as usize;
-    let queue_timeout = Duration::from_millis(config_u64(&global, "serve.queue_timeout_ms")?);
-    let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
-    let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
-    let idle_timeout = Duration::from_secs(
-        args.idle_timeout
-            .unwrap_or(config_u64(&global, "serve.idle_timeout_seconds")?),
-    );
-    let default_model = args
-        .model
-        .clone()
-        .unwrap_or(config_string(&global, "serve.default_model")?);
-    let instance_token = serve_instance_token();
-    let shared = Arc::new(ServeShared {
-        runtime: Mutex::new(ServeRuntime {
-            engine,
-            paths: paths.clone(),
-            registry: registry.clone(),
-            current_path: None,
-            current_max_seq: 0,
-            cache_capable: false,
-            kv_override: args.kv_mode.clone(),
-            kv_backend_override: args.kv_backend.clone(),
-            tp: args.tp,
-        }),
-        meta: Mutex::new(ServeMeta {
-            current_model: None,
-            loading_model: None,
-            instance_token: instance_token.clone(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
-            last_activity: Instant::now(),
-        }),
-        max_request_bytes,
-        admission: Arc::new(Admission::new(max_queue, queue_timeout)),
-        idle_timeout,
-        retry_enabled,
-        retry_backoff,
-        backoff_hook: Mutex::new(None),
-    });
-
-    let bind = format_bind(host, port);
-    let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
-    fs::create_dir_all(&paths.root)?;
-    let pid_path = paths.root.join("serve.pid");
-    let pid_record = ServePidRecord {
-        pid: std::process::id(),
-        start_time: proc_start_time(std::process::id()),
-        port: Some(port),
-        token: Some(instance_token),
-        legacy: false,
-    };
-    fs::write(
-        &pid_path,
-        format!("{}\n", serde_json::to_string(&pid_record)?),
-    )?;
-    let cleanup = pid_path.clone();
-    ctrlc::set_handler(move || {
-        let _ = fs::remove_file(&cleanup);
-        std::process::exit(0);
-    })
-    .context("failed to install serve signal handler")?;
-    eprintln!("[hipfire] native serve listening on http://{bind}");
-    if !args.no_prewarm {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .loading_model = Some(default_model.clone());
-            let result = shared
-                .runtime
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .ensure_model(&default_model, &shared.meta, None);
-            shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .loading_model = None;
-            match result {
-                Ok(_) => eprintln!("[hipfire] pre-warmed {default_model}"),
-                Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
-            }
-        });
-    }
-    if !shared.idle_timeout.is_zero() {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(1));
-            if shared.admission.inflight() != 0 {
-                continue;
-            }
-            let expired = {
-                let meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model.is_some() && meta.last_activity.elapsed() >= shared.idle_timeout
-            };
-            if !expired {
-                continue;
-            }
-            let unloaded = {
-                let mut runtime = shared
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if runtime.current_path.is_some() {
-                    let result = runtime.engine.unload();
-                    if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
-                    }
-                    result
-                } else {
-                    Ok(())
-                }
-            };
-            if unloaded.is_ok() {
-                let mut meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model = None;
-                meta.loading_model = None;
-                meta.last_activity = Instant::now();
-                eprintln!("[hipfire] unloaded idle model");
-            }
-        });
-    }
-    for request in server.incoming_requests() {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            if let Err(error) = handle_http(request, shared) {
-                eprintln!("[hipfire] HTTP request failed: {error:#}");
-            }
-        });
-    }
-    let _ = fs::remove_file(pid_path);
-    Ok(())
-}
-
-fn format_bind(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
-    let path = request
-        .url()
-        .split('?')
-        .next()
-        .unwrap_or(request.url())
-        .to_owned();
-    match (request.method(), path.as_str()) {
-        (&Method::Get, "/health") => {
-            let meta = shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            request.respond(json_response(
-                serde_json::json!({
-                    "status": "ok",
-                    "model": meta.current_model,
-                    "loading_model": meta.loading_model,
-                    "pid": std::process::id(),
-                    "token": meta.instance_token,
-                    "native": true,
-                }),
-                200,
-            ))?;
-        }
-        (&Method::Get, "/stats") => {
-            let meta = shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            request.respond(json_response(
-                serde_json::json!({
-                    "model": meta.current_model,
-                    "uptime_sec": meta.started.elapsed().as_secs(),
-                    "queue_depth": shared.admission.inflight(),
-                    "requests_served": meta.requests_served,
-                    "retries_attempted": meta.retries_attempted,
-                    "retries_succeeded": meta.retries_succeeded,
-                    "recent_tok_s": meta.recent_tok_s,
-                }),
-                200,
-            ))?;
-        }
-        (&Method::Get, "/v1/models") => {
-            let runtime = shared
-                .runtime
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let local = list_local_models(&runtime.paths, &runtime.registry)?;
-            request.respond(json_response(
-                serde_json::json!({
-                    "object": "list",
-                    "data": local.into_iter().map(|model| serde_json::json!({
-                        "id": model.registry_tag.unwrap_or(model.name),
-                        "object": "model",
-                        "owned_by": "hipfire",
-                    })).collect::<Vec<_>>()
-                }),
-                200,
-            ))?;
-        }
-        (&Method::Options, _) => {
-            request.respond(
-                Response::empty(204)
-                    .with_header(header("Access-Control-Allow-Origin", "*"))
-                    .with_header(header(
-                        "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization",
-                    ))
-                    .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")),
-            )?;
-        }
-        (&Method::Post, "/v1/chat/completions") => {
-            let body = match read_request_json(&mut request, shared.max_request_bytes) {
-                Ok(body) => body,
-                Err(error) => {
-                    let message = error.to_string();
-                    let status = if message.contains("exceeds") {
-                        413
-                    } else {
-                        400
-                    };
-                    request.respond(openai_error(&message, status))?;
-                    return Ok(());
-                }
-            };
-            let guard = match shared.admission.acquire() {
-                Ok(guard) => guard,
-                Err(error) => {
-                    request.respond(admission_error_response(&error))?;
-                    return Ok(());
-                }
-            };
-            // Tools require a lossless endpoint adapter before any generation.
-            if let Err(error) = gate_chat_completions_tools(&body) {
-                request.respond(openai_error(&error.to_string(), 400))?;
-                return Ok(());
-            }
-            if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
-                respond_streaming(request, shared, body, guard)?;
-            } else {
-                respond_nonstreaming(request, shared, body, guard)?;
-            }
-        }
-        _ => request.respond(openai_error("not found", 404))?,
-    }
-    Ok(())
-}
-
-fn request_error_status(message: &str) -> u16 {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("model not found") {
-        404
-    } else if lower.contains("kv budget")
-        || lower.contains("max_tokens")
-        || lower.contains("invalid")
-        || lower.contains("required")
-        || lower.contains("endpoint adapter")
-        || lower.contains("lossy")
-        || lower.contains("malformed canonical tool call")
-    {
-        400
-    } else {
-        500
-    }
-}
-
-fn read_request_json(request: &mut Request, max_bytes: u64) -> Result<serde_json::Value> {
-    if request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Content-Length"))
-        .and_then(|header| header.value.as_str().parse::<u64>().ok())
-        .is_some_and(|length| length > max_bytes)
-    {
-        bail!("request body exceeds {max_bytes} bytes");
-    }
-    let mut bytes = Vec::new();
-    request
-        .as_reader()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        bail!("request body exceeds {max_bytes} bytes");
-    }
-    serde_json::from_slice(&bytes).context("request body is not valid JSON")
-}
-
-fn respond_streaming(
-    request: Request,
-    shared: Arc<ServeShared>,
-    body: serde_json::Value,
-    guard: AdmissionGuard,
-) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-    thread::spawn(move || {
-        let id = request_id();
-        let created = unix_timestamp();
-        let include_usage = body
-            .pointer("/stream_options/include_usage")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let model = body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
-        let first = serde_json::json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-        });
-        let _ = sender.send(ResponseChunk::plain(sse_data(&first)));
-        let result = complete_request(
-            &shared,
-            &body,
-            guard,
-            Some((id.clone(), created)),
-            |event| forward_sse_stream_event(&sender, &id, created, &model, event),
-            |completion| {
-                // Full terminal representation before Engine can commit.
-                deliver_sse_terminal_ack(&sender, completion, include_usage)
-            },
-        );
-        finish_sse_stream(sender, result);
-    });
-    request.respond(Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "text/event-stream"),
-            header("Cache-Control", "no-cache"),
-            header("Connection", "keep-alive"),
-            header("Access-Control-Allow-Origin", "*"),
-        ],
-        ChannelReader::new(receiver),
-        None,
-        None,
-    ))?;
-    Ok(())
-}
-
-/// Non-stream OpenAI completion: stage the full JSON body before commit, then
-/// wait for worker commit+done before EOF. Pre-terminal failures keep error status.
-fn respond_nonstreaming(
-    request: Request,
-    shared: Arc<ServeShared>,
-    body: serde_json::Value,
-    guard: AdmissionGuard,
-) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-    let (status_tx, status_rx) = mpsc::channel::<Result<(), String>>();
-    thread::spawn(move || {
-        let result = complete_request(
-            &shared,
-            &body,
-            guard,
-            None,
-            |_event| Ok(()),
-            |completion| {
-                let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
-                    hipfire_client::ClientError::Protocol(format!(
-                        "completion json serialize failed: {err}"
-                    ))
-                })?;
-                if bytes.is_empty() {
-                    return Err(hipfire_client::ClientError::Protocol(
-                        "nonstream terminal body must be non-empty".into(),
-                    ));
-                }
-                let (ack_tx, ack_rx) = mpsc::channel();
-                sender
-                    .send(ResponseChunk {
-                        bytes,
-                        ack: Some(ack_tx),
-                        fail: false,
-                    })
-                    .map_err(|_| hipfire_client::ClientError::Cancelled)?;
-                // Signal handler that terminal bytes are staged (success headers).
-                let _ = status_tx.send(Ok(()));
-                match ack_rx.recv() {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-                }
-            },
-        );
-        match result {
-            Ok(_completion) => {
-                // Terminal already delivered+acked; close body with no post-commit bytes.
-                drop(sender);
-            }
-            Err(error) => {
-                let cancelled = error
-                    .downcast_ref::<hipfire_client::ClientError>()
-                    .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-                if cancelled {
-                    // Drop without framing — unclean only if bytes already went out.
-                    drop(sender);
-                    return;
-                }
-                // If terminal was never staged, report error status to the handler.
-                let message = error.to_string();
-                if status_tx.send(Err(message)).is_err() {
-                    // Handler already started success body — force unclean close.
-                    drop(sender);
-                }
-            }
-        }
-    });
-
-    match status_rx.recv() {
-        Ok(Ok(())) => {
-            // Terminal body staged — success headers, reader owns JSON + waits for EOF.
-            request.respond(Response::new(
-                StatusCode(200),
-                vec![
-                    header("Content-Type", "application/json"),
-                    header("Access-Control-Allow-Origin", "*"),
-                ],
-                ChannelReader::new(receiver),
-                None,
-                None,
-            ))?;
-        }
-        Ok(Err(message)) => {
-            request.respond(openai_error(&message, request_error_status(&message)))?;
-        }
-        Err(_) => {
-            // Worker died before status — treat as internal failure.
-            request.respond(openai_error("generation worker disconnected", 500))?;
-        }
-    }
-    Ok(())
-}
-
-/// Convert a daemon v2 structured tool-call JSON object into canonical [`ToolCall`].
-fn tool_call_from_canonical_value(value: &serde_json::Value) -> Result<ToolCall, String> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| "tool call must be a JSON object".to_owned())?;
-    let name = obj
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| "tool call missing non-empty name".to_owned())?
-        .to_owned();
-    let arguments = obj
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Ok(ToolCall { name, arguments })
-}
-
-/// Convert a retained legacy completion-boundary tool-call JSON value into
-/// canonical [`ToolCall`] without marker parsing.
-fn tool_call_from_legacy_value(value: &serde_json::Value) -> Result<ToolCall, String> {
-    // Legacy wire already used `{name, arguments}` objects (same shape as v2).
-    // Keep an explicit boundary so legacy retention never reintroduces text scans.
-    tool_call_from_canonical_value(value)
-}
-
-/// Endpoint adapter kinds known to the serve HTTP surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndpointAdapterKind {
-    OpenAiChatCompletions,
-}
-
-/// Capability status of an endpoint adapter for non-empty tools requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndpointAdapterStatus {
-    /// Adapter is present and preserves canonical tool-call semantics losslessly.
-    AvailableLossless,
-    /// No adapter is registered for this endpoint.
-    Unavailable,
-    /// Adapter exists but would drop or rewrite tool-call semantics.
-    Lossy,
-}
-
-/// Pre-generation denial when tools are requested without a safe adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EndpointAdapterError {
-    Unavailable { endpoint: &'static str },
-    Lossy { endpoint: &'static str },
-}
-
-impl std::fmt::Display for EndpointAdapterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unavailable { endpoint } => {
-                write!(f, "endpoint adapter unavailable for tools on {endpoint}")
-            }
-            Self::Lossy { endpoint } => {
-                write!(f, "endpoint adapter lossy for tools on {endpoint}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EndpointAdapterError {}
-
-/// Typed registry of HTTP endpoint adapters and their tool-call capability.
-struct EndpointAdapterRegistry;
-
-impl EndpointAdapterRegistry {
-    fn status(kind: EndpointAdapterKind) -> EndpointAdapterStatus {
-        match kind {
-            // OpenAI chat completions lowering is present and lossless for ToolCall.
-            EndpointAdapterKind::OpenAiChatCompletions => EndpointAdapterStatus::AvailableLossless,
-        }
-    }
-}
-
-fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdapterStatus {
-    EndpointAdapterRegistry::status(kind)
-}
-
-/// Gate `/v1/chat/completions` when the request carries a non-empty `tools` array.
-/// Tool-free requests are unchanged. Adapter availability never overrides producer safety.
-fn gate_chat_completions_tools(body: &serde_json::Value) -> Result<(), EndpointAdapterError> {
-    let has_tools = body
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|tools| !tools.is_empty());
-    if !has_tools {
-        return Ok(());
-    }
-    match endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions) {
-        EndpointAdapterStatus::AvailableLossless => Ok(()),
-        EndpointAdapterStatus::Unavailable => Err(EndpointAdapterError::Unavailable {
-            endpoint: "/v1/chat/completions",
-        }),
-        EndpointAdapterStatus::Lossy => Err(EndpointAdapterError::Lossy {
-            endpoint: "/v1/chat/completions",
-        }),
-    }
-}
-
-/// Errors from request+attempt correlated semantic event folding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SemanticFoldError {
-    /// Fold was used before `begin_attempt` established required ids.
-    NoActiveAttempt,
-    /// Event carried a different attempt id than the fold's active attempt.
-    StaleAttempt { current: u64, got: u64 },
-    /// Active attempt requires attempt_id on every subsequent event.
-    MissingAttemptId { current: u64 },
-    /// attempt_id was present but not a JSON number (u64 / non-neg i64).
-    MalformedAttemptId { current: u64 },
-    /// Event carried a different request id than the fold's active request.
-    StaleRequestId { current: String, got: String },
-    /// Active request requires nonempty string `id` on every subsequent event.
-    MissingRequestId { current: String },
-    /// `id` was present but empty or not a string.
-    MalformedRequestId { current: String },
-    /// Canonical tool-call payload failed structured conversion.
-    MalformedToolCall { detail: String },
-}
-
-impl std::fmt::Display for SemanticFoldError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoActiveAttempt => {
-                write!(f, "semantic fold requires begin_attempt before events")
-            }
-            Self::StaleAttempt { current, got } => {
-                write!(f, "stale attempt event: current={current} got={got}")
-            }
-            Self::MissingAttemptId { current } => {
-                write!(f, "missing attempt_id on event for attempt {current}")
-            }
-            Self::MalformedAttemptId { current } => {
-                write!(f, "malformed attempt_id on event for attempt {current}")
-            }
-            Self::StaleRequestId { current, got } => {
-                write!(f, "stale request id: current={current} got={got}")
-            }
-            Self::MissingRequestId { current } => {
-                write!(f, "missing request id on event for request {current}")
-            }
-            Self::MalformedRequestId { current } => {
-                write!(f, "malformed request id on event for request {current}")
-            }
-            Self::MalformedToolCall { detail } => {
-                write!(f, "malformed canonical tool call: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SemanticFoldError {}
-
-/// Attempt-local pure fold over daemon **contract v2** semantic JSON events.
-///
-/// Accumulates clean content/reasoning verbatim (no marker scanning), buffers
-/// structured tool calls until a tool-safe done, preserves the daemon
-/// finish_reason, and rejects stale/missing/malformed attempt correlation from
-/// the first event. Never invokes [`ThinkChannelRouter`].
-///
-/// Activate only when `gen_start.contract_version == 2`. Legacy (non-v2)
-/// MiniMax/Cohere raw-think streams stay on the explicit ThinkChannelRouter
-/// path outside this type.
-#[derive(Debug, Default)]
-struct SemanticEventFold {
-    content: String,
-    reasoning_content: String,
-    buffered_tool_calls: Vec<ToolCall>,
-    current_request_id: Option<String>,
-    current_attempt_id: Option<u64>,
-    done: Option<serde_json::Value>,
-}
-
-impl SemanticEventFold {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Start (or restart) a correlated request+attempt, clearing attempt-local state.
-    /// Must be called with the allocated wire ids before the first event.
-    fn begin_attempt(&mut self, request_id: impl Into<String>, attempt_id: u64) {
-        self.current_request_id = Some(request_id.into());
-        self.current_attempt_id = Some(attempt_id);
-        self.content.clear();
-        self.reasoning_content.clear();
-        self.buffered_tool_calls.clear();
-        self.done = None;
-    }
-
-    fn current_request_id(&self) -> Option<&str> {
-        self.current_request_id.as_deref()
-    }
-
-    fn current_attempt_id(&self) -> Option<u64> {
-        self.current_attempt_id
-    }
-
-    fn content(&self) -> &str {
-        &self.content
-    }
-
-    fn reasoning_content(&self) -> &str {
-        &self.reasoning_content
-    }
-
-    fn buffered_tool_calls(&self) -> &[ToolCall] {
-        &self.buffered_tool_calls
-    }
-
-    fn done(&self) -> Option<&serde_json::Value> {
-        self.done.as_ref()
-    }
-
-    /// Executable calls after a tool-safe terminal; empty otherwise.
-    /// Prefer canonical `calls` embedded on the staged/final done payload
-    /// (authoritative). Fall back to mid-stream buffered events only when the
-    /// terminal omits `calls` (legacy producers).
-    fn executable_tool_calls(&self) -> &[ToolCall] {
-        match self
-            .done
-            .as_ref()
-            .and_then(|done| done.get("finish_reason"))
-            .and_then(serde_json::Value::as_str)
-        {
-            // Only the daemon's tool_calls terminal may release calls.
-            Some("tool_calls") => &self.buffered_tool_calls,
-            _ => &[],
-        }
-    }
-
-    /// Parse canonical `calls` from a staged/final done envelope.
-    /// When `finish_reason=tool_calls`, missing/non-array/malformed fails closed.
-    /// Other finish reasons ignore `calls` (leave buffer untouched for withhold).
-    fn absorb_terminal_calls(&mut self, done: &serde_json::Value) -> Result<(), SemanticFoldError> {
-        let finish = done
-            .get("finish_reason")
-            .and_then(serde_json::Value::as_str);
-        if finish != Some("tool_calls") {
-            return Ok(());
-        }
-        let Some(calls_val) = done.get("calls") else {
-            return Err(SemanticFoldError::MalformedToolCall {
-                detail: "tool_calls terminal requires `calls` array on staged done".to_owned(),
-            });
-        };
-        let Some(calls) = calls_val.as_array() else {
-            return Err(SemanticFoldError::MalformedToolCall {
-                detail: "tool_calls terminal `calls` must be a JSON array".to_owned(),
-            });
-        };
-        // Authoritative staged payload — replace any previously buffered calls
-        // so we never duplicate mid-stream + terminal arrays.
-        let mut parsed = Vec::with_capacity(calls.len());
-        for call in calls {
-            let tc = tool_call_from_canonical_value(call)
-                .map_err(|detail| SemanticFoldError::MalformedToolCall { detail })?;
-            parsed.push(tc);
-        }
-        self.buffered_tool_calls = parsed;
-        Ok(())
-    }
-
-    /// Parse attempt_id: JSON numbers only (u64 or non-neg i64). Distinguishes
-    /// missing vs malformed (string / null / negative / object).
-    fn parse_event_attempt_id(event: &serde_json::Value) -> Result<Option<u64>, SemanticFoldError> {
-        match event.get("attempt_id") {
-            None => Ok(None),
-            Some(value) => {
-                if let Some(n) = value.as_u64() {
-                    return Ok(Some(n));
-                }
-                if let Some(n) = value.as_i64() {
-                    if n >= 0 {
-                        return Ok(Some(n as u64));
-                    }
-                }
-                // Present but not a usable number — caller maps to Malformed.
-                Err(SemanticFoldError::MalformedAttemptId {
-                    current: 0, // placeholder; check_correlation overwrites with active id
-                })
-            }
-        }
-    }
-
-    /// Parse request `id`: nonempty JSON string only. Distinguishes missing vs
-    /// malformed (empty string / non-string).
-    fn parse_event_request_id(
-        event: &serde_json::Value,
-    ) -> Result<Option<String>, SemanticFoldError> {
-        match event.get("id") {
-            None => Ok(None),
-            Some(value) => match value.as_str() {
-                Some(s) if !s.is_empty() => Ok(Some(s.to_owned())),
-                Some(_) | None => Err(SemanticFoldError::MalformedRequestId {
-                    current: String::new(),
-                }),
-            },
-        }
-    }
-
-    fn check_correlation(&self, event: &serde_json::Value) -> Result<(), SemanticFoldError> {
-        let current_attempt = self
-            .current_attempt_id
-            .ok_or(SemanticFoldError::NoActiveAttempt)?;
-        let current_request = self
-            .current_request_id
-            .as_deref()
-            .ok_or(SemanticFoldError::NoActiveAttempt)?;
-
-        match Self::parse_event_request_id(event) {
-            Ok(None) => {
-                return Err(SemanticFoldError::MissingRequestId {
-                    current: current_request.to_owned(),
-                });
-            }
-            Ok(Some(got)) if got != current_request => {
-                return Err(SemanticFoldError::StaleRequestId {
-                    current: current_request.to_owned(),
-                    got,
-                });
-            }
-            Ok(Some(_)) => {}
-            Err(SemanticFoldError::MalformedRequestId { .. }) => {
-                return Err(SemanticFoldError::MalformedRequestId {
-                    current: current_request.to_owned(),
-                });
-            }
-            Err(other) => return Err(other),
-        }
-
-        match Self::parse_event_attempt_id(event) {
-            Ok(None) => Err(SemanticFoldError::MissingAttemptId {
-                current: current_attempt,
-            }),
-            Ok(Some(got)) if got != current_attempt => Err(SemanticFoldError::StaleAttempt {
-                current: current_attempt,
-                got,
-            }),
-            Ok(Some(_)) => Ok(()),
-            Err(SemanticFoldError::MalformedAttemptId { .. }) => {
-                Err(SemanticFoldError::MalformedAttemptId {
-                    current: current_attempt,
-                })
-            }
-            Err(other) => Err(other),
-        }
-    }
-
-    /// Fold one daemon v2 semantic event. Returns logical events the caller may
-    /// forward (token/reasoning fragments, done, …). Structured `tool_calls`
-    /// are buffered and never returned for mid-stream forwarding.
-    ///
-    /// Token and reasoning text are appended **verbatim** — no marker scan.
-    fn push(
-        &mut self,
-        event: &serde_json::Value,
-    ) -> Result<Vec<serde_json::Value>, SemanticFoldError> {
-        self.check_correlation(event)?;
-        let mut forward = Vec::new();
-        match event.get("type").and_then(serde_json::Value::as_str) {
-            Some("gen_start") => {
-                // v2 channels are typed; started_in_think is ignored (no marker router).
-            }
-            Some("token") => {
-                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                    // Daemon may tag reasoning on the token envelope; still verbatim.
-                    if event.get("reasoning").and_then(serde_json::Value::as_bool) == Some(true) {
-                        self.reasoning_content.push_str(text);
-                        forward.push(serde_json::json!({ "type": "reasoning", "text": text }));
-                    } else {
-                        self.content.push_str(text);
-                        forward.push(serde_json::json!({ "type": "token", "text": text }));
-                    }
-                }
-            }
-            Some("reasoning") => {
-                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                    self.reasoning_content.push_str(text);
-                    forward.push(serde_json::json!({ "type": "reasoning", "text": text }));
-                }
-            }
-            Some("tool_calls") => {
-                let calls = event
-                    .get("calls")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| SemanticFoldError::MalformedToolCall {
-                        detail: "tool_calls event requires `calls` array".to_owned(),
-                    })?;
-                for call in calls {
-                    let tc = tool_call_from_canonical_value(call)
-                        .map_err(|detail| SemanticFoldError::MalformedToolCall { detail })?;
-                    self.buffered_tool_calls.push(tc);
-                }
-                // Intentionally not forwarded — release only after tool-safe done.
-            }
-            Some("done") => {
-                // Staged commit_ready is folded as type=done; absorb canonical
-                // calls from the terminal payload before latching done.
-                self.absorb_terminal_calls(event)?;
-                self.done = Some(event.clone());
-                forward.push(event.clone());
-            }
-            _ => {
-                // Pass through unknown/control events (committed, error envelopes, …).
-                forward.push(event.clone());
-            }
-        }
-        Ok(forward)
-    }
-}
-
-/// Allocate a fresh numeric generation attempt id (never 0 on success paths).
-fn next_attempt_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Latched daemon event-contract for one `complete_request` stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamContract {
-    /// Non-v2 / missing contract_version — ThinkChannelRouter path.
-    Legacy,
-    /// `gen_start.contract_version == 2` — SemanticEventFold path.
-    V2,
-}
-
-/// Fail-closed stream framing / contract-selection errors for `complete_request`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StreamContractError {
-    /// Stream opened with a non-`gen_start` event (no unchecked legacy default).
-    PreStartEvent { event_type: String },
-    /// More than one `gen_start` in a single attempt stream.
-    SecondGenStart,
-    /// `gen_start` lacked `attempt_id`.
-    MissingAttemptId { expected: u64 },
-    /// `gen_start.attempt_id` was present but not a usable number.
-    MalformedAttemptId { expected: u64 },
-    /// `gen_start.attempt_id` did not match the allocated wire id.
-    StaleAttempt { expected: u64, got: u64 },
-    /// `gen_start` lacked nonempty request `id`.
-    MissingRequestId { expected: String },
-    /// `gen_start.id` was present but empty or not a string.
-    MalformedRequestId { expected: String },
-    /// `gen_start.id` did not match the allocated wire request id.
-    StaleRequestId { expected: String, got: String },
-    /// Canonical tool-call payload failed structured conversion.
-    MalformedToolCall { detail: String },
-}
-
-impl std::fmt::Display for StreamContractError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PreStartEvent { event_type } => {
-                write!(
-                    f,
-                    "stream must begin with gen_start; got {event_type} before contract latch"
-                )
-            }
-            Self::SecondGenStart => {
-                write!(f, "duplicate gen_start after contract already latched")
-            }
-            Self::MissingAttemptId { expected } => {
-                write!(
-                    f,
-                    "gen_start missing attempt_id (expected {expected}); contract not latched"
-                )
-            }
-            Self::MalformedAttemptId { expected } => {
-                write!(
-                    f,
-                    "gen_start malformed attempt_id (expected {expected}); contract not latched"
-                )
-            }
-            Self::StaleAttempt { expected, got } => {
-                write!(
-                    f,
-                    "gen_start stale attempt_id: expected={expected} got={got}; contract not latched"
-                )
-            }
-            Self::MissingRequestId { expected } => {
-                write!(
-                    f,
-                    "gen_start missing request id (expected {expected}); contract not latched"
-                )
-            }
-            Self::MalformedRequestId { expected } => {
-                write!(
-                    f,
-                    "gen_start malformed request id (expected {expected}); contract not latched"
-                )
-            }
-            Self::StaleRequestId { expected, got } => {
-                write!(
-                    f,
-                    "gen_start stale request id: expected={expected} got={got}; contract not latched"
-                )
-            }
-            Self::MalformedToolCall { detail } => {
-                write!(f, "malformed canonical tool call: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for StreamContractError {}
-
-/// One-shot contract latch for a generate stream.
-///
-/// Rules:
-/// - first event must be exactly one `gen_start` with the expected numeric `attempt_id`
-/// - correlation is validated **before** reading/latching `contract_version`
-/// - legacy or v2 is latched once; a second `gen_start` is always rejected
-/// - pre-start events never default to unchecked legacy
-/// - after v2 is latched, nothing may switch the stream to legacy
-#[derive(Debug)]
-struct StreamContractGate {
-    expected_request_id: String,
-    expected_attempt_id: u64,
-    latched: Option<StreamContract>,
-}
-
-impl StreamContractGate {
-    fn new(expected_request_id: impl Into<String>, expected_attempt_id: u64) -> Self {
-        Self {
-            expected_request_id: expected_request_id.into(),
-            expected_attempt_id,
-            latched: None,
-        }
-    }
-
-    fn contract(&self) -> Option<StreamContract> {
-        self.latched
-    }
-
-    fn is_v2(&self) -> bool {
-        self.latched == Some(StreamContract::V2)
-    }
-
-    /// Observe the next daemon event for framing/contract selection only.
-    ///
-    /// Returns the latched contract after a successful observe. Does not fold
-    /// payloads — callers route to `SemanticEventFold` or legacy separately.
-    fn observe(
-        &mut self,
-        event: &serde_json::Value,
-    ) -> Result<StreamContract, StreamContractError> {
-        let event_type = event
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("<missing>");
-
-        if let Some(contract) = self.latched {
-            if event_type == "gen_start" {
-                // Never re-latch / never allow a stale or missing-id start to
-                // downgrade v2 → legacy (or flip legacy → v2).
-                return Err(StreamContractError::SecondGenStart);
-            }
-            return Ok(contract);
-        }
-
-        // Unlatched: first event must be gen_start. No pre-start legacy default.
-        if event_type != "gen_start" {
-            return Err(StreamContractError::PreStartEvent {
-                event_type: event_type.to_owned(),
-            });
-        }
-
-        // Correlation BEFORE contract_version read/latch (exact id + attempt).
-        let expected_request = self.expected_request_id.as_str();
-        match SemanticEventFold::parse_event_request_id(event) {
-            Ok(None) => {
-                return Err(StreamContractError::MissingRequestId {
-                    expected: expected_request.to_owned(),
-                });
-            }
-            Ok(Some(got)) if got != expected_request => {
-                return Err(StreamContractError::StaleRequestId {
-                    expected: expected_request.to_owned(),
-                    got,
-                });
-            }
-            Ok(Some(_)) => {}
-            Err(SemanticFoldError::MalformedRequestId { .. }) => {
-                return Err(StreamContractError::MalformedRequestId {
-                    expected: expected_request.to_owned(),
-                });
-            }
-            Err(_) => {
-                return Err(StreamContractError::MalformedRequestId {
-                    expected: expected_request.to_owned(),
-                });
-            }
-        }
-
-        let expected = self.expected_attempt_id;
-        match SemanticEventFold::parse_event_attempt_id(event) {
-            Ok(None) => {
-                return Err(StreamContractError::MissingAttemptId { expected });
-            }
-            Ok(Some(got)) if got != expected => {
-                return Err(StreamContractError::StaleAttempt { expected, got });
-            }
-            Ok(Some(_)) => {}
-            Err(SemanticFoldError::MalformedAttemptId { .. }) => {
-                return Err(StreamContractError::MalformedAttemptId { expected });
-            }
-            Err(_) => {
-                return Err(StreamContractError::MalformedAttemptId { expected });
-            }
-        }
-
-        let contract = if event
-            .get("contract_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(2)
-        {
-            StreamContract::V2
-        } else {
-            StreamContract::Legacy
-        };
-        self.latched = Some(contract);
-        Ok(contract)
-    }
-}
-
-/// Retry-disabling observations for one generation attempt.
-///
-/// Every event about to hit the client callback passes through [`Self::observe`]
-/// (v2 fold logicals and legacy router fragments alike), so latching is
-/// route-agnostic. `visible` matches exactly the wire-visible delta set of
-/// [`openai_stream_delta_for_event`] (token/reasoning).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct AttemptLatches {
-    visible: bool,
-    commit_ready_seen: bool,
-}
-
-impl AttemptLatches {
-    fn observe(&mut self, event: &serde_json::Value) {
-        match event.get("type").and_then(serde_json::Value::as_str) {
-            Some("token") | Some("reasoning") => self.visible = true,
-            Some("commit_ready") => self.commit_ready_seen = true,
-            _ => {}
-        }
-    }
-}
-
-/// Whether the failed attempt may be retried once server-side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryDecision {
-    Retry,
-    Fail,
-}
-
-/// Single enforced retry-eligibility decision for the serve retry driver.
-///
-/// Retry iff ALL hold: gate enabled; first attempt; no visible token/reasoning
-/// observed; commit_ready handshake never entered; daemon attested retry-reset
-/// eligibility; the error is a typed daemon error of class `transient` with
-/// `retryable=true` and an `attempt_id` matching the failed attempt. Every
-/// other failure — malformed/validation/context/schema/tool/cancel classes,
-/// callback/cancellation, I/O, EOF, invalid JSON, protocol/framing errors,
-/// untyped legacy errors — fails closed with no retry.
-fn decide_retry(
-    error: &anyhow::Error,
-    attempt_id: u64,
-    latches: &AttemptLatches,
-    eligible: bool,
-    enabled: bool,
-    attempt_index: u32,
-) -> RetryDecision {
-    if !enabled || attempt_index != 1 || latches.visible || latches.commit_ready_seen || !eligible {
-        return RetryDecision::Fail;
-    }
-    let Some(hipfire_client::ClientError::Daemon(typed)) =
-        error.downcast_ref::<hipfire_client::ClientError>()
-    else {
-        return RetryDecision::Fail;
-    };
-    if typed.class != hipfire_client::error_class::TRANSIENT
-        || !typed.retryable
-        || typed.attempt_id != attempt_id
-    {
-        return RetryDecision::Fail;
-    }
-    RetryDecision::Retry
-}
-
-/// Pure dual-route fold over a generate event sequence (test + `complete_request` core).
-///
-/// Applies [`StreamContractGate`] framing, then either [`SemanticEventFold`] (v2)
-/// or legacy ThinkChannelRouter accumulation. Used by focused stream-contract
-/// tests so production framing rules are exercised without a live Engine.
-#[cfg(test)]
-#[derive(Debug)]
-struct FoldedStream {
-    contract: StreamContract,
-    content: String,
-    reasoning_content: String,
-    tool_calls: Vec<ToolCall>,
-    done: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    forwarded: Vec<serde_json::Value>,
-}
-
-#[cfg(test)]
-fn fold_complete_request_stream(
-    expected_request_id: &str,
-    expected_attempt_id: u64,
-    events: &[serde_json::Value],
-) -> Result<FoldedStream, StreamContractError> {
-    let mut fold = SemanticEventFold::new();
-    fold.begin_attempt(expected_request_id, expected_attempt_id);
-    let mut gate = StreamContractGate::new(expected_request_id, expected_attempt_id);
-    let mut legacy_router = ThinkChannelRouter::default();
-    let mut legacy_content = String::new();
-    let mut legacy_reasoning = String::new();
-    let mut legacy_tool_calls: Vec<ToolCall> = Vec::new();
-    let mut legacy_done: Option<serde_json::Value> = None;
-    let mut forwarded = Vec::new();
-
-    for event in events {
-        let contract = gate.observe(event)?;
-        match contract {
-            StreamContract::V2 => {
-                // Map fold correlation errors onto stream framing errors for the
-                // shared test surface (gate already validated gen_start).
-                let logicals = fold.push(event).map_err(|err| match err {
-                    SemanticFoldError::MissingAttemptId { current } => {
-                        StreamContractError::MissingAttemptId { expected: current }
-                    }
-                    SemanticFoldError::MalformedAttemptId { current } => {
-                        StreamContractError::MalformedAttemptId { expected: current }
-                    }
-                    SemanticFoldError::StaleAttempt { current, got } => {
-                        StreamContractError::StaleAttempt {
-                            expected: current,
-                            got,
-                        }
-                    }
-                    SemanticFoldError::MissingRequestId { current } => {
-                        StreamContractError::MissingRequestId { expected: current }
-                    }
-                    SemanticFoldError::MalformedRequestId { current } => {
-                        StreamContractError::MalformedRequestId { expected: current }
-                    }
-                    SemanticFoldError::StaleRequestId { current, got } => {
-                        StreamContractError::StaleRequestId {
-                            expected: current,
-                            got,
-                        }
-                    }
-                    SemanticFoldError::NoActiveAttempt => StreamContractError::PreStartEvent {
-                        event_type: "no_active_attempt".into(),
-                    },
-                    SemanticFoldError::MalformedToolCall { detail } => {
-                        StreamContractError::MalformedToolCall { detail }
-                    }
-                })?;
-                for logical in logicals {
-                    let ty = logical.get("type").and_then(serde_json::Value::as_str);
-                    if ty == Some("done") || ty == Some("gen_start") {
-                        continue;
-                    }
-                    forwarded.push(logical);
-                }
-            }
-            StreamContract::Legacy => match event.get("type").and_then(serde_json::Value::as_str) {
-                Some("gen_start") => {
-                    if let Some(started) = event
-                        .get("started_in_think")
-                        .and_then(serde_json::Value::as_bool)
-                    {
-                        legacy_router.set_started_in_think(started);
-                    }
-                }
-                Some("token") => {
-                    if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                        let fragments =
-                            if event.get("reasoning").and_then(serde_json::Value::as_bool)
-                                == Some(true)
-                            {
-                                legacy_router.push_semantic(text, true)
-                            } else {
-                                legacy_router.push(text)
-                            };
-                        for fragment in fragments {
-                            match fragment {
-                                ThinkFragment::Content(t) => {
-                                    legacy_content.push_str(&t);
-                                    forwarded.push(serde_json::json!({
-                                        "type": "token",
-                                        "text": t
-                                    }));
-                                }
-                                ThinkFragment::Reasoning(t) => {
-                                    legacy_reasoning.push_str(&t);
-                                    forwarded.push(serde_json::json!({
-                                        "type": "reasoning",
-                                        "text": t
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("reasoning") => {
-                    if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                        for fragment in legacy_router.push_semantic(text, true) {
-                            match fragment {
-                                ThinkFragment::Content(t) => {
-                                    legacy_content.push_str(&t);
-                                    forwarded.push(serde_json::json!({
-                                        "type": "token",
-                                        "text": t
-                                    }));
-                                }
-                                ThinkFragment::Reasoning(t) => {
-                                    legacy_reasoning.push_str(&t);
-                                    forwarded.push(serde_json::json!({
-                                        "type": "reasoning",
-                                        "text": t
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("tool_calls") => {
-                    if let Some(calls) = event.get("calls").and_then(serde_json::Value::as_array) {
-                        for call in calls {
-                            let tc = tool_call_from_legacy_value(call).map_err(|detail| {
-                                StreamContractError::MalformedToolCall { detail }
-                            })?;
-                            legacy_tool_calls.push(tc);
-                        }
-                    }
-                }
-                Some("done") => {
-                    for fragment in legacy_router.finish() {
-                        match fragment {
-                            ThinkFragment::Content(t) => {
-                                legacy_content.push_str(&t);
-                                forwarded.push(serde_json::json!({
-                                    "type": "token",
-                                    "text": t
-                                }));
-                            }
-                            ThinkFragment::Reasoning(t) => {
-                                legacy_reasoning.push_str(&t);
-                                forwarded.push(serde_json::json!({
-                                    "type": "reasoning",
-                                    "text": t
-                                }));
-                            }
-                        }
-                    }
-                    legacy_done = Some(event.clone());
-                }
-                _ => {
-                    forwarded.push(event.clone());
-                }
-            },
-        }
-    }
-
-    let contract = gate
-        .contract()
-        .ok_or_else(|| StreamContractError::PreStartEvent {
-            event_type: "<empty stream>".into(),
-        })?;
-
-    match contract {
-        StreamContract::V2 => {
-            let finish = fold
-                .done()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(serde_json::Value::as_str);
-            let tool_calls = if finish == Some("tool_calls") {
-                fold.executable_tool_calls().to_vec()
-            } else {
-                Vec::new()
-            };
-            Ok(FoldedStream {
-                contract,
-                content: fold.content().to_owned(),
-                reasoning_content: fold.reasoning_content().to_owned(),
-                tool_calls,
-                done: fold.done().cloned(),
-                forwarded,
-            })
-        }
-        StreamContract::Legacy => {
-            let finish = legacy_done
-                .as_ref()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(serde_json::Value::as_str);
-            let tool_calls = if finish == Some("tool_calls") {
-                legacy_tool_calls
-            } else {
-                Vec::new()
-            };
-            Ok(FoldedStream {
-                contract,
-                content: legacy_content,
-                reasoning_content: legacy_reasoning,
-                tool_calls,
-                done: legacy_done,
-                forwarded,
-            })
-        }
-    }
-}
-
-/// One correlated generation attempt under the shared serve runtime lock.
-///
-/// `identity` is the public completion identity (stable across retries);
-/// `attempt_id` is the freshly allocated wire attempt id for this attempt.
-/// `force_reset` (retry attempts) cold-resets before generate; a failed forced
-/// reset poisons cached model state so the next request full-reloads.
-/// `latches` records retry-disabling observations for the driver.
-fn complete_request_attempt(
-    shared: &ServeShared,
-    body: &serde_json::Value,
-    _guard: AdmissionGuard,
-    identity: &(String, u64),
-    attempt_id: u64,
-    force_reset: bool,
-    latches: &std::cell::RefCell<AttemptLatches>,
-    event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
-    terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
-) -> Result<Completion> {
-    // Latch retry-disabling observations on every event bound for the client.
-    let mut event_callback = |event: &serde_json::Value| {
-        latches.borrow_mut().observe(event);
-        event_callback(event)
-    };
-    let model = body
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("model is required"))?
-        .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
-    let mut runtime = shared
-        .runtime
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    // Attempt id is allocated by the retry driver before any cold reset /
-    // generate so reset ack, generate request, and the semantic fold share one
-    // wire id.
-    let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
-    if force_reset || !runtime.cache_capable {
-        if let Err(error) = runtime.engine.reset(attempt_id) {
-            if force_reset {
-                // Rollback could not be attested: model state is unknown, so
-                // the next request must full-reload rather than trust it.
-                runtime.current_path = None;
-                runtime.current_max_seq = 0;
-                runtime.cache_capable = false;
-            }
-            return Err(error.into());
-        }
-    }
-    let max_tokens = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    let required_max_seq = max_tokens.saturating_add(1024);
-    if runtime.current_max_seq < required_max_seq {
-        runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
-    }
-    let mut normalized_messages = normalize_openai_messages(body.get("messages"));
-    let default_system = request_string(&resolved, "prompt.system", None)?;
-    inject_default_system_message(&mut normalized_messages, default_system.as_deref());
-    let mut generate = serde_json::json!({
-        "type": "generate",
-        "id": request_id(),
-        "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
-        "messages": normalized_messages,
-        "max_tokens": max_tokens,
-        "attempt_id": attempt_id,
-    });
-    if let Some(image) = image_base64 {
-        generate["image_base64"] = serde_json::Value::String(image);
-    }
-    for (key, config_key) in [
-        ("temperature", "generation.temperature"),
-        ("top_p", "generation.top_p"),
-        ("repeat_penalty", "generation.repeat_penalty"),
-    ] {
-        let explicit = body.get(key).and_then(serde_json::Value::as_f64);
-        insert_optional_f64(
-            &mut generate,
-            key,
-            request_f64(&resolved, config_key, explicit)?,
-        );
-    }
-    for name in [
-        "tools",
-        "tool_choice",
-        "frequency_penalty",
-        "stop",
-        "reasoning_effort",
-    ] {
-        if let Some(value) = body.get(name) {
-            generate[name] = value.clone();
-        }
-    }
-    if let Some(value) = body.get("top_k") {
-        generate["top_k"] = value.clone();
-    } else {
-        insert_optional_u64(
-            &mut generate,
-            "top_k",
-            request_u64(&resolved, "generation.top_k", None)?,
-        );
-    }
-    for (key, config_key) in [
-        ("min_p", "generation.min_p"),
-        ("presence_penalty", "generation.presence_penalty"),
-    ] {
-        if let Some(value) = body.get(key) {
-            generate[key] = value.clone();
-        } else {
-            insert_optional_f64(
-                &mut generate,
-                key,
-                request_f64(&resolved, config_key, None)?,
-            );
-        }
-    }
-    apply_http_reasoning_request(body, &resolved, &mut generate)?;
-    let (id, created) = identity.clone();
-    generate["id"] = serde_json::Value::String(id.clone());
-    generate["attempt_id"] = serde_json::json!(attempt_id);
-
-    // Dual route gated by StreamContractGate:
-    // - first event must be gen_start with matching request id + attempt_id
-    // - contract_version is read only after correlation succeeds
-    // - legacy/v2 latched once; second gen_start and pre-start events rejected
-    // - v2 cannot be downgraded by a later stale/missing-id gen_start
-    // - commit_ready is staged done: folded once via terminal_callback before commit
-    let mut fold = SemanticEventFold::new();
-    fold.begin_attempt(&id, attempt_id);
-    let mut contract_gate = StreamContractGate::new(id.clone(), attempt_id);
-    let mut legacy_router = ThinkChannelRouter::default();
-    let mut legacy_content = String::new();
-    let mut legacy_reasoning = String::new();
-    let mut legacy_tool_calls: Vec<ToolCall> = Vec::new();
-    let mut legacy_done: Option<serde_json::Value> = None;
-    let mut terminal_delivered = false;
-    let preserve_thinking = body
-        .pointer("/chat_template_kwargs/preserve_thinking")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-
-    let done = runtime.engine.generate(&generate, |event| {
-        let event_type = event.get("type").and_then(serde_json::Value::as_str);
-
-        // Staged terminal: commit_ready carries done fields with type != done.
-        // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
-        if event_type == Some("commit_ready") {
-            latches.borrow_mut().commit_ready_seen = true;
-            if terminal_delivered {
-                return Err(hipfire_client::ClientError::Protocol(
-                    "duplicate commit_ready".into(),
-                ));
-            }
-            // Gate correlation on the raw envelope first (same id+attempt rules).
-            let contract = contract_gate
-                .observe(event)
-                .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
-
-            let mut staged = event.clone();
-            if let Some(obj) = staged.as_object_mut() {
-                obj.insert("type".into(), serde_json::Value::String("done".into()));
-            } else {
-                return Err(hipfire_client::ClientError::Protocol(
-                    "commit_ready must be a JSON object".into(),
-                ));
-            }
-
-            let preview = match contract {
-                StreamContract::V2 => {
-                    let forward = fold.push(&staged).map_err(|error| {
-                        hipfire_client::ClientError::Protocol(error.to_string())
-                    })?;
-                    // Staged done is held on the fold; do not forward mid-stream.
-                    let _ = forward;
-                    Completion {
-                        id: id.clone(),
-                        created,
-                        model: model.clone(),
-                        content: fold.content().to_owned(),
-                        reasoning_content: fold.reasoning_content().to_owned(),
-                        preserve_thinking,
-                        tool_calls: fold.executable_tool_calls().to_vec(),
-                        done: fold.done().cloned().unwrap_or(staged),
-                    }
-                }
-                StreamContract::Legacy => {
-                    forward_think_fragments(
-                        legacy_router.finish(),
-                        &mut legacy_content,
-                        &mut legacy_reasoning,
-                        &mut event_callback,
-                    )?;
-                    legacy_done = Some(staged.clone());
-                    let finish = staged
-                        .get("finish_reason")
-                        .and_then(serde_json::Value::as_str);
-                    let tool_calls = if finish == Some("tool_calls") {
-                        legacy_tool_calls.clone()
-                    } else {
-                        Vec::new()
-                    };
-                    Completion {
-                        id: id.clone(),
-                        created,
-                        model: model.clone(),
-                        content: legacy_content.clone(),
-                        reasoning_content: legacy_reasoning.clone(),
-                        preserve_thinking,
-                        tool_calls,
-                        done: staged,
-                    }
-                }
-            };
-
-            terminal_callback(&preview)?;
-            terminal_delivered = true;
-            return Ok(());
-        }
-
-        let contract = contract_gate
-            .observe(event)
-            .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
-
-        match contract {
-            StreamContract::V2 => {
-                let forward = fold
-                    .push(event)
-                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
-                for logical in forward {
-                    // gen_start is consumed for latching; done is held on the fold.
-                    // Post-commit done is not callback-visible from Engine, but
-                    // still ignore if seen.
-                    let ty = logical.get("type").and_then(serde_json::Value::as_str);
-                    if ty == Some("done") || ty == Some("gen_start") {
-                        continue;
-                    }
-                    event_callback(&logical)?;
-                }
-            }
-            StreamContract::Legacy => {
-                match event_type {
-                    Some("gen_start") => {
-                        if let Some(started) = event
-                            .get("started_in_think")
-                            .and_then(serde_json::Value::as_bool)
-                        {
-                            legacy_router.set_started_in_think(started);
-                        }
-                    }
-                    Some("token") => {
-                        if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                            let fragments =
-                                if event.get("reasoning").and_then(serde_json::Value::as_bool)
-                                    == Some(true)
-                                {
-                                    legacy_router.push_semantic(text, true)
-                                } else {
-                                    legacy_router.push(text)
-                                };
-                            forward_think_fragments(
-                                fragments,
-                                &mut legacy_content,
-                                &mut legacy_reasoning,
-                                &mut event_callback,
-                            )?;
-                        }
-                    }
-                    Some("reasoning") => {
-                        if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                            let fragments = legacy_router.push_semantic(text, true);
-                            forward_think_fragments(
-                                fragments,
-                                &mut legacy_content,
-                                &mut legacy_reasoning,
-                                &mut event_callback,
-                            )?;
-                        }
-                    }
-                    Some("tool_calls") => {
-                        if let Some(calls) =
-                            event.get("calls").and_then(serde_json::Value::as_array)
-                        {
-                            for call in calls {
-                                let tc = tool_call_from_legacy_value(call).map_err(|detail| {
-                                    hipfire_client::ClientError::Protocol(format!(
-                                        "malformed canonical tool call: {detail}"
-                                    ))
-                                })?;
-                                legacy_tool_calls.push(tc);
-                            }
-                        }
-                    }
-                    Some("done") => {
-                        // Prefer staged commit_ready terminal; keep post-commit done
-                        // only as payload fill if staging was skipped (legacy path).
-                        if !terminal_delivered {
-                            forward_think_fragments(
-                                legacy_router.finish(),
-                                &mut legacy_content,
-                                &mut legacy_reasoning,
-                                &mut event_callback,
-                            )?;
-                            legacy_done = Some(event.clone());
-                        }
-                    }
-                    _ => {
-                        event_callback(event)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    })?;
-    let mut meta = shared
-        .meta
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    meta.requests_served = meta.requests_served.saturating_add(1);
-    meta.recent_tok_s = done.get("tok_s").and_then(serde_json::Value::as_f64);
-    meta.last_activity = Instant::now();
-
-    if contract_gate.is_v2() {
-        let done = fold.done().cloned().unwrap_or(done);
-        return Ok(Completion {
-            id,
-            created,
-            model,
-            content: fold.content().to_owned(),
-            reasoning_content: fold.reasoning_content().to_owned(),
-            preserve_thinking,
-            tool_calls: fold.executable_tool_calls().to_vec(),
-            done,
-        });
-    }
-
-    let done = legacy_done.unwrap_or(done);
-    let finish = done
-        .get("finish_reason")
-        .and_then(serde_json::Value::as_str);
-    let tool_calls = if finish == Some("tool_calls") {
-        legacy_tool_calls
-    } else {
-        Vec::new()
-    };
-    Ok(Completion {
-        id,
-        created,
-        model,
-        content: legacy_content,
-        reasoning_content: legacy_reasoning,
-        preserve_thinking,
-        tool_calls,
-        done,
-    })
-}
-
-/// Server-owned one-retry driver over [`complete_request_attempt`].
-///
-/// Disabled unless `serve.retry_enabled`; at most one retry; typed transient
-/// daemon failures only; only before any visible token/reasoning delta or the
-/// commit_ready terminal handshake; only after the daemon attested retry-reset
-/// eligibility. The retry attempt performs a forced cold reset whose validated
-/// ack is the synchronized matching rollback attestation, under the same
-/// runtime lock acquisition as the re-generate. Backoff sleeps with neither
-/// the runtime mutex nor an admission guard held (the failed attempt's guard
-/// dropped with it); admission is re-acquired after the backoff, and a
-/// re-acquire failure surfaces the original error. The public completion id is
-/// allocated once and reused; attempt ids are distinct and monotonic.
-fn complete_request(
-    shared: &ServeShared,
-    body: &serde_json::Value,
-    guard: AdmissionGuard,
-    request_identity: Option<(String, u64)>,
-    mut event_callback: impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
-    mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
-) -> Result<Completion> {
-    let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
-    let mut attempt_index = 1u32;
-    let mut guard = guard;
-    loop {
-        let attempt_id = next_attempt_id();
-        let latches = std::cell::RefCell::new(AttemptLatches::default());
-        let outcome = complete_request_attempt(
-            shared,
-            body,
-            guard,
-            &identity,
-            attempt_id,
-            attempt_index > 1,
-            &latches,
-            &mut event_callback,
-            &mut terminal_callback,
-        );
-        let latches = latches.into_inner();
-        match outcome {
-            Ok(completion) => {
-                if attempt_index > 1 {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.retries_succeeded = meta.retries_succeeded.saturating_add(1);
-                }
-                return Ok(completion);
-            }
-            Err(error) => {
-                let eligible = {
-                    let runtime = shared
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    runtime.engine.last_retry_reset_eligible() == Some(true)
-                };
-                if decide_retry(
-                    &error,
-                    attempt_id,
-                    &latches,
-                    eligible,
-                    shared.retry_enabled,
-                    attempt_index,
-                ) == RetryDecision::Fail
-                {
-                    return Err(error);
-                }
-                {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.retries_attempted = meta.retries_attempted.saturating_add(1);
-                }
-                eprintln!(
-                    "[hipfire] {}: typed transient daemon failure on attempt {attempt_index}; \
-                     rolling back and retrying once",
-                    identity.0
-                );
-                let hook = shared
-                    .backoff_hook
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.clone());
-                if let Some(hook) = hook {
-                    hook(shared.retry_backoff);
-                } else {
-                    std::thread::sleep(shared.retry_backoff);
-                }
-                guard = match shared.admission.acquire() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        return Err(error.context("retry aborted: admission re-acquire failed"));
-                    }
-                };
-                attempt_index = attempt_index.saturating_add(1);
-            }
-        }
-    }
-}
-
-fn forward_think_fragments(
-    fragments: Vec<ThinkFragment>,
-    content: &mut String,
-    reasoning_content: &mut String,
-    event_callback: &mut impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
-) -> Result<(), hipfire_client::ClientError> {
-    for fragment in fragments {
-        let logical = match fragment {
-            ThinkFragment::Content(text) => {
-                content.push_str(&text);
-                serde_json::json!({ "type": "token", "text": text })
-            }
-            ThinkFragment::Reasoning(text) => {
-                reasoning_content.push_str(&text);
-                serde_json::json!({ "type": "reasoning", "text": text })
-            }
-        };
-        event_callback(&logical)?;
-    }
-    Ok(())
-}
-
-impl ServeRuntime {
-    fn ensure_model(
-        &mut self,
-        model: &str,
-        meta: &Mutex<ServeMeta>,
-        minimum_max_seq: Option<u64>,
-    ) -> Result<hipfire_config::ResolvedConfig> {
-        let (tag, entry) = self
-            .registry
-            .model(model)
-            .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-            .unwrap_or((None, None));
-        let mut path = find_model_path(&self.paths, &self.registry, model);
-        if path.is_none() && entry.is_some() {
-            pull_command(
-                &self.paths,
-                PullArgs {
-                    model: model.to_owned(),
-                    force: false,
-                },
-            )?;
-            path = entry.map(|entry| self.paths.models.join(&entry.file));
-        }
-        let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
-        let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
-        let must_reload = self.current_path.as_ref() != Some(&path)
-            || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
-        if must_reload {
-            let max_tokens = minimum_max_seq
-                .map(|minimum| minimum.saturating_sub(1024))
-                .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-            let mut params = load_params(
-                &resolved,
-                entry,
-                &path,
-                max_tokens,
-                self.kv_override.as_deref(),
-                self.kv_backend_override.as_deref(),
-            )?;
-            if let Some(tp) = self.tp {
-                params["tp"] = serde_json::json!(tp);
-            }
-            let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
-            if minimum_max_seq.is_some() {
-                eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
-            }
-            let loaded = self.engine.load(&path, params)?;
-            self.cache_capable = loaded
-                .get("cache_capable")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            self.current_path = Some(path);
-            self.current_max_seq = loaded_max_seq;
-            meta.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .current_model = Some(tag.unwrap_or_else(|| model.to_owned()));
-        }
-        Ok(resolved)
-    }
-}
-
-fn openai_content_text(content: Option<&serde_json::Value>) -> String {
-    match content {
-        None | Some(serde_json::Value::Null) => String::new(),
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(serde_json::Value::Array(parts)) => parts
-            .iter()
-            .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-            .collect(),
-        Some(other) => other.to_string(),
-    }
-}
-
-fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
-    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
-        return Ok(None);
-    };
-    let mut image = None;
-    for message in messages {
-        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for part in parts {
-            if part.get("type").and_then(serde_json::Value::as_str) != Some("image_url") {
-                continue;
-            }
-            let url = part
-                .pointer("/image_url/url")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("image_url content part requires image_url.url"))?;
-            let payload = ["data:image/png;base64,", "data:image/jpeg;base64,"]
-                .into_iter()
-                .find_map(|prefix| url.strip_prefix(prefix))
-                .ok_or_else(|| {
-                    if url.starts_with("data:") {
-                        anyhow!("only base64 PNG and JPEG image_url data URIs are supported")
-                    } else {
-                        anyhow!("remote image_url values are unsupported; send a base64 data URI")
-                    }
-                })?;
-            if payload.is_empty() {
-                bail!("image_url data URI has an empty base64 payload");
-            }
-            if image.replace(payload.to_owned()).is_some() {
-                bail!("at most one image_url is supported per request");
-            }
-        }
-    }
-    Ok(image)
-}
-
-fn strip_inline_thinking(text: &str) -> String {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
-    let mut visible = String::new();
-    let mut remaining = text;
-    while let Some(open) = remaining.find(OPEN) {
-        visible.push_str(&remaining[..open]);
-        let after_open = &remaining[open + OPEN.len()..];
-        let Some(close) = after_open.find(CLOSE) else {
-            return visible;
-        };
-        remaining = after_open[close + CLOSE.len()..].trim_start();
-    }
-    visible.push_str(remaining);
-    visible
-}
-
-fn inline_thinking(text: &str) -> Option<String> {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
-    let after_open = text.split_once(OPEN)?.1;
-    let reasoning = after_open.split_once(CLOSE)?.0.trim();
-    (!reasoning.is_empty()).then(|| reasoning.to_owned())
-}
-
-fn normalize_openai_tool_call(call: &serde_json::Value) -> serde_json::Value {
-    let function = call.get("function").unwrap_or(call);
-    let name = function
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let arguments = match function.get("arguments") {
-        Some(serde_json::Value::String(raw)) => {
-            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }))
-        }
-        Some(value) => value.clone(),
-        None => serde_json::json!({}),
-    };
-    serde_json::json!({ "name": name, "arguments": arguments })
-}
-
-fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json::Value {
-    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
-        return serde_json::json!([]);
-    };
-    let normalized = messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.get("role").and_then(serde_json::Value::as_str)? {
-                "developer" => "system",
-                "toolResult" | "tool_result" => "tool",
-                role @ ("system" | "user" | "assistant" | "tool") => role,
-                _ => return None,
-            };
-            let raw_content = openai_content_text(message.get("content"));
-            let mut entry = serde_json::json!({
-                "role": role,
-                "content": if role == "assistant" {
-                    strip_inline_thinking(&raw_content)
-                } else {
-                    raw_content.clone()
-                },
-            });
-            if role == "assistant" {
-                let reasoning = message
-                    .get("reasoning")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .or_else(|| {
-                        message
-                            .get("reasoning_content")
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|text| !text.is_empty())
-                    })
-                    .map(str::to_owned)
-                    .or_else(|| inline_thinking(&raw_content));
-                if let Some(reasoning) = reasoning {
-                    entry["tool_plan"] = serde_json::Value::String(reasoning);
-                }
-                if let Some(calls) = message
-                    .get("tool_calls")
-                    .and_then(serde_json::Value::as_array)
-                    .filter(|calls| !calls.is_empty())
-                {
-                    entry["tool_calls"] = serde_json::Value::Array(
-                        calls.iter().map(normalize_openai_tool_call).collect(),
-                    );
-                }
-            } else if role == "tool" {
-                if let Some(tool_call_id) = message
-                    .get("tool_call_id")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    entry["tool_call_id"] = serde_json::Value::String(tool_call_id.to_owned());
-                }
-            }
-            Some(entry)
-        })
-        .collect();
-    serde_json::Value::Array(normalized)
-}
-
-fn inject_default_system_message(messages: &mut serde_json::Value, system: Option<&str>) {
-    let Some(system) = system.filter(|value| !value.is_empty()) else {
-        return;
-    };
-    let Some(messages) = messages.as_array_mut() else {
-        return;
-    };
-    if messages
-        .iter()
-        .any(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
-    {
-        return;
-    }
-    messages.insert(
-        0,
-        serde_json::json!({ "role": "system", "content": system }),
-    );
-}
-
-fn last_user_prompt(messages: &serde_json::Value) -> Option<String> {
-    messages
-        .as_array()?
-        .iter()
-        .rev()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-}
-
-fn openai_finish_reason(done: &serde_json::Value) -> String {
-    // Only an explicit raw daemon finish_reason string is authoritative.
-    // Never synthesize "tool_calls" from buffered/leaked calls when the
-    // terminal is missing, null, non-string, or any other unsafe value.
-    match done
-        .get("finish_reason")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some(reason) => reason.to_owned(),
-        // Missing/null/non-string → fail closed to stop (not tool_calls).
-        None => "stop".into(),
-    }
-}
-
-fn completion_json(completion: &Completion) -> serde_json::Value {
-    let finish_reason = openai_finish_reason(&completion.done);
-    // Structured calls only for a tool-safe terminal; never on length/error/cancel.
-    let tool_calls = if finish_reason == "tool_calls" {
-        openai_tool_calls(&completion.tool_calls)
-    } else {
-        Vec::new()
-    };
-    let visible_content =
-        if completion.preserve_thinking && !completion.reasoning_content.is_empty() {
-            format!(
-                "<think>{}</think>\n{}",
-                completion.reasoning_content, completion.content
-            )
-        } else {
-            completion.content.clone()
-        };
-    // Pure tool turns: OpenAI content is JSON null (not "").
-    let content_value = if visible_content.is_empty() && !tool_calls.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(visible_content)
-    };
-    let mut message = serde_json::json!({
-        "role": "assistant",
-        "content": content_value,
-    });
-    if !completion.preserve_thinking && !completion.reasoning_content.is_empty() {
-        message["reasoning_content"] =
-            serde_json::Value::String(completion.reasoning_content.clone());
-    }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = serde_json::Value::Array(tool_calls);
-    }
-    serde_json::json!({
-        "id": completion.id,
-        "object": "chat.completion",
-        "created": completion.created,
-        "model": completion.model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
-        "usage": completion_usage(completion),
-        "timings": completion_timings(completion),
-        "hipfire": {
-            "tok_s": completion.done.get("tok_s"),
-            "prefill_tok_s": completion.done.get("prefill_tok_s"),
-            "decode_tok_s": completion.done.get("decode_tok_s"),
-        }
-    })
-}
-
-fn completion_usage(completion: &Completion) -> serde_json::Value {
-    let cached_tokens = completion
-        .done
-        .get("cached_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let prompt_tokens = completion
-        .done
-        .get("prompt_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_else(|| {
-            completion
-                .done
-                .get("prefill_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                .saturating_add(cached_tokens)
-        });
-    let completion_tokens = completion
-        .done
-        .get("tokens")
-        .or_else(|| completion.done.get("completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    serde_json::json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "prompt_tokens_details": { "cached_tokens": cached_tokens },
-    })
-}
-
-fn completion_timings(completion: &Completion) -> serde_json::Value {
-    let done = &completion.done;
-    serde_json::json!({
-        "ttft_ms": done.get("ttft_ms"),
-        "prefill_ms": done.get("prefill_ms"),
-        "prefill_tok_s": done.get("prefill_tok_s"),
-        "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
-        "tau": done.get("tau"),
-        "cycles": done.get("cycles"),
-        "dflash": done.get("dflash"),
-        "mtp": done.get("mtp"),
-    })
-}
-
-/// One OpenAI-lowered tool call from the shared canonical adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OpenAiToolCallAdapterResult {
-    pub index: usize,
-    pub id: String,
-    pub name: String,
-    /// JSON-text arguments (OpenAI wire requires a string, not an object).
-    pub arguments: String,
-}
-
-/// Build the single shared OpenAI adapter result vector for a completion.
-/// Deterministic response-scoped ids `call_{index}`; no filtering/dropping.
-fn openai_tool_call_adapter_results(calls: &[ToolCall]) -> Vec<OpenAiToolCallAdapterResult> {
-    calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| OpenAiToolCallAdapterResult {
-            index,
-            id: format!("call_{index}"),
-            name: call.name.clone(),
-            arguments: serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
-        })
-        .collect()
-}
-
-/// Lower shared adapter results into OpenAI `message.tool_calls` objects.
-fn openai_tool_calls_from_adapter(
-    adapted: &[OpenAiToolCallAdapterResult],
-) -> Vec<serde_json::Value> {
-    adapted
-        .iter()
-        .map(|call| {
-            serde_json::json!({
-                "id": call.id,
-                "type": "function",
-                "function": {
-                    "name": call.name,
-                    "arguments": call.arguments,
-                }
-            })
-        })
-        .collect()
-}
-
-/// Canonical → OpenAI non-stream tool_calls array (shared adapter path).
-fn openai_tool_calls(calls: &[ToolCall]) -> Vec<serde_json::Value> {
-    openai_tool_calls_from_adapter(&openai_tool_call_adapter_results(calls))
-}
-
-/// Map a folded callback event to an OpenAI stream delta.
-/// Only clean content/reasoning are forwarded mid-stream; structured tool
-/// calls release only via [`openai_stream_terminal_chunks`].
-fn openai_stream_delta_for_event(event: &serde_json::Value) -> Option<serde_json::Value> {
-    match event.get("type").and_then(serde_json::Value::as_str) {
-        Some("token") => event
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .map(|text| serde_json::json!({ "content": text })),
-        Some("reasoning") => event
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .map(|text| serde_json::json!({ "reasoning_content": text })),
-        // tool_calls are released only after a tool-safe terminal verdict.
-        Some("tool_calls") => None,
-        _ => None,
-    }
-}
-
-/// Lower shared adapter results into an OpenAI stream `delta` tool_calls object.
-fn openai_tool_call_delta_from_adapter(
-    adapted: &[OpenAiToolCallAdapterResult],
-) -> serde_json::Value {
-    serde_json::json!({
-        "tool_calls": adapted
-            .iter()
-            .map(|call| {
-                serde_json::json!({
-                    "index": call.index,
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    }
-                })
-            })
-            .collect::<Vec<_>>()
-    })
-}
-
-/// Post-completion SSE chunks: optional tool_calls release, terminal choice,
-/// then optional separate `choices: []` usage chunk (never on the terminal).
-fn openai_stream_terminal_chunks(
-    completion: &Completion,
-    include_usage: bool,
-) -> Vec<serde_json::Value> {
-    let finish_reason = openai_finish_reason(&completion.done);
-    let mut chunks = Vec::new();
-
-    // Release structured calls only on a tool-safe terminal.
-    // Same adapter vector as non-stream `openai_tool_calls`.
-    if finish_reason == "tool_calls" && !completion.tool_calls.is_empty() {
-        let adapted = openai_tool_call_adapter_results(&completion.tool_calls);
-        let delta = openai_tool_call_delta_from_adapter(&adapted);
-        chunks.push(serde_json::json!({
-            "id": completion.id,
-            "object": "chat.completion.chunk",
-            "created": completion.created,
-            "model": completion.model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": null
-            }],
-        }));
-    }
-
-    chunks.push(serde_json::json!({
-        "id": completion.id,
-        "object": "chat.completion.chunk",
-        "created": completion.created,
-        "model": completion.model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
-        "timings": completion_timings(completion),
-    }));
-
-    if include_usage {
-        chunks.push(serde_json::json!({
-            "id": completion.id,
-            "object": "chat.completion.chunk",
-            "created": completion.created,
-            "model": completion.model,
-            "choices": [],
-            "usage": completion_usage(completion),
-        }));
-    }
-
-    chunks
-}
-
-fn request_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "chatcmpl-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn sse_data(value: &serde_json::Value) -> Vec<u8> {
-    format!("data: {}\n\n", value).into_bytes()
-}
-
-/// Forward one logical generate event onto the OpenAI SSE channel.
-///
-/// Delta-bearing events serialize to plain (no-ack) SSE bytes. No-delta mid-stream
-/// events (e.g. withheld tool_calls) are silent — terminal ack handles pure-tool
-/// delivery. A dropped receiver maps to [`hipfire_client::ClientError::Cancelled`].
-fn forward_sse_stream_event(
-    sender: &mpsc::Sender<ResponseChunk>,
-    id: &str,
-    created: u64,
-    model: &str,
-    event: &serde_json::Value,
-) -> Result<(), hipfire_client::ClientError> {
-    if let Some(delta) = openai_stream_delta_for_event(event) {
-        let chunk = serde_json::json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-        });
-        sender
-            .send(ResponseChunk::plain(sse_data(&chunk)))
-            .map_err(|_| hipfire_client::ClientError::Cancelled)
-    } else {
-        // Mid-stream no-delta: do not queue empty probes. Terminal path acks.
-        let _ = sender;
-        Ok(())
-    }
-}
-
-/// Serialize terminal tool_calls (if safe), finish, optional usage, and `[DONE]`
-/// into one non-empty acknowledged chunk. Waits for ChannelReader progress ack.
-fn deliver_sse_terminal_ack(
-    sender: &mpsc::Sender<ResponseChunk>,
-    completion: &Completion,
-    include_usage: bool,
-) -> Result<(), hipfire_client::ClientError> {
-    let mut bytes = Vec::new();
-    for chunk in openai_stream_terminal_chunks(completion, include_usage) {
-        bytes.extend_from_slice(&sse_data(&chunk));
-    }
-    bytes.extend_from_slice(b"data: [DONE]\n\n");
-    if bytes.is_empty() {
-        return Err(hipfire_client::ClientError::Protocol(
-            "stream terminal payload must be non-empty".into(),
-        ));
-    }
-    let (ack_tx, ack_rx) = mpsc::channel();
-    sender
-        .send(ResponseChunk {
-            bytes,
-            ack: Some(ack_tx),
-            fail: false,
-        })
-        .map_err(|_| hipfire_client::ClientError::Cancelled)?;
-    match ack_rx.recv() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-    }
-}
-
-/// Close an OpenAI SSE body after `complete_request`.
-///
-/// Success: terminal already delivered+acked at commit_ready — emit no post-commit
-/// bytes. Cancelled: no server_error/`[DONE]`. Post-terminal engine errors force
-/// an unclean reader failure rather than appending a success/error frame.
-fn finish_sse_stream(sender: mpsc::Sender<ResponseChunk>, result: Result<Completion>) {
-    match result {
-        Ok(_completion) => {
-            // Terminal representation already went out before commit.
-            drop(sender);
-        }
-        Err(error) => {
-            let cancelled = error
-                .downcast_ref::<hipfire_client::ClientError>()
-                .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-            if cancelled {
-                drop(sender);
-                return;
-            }
-            // Unclean failure: poison the reader instead of framing success/error.
-            let _ = sender.send(ResponseChunk {
-                bytes: Vec::new(),
-                ack: None,
-                fail: false,
-            });
-            // Marker for reader: empty+no-ack is ignored; use fail signal via drop
-            // after a special poison is not needed — ChannelReader fails when the
-            // optional fail flag is set. Prefer ResponseChunk::fail.
-            let _ = sender.send(ResponseChunk::fail());
-            drop(sender);
-        }
-    }
-}
-
-fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static HTTP header")
-}
-
-fn json_response(value: serde_json::Value, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
-    let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
-    Response::new(
-        StatusCode(status),
-        vec![
-            header("Content-Type", "application/json"),
-            header("Access-Control-Allow-Origin", "*"),
-        ],
-        std::io::Cursor::new(bytes.clone()),
-        Some(bytes.len()),
-        None,
-    )
-}
-
-fn openai_error(message: &str, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
-    let error_type = if (400..500).contains(&status) {
-        "invalid_request_error"
-    } else {
-        "server_error"
-    };
-    json_response(
-        serde_json::json!({
-            "error": { "message": message, "type": error_type }
-        }),
-        status,
-    )
-}
-
-fn admission_error_response(error: &AdmissionError) -> Response<std::io::Cursor<Vec<u8>>> {
-    openai_error(&error.message, 503).with_header(header(
-        "Retry-After",
-        &error.retry_after_seconds.to_string(),
-    ))
-}
-
-/// One HTTP response body record. Optional `ack` is signaled only after the
-/// reader fully drains `bytes` and the *next* `read` begins (proving writer
-/// progress). Queue insertion alone never acknowledges. Drop before that next
-/// read disconnects the waiter as Cancelled.
-#[derive(Debug)]
-struct ResponseChunk {
-    bytes: Vec<u8>,
-    ack: Option<mpsc::Sender<Result<(), ()>>>,
-    /// When set, the next read fails uncleanly (post-terminal engine error).
-    fail: bool,
-}
-
-impl ResponseChunk {
-    fn plain(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes,
-            ack: None,
-            fail: false,
-        }
-    }
-
-    fn fail() -> Self {
-        Self {
-            bytes: Vec::new(),
-            ack: None,
-            fail: true,
-        }
-    }
-}
-
-struct ChannelReader {
-    receiver: mpsc::Receiver<ResponseChunk>,
-    current: std::io::Cursor<Vec<u8>>,
-    /// Ack to fire on the *next* read after the current chunk is fully drained.
-    pending_ack: Option<mpsc::Sender<Result<(), ()>>>,
-    failed: bool,
-}
-
-impl ChannelReader {
-    fn new(receiver: mpsc::Receiver<ResponseChunk>) -> Self {
-        Self {
-            receiver,
-            current: std::io::Cursor::new(Vec::new()),
-            pending_ack: None,
-            failed: false,
-        }
-    }
-
-    fn fire_pending_ack(&mut self) {
-        if let Some(ack) = self.pending_ack.take() {
-            let _ = ack.send(Ok(()));
-        }
-    }
-}
-
-impl Drop for ChannelReader {
-    fn drop(&mut self) {
-        // Drop before the next-read ack → waiter sees disconnect/Cancelled.
-        if let Some(ack) = self.pending_ack.take() {
-            let _ = ack.send(Err(()));
-        }
-    }
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if self.failed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "response body failed after terminal delivery",
-            ));
-        }
-        // Next-read after full drain acknowledges the prior chunk. Partial
-        // reads must keep draining without firing the pending ack.
-        if self.current.position() == self.current.get_ref().len() as u64 {
-            self.fire_pending_ack();
-        }
-
-        loop {
-            let read = self.current.read(output)?;
-            if read > 0 {
-                return Ok(read);
-            }
-            // Current buffer exhausted. Do not ack yet — ack waits for *next* read.
-            match self.receiver.recv() {
-                Ok(chunk) if chunk.fail => {
-                    self.failed = true;
-                    if let Some(ack) = chunk.ack {
-                        let _ = ack.send(Err(()));
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "response body failed after terminal delivery",
-                    ));
-                }
-                // Empty non-fail chunks are ignored (no ack on empty).
-                Ok(chunk) if chunk.bytes.is_empty() => {
-                    if let Some(ack) = chunk.ack {
-                        // Empty acknowledged chunk is invalid — disconnect waiter.
-                        let _ = ack.send(Err(()));
-                    }
-                    continue;
-                }
-                Ok(chunk) => {
-                    // If a previous chunk still had a pending ack (shouldn't with
-                    // single outstanding), fire it only on this next read entry —
-                    // already fired at top. Stage this chunk's ack for the read
-                    // *after* it is fully drained.
-                    self.current = std::io::Cursor::new(chunk.bytes);
-                    self.pending_ack = chunk.ack;
-                }
-                Err(_) => {
-                    // Channel closed: any pending ack is a disconnect.
-                    if let Some(ack) = self.pending_ack.take() {
-                        let _ = ack.send(Err(()));
-                    }
-                    return Ok(0);
-                }
-            }
-        }
-    }
-}
-
-fn serve_instance_token() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut digest = Sha256::new();
-    digest.update(std::process::id().to_le_bytes());
-    digest.update(now.to_le_bytes());
-    format!("{:x}", digest.finalize())
-}
-
-fn proc_start_time(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
-    let mut listen_inodes = BTreeSet::new();
-    let port_hex = format!("{port:04X}");
-    let mut read_any = false;
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(raw) = fs::read_to_string(table) else {
-            continue;
-        };
-        read_any = true;
-        for line in raw.lines().skip(1) {
-            let columns = line.split_whitespace().collect::<Vec<_>>();
-            if columns.len() < 10 || columns[3] != "0A" {
-                continue;
-            }
-            let Some((_, local_port)) = columns[1].rsplit_once(':') else {
-                continue;
-            };
-            if local_port.eq_ignore_ascii_case(&port_hex) {
-                listen_inodes.insert(columns[9].to_owned());
-            }
-        }
-    }
-    if !read_any {
-        return None;
-    }
-    if listen_inodes.is_empty() {
-        return Some(false);
-    }
-    let entries = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
-    for entry in entries.flatten() {
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
-        };
-        let target = target.to_string_lossy();
-        if let Some(inode) = target
-            .strip_prefix("socket:[")
-            .and_then(|value| value.strip_suffix(']'))
-        {
-            if listen_inodes.contains(inode) {
-                return Some(true);
-            }
-        }
-    }
-    Some(false)
-}
-
-fn validate_serve_pid(record: &ServePidRecord, host: &str, fallback_port: u16) -> Result<()> {
-    let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
-    if !proc_dir.is_dir() {
-        bail!("tracked serve PID {} is no longer alive", record.pid);
-    }
-    let cmdline = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
-    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-    if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
-        bail!("PID {} is not a hipfire serve process", record.pid);
-    }
-    if let Some(expected) = record.start_time {
-        if proc_start_time(record.pid) != Some(expected) {
-            bail!("PID {} was reused after serve.pid was written", record.pid);
-        }
-    }
-
-    let port = record.port.unwrap_or(fallback_port);
-    let owns_port = pid_owns_listen_port(record.pid, port);
-    if owns_port == Some(false) {
-        bail!(
-            "PID {} does not own the tracked serve port {port}",
-            record.pid
-        );
-    }
-    let health_matches = record.token.as_deref().is_some_and(|expected| {
-        http_get_json(host, port, "/health").is_some_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
-                && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
-        })
-    });
-    if owns_port == Some(true) || health_matches || record.legacy && owns_port.is_none() {
-        Ok(())
-    } else {
-        bail!(
-            "could not prove ownership of PID {} with port or health token",
-            record.pid
-        )
-    }
-}
-
-fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
-    let pid_path = paths.root.join("serve.pid");
-    match fs::read_to_string(&pid_path) {
-        Ok(raw) => {
-            let record = parse_pid_record(&raw)
-                .ok_or_else(|| anyhow!("invalid serve.pid; refusing to signal"))?;
-            let resolved = resolved_global(paths, true)
-                .ok()
-                .map(|(_, resolved)| resolved);
-            let host = resolved
-                .as_ref()
-                .and_then(|resolved| config_string(resolved, "serve.host").ok())
-                .unwrap_or_else(|| "127.0.0.1".into());
-            let fallback_port = args
-                .port
-                .or_else(|| {
-                    resolved.as_ref().and_then(|resolved| {
-                        config_u64(resolved, "serve.port")
-                            .ok()
-                            .and_then(|port| u16::try_from(port).ok())
-                    })
-                })
-                .unwrap_or(11435);
-            if let Err(error) = validate_serve_pid(&record, probe_host(&host), fallback_port) {
-                fs::remove_file(&pid_path)?;
-                if !args.force {
-                    bail!("{error}; removed stale pidfile without signaling");
-                }
-                eprintln!(
-                    "warning: {error}; refusing direct PID signal and continuing forced reap"
-                );
-            } else {
-                let status = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(record.pid.to_string())
-                    .status()
-                    .context("failed to invoke kill")?;
-                if !status.success() {
-                    bail!("failed to stop native serve PID {}", record.pid);
-                }
-                for _ in 0..50 {
-                    if !Path::new(&format!("/proc/{}", record.pid)).exists() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                let _ = fs::remove_file(&pid_path);
-                println!("hipfire serve stopped (PID {})", record.pid);
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("hipfire serve is not running");
-        }
-        Err(error) => return Err(error).context("failed to read serve.pid"),
-    }
-    if args.force || args.all {
-        let (_, resolved) = resolved_global(paths, true)?;
-        let port = args
-            .port
-            .unwrap_or(config_u64(&resolved, "serve.port")? as u16);
-        let _ = Command::new("pkill").args(["-x", "daemon"]).status();
-        if args.all {
-            let _ = Command::new("pkill")
-                .args(["-f", "target/release/hipfire-quantize"])
-                .status();
-        }
-        let _ = Command::new("fuser")
-            .args(["-k", &format!("{port}/tcp")])
-            .status();
-        println!("reaped orphan daemon processes and freed port {port}");
-    }
-    Ok(())
-}
-
-fn parse_pid_record(raw: &str) -> Option<ServePidRecord> {
-    if let Ok(pid) = raw.trim().parse() {
-        return Some(ServePidRecord {
-            pid,
-            start_time: None,
-            port: None,
-            token: None,
-            legacy: true,
-        });
-    }
-    let mut record = serde_json::from_str::<ServePidRecord>(raw).ok()?;
-    record.legacy = record.start_time.is_none() && record.port.is_none() && record.token.is_none();
-    Some(record)
-}
-
-fn resolved_for_model(
+pub(crate) fn resolved_for_model(
     paths: &Paths,
     model_name: &str,
     tag: Option<&str>,
@@ -5604,18 +2309,14 @@ fn resolved_for_model(
 ) -> Result<hipfire_config::ResolvedConfig> {
     let loaded = load_global(&paths.config)?;
     let mut layers = Vec::new();
-    if let (Some(tag), Some(settings)) = (
-        tag,
-        entry.and_then(|entry| entry.recommended_settings.as_ref()),
-    ) {
+    if let (Some(tag), Some(entry)) = (tag, entry) {
         layers.push(NamedLayer {
             source: ConfigSource::RegistryModel {
                 tag: tag.to_owned(),
                 revision: "v1".into(),
             },
-            layer: settings
-                .config_layer()
-                .map_err(|error| anyhow!("invalid registry recommendations: {error}"))?,
+            layer: hipfire_registry::config_layer_for_tag(tag, entry)
+                .map_err(|error| anyhow!("invalid registry model defaults: {error}"))?,
         });
     }
     layers.push(NamedLayer {
@@ -5651,7 +2352,11 @@ fn resolved_for_model(
     Ok(resolve(layers)?)
 }
 
-fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Option<PathBuf> {
+pub(crate) fn find_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Option<PathBuf> {
     let direct = PathBuf::from(model);
     if direct.is_file() {
         return fs::canonicalize(direct).ok();
@@ -5705,83 +2410,7 @@ fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Option<
     candidates.into_iter().next()
 }
 
-/// Parse a `HIPFIRE_*` multi-GPU degree (device-mesh parity with the dropped
-/// TS CLI). Empty → `None` (degree 1). An explicit non-integer is a hard
-/// error — the TS CLI silently skipped it, but the native control plane
-/// surfaces misconfiguration. Values ≤ 1 are treated as unset so single-GPU
-/// loads stay byte-identical. Pure: env reads live in [`mesh_degree_env`].
-fn parse_mesh_degree(name: &str, raw: &str) -> Result<Option<u64>> {
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-    let degree: u64 = raw
-        .parse()
-        .map_err(|_| anyhow!("{name} must be an integer; got '{raw}'"))?;
-    Ok((degree > 1).then_some(degree))
-}
-
-fn mesh_degree_env(name: &str) -> Result<Option<u64>> {
-    let Some(raw) = env::var_os(name) else {
-        return Ok(None);
-    };
-    parse_mesh_degree(name, &raw.to_string_lossy())
-}
-
-/// Parse an explicit MTP draft-window override (`parseMtpK` parity): 1..=8.
-/// The daemon re-validates via `resolve_mtp_k`; this surfaces the error
-/// before the load round-trip. Pure: env reads live in [`mtp_k_env`].
-fn parse_mtp_k(raw: &str) -> Result<u64> {
-    let k: u64 = raw
-        .parse()
-        .map_err(|_| anyhow!("HIPFIRE_MTP_K must be an integer from 1 to 8; got '{raw}'"))?;
-    if !(1..=8).contains(&k) {
-        bail!("HIPFIRE_MTP_K must be between 1 and 8; got {k}");
-    }
-    Ok(k)
-}
-
-fn mtp_k_env() -> Result<Option<u64>> {
-    let Some(raw) = env::var_os("HIPFIRE_MTP_K") else {
-        return Ok(None);
-    };
-    let raw = raw.to_string_lossy();
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(parse_mtp_k(&raw)?))
-}
-
-/// Lower `--draft-max` into per-mechanism draft windows (TS `mtp_k.ts` parity):
-/// ngram takes the flag value; the MTP window is `HIPFIRE_MTP_K` env > flag,
-/// validated 1..=8; auto/other applies both windows.
-fn apply_draft_max(
-    params: &mut serde_json::Value,
-    window: u64,
-    speculation: Option<&str>,
-) -> Result<()> {
-    if !(1..=32).contains(&window) {
-        bail!("--draft-max must be between 1 and 32");
-    }
-    match speculation.unwrap_or("auto") {
-        "ngram" => params["ngram_k"] = serde_json::json!(window),
-        "mtp" => {
-            let k = mtp_k_env()?.unwrap_or(window);
-            if !(1..=8).contains(&k) {
-                bail!("--draft-max for MTP must be between 1 and 8; got {k}");
-            }
-            params["mtp_k"] = serde_json::json!(k);
-        }
-        _ => {
-            // HIPFIRE_MTP_K outranks the flag; both are applied here so the
-            // lowering is self-contained (load_params also honors the env).
-            params["mtp_k"] = serde_json::json!(mtp_k_env()?.unwrap_or(window));
-            params["ngram_k"] = serde_json::json!(window);
-        }
-    }
-    Ok(())
-}
-
-fn load_params(
+pub(crate) fn load_params(
     resolved: &hipfire_config::ResolvedConfig,
     entry: Option<&ModelEntry>,
     model_path: &Path,
@@ -5801,10 +2430,11 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let configured_backend = config_string(resolved, "memory.kv_backend")?;
     let kv_backend = kv_backend_override
         .map(str::to_owned)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "contiguous".into())
+        .unwrap_or(configured_backend)
         .to_ascii_lowercase();
     if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
         bail!("--kv-backend must be contiguous or vmm");
@@ -5823,6 +2453,10 @@ fn load_params(
     }
     let mut params = serde_json::json!({
         "max_seq": max_seq,
+        "deepseek4_compute_placement": config_string(
+            resolved,
+            "hardware.deepseek4_compute_placement",
+        )?,
         "kv_mode": kv_mode,
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
@@ -5839,6 +2473,7 @@ fn load_params(
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
+        "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
         "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
@@ -5853,28 +2488,16 @@ fn load_params(
         "prefill_drafter_device": config_i64(resolved, "speculation.prefill.drafter_device")?,
         "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
+        "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
+    if let Some(experts_per_token) =
+        config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
+    {
+        params["deepseek4_experts_per_token"] = serde_json::json!(experts_per_token);
+    }
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
     project_dflash_draft(&mut params, developer_dflash_draft(resolved));
-    // Multi-GPU mesh env routing (device-mesh parity with the dropped TS CLI).
-    // HIPFIRE_TP / HIPFIRE_EP / HIPFIRE_PP forward as params.tp/ep/pp only
-    // when > 1 so single-GPU loads stay byte-identical; the daemon refuses
-    // ep/tp > 1 for DFlash drafters and rejects incompatible tp+pp combos.
-    for (name, key) in [
-        ("HIPFIRE_TP", "tp"),
-        ("HIPFIRE_EP", "ep"),
-        ("HIPFIRE_PP", "pp"),
-    ] {
-        if let Some(degree) = mesh_degree_env(name)? {
-            params[key] = serde_json::json!(degree);
-        }
-    }
-    // Explicit MTP window: env > config (TS resolveMtpK ladder). The run
-    // command's --draft-max lowering also defers to it via apply_draft_max.
-    if let Some(k) = mtp_k_env()? {
-        params["mtp_k"] = serde_json::json!(k);
-    }
     Ok(params)
 }
 
@@ -5947,89 +2570,659 @@ fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) ->
     Ok(())
 }
 
-fn apply_reasoning_request(
-    resolved: &hipfire_config::ResolvedConfig,
-    request: &mut serde_json::Value,
-) -> Result<()> {
-    if config_string(resolved, "reasoning.mode")? == "off" {
-        request["max_think_tokens"] = serde_json::json!(1);
-        request["assistant_prefix"] = serde_json::json!("closed_think");
-        return Ok(());
-    }
-    let explicit = resolved
-        .get("reasoning.max_tokens")
-        .map(|value| &value.value)
-        .filter(|value| !matches!(value, hipfire_config::ConfigValue::Null));
-    let max_think = if let Some(value) = explicit {
-        match value {
-            hipfire_config::ConfigValue::Integer(value) => *value as u64,
-            _ => bail!("reasoning.max_tokens resolved to a non-integer"),
-        }
-    } else {
-        match config_string(resolved, "reasoning.budget")?.as_str() {
-            // 1 = the engine's "no thinking" sentinel (daemon: `enable_thinking:
-            // max_think_tokens != 1`), matching what the OpenAI
-            // enable_thinking=false / reasoning_effort="none" paths send. Pair it
-            // with the closed-think assistant prefix so the turn starts in answer
-            // mode instead of relying on the template alone.
-            "off" => {
-                request["max_think_tokens"] = serde_json::json!(1);
-                request["assistant_prefix"] = serde_json::json!("closed_think");
-                request["reasoning_effort"] = serde_json::json!("none");
-                return Ok(());
-            }
-            "low" => 512,
-            "med" => 2048,
-            "high" => 8192,
-            "xhigh" => 24576,
-            "max" => 32768,
-            "uncapped" => 0,
-            value => bail!("unknown reasoning budget {value}"),
-        }
-    };
-    request["max_think_tokens"] = serde_json::json!(max_think);
-    Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasoningResolution {
+    pub effective_mode: String,
+    pub effective_effort: Option<String>,
+    pub effective_cap: Option<u64>,
+    pub cap_source: String,
+    pub contract: ReasoningContract,
+    pub warnings: Vec<String>,
 }
 
-fn apply_http_reasoning_request(
+pub(crate) fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
     request: &mut serde_json::Value,
-) -> Result<()> {
-    let thinking_disabled = body
+    contract: ReasoningContract,
+    effort_native: bool,
+    supported_efforts: &[String],
+) -> Result<ReasoningResolution> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut push_warn = |msg: String| {
+        eprintln!("[WARN: INVALID CONFIG] {}", msg);
+        warnings.push(msg);
+    };
+    if let Some(object) = request.as_object_mut() {
+        for key in [
+            "thinking_enabled",
+            "assistant_prefix",
+            "reasoning_effort",
+            "max_think_tokens",
+        ] {
+            object.remove(key);
+        }
+    }
+    if body.get("enable_thinking").is_some() {
+        if let Some(value) = body.get("enable_thinking") {
+            if !value.is_boolean() && !value.is_null() {
+                bail!("enable_thinking must be a boolean");
+            }
+        }
+    }
+    let top_enable = body
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    if body
         .pointer("/chat_template_kwargs/enable_thinking")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false);
-    let effort = body
+        .is_some()
+    {
+        if let Some(value) = body.pointer("/chat_template_kwargs/enable_thinking") {
+            if !value.is_boolean() && !value.is_null() {
+                bail!("chat_template_kwargs.enable_thinking must be a boolean");
+            }
+        }
+    }
+    let kwargs_enable = body
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    let thinking_type_raw = body
+        .pointer("/thinking/type")
+        .or_else(|| body.get("thinking").and_then(|value| value.get("type")));
+    let mut thinking_type_str: Option<&str> = None;
+    if let Some(raw) = thinking_type_raw {
+        if !raw.is_string() {
+            bail!("thinking.type must be enabled or disabled");
+        } else {
+            let s = raw.as_str().unwrap();
+            if s == "enabled" || s == "disabled" {
+                thinking_type_str = Some(s);
+            } else {
+                push_warn(format!(
+                    "thinking.type '{}' dropped: expected enabled|disabled",
+                    s
+                ));
+                thinking_type_str = None;
+            }
+        }
+    }
+    let effort_raw = body
         .get("reasoning_effort")
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
             body.pointer("/reasoning/effort")
                 .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            body.pointer("/chat_template_kwargs/reasoning_effort")
+                .and_then(serde_json::Value::as_str)
         });
-    if thinking_disabled || effort == Some("none") {
-        request["max_think_tokens"] = serde_json::json!(1);
-        request["assistant_prefix"] = serde_json::json!("closed_think");
-        request["reasoning_effort"] = serde_json::json!("none");
-        return Ok(());
+    let effort_present = body.get("reasoning_effort").is_some()
+        || body.pointer("/reasoning/effort").is_some()
+        || body
+            .pointer("/chat_template_kwargs/reasoning_effort")
+            .is_some();
+    if effort_present && effort_raw.is_none() {
+        bail!("reasoning_effort must be a string");
     }
-    if let Some(effort) = effort {
-        let max_think = match effort {
-            "minimal" => 64,
-            "low" => 256,
-            "medium" | "med" => 1024,
-            "high" => 4096,
-            "xhigh" | "max" | "uncapped" => 0,
-            other => bail!("unknown reasoning effort '{other}'"),
+    let body_budget_present = body.get("thinking_budget").is_some();
+    let body_budget_str = body
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_str);
+    if body_budget_present && body_budget_str.is_none() {
+        bail!("thinking_budget must be a string preset");
+    }
+    let body_top_max_present = body.get("max_think_tokens").is_some();
+    let body_nested_max_present = body.pointer("/reasoning/max_tokens").is_some();
+    let parse_body_think_cap = |value: &serde_json::Value, field: &str| -> Result<u64> {
+        match value {
+            serde_json::Value::Number(number) => {
+                if let Some(parsed) = number.as_u64() {
+                    if parsed > 393_216 {
+                        bail!("{field} must be between 0 and 393216");
+                    }
+                    Ok(parsed)
+                } else {
+                    bail!("{field} must be between 0 and 393216");
+                }
+            }
+            _ => bail!("{field} must be between 0 and 393216"),
+        }
+    };
+    let top_max_opt = if body_top_max_present {
+        Some(parse_body_think_cap(
+            body.get("max_think_tokens").unwrap(),
+            "max_think_tokens",
+        )?)
+    } else {
+        None
+    };
+    let nested_max_opt = if body_nested_max_present {
+        Some(parse_body_think_cap(
+            body.pointer("/reasoning/max_tokens").unwrap(),
+            "reasoning.max_tokens",
+        )?)
+    } else {
+        None
+    };
+    let (max_opt, body_max_source) = match (top_max_opt, nested_max_opt) {
+        (Some(top), Some(nested)) => {
+            if top != nested {
+                push_warn(
+                    "reasoning.max_tokens dropped because explicit max_think_tokens takes precedence"
+                        .to_string(),
+                );
+            }
+            (Some(top), "explicit:body:max_think_tokens")
+        }
+        (Some(top), None) => (Some(top), "explicit:body:max_think_tokens"),
+        (None, Some(nested)) => (Some(nested), "explicit:body:reasoning.max_tokens"),
+        (None, None) => (None, ""),
+    };
+    let has_explicit_body_max = body_top_max_present || body_nested_max_present;
+    let config_max_entry = resolved.get("reasoning.max_tokens").filter(|value| {
+        !matches!(value.source, hipfire_config::ConfigSource::BuiltIn)
+            && !matches!(value.value, hipfire_config::ConfigValue::Null)
+    });
+    let mut config_max_opt: Option<u64> = None;
+    if let Some(entry) = config_max_entry {
+        match entry.value {
+            hipfire_config::ConfigValue::Integer(value) if value >= 0 => {
+                config_max_opt = Some(value as u64);
+            }
+            _ => bail!("reasoning.max_tokens resolved to a non-negative integer"),
+        }
+    }
+    let has_explicit_config_max = config_max_opt.is_some();
+    let config_budget_entry = resolved
+        .get("reasoning.budget")
+        .filter(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let has_explicit_config_budget = config_budget_entry.is_some();
+    let config_budget_str: Option<String> = if has_explicit_config_budget {
+        Some(config_string(resolved, "reasoning.budget")?)
+    } else {
+        None
+    };
+    let has_explicit_effort = effort_raw.is_some();
+    let has_explicit_toggle =
+        top_enable.is_some() || kwargs_enable.is_some() || thinking_type_str.is_some();
+    let is_effort_native = match contract {
+        ReasoningContract::QwenJinja => effort_native,
+        ReasoningContract::DeepSeek4 => true,
+        ReasoningContract::MuseGlimmer => true,
+        _ => false,
+    };
+    if matches!(contract, ReasoningContract::Unsupported) {
+        if has_explicit_toggle {
+            push_warn(
+                "reasoning controls dropped for unsupported contract: thinking toggle ignored"
+                    .to_string(),
+            );
+        }
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped for unsupported contract",
+                effort_raw.unwrap_or("unknown")
+            ));
+        }
+        if has_explicit_body_max
+            || body_budget_present
+            || has_explicit_config_max
+            || has_explicit_config_budget
+        {
+            push_warn("max_think_tokens/budget dropped for unsupported contract".to_string());
+        }
+        let resolution = ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract,
+            warnings: warnings.clone(),
         };
-        request["max_think_tokens"] = serde_json::json!(max_think);
-        request["reasoning_effort"] = serde_json::json!(effort);
-        return Ok(());
+        return Ok(resolution);
     }
-    apply_reasoning_request(resolved, request)
+    if matches!(contract, ReasoningContract::GemmaBoolean) {
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped for gemma_boolean: use thinking toggle only",
+                effort_raw.unwrap()
+            ));
+        }
+        if body_budget_present {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for gemma_boolean",
+                body_budget_str.unwrap()
+            ));
+        }
+        if has_explicit_body_max {
+            push_warn(format!(
+                "{} {} dropped for gemma_boolean: use thinking toggle only",
+                if body_top_max_present {
+                    "max_think_tokens"
+                } else {
+                    "reasoning.max_tokens"
+                },
+                max_opt.unwrap()
+            ));
+        }
+        if has_explicit_config_max {
+            push_warn(format!(
+                "reasoning.max_tokens {} dropped for gemma_boolean: use thinking toggle only",
+                config_max_opt.unwrap()
+            ));
+        }
+        if has_explicit_config_budget {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for gemma_boolean",
+                config_budget_str.clone().unwrap()
+            ));
+        }
+    }
+    let thinking_type_toggle = thinking_type_str.map(|value| value == "enabled");
+    let toggle_values = [top_enable, kwargs_enable, thinking_type_toggle];
+    let saw_enabled = toggle_values.iter().flatten().any(|value| *value);
+    let saw_disabled = toggle_values.iter().flatten().any(|value| !*value);
+    if saw_enabled && saw_disabled {
+        push_warn("conflicting thinking toggles normalized: disabled wins".to_string());
+    }
+    let mut toggle_opt = toggle_values
+        .into_iter()
+        .flatten()
+        .reduce(|previous, value| previous && value);
+    let is_off_effort = matches!(
+        contract,
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4
+    ) && matches!(effort_raw, Some("none") | Some("off") | Some("chat"));
+    if is_off_effort {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with off/none effort; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    let is_off_budget = !is_effort_native
+        && !matches!(contract, ReasoningContract::GemmaBoolean)
+        && body_budget_str == Some("off");
+    if is_off_budget {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with legacy budget off; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    let config_mode = config_string(resolved, "reasoning.mode").unwrap_or_else(|_| "on".into());
+    let config_mode_is_explicit = resolved
+        .get("reasoning.mode")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let config_effort =
+        config_string(resolved, "reasoning.effort").unwrap_or_else(|_| "auto".into());
+    let config_effort_is_explicit = resolved
+        .get("reasoning.effort")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let config_budget =
+        config_string(resolved, "reasoning.budget").unwrap_or_else(|_| "uncapped".into());
+    let config_budget_is_explicit = resolved
+        .get("reasoning.budget")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let configured_off = (config_mode_is_explicit && config_mode == "off")
+        || (config_effort_is_explicit && config_effort == "none")
+        || (!is_effort_native
+            && !matches!(contract, ReasoningContract::GemmaBoolean)
+            && config_budget_is_explicit
+            && config_budget == "off");
+    let family_default = !matches!(contract, ReasoningContract::GemmaBoolean);
+    let mut thinking_enabled = toggle_opt.unwrap_or_else(|| {
+        if configured_off {
+            false
+        } else if config_mode_is_explicit {
+            config_mode != "off"
+        } else {
+            family_default
+        }
+    });
+    if matches!(contract, ReasoningContract::MuseGlimmer) && !thinking_enabled {
+        push_warn("reasoning off dropped for muse_glimmer: always-on reasoning".to_string());
+        thinking_enabled = true;
+    }
+    request["thinking_enabled"] = serde_json::json!(thinking_enabled);
+    let prefix = match contract {
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4 => {
+            if thinking_enabled {
+                "open_think"
+            } else {
+                "closed_think"
+            }
+        }
+        ReasoningContract::GemmaBoolean | ReasoningContract::MuseGlimmer => "plain",
+        ReasoningContract::Unsupported => "plain",
+    };
+    request["assistant_prefix"] = serde_json::json!(prefix);
+    if !thinking_enabled {
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped: thinking disabled",
+                effort_raw.unwrap()
+            ));
+        }
+        if config_effort_is_explicit && config_effort != "auto" && config_effort != "none" {
+            push_warn(format!(
+                "reasoning.effort '{}' dropped: thinking disabled",
+                config_effort
+            ));
+        }
+        let cap_present = has_explicit_body_max
+            || body_budget_present
+            || has_explicit_config_max
+            || has_explicit_config_budget;
+        if cap_present {
+            push_warn("max_think_tokens/budget dropped: thinking disabled".to_string());
+        }
+        let resolution = ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract,
+            warnings: warnings.clone(),
+        };
+        return Ok(resolution);
+    }
+    if matches!(contract, ReasoningContract::QwenJinja) && is_effort_native && body_budget_present {
+        push_warn(format!(
+            "thinking_budget '{}' ignored for effort-native contract {}: use explicit max_think_tokens for cap",
+            body_budget_str.unwrap(),
+            contract.wire_name()
+        ));
+    }
+    if matches!(contract, ReasoningContract::QwenJinja)
+        && is_effort_native
+        && has_explicit_config_budget
+    {
+        push_warn(format!(
+            "thinking_budget '{}' ignored for effort-native contract {}: use explicit max_think_tokens for cap",
+            config_budget_str.clone().unwrap(),
+            contract.wire_name()
+        ));
+    }
+
+    let (mut effective_cap, mut cap_source) = if matches!(contract, ReasoningContract::GemmaBoolean)
+    {
+        (None, "none".to_string())
+    } else if matches!(
+        contract,
+        ReasoningContract::DeepSeek4 | ReasoningContract::MuseGlimmer
+    ) && (has_explicit_body_max
+        || has_explicit_config_max
+        || body_budget_present
+        || has_explicit_config_budget)
+    {
+        if has_explicit_body_max {
+            push_warn(format!(
+                "{} {} dropped for {}: use reasoning_effort only",
+                if body_top_max_present {
+                    "max_think_tokens"
+                } else {
+                    "reasoning.max_tokens"
+                },
+                max_opt.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if has_explicit_config_max {
+            push_warn(format!(
+                "reasoning.max_tokens {} dropped for {}: use reasoning_effort only",
+                config_max_opt.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if body_budget_present {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for {}: use reasoning_effort only",
+                body_budget_str.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if has_explicit_config_budget {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for {}: use reasoning_effort only",
+                config_budget_str.clone().unwrap(),
+                contract.wire_name()
+            ));
+        }
+        (None, "none".to_string())
+    } else if has_explicit_body_max {
+        if body_budget_present {
+            push_warn(
+                "thinking_budget dropped because explicit max_think_tokens takes precedence"
+                    .to_string(),
+            );
+        }
+        (max_opt, body_max_source.to_string())
+    } else if !is_effort_native && body_budget_present {
+        let budget_str = body_budget_str.unwrap();
+        let mapped = match budget_str {
+            "off" => None,
+            "low" => Some(512),
+            "med" => Some(2048),
+            "high" => Some(8192),
+            "xhigh" => Some(24576),
+            "max" => Some(32768),
+            "uncapped" => Some(0),
+            other => {
+                push_warn(format!(
+                    "thinking_budget '{}' dropped: unknown preset",
+                    other
+                ));
+                None
+            }
+        };
+        if mapped.is_none() && budget_str != "off" && {
+            let known = ["low", "med", "high", "xhigh", "max", "uncapped"];
+            !known.contains(&budget_str)
+        } {
+            (None, "none".to_string())
+        } else {
+            (mapped, "explicit:body:thinking_budget".to_string())
+        }
+    } else if has_explicit_config_max {
+        (config_max_opt, "config:reasoning.max_tokens".to_string())
+    } else if !is_effort_native && has_explicit_config_budget {
+        let budget_str = config_budget_str.as_deref().unwrap();
+        let mapped = match budget_str {
+            "off" => None,
+            "low" => Some(512),
+            "med" => Some(2048),
+            "high" => Some(8192),
+            "xhigh" => Some(24576),
+            "max" => Some(32768),
+            "uncapped" => Some(0),
+            other => {
+                push_warn(format!(
+                    "thinking_budget '{}' dropped: unknown preset",
+                    other
+                ));
+                None
+            }
+        };
+        if mapped.is_none() && budget_str != "off" && {
+            let known = ["low", "med", "high", "xhigh", "max", "uncapped"];
+            !known.contains(&budget_str)
+        } {
+            (None, "none".to_string())
+        } else {
+            (mapped, "config:reasoning.budget".to_string())
+        }
+    } else {
+        (None, "none".to_string())
+    };
+    if effective_cap == Some(0) {
+        effective_cap = None;
+        cap_source = "none".to_string();
+    }
+    if let Some(value) = effective_cap {
+        request["max_think_tokens"] = serde_json::json!(value);
+    }
+    let mut effective_effort: Option<String> = None;
+    match contract {
+        ReasoningContract::QwenJinja => {
+            if !effort_native {
+                if has_explicit_effort {
+                    push_warn(format!(
+                        "reasoning_effort '{}' dropped: template does not natively support effort (Qwen3.6); use thinking_budget or max_think_tokens for cap",
+                        effort_raw.unwrap()
+                    ));
+                }
+                if config_effort_is_explicit && config_effort != "auto" {
+                    push_warn(format!(
+                        "reasoning.effort '{}' dropped: template does not natively support effort",
+                        config_effort
+                    ));
+                }
+                effective_effort = None;
+            } else if has_explicit_effort || config_effort_is_explicit {
+                let raw = if let Some(value) = effort_raw {
+                    value.to_owned()
+                } else {
+                    config_effort.clone()
+                };
+                if raw == "auto" {
+                    effective_effort = Some("xhigh".to_string());
+                    request["reasoning_effort"] = serde_json::json!("xhigh");
+                } else {
+                    match raw.as_str() {
+                        "low" | "medium" | "xhigh" => {
+                            if !supported_efforts.is_empty() && !supported_efforts.contains(&raw) {
+                                push_warn(format!(
+                                    "reasoning_effort '{}' dropped: not in supported {:?}",
+                                    raw, supported_efforts
+                                ));
+                                effective_effort = Some("xhigh".to_string());
+                                request["reasoning_effort"] = serde_json::json!("xhigh");
+                            } else {
+                                effective_effort = Some(raw.clone());
+                                request["reasoning_effort"] = serde_json::json!(raw);
+                            }
+                        }
+                        "high" | "max" | "minimal" | "med" => {
+                            push_warn(format!(
+                                "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
+                                raw
+                            ));
+                            effective_effort = Some("xhigh".to_string());
+                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                        }
+                        other => {
+                            push_warn(format!(
+                                "reasoning_effort '{}' normalized to qwen_jinja default xhigh",
+                                other
+                            ));
+                            effective_effort = Some("xhigh".to_string());
+                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                        }
+                    }
+                }
+            } else {
+                let default = "xhigh".to_string();
+                effective_effort = Some(default.clone());
+                request["reasoning_effort"] = serde_json::json!(default);
+            }
+        }
+        ReasoningContract::DeepSeek4 => {
+            let raw = if let Some(value) = effort_raw {
+                value.to_owned()
+            } else {
+                let cfg = config_string(resolved, "reasoning.effort")
+                    .unwrap_or_else(|_| "auto".to_string());
+                if cfg != "auto" {
+                    cfg
+                } else {
+                    "high".to_string()
+                }
+            };
+            let normalized = match raw.as_str() {
+                "minimal" => "low",
+                "low" => "low",
+                "medium" | "med" => "high",
+                "xhigh" => "high",
+                "high" => "high",
+                "max" => "max",
+                other => {
+                    push_warn(format!(
+                        "reasoning_effort '{}' normalized to deepseek4 default high",
+                        other
+                    ));
+                    "high"
+                }
+            };
+            effective_effort = Some(normalized.to_string());
+            request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::MuseGlimmer => {
+            let raw = if let Some(value) = effort_raw {
+                value.to_owned()
+            } else {
+                let cfg = config_string(resolved, "reasoning.effort")
+                    .unwrap_or_else(|_| "auto".to_string());
+                if cfg != "auto" {
+                    match cfg.as_str() {
+                        "low" | "medium" | "high" | "xhigh" | "max" => cfg,
+                        other => {
+                            push_warn(format!(
+                                "reasoning.effort '{}' normalized to muse_glimmer default high",
+                                other
+                            ));
+                            "high".to_string()
+                        }
+                    }
+                } else {
+                    "high".to_string()
+                }
+            };
+            let normalized = match raw.as_str() {
+                "low" => "low",
+                "medium" | "med" => "medium",
+                "high" => "high",
+                "xhigh" => "xhigh",
+                "max" => "xhigh",
+                other => {
+                    push_warn(format!(
+                        "reasoning_effort '{}' normalized to muse_glimmer default high",
+                        other
+                    ));
+                    "high"
+                }
+            };
+            effective_effort = Some(normalized.to_string());
+            request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::GemmaBoolean => {
+            effective_effort = None;
+        }
+        ReasoningContract::Unsupported => {
+            effective_effort = None;
+        }
+    }
+    let resolution = ReasoningResolution {
+        effective_mode: if thinking_enabled {
+            "enabled".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        effective_effort,
+        effective_cap,
+        cap_source,
+        contract,
+        warnings: warnings.clone(),
+    };
+    Ok(resolution)
 }
 
-fn config_value<'a>(
+pub(crate) fn config_value<'a>(
     resolved: &'a hipfire_config::ResolvedConfig,
     key: &str,
 ) -> Result<&'a hipfire_config::ConfigValue> {
@@ -6039,33 +3232,52 @@ fn config_value<'a>(
         .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
 }
 
-fn config_string(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<String> {
+pub(crate) fn config_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<String> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
         value => bail!("{key} resolved as {}, expected string", value.kind()),
     }
 }
 
-fn config_bool(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<bool> {
+pub(crate) fn config_bool(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<bool> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::Bool(value) => Ok(*value),
         value => bail!("{key} resolved as {}, expected bool", value.kind()),
     }
 }
 
-fn config_i64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<i64> {
+pub(crate) fn config_i64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<i64> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::Integer(value) => Ok(*value),
         value => bail!("{key} resolved as {}, expected integer", value.kind()),
     }
 }
 
-fn config_u64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<u64> {
+pub(crate) fn config_u64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<u64> {
     let value = config_i64(resolved, key)?;
     u64::try_from(value).map_err(|_| anyhow!("{key} cannot be negative"))
 }
 
-fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f64> {
+pub(crate) fn config_optional_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<u64>> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Null => Ok(None),
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| anyhow!("{key} cannot be negative")),
+        value => bail!(
+            "{key} resolved as {}, expected integer or null",
+            value.kind()
+        ),
+    }
+}
+
+pub(crate) fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f64> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::Integer(value) => Ok(*value as f64),
         hipfire_config::ConfigValue::Float(value) => Ok(*value),
@@ -6240,7 +3452,7 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     Ok(())
 }
 
-fn http_get_json(host: &str, port: u16, path: &str) -> Option<serde_json::Value> {
+pub(crate) fn http_get_json(host: &str, port: u16, path: &str) -> Option<serde_json::Value> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(1)))
         .http_status_as_error(false)
@@ -6299,6 +3511,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
+    // --exp runs a fixed 128-token protocol across five RDNA2 variants and
+    // ignores --max-tokens, so it can never give a think span room to close.
+    // Reject the combination rather than silently drop the flag and abort
+    // later on an open-think terminal.
+    if args.exp && args.reasoning_on {
+        bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
+    }
+    if let Some(spec) = args.concurrency.clone() {
+        return bench_concurrency_command(paths, &args, &spec);
+    }
     for (name, values) in [
         ("--pp", &args.pp),
         ("--ctx", &args.ctx),
@@ -6312,9 +3534,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("decode lengths must be positive");
     }
     if let Some(mode) = args.kv_mode.as_deref() {
-        if !matches!(mode, "q8" | "fwht2" | "fwht3" | "fwht4") {
-            bail!("--kv-mode must be q8, fwht2, fwht3, or fwht4");
-        }
+        // Validate against the canonical `memory.kv_cache` schema instead of a
+        // local subset. The old hardcoded list accepted only q8/fwht{2,3,4} and
+        // so rejected `f32`/`f16` — the only KV formats DeepSeek V4 implements,
+        // and precisely what the loader tells you to pass when it falls back
+        // ("Pass --kv f32 for the golden configuration"). That made the advised
+        // configuration unreachable through `bench`.
+        let field = hipfire_config::field("memory.kv_cache")
+            .ok_or_else(|| anyhow!("missing memory.kv_cache configuration field"))?;
+        field
+            .validate(&hipfire_config::ConfigValue::String(mode.to_owned()))
+            .map_err(|err| anyhow!("--kv-mode {mode}: {err}"))?;
     }
 
     if args.exp {
@@ -6343,16 +3573,26 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
+    eprintln!("  max_tokens: {}", args.max_tokens);
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
+        // The warmup exists to populate kernel caches and its output is
+        // discarded, so it stays in answer mode even under --reasoning-on: a
+        // 16-token budget cannot close a think span, and letting the warmup
+        // think would abort the run before a single measured sample.
         let _ = bench_generate(&mut engine, "Hello", 16)?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         for _ in 0..args.runs {
-            let done = bench_generate(&mut engine, &prompt, 128)?;
+            let done = bench_generate_with_reasoning(
+                &mut engine,
+                &prompt,
+                args.max_tokens as u64,
+                args.reasoning_on,
+            )?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -6378,6 +3618,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "loaded": loaded,
             "gpu": post_diag,
             "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+            "max_tokens": args.max_tokens,
+            "runs": args.runs,
+            "batch": 1,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
@@ -6394,6 +3637,182 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         }
         Ok(())
     }
+}
+
+/// Concurrency sweep across both concurrent backends. Only reached when
+/// `--concurrency` is given; the single-stream path above is untouched.
+fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
+    use crate::bench_concurrency::{
+        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
+        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+    };
+
+    let points = parse_concurrency(spec)?;
+    let max_k = *points.iter().max().expect("non-empty");
+    let backend_sel = match args.backend.as_str() {
+        "slots" => BackendSel::Slots,
+        "noslots" => BackendSel::Sequential,
+        "batch" => BackendSel::Batch,
+        _ => BackendSel::Both,
+    };
+    let arms: Vec<WorkloadSel> = match args.workload.as_str() {
+        "stateless" => vec![WorkloadSel::Stateless],
+        "multiturn" => vec![WorkloadSel::Multiturn],
+        _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
+    };
+
+    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("  model:       {}", args.model);
+    eprintln!("  concurrency: {points:?}");
+    eprintln!("  runs/point:  {}", args.runs);
+    eprintln!("  max_tokens:  {}", args.max_tokens);
+
+    let mut out: Vec<Point> = Vec::new();
+
+    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
+    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
+    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
+    // Drop closes its channel and joins the worker thread that owns the Gpu,
+    // weights and KV arenas, so leaving this scope is what actually frees the
+    // first model before the daemon loads the second.
+    if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
+        let registry = load_registry(&paths.registry).registry;
+        let model_path = find_model_path(paths, &registry, &args.model)
+            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        // 2048-token slots, not the serve default of 8192: the sweep's prompts
+        // are one short turn and --max-tokens is small, so a larger arena buys
+        // nothing and multiplies per-slot KV by four.
+        match SlotDriver::start(&model_path, max_k, 2048) {
+            Ok(mut d) => {
+                eprintln!("  slots backend up ({max_k} slots)");
+                let r = sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                );
+                // Free the weights before the batch backend loads its own copy,
+                // even on the error path.
+                drop(d);
+                r?;
+            }
+            // A backend that cannot run this model is a RESULT, not a crash.
+            Err(e) => eprintln!("  slots backend unavailable: {e}"),
+        }
+    }
+
+    // No-slots baseline: k requests one after another through the ordinary
+    // daemon path. Runs after the slots engine has been dropped, so only one
+    // copy of the weights is ever resident.
+    if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut seq_args = args.clone();
+        seq_args.concurrency = None;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None)?;
+        let mut d = SequentialDriver::start(engine, max_k)?;
+        eprintln!("  noslots backend up (sequential daemon path)");
+        let r = sweep_backend(
+            &mut d as &mut dyn ConcurrencyBackend,
+            &arms,
+            &points,
+            args.runs,
+            args.max_tokens as u64,
+            &mut out,
+        );
+        drop(d);
+        r?;
+    }
+
+    if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut batch_args = args.clone();
+        batch_args.concurrency = None;
+        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let capable = loaded
+            .get("continuous_batch_capable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match DaemonDriver::start(engine, max_k, capable) {
+            Ok(mut d) => {
+                eprintln!("  batch backend up (continuous_batch_size={max_k})");
+                sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                )?;
+            }
+            Err(e) => eprintln!("  batch backend unavailable: {e}"),
+        }
+    }
+
+    println!("{}", render_table(&out));
+    Ok(())
+}
+
+/// Refuse to load a model that will not fit in available host memory.
+///
+/// The GPU allocates from system RAM on this class of box and there is no
+/// swap, so an overcommit is an OOM kill of the whole machine rather than a
+/// slow run. Checked between the two backends because that is precisely where
+/// a leaked first model would show up: if the slots engine did not actually
+/// release its weights, `MemAvailable` is still depressed here and this stops
+/// the sweep instead of taking the box down.
+fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    let registry = load_registry(&paths.registry).registry;
+    let Some(path) = find_model_path(paths, &registry, model) else {
+        return Ok(());
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(());
+    };
+    let need = meta.len();
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return Ok(());
+    };
+    let avail_kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let avail = avail_kb * 1024;
+    // 20% headroom over the raw weight bytes for KV arenas and scratch.
+    let want = need + need / 5;
+    if avail < want {
+        bail!(
+            "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
+             A previous backend may not have released its weights.",
+            path.display(),
+            want as f64 / 1e9,
+            avail as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
+/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
+/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
+/// The value is fixed per load, which is why the sweep holds it at max.
+fn open_bench_engine_batched(
+    paths: &Paths,
+    args: &BenchArgs,
+    batch_size: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    std::env::set_var("HIPFIRE_BENCH_CONTINUOUS_BATCH", batch_size.to_string());
+    let r = open_bench_engine(paths, args, None);
+    std::env::remove_var("HIPFIRE_BENCH_CONTINUOUS_BATCH");
+    r
 }
 
 fn open_bench_engine(
@@ -6463,18 +3882,51 @@ fn open_bench_engine(
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
     )?;
+    if let Some(selector) = args.speculation.as_deref() {
+        apply_speculation_selector(&mut params, selector)?;
+    }
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
         params["max_seq"] = serde_json::json!(configured.max(requested));
+    }
+    if let Ok(n) = std::env::var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
+        if let Ok(n) = n.parse::<u64>() {
+            params["continuous_batch_size"] = serde_json::json!(n);
+        }
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     Ok((engine, loaded, pre_diag, post_diag))
 }
 
+/// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
+///
+/// Answer mode is the default rather than an opt-in because a benchmark that
+/// lets the model think cannot complete. A reasoning model (any Qwen3.6 SKU,
+/// for one) opens `<think>` within its first tokens and has no chance of
+/// closing it inside the benchmark's budget — 16 tokens for the warmup, 128
+/// for a measured run. The daemon ranks an unclosed think span at finish above
+/// the length cap in both terminal classifiers (`QwenArTerminalCause::resolve`
+/// and `qwen_dflash_wire_terminal`), so it reports the truncation as a
+/// non-retryable validation error rather than `finish_reason=length`. The
+/// benchmark then aborts on the warmup generate, before recording a sample.
+///
+/// Benchmarks measure tokens per second and never read the text, so asking for
+/// answer mode costs nothing and removes the dependency on the model finishing
+/// a thought inside an arbitrary budget. `--reasoning-on` restores the
+/// thinking turn for anyone who wants to measure that path — with a budget
+/// large enough to close the span.
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
-    serde_json::json!({
+    bench_generate_request_reasoning(prompt, max_tokens, false)
+}
+
+fn bench_generate_request_reasoning(
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
         "type": "generate",
         "id": request_id(),
         "prompt": prompt,
@@ -6483,14 +3935,27 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
         "repeat_penalty": 1.1,
         "max_tokens": max_tokens,
         "attempt_id": 1,
-    })
+    });
+    if !reasoning_on {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    request
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
-    Ok(engine.generate(
-        &bench_generate_request(prompt, max_tokens),
-        |_| Ok(()),
-    )?)
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
+}
+
+fn bench_generate_with_reasoning(
+    engine: &mut Engine,
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> Result<serde_json::Value> {
+    let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
+    Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -6693,12 +4158,18 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
+            max_tokens: 128,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
             kv_backend: None,
             redline: false,
+            speculation: None,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
@@ -6940,7 +4411,9 @@ fn ensure_update_not_interrupted() -> Result<()> {
 
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
-        bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
+        bail!(
+            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+        );
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -7137,6 +4610,8 @@ fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision)
         &resolved.selector,
         recorded.rocm_root.as_deref(),
         recorded.gpu_arch.as_deref(),
+        recorded.hipcc.as_deref(),
+        recorded.strict_rocm,
     ) {
         installer_cmd.arg(arg);
     }
@@ -7213,6 +4688,8 @@ fn installer_handoff_args(
     selector: &RevisionSelector,
     rocm_root: Option<&Path>,
     gpu_arch: Option<&str>,
+    hipcc: Option<&Path>,
+    strict_rocm: bool,
 ) -> Vec<String> {
     let mut args = vec!["--yes".to_owned()];
     match selector.kind {
@@ -7241,6 +4718,17 @@ fn installer_handoff_args(
         args.push("--gpu-arch".to_owned());
         args.push(arch.to_owned());
     }
+    if let Some(hipcc) = hipcc
+        .map(|p| p.to_string_lossy().into_owned())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--hipcc".to_owned());
+        args.push(hipcc);
+    }
+    if strict_rocm {
+        args.push("--strict-rocm".to_owned());
+    }
     args
 }
 
@@ -7248,8 +4736,9 @@ fn installer_handoff_args(
 struct RecordedInstallMetadata {
     rocm_root: Option<PathBuf>,
     gpu_arch: Option<String>,
+    hipcc: Option<PathBuf>,
+    strict_rocm: bool,
 }
-
 fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
     let text = match fs::read_to_string(install_home.join("install.json")) {
         Ok(text) => text,
@@ -7271,9 +4760,26 @@ fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
         .map(str::trim)
         .filter(|arch| !arch.is_empty())
         .map(str::to_owned);
+    let hipcc = value
+        .get("hipcc")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let strict_rocm = match value.get("strict_rocm") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().is_some_and(|v| v != 0),
+        _ => false,
+    };
     RecordedInstallMetadata {
         rocm_root,
         gpu_arch,
+        hipcc,
+        strict_rocm,
     }
 }
 
@@ -7611,7 +5117,7 @@ fn run_checked(command: &mut Command, label: &str) -> Result<()> {
     }
 }
 
-fn unix_timestamp() -> u64 {
+pub(crate) fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -7877,7 +5383,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                 "path": root.display().to_string(),
                 "device_compiler": hipfire_config::rocm::DEVICE_COMPILERS
                     .iter()
-                    .find(|name| root.join("bin").join(name).is_file()),
+                    .find_map(|name| hipfire_config::rocm::tool_from_selected_root(root, name)),
                 "hip_headers": hipfire_config::rocm::is_complete_root(root),
                 "hip_runtime": hipfire_config::rocm::runtime_library(root)
                     .map(|p| p.display().to_string()),
@@ -8125,23 +5631,45 @@ fn command_version(command: &str, argument: &str) -> Option<String> {
         .filter(|line| !line.is_empty())
 }
 
-fn find_daemon(paths: &Paths) -> Option<PathBuf> {
+pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
     if let Some(path) = env::var_os("HIPFIRE_DAEMON_BIN").map(PathBuf::from) {
         if path.is_file() {
             return Some(path);
         }
     }
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    [
-        paths.root.join("bin/daemon"),
-        workspace.join("release/examples/daemon"),
-        workspace.join("debug/examples/daemon"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    find_daemon_in(paths, &workspace, cfg!(windows))
 }
 
-fn request_f64(
+/// Daemon binary name candidates, most preferred first.
+///
+/// Windows ships the daemon as `daemon.exe`; ELF platforms ship an
+/// extensionless `daemon`. The bare spelling is kept as a fallback so a
+/// future extensionless shim still wins. `windows` is a pure parameter
+/// (mirroring `hipfire_config::rocm::tool_filename_candidates`) so the
+/// policy is unit-testable on any host without process-global env.
+fn daemon_bin_names(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["daemon.exe", "daemon"]
+    } else {
+        &["daemon"]
+    }
+}
+
+/// Candidate lookup shared by [`find_daemon`] and its platform-shaped tests:
+/// probe the install root (`~/.hipfire/bin/`) and the source-tree target dir
+/// (`release/`, then `debug/`), in that order, for each candidate name.
+fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for name in daemon_bin_names(windows) {
+        candidates.push(paths.root.join("bin").join(name));
+        candidates.push(workspace.join("release").join(name));
+        candidates.push(workspace.join("debug").join(name));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+pub(crate) fn request_f64(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,
     explicit: Option<f64>,
@@ -8154,7 +5682,7 @@ fn request_f64(
         .transpose()
 }
 
-fn request_u64(
+pub(crate) fn request_u64(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,
     explicit: Option<u64>,
@@ -8167,7 +5695,7 @@ fn request_u64(
         .transpose()
 }
 
-fn request_string(
+pub(crate) fn request_string(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,
     explicit: Option<String>,
@@ -8186,7 +5714,7 @@ fn request_string(
         .transpose()
 }
 
-fn request_config_value<'a>(
+pub(crate) fn request_config_value<'a>(
     resolved: &'a hipfire_config::ResolvedConfig,
     key: &str,
 ) -> Result<Option<&'a hipfire_config::ConfigValue>> {
@@ -8210,7 +5738,7 @@ fn request_config_value<'a>(
     }
 }
 
-fn config_value_f64(value: &hipfire_config::ConfigValue, key: &str) -> Result<f64> {
+pub(crate) fn config_value_f64(value: &hipfire_config::ConfigValue, key: &str) -> Result<f64> {
     match value {
         hipfire_config::ConfigValue::Float(value) => Ok(*value),
         hipfire_config::ConfigValue::Integer(value) => Ok(*value as f64),
@@ -8218,7 +5746,7 @@ fn config_value_f64(value: &hipfire_config::ConfigValue, key: &str) -> Result<f6
     }
 }
 
-fn config_value_u64(value: &hipfire_config::ConfigValue, key: &str) -> Result<u64> {
+pub(crate) fn config_value_u64(value: &hipfire_config::ConfigValue, key: &str) -> Result<u64> {
     match value {
         hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
             .map_err(|_| anyhow!("configuration key '{key}' cannot be negative")),
@@ -8229,13 +5757,13 @@ fn config_value_u64(value: &hipfire_config::ConfigValue, key: &str) -> Result<u6
     }
 }
 
-fn insert_optional_f64(target: &mut serde_json::Value, key: &str, value: Option<f64>) {
+pub(crate) fn insert_optional_f64(target: &mut serde_json::Value, key: &str, value: Option<f64>) {
     if let Some(value) = value {
         target[key] = serde_json::json!(value);
     }
 }
 
-fn insert_optional_u64(target: &mut serde_json::Value, key: &str, value: Option<u64>) {
+pub(crate) fn insert_optional_u64(target: &mut serde_json::Value, key: &str, value: Option<u64>) {
     if let Some(value) = value {
         target[key] = serde_json::json!(value);
     }
@@ -8327,6 +5855,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "type": "string",
             "format": "kv-adaptive-policy",
         }),
+        ValueRule::Deepseek4Placement => serde_json::json!({
+            "type": "string",
+            "format": "deepseek4-compute-placement",
+        }),
     }
 }
 
@@ -8346,6 +5878,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableInteger { .. } => "integer|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
 
@@ -8376,14 +5909,12 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::complete::{
+        forward_think_fragments, inject_default_system_message, normalize_openai_messages,
+        Completion, ThinkFragment,
+    };
+    use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
-
-    /// Process-wide mutex for tests that mutate `HIPFIRE_*` env vars read by
-    /// `load_params`. Serializes the env-mutating tests against each other;
-    /// readers (pre-existing load_params tests) never fail because mutators
-    /// only ever install valid values.
-    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8404,10 +5935,26 @@ mod tests {
         }
     }
 
+    fn idle_test_meta() -> ServeMeta {
+        ServeMeta {
+            current_model: Some("model.hfq".to_owned()),
+            loading_model: Some("model.hfq".to_owned()),
+            instance_token: "test".to_owned(),
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now() - Duration::from_secs(600),
+        }
+    }
+
     #[test]
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
         assert!(is_model_file("deepseek.mq2lloyd"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
@@ -8433,6 +5980,80 @@ mod tests {
     }
 
     #[test]
+    fn daemon_discovery_prefers_windows_exe_spelling() {
+        // Windows-shaped policy (runs on any host, like the rocm.rs HIPCC
+        // suffix tests): daemon.exe is probed before the bare name so an
+        // install or source-tree build is found on Windows.
+        assert_eq!(daemon_bin_names(true), &["daemon.exe", "daemon"]);
+        assert_eq!(daemon_bin_names(false), &["daemon"]);
+    }
+
+    #[test]
+    fn find_daemon_discovers_daemon_exe_under_windows_shaped_policy() {
+        // Only the .exe spelling exists — exactly the Windows install layout.
+        let paths = test_paths("daemon-exe");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon.exe"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon.exe"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_windows_policy_accepts_extensionless_shim() {
+        // The bare spelling stays a fallback on Windows for a future shim.
+        let paths = test_paths("daemon-shim");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_prefers_install_dir_over_source_tree() {
+        // Install root (~/.hipfire/bin) wins over the source-tree target dir
+        // even when both carry a candidate (real host: Windows + dev build).
+        let paths = test_paths("daemon-install-vs-target");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon.exe"), b"install").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(workspace.join("release")).unwrap();
+        fs::write(workspace.join("release").join("daemon.exe"), b"dev").unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon.exe"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_falls_back_to_bare_spelling_for_unix_shaped_policy() {
+        // Unix-shaped policy: only the extensionless daemon is probed.
+        let paths = test_paths("daemon-bare");
+        let release = paths.root.join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("daemon"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, false),
+            Some(release.join("daemon"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
     fn cask_triattn_and_pflash_remain_opt_in_at_load() {
         let paths = test_paths("experimental-defaults");
         fs::create_dir_all(&paths.models).unwrap();
@@ -8451,6 +6072,7 @@ mod tests {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
 
@@ -8471,7 +6093,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_forwards_explicit_vmm_backend() {
+    pub(crate) fn load_params_forwards_explicit_vmm_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
         let params =
@@ -8480,150 +6102,462 @@ mod tests {
     }
 
     #[test]
-    fn load_params_routes_mesh_env_degrees() {
-        // load_params reads HIPFIRE_* env; the three env-mutating tests in
-        // this binary must serialize (see ENV_TEST_MUTEX).
-        let _env_lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
-
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(value) => env::set_var(self.0, value),
-                    None => env::remove_var(self.0),
-                }
-            }
-        }
-
-        let _tp = EnvRestore("HIPFIRE_TP", env::var_os("HIPFIRE_TP"));
-        let _ep = EnvRestore("HIPFIRE_EP", env::var_os("HIPFIRE_EP"));
-        let _pp = EnvRestore("HIPFIRE_PP", env::var_os("HIPFIRE_PP"));
+    pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-
-        env::remove_var("HIPFIRE_TP");
-        env::remove_var("HIPFIRE_EP");
-        env::remove_var("HIPFIRE_PP");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
-        assert!(
-            params.get("tp").is_none() && params.get("ep").is_none() && params.get("pp").is_none(),
-            "single-GPU load must stay byte-identical"
-        );
-
-        env::set_var("HIPFIRE_TP", "2");
-        env::set_var("HIPFIRE_EP", "4");
-        env::set_var("HIPFIRE_PP", "3");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
-        assert_eq!(params["tp"], 2);
-        assert_eq!(params["ep"], 4);
-        assert_eq!(params["pp"], 3);
-
-        // Degrees <= 1 are not forwarded.
-        env::set_var("HIPFIRE_TP", "1");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
-        assert!(params.get("tp").is_none());
-
-        // Malformed values are a hard error at the pure parse boundary (kept
-        // out of the process env so concurrent load_params calls in this
-        // binary never observe an invalid transient value).
-        assert_eq!(parse_mesh_degree("HIPFIRE_TP", "2").unwrap(), Some(2));
-        assert_eq!(parse_mesh_degree("HIPFIRE_TP", "1").unwrap(), None);
-        assert_eq!(parse_mesh_degree("HIPFIRE_TP", "").unwrap(), None);
-        assert!(parse_mesh_degree("HIPFIRE_TP", "abc").is_err());
-
-        // Empty env is treated as unset (script-friendly `HIPFIRE_TP=${TP:-}`).
-        env::set_var("HIPFIRE_TP", "");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
-        assert!(params.get("tp").is_none());
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["kv_backend"], "contiguous");
+        assert_eq!(params["max_seq"], 32768);
     }
 
     #[test]
-    fn load_params_mtp_k_env_override_is_validated() {
-        let _env_lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+    pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
+        let paths = test_paths("registry-qwen-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.8:27b-fast":{"repo":"x","file":"qwen3.8-27b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.5:9b-draft":{"repo":"x","file":"qwen35-9b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.6:27b-dflash":{"repo":"x","file":"qwen36-27b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(value) => env::set_var(self.0, value),
-                    None => env::remove_var(self.0),
-                }
-            }
+        // Exact Qwen families get VMM + 262144 + 81920
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                262144,
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                81920,
+                "{tag}"
+            );
         }
 
-        let _mtp_k = EnvRestore("HIPFIRE_MTP_K", env::var_os("HIPFIRE_MTP_K"));
-        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let configured = config_u64(&defaults, "speculation.mtp_k").unwrap();
-
-        env::remove_var("HIPFIRE_MTP_K");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
+        // Original qwen3:* stays contiguous (no automatic policy) — original Qwen3 uses default schema.
+        let (_, entry) = registry.model("qwen3:8b").unwrap();
+        let resolved =
+            resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
         assert_eq!(
-            params["mtp_k"], configured,
-            "configured window when env unset"
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "contiguous",
+            "original qwen3 must keep the built-in contiguous backend"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            4096
+        );
+        // More directly, check the helper layer itself has no policy.
+        let direct = hipfire_registry::config_layer_for_tag("qwen3:8b", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        // Draft/dflash sidecars do not get the Qwen policy even though family matches.
+        for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} sidecar must not get vmm"
+            );
+            assert!(direct.get("memory.max_seq").is_none());
+            assert!(direct.get("generation.max_tokens").is_none());
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_applies_glimmer_and_deepseek_targets() {
+        let paths = test_paths("registry-glimmer-deepseek-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:fast":{"repo":"x","file":"muse-glimmer-30b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:draft":{"repo":"x","file":"muse-glimmer-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash":{"repo":"x","file":"deepseek-v4-flash-0731.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"deepseek-v4-flash-0731.mq2lloyd","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash-preview":{"repo":"x","file":"deepseek-v4-flash-preview.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:draft":{"repo":"x","file":"deepseek-v4-flash-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "other:model":{"repo":"x","file":"other.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{
+                "deepseek4":"deepseek-v4-flash",
+                "ds4":"deepseek-v4-flash",
+                "deepseek4:preview":"deepseek-v4-flash-preview",
+                "muse-glimmer:quality":"muse-glimmer"
+            }
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Muse Glimmer quality and fast targets get VMM + native 131072, no invented max_tokens.
+        for tag in ["muse-glimmer", "muse-glimmer:fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                131072,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.kv_backend"),
+                Some(&hipfire_config::ConfigValue::String("vmm".into()))
+            );
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(131072)),
+                "{tag} should get 131072"
+            );
+            assert!(
+                direct.get("generation.max_tokens").is_none(),
+                "{tag} must not get max_tokens"
+            );
+        }
+        // quality alias lands on trunk policy.
+        let (resolved_tag, entry) = registry.model("muse-glimmer:quality").unwrap();
+        assert_eq!(resolved_tag, "muse-glimmer");
+        let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+        assert_eq!(
+            direct.get("memory.max_seq"),
+            Some(&hipfire_config::ConfigValue::Integer(131072))
         );
 
-        env::set_var("HIPFIRE_MTP_K", "6");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
-        assert_eq!(params["mtp_k"], 6, "env outranks the configured window");
+        // Muse Glimmer draft receives none.
+        let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("muse-glimmer:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+        let resolved = resolved_for_model(
+            &paths,
+            "muse-glimmer:draft",
+            Some("muse-glimmer:draft"),
+            Some(entry),
+        )
+        .unwrap();
+        assert!(
+            resolved.get("memory.kv_backend").is_none()
+                || config_string(&resolved, "memory.kv_backend").unwrap() != "vmm"
+        );
 
-        // Out-of-range / malformed values are a hard error at the pure parse
-        // boundary (kept out of the process env so concurrent load_params
-        // calls in this binary never observe an invalid transient value).
-        assert_eq!(parse_mtp_k("6").unwrap(), 6);
-        assert!(parse_mtp_k("9").is_err());
-        assert!(parse_mtp_k("abc").is_err());
-
-        env::set_var("HIPFIRE_MTP_K", "");
-        let params = load_params(&defaults, None, &model_path, 64, None, None).unwrap();
-        assert_eq!(params["mtp_k"], configured, "empty env is treated as unset");
-    }
-
-    #[test]
-    fn apply_draft_max_ladder_env_over_flag() {
-        let _env_lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
-
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(value) => env::set_var(self.0, value),
-                    None => env::remove_var(self.0),
-                }
-            }
+        // DeepSeek official / MQ2Lloyd / preview targets get VMM + 1M + 384Ki.
+        for tag in [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ] {
+            let (resolved_tag, entry) = registry.model(tag).unwrap();
+            let resolved =
+                resolved_for_model(&paths, resolved_tag, Some(resolved_tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                1048576,
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                393216,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.kv_backend"),
+                Some(&hipfire_config::ConfigValue::String("vmm".into()))
+            );
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(1048576))
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216))
+            );
         }
+        for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
+            let (resolved_tag, entry) = registry.model(alias).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(1048576)),
+                "{alias}->{resolved_tag}"
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216)),
+                "{alias}->{resolved_tag}"
+            );
+        }
+        // DeepSeek draft sidecar receives none.
+        let (_, entry) = registry.model("deepseek-v4-flash:draft").unwrap();
+        let direct =
+            hipfire_registry::config_layer_for_tag("deepseek-v4-flash:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
 
-        let _mtp_k = EnvRestore("HIPFIRE_MTP_K", env::var_os("HIPFIRE_MTP_K"));
-        env::remove_var("HIPFIRE_MTP_K");
+        // Absent policy: unrelated model gets no automatic policy.
+        let (_, entry) = registry.model("other:model").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("other:model", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
 
-        // ngram: flag only, no MTP touch.
-        let mut params = serde_json::json!({"mtp_k": 3, "ngram_k": 8});
-        apply_draft_max(&mut params, 12, Some("ngram")).unwrap();
-        assert_eq!(params["ngram_k"], 12);
-        assert_eq!(params["mtp_k"], 3);
-
-        // mtp: flag applies, validated 1..=8.
-        let mut params = serde_json::json!({"mtp_k": 3, "ngram_k": 8});
-        apply_draft_max(&mut params, 8, Some("mtp")).unwrap();
-        assert_eq!(params["mtp_k"], 8);
-        assert!(apply_draft_max(&mut params, 9, Some("mtp")).is_err());
-
-        // auto: flag sets both windows.
-        let mut params = serde_json::json!({"mtp_k": 3, "ngram_k": 8});
-        apply_draft_max(&mut params, 5, None).unwrap();
-        assert_eq!(params["mtp_k"], 5);
-        assert_eq!(params["ngram_k"], 5);
-
-        // HIPFIRE_MTP_K outranks the flag for the MTP window only.
-        env::set_var("HIPFIRE_MTP_K", "6");
-        let mut params = serde_json::json!({"mtp_k": 3, "ngram_k": 8});
-        apply_draft_max(&mut params, 5, None).unwrap();
-        assert_eq!(params["mtp_k"], 6, "env beats flag for mtp_k");
-        assert_eq!(params["ngram_k"], 5, "flag still sets ngram_k");
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
-    fn load_params_forwards_dflash_draft_from_environment() {
+    pub(crate) fn resolved_for_model_tag_policy_is_overridable_by_user() {
+        let paths = test_paths("registry-tag-policy-override");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 262144);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            81920
+        );
+
+        // Global user override wins over registry tag policy (registry below global).
+        let mut user_layer = ConfigLayer::default();
+        user_layer
+            .set_cli("memory.kv_backend", "contiguous")
+            .unwrap();
+        user_layer.set_cli("memory.max_seq", "32768").unwrap();
+        user_layer.set_cli("generation.max_tokens", "1024").unwrap();
+        let overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test.toml"),
+                },
+                layer: user_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&overridden, "memory.kv_backend").unwrap(),
+            "contiguous"
+        );
+        assert_eq!(config_u64(&overridden, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&overridden, "generation.max_tokens").unwrap(),
+            1024
+        );
+
+        // Also verify load_params respects explicit kv_backend override over configured vmm.
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("contiguous"),
+        )
+        .unwrap();
+        assert_eq!(params["kv_backend"], "contiguous");
+        // Without explicit override, load_params uses the resolved vmm.
+        let params2 =
+            load_params(&resolved, Some(entry), &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params2["kv_backend"], "vmm");
+        assert_eq!(params2["max_seq"], 262144);
+
+        // Glimmer target likewise overridable (backend + max_seq).
+        let raw2 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry2 = RegistryV1::parse(raw2, "test").unwrap();
+        let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
+        let g_layer = hipfire_registry::config_layer_for_tag(g_tag, g_entry).unwrap();
+        assert_eq!(
+            g_layer.get("memory.kv_backend"),
+            Some(&hipfire_config::ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            g_layer.get("memory.max_seq"),
+            Some(&hipfire_config::ConfigValue::Integer(131072))
+        );
+        assert!(g_layer.get("generation.max_tokens").is_none());
+        let mut g_user = ConfigLayer::default();
+        g_user.set_cli("memory.kv_backend", "contiguous").unwrap();
+        g_user.set_cli("memory.max_seq", "8192").unwrap();
+        let g_resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: g_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: g_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test2.toml"),
+                },
+                layer: g_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&g_resolved, "memory.kv_backend").unwrap(),
+            "contiguous"
+        );
+        assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
+
+        // DeepSeek target override wins over 1M/384Ki policy.
+        let raw3 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry3 = RegistryV1::parse(raw3, "test").unwrap();
+        let (d_tag, d_entry) = registry3.model("deepseek-v4-flash").unwrap();
+        let d_resolved = resolved_for_model(&paths, d_tag, Some(d_tag), Some(d_entry)).unwrap();
+        assert_eq!(
+            config_string(&d_resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 1048576);
+        assert_eq!(
+            config_u64(&d_resolved, "generation.max_tokens").unwrap(),
+            393216
+        );
+        let mut d_user = ConfigLayer::default();
+        d_user.set_cli("memory.max_seq", "65536").unwrap();
+        d_user.set_cli("generation.max_tokens", "2048").unwrap();
+        let d_overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: d_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(d_tag, d_entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test3.toml"),
+                },
+                layer: d_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(config_u64(&d_overridden, "memory.max_seq").unwrap(), 65536);
+        assert_eq!(
+            config_u64(&d_overridden, "generation.max_tokens").unwrap(),
+            2048
+        );
+
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
+        let model_path = PathBuf::from("/tmp/test-model.mq2r");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], "single");
+        assert!(params.get("deepseek4_experts_per_token").is_none());
+
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("model.deepseek4_experts_per_token", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "model.deepseek4_experts_per_token=4".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_typed_deepseek4_compute_placement() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("hardware.deepseek4_compute_placement={raw}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            Path::new("/tmp/test-model.mq2r"),
+            64,
+            Some("q8"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], raw);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_dflash_draft_from_environment() {
         let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
 
         let mut explicit = ConfigLayer::default();
@@ -8686,37 +6620,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_timings_preserves_speculator_identity() {
-        let completion = |done| Completion {
-            id: "req-test".into(),
-            created: 0,
-            model: "test-model".into(),
-            content: String::new(),
-            reasoning_content: String::new(),
-            preserve_thinking: false,
-            tool_calls: Vec::new(),
-            done,
-        };
-
-        let dflash = completion_timings(&completion(serde_json::json!({
-            "dflash": true,
-            "tau": 3.5,
-            "cycles": 4,
-        })));
-        assert_eq!(dflash["dflash"], true);
-        assert!(dflash["mtp"].is_null());
-
-        let mtp = completion_timings(&completion(serde_json::json!({
-            "mtp": true,
-            "tau": 2.0,
-            "cycles": 6,
-        })));
-        assert!(mtp["dflash"].is_null());
-        assert_eq!(mtp["mtp"], true);
-    }
-
-    #[test]
-    fn artifact_urls_honor_endpoint_precedence() {
+    pub(crate) fn artifact_urls_honor_endpoint_precedence() {
         struct EnvRestore(&'static str, Option<std::ffi::OsString>);
 
         impl Drop for EnvRestore {
@@ -8732,7 +6636,7 @@ mod tests {
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
-        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+        let suffix = "hipfire-models/qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
 
         env::remove_var("HIPFIRE_HF_BASE");
         env::remove_var("HF_ENDPOINT");
@@ -8788,6 +6692,20 @@ mod tests {
         assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
         assert!(rendered.contains(BUILD_COMMIT.get(..12).unwrap_or(BUILD_COMMIT)));
         assert!(rendered.contains(BUILD_REF));
+    }
+    #[test]
+    fn serve_continuous_batch_size_boundary_is_loader_cap() {
+        // Hard cap 64 — the loader/scheduler lane ceiling
+        // (hipfire_loader::batch_staging::CONTINUOUS_BATCH_MAX_LANES).
+        let ok = Cli::try_parse_from(["hipfire", "serve", "--continuous-batch-size", "64"]);
+        assert!(ok.is_ok(), "64 must parse");
+        let rejected = Cli::try_parse_from(["hipfire", "serve", "--continuous-batch-size", "65"]);
+        assert!(
+            rejected.is_err(),
+            "65 exceeds the loader/scheduler lane cap and must be rejected at the CLI"
+        );
+        let rejected = Cli::try_parse_from(["hipfire", "serve", "--continuous-batch-size", "0"]);
+        assert!(rejected.is_err(), "0 must be rejected at the CLI");
     }
 
     #[test]
@@ -9112,6 +7030,8 @@ mod tests {
             },
             recorded.rocm_root.as_deref(),
             recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
         );
         assert_eq!(
             args,
@@ -9134,6 +7054,8 @@ mod tests {
         let empty = recorded_install_metadata(&home);
         assert!(empty.rocm_root.is_none());
         assert!(empty.gpu_arch.is_none());
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
         let bare = installer_handoff_args(
             &RevisionSelector {
                 value: "deadbeef".into(),
@@ -9141,6 +7063,8 @@ mod tests {
             },
             None,
             None,
+            None,
+            false,
         );
         assert_eq!(
             bare,
@@ -9159,6 +7083,8 @@ mod tests {
             },
             None,
             Some("gfx1100"),
+            None,
+            false,
         );
         assert_eq!(
             arch_only,
@@ -9170,6 +7096,76 @@ mod tests {
                 "gfx1100".to_owned(),
             ]
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn update_handoff_forwards_hipcc_and_strict_with_backward_compat() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-hipcc-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        // New format with hipcc and strict_rocm.
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","hipcc":"/usr/bin/hipcc","strict_rocm":true,"gpu_arch":"gfx1201"}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(recorded.hipcc.as_deref(), Some(Path::new("/usr/bin/hipcc")));
+        assert!(recorded.strict_rocm);
+        assert_eq!(recorded.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        );
+        assert!(args.contains(&"--hipcc".to_owned()));
+        assert!(args.contains(&"/usr/bin/hipcc".to_owned()));
+        assert!(args.contains(&"--strict-rocm".to_owned()));
+        assert!(args.contains(&"--rocm-root".to_owned()));
+        // Empty/whitespace hipcc is treated as None, like rocm_root.
+        fs::write(
+            home.join("install.json"),
+            r#"{"hipcc":"  ","strict_rocm":false}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            None,
+            None,
+            empty.hipcc.as_deref(),
+            empty.strict_rocm,
+        );
+        assert!(!bare.contains(&"--hipcc".to_owned()));
+        assert!(!bare.contains(&"--strict-rocm".to_owned()));
+        // Older file without hipcc key loads without error (backward compat).
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","gpu_arch":"gfx1100"}"#,
+        )
+        .unwrap();
+        let old = recorded_install_metadata(&home);
+        assert_eq!(old.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        assert!(old.hipcc.is_none());
+        assert!(!old.strict_rocm);
+        // Strict can be stored as string \"1\" or number 1 for compat.
+        fs::write(home.join("install.json"), r#"{"strict_rocm":"1"}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::write(home.join("install.json"), r#"{"strict_rocm":1}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -9476,25 +7472,6 @@ mod tests {
     }
 
     #[test]
-    fn bind_and_pid_compatibility_parsers_cover_legacy_shapes() {
-        assert_eq!(
-            parse_bind(Some("127.0.0.1:12000"), None, "0.0.0.0", 11435).unwrap(),
-            ("127.0.0.1".into(), 12000)
-        );
-        assert_eq!(
-            parse_bind(Some("[::1]:12001"), None, "0.0.0.0", 11435).unwrap(),
-            ("::1".into(), 12001)
-        );
-        let legacy = parse_pid_record("42\n").unwrap();
-        assert_eq!(legacy.pid, 42);
-        assert!(legacy.legacy);
-        let json = parse_pid_record(r#"{"pid":43,"token":"old"}"#).unwrap();
-        assert_eq!(json.pid, 43);
-        assert_eq!(json.token.as_deref(), Some("old"));
-        assert!(!json.legacy);
-    }
-
-    #[test]
     fn run_options_after_prompt_and_tui_passthrough_parse() {
         let cli =
             Cli::try_parse_from(["hipfire", "run", "qwen:test", "hello", "--max-tokens", "7"])
@@ -9513,98 +7490,24 @@ mod tests {
     }
 
     #[test]
-    fn last_user_prompt_handles_text_parts() {
-        let body = serde_json::json!({
-            "messages": [
-                { "role": "assistant", "content": "old" },
-                { "role": "user", "content": [
-                    { "type": "text", "text": "one" },
-                    { "type": "text", "text": "two" }
-                ] }
-            ]
-        });
-        let messages = normalize_openai_messages(body.get("messages"));
-        assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
-    }
-
-    #[test]
-    fn openai_images_forward_one_base64_payload_and_reject_unsafe_shapes() {
-        let messages = serde_json::json!([{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": "describe" },
-                { "type": "image_url", "image_url": { "url": "data:image/png;base64,YWJj" } }
-            ]
-        }]);
-        assert_eq!(
-            request_image_base64(Some(&messages)).unwrap().as_deref(),
-            Some("YWJj")
-        );
-        let remote = serde_json::json!([{
-            "role": "user",
-            "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
-        }]);
-        assert!(request_image_base64(Some(&remote))
-            .unwrap_err()
-            .to_string()
-            .contains("remote"));
-    }
-
-    #[test]
-    fn openai_messages_normalize_roles_content_and_tool_history() {
-        let body = serde_json::json!({
-            "messages": [
-                { "role": "developer", "content": "system policy" },
-                { "role": "user", "content": [
-                    { "type": "text", "text": "first" },
-                    { "type": "image_url", "image_url": { "url": "ignored" } },
-                    { "type": "text", "text": " second" }
-                ] },
-                {
-                    "role": "assistant",
-                    "content": null,
-                    "reasoning_content": "tool reasoning",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"README.md\"}"
-                        }
-                    }]
-                },
-                { "role": "toolResult", "tool_call_id": "call_1", "content": "done" },
-                { "role": "unsupported", "content": "drop me" }
-            ]
-        });
-        let normalized = normalize_openai_messages(body.get("messages"));
-        assert_eq!(normalized.as_array().unwrap().len(), 4);
-        assert_eq!(normalized[0]["role"], "system");
-        assert_eq!(normalized[1]["content"], "first second");
-        assert_eq!(normalized[2]["content"], "");
-        assert_eq!(normalized[2]["tool_plan"], "tool reasoning");
-        assert_eq!(normalized[2]["tool_calls"][0]["name"], "read_file");
-        assert_eq!(
-            normalized[2]["tool_calls"][0]["arguments"],
-            serde_json::json!({ "path": "README.md" })
-        );
-        assert_eq!(normalized[3]["role"], "tool");
-        assert_eq!(normalized[3]["tool_call_id"], "call_1");
-    }
-
-    #[test]
     fn registry_system_prompt_is_injected_only_when_client_omits_one() {
-        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
-            { "role": "user", "content": "hello" }
-        ])));
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
         inject_default_system_message(&mut messages, Some("registry identity"));
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "registry identity");
 
-        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
-            { "role": "developer", "content": "client policy" },
-            { "role": "user", "content": "hello" }
-        ])));
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "developer", "content": "client policy" },
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
         inject_default_system_message(&mut messages, Some("registry identity"));
         assert_eq!(messages.as_array().unwrap().len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -9612,104 +7515,132 @@ mod tests {
     }
 
     #[test]
-    fn openai_assistant_history_strips_thinking_and_preserves_fallback_arguments() {
+    fn normalize_reasoning_sources_with_flag_on_and_off() {
+        // reasoning field takes precedence over reasoning_content and inline think
         let body = serde_json::json!({
             "messages": [{
                 "role": "assistant",
-                "content": "<think>private plan</think>\n\nvisible answer",
+                "content": "<think>inline</think>\nvisible",
+                "reasoning": "explicit reasoning",
+                "reasoning_content": "secondary"
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(off[0]["content"], "visible");
+        assert_eq!(off[0]["tool_plan"], "explicit reasoning");
+        assert!(off[0].get("reasoning_content").is_none());
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(on[0]["content"], "visible");
+        assert_eq!(on[0]["tool_plan"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], on[0]["tool_plan"]);
+
+        // reasoning_content when reasoning absent
+        let body2 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "visible only",
+                "reasoning_content": "from content field"
+            }]
+        });
+        let off2 = normalize_openai_messages(body2.get("messages"), false);
+        assert_eq!(off2[0]["tool_plan"], "from content field");
+        assert!(off2[0].get("reasoning_content").is_none());
+        let on2 = normalize_openai_messages(body2.get("messages"), true);
+        assert_eq!(on2[0]["reasoning_content"], "from content field");
+        assert_eq!(on2[0]["tool_plan"], "from content field");
+        assert_eq!(on2[0]["content"], "visible only");
+
+        // inline <think> when neither reasoning field present
+        let body3 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline think</think>\n\nvisible answer"
+            }]
+        });
+        let off3 = normalize_openai_messages(body3.get("messages"), false);
+        assert_eq!(off3[0]["content"], "visible answer");
+        assert_eq!(off3[0]["tool_plan"], "inline think");
+        assert!(off3[0].get("reasoning_content").is_none());
+        let on3 = normalize_openai_messages(body3.get("messages"), true);
+        assert_eq!(on3[0]["content"], "visible answer");
+        assert_eq!(on3[0]["tool_plan"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], on3[0]["tool_plan"]);
+    }
+
+    #[test]
+    fn normalize_tool_call_id_and_tool_result_name_survive() {
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [{
+                        "id": "call_42",
+                        "type": "function",
+                        "function": { "name": "my_tool", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_42",
+                    "name": "my_tool",
+                    "content": "result"
+                }
+            ]
+        });
+        for flag in [false, true] {
+            let normalized = normalize_openai_messages(body.get("messages"), flag);
+            assert_eq!(normalized[0]["tool_calls"][0]["id"], "call_42");
+            assert_eq!(normalized[0]["tool_calls"][0]["name"], "my_tool");
+            assert_eq!(normalized[1]["tool_call_id"], "call_42");
+            assert_eq!(normalized[1]["name"], "my_tool");
+            assert_eq!(normalized[1]["content"], "result");
+        }
+    }
+
+    #[test]
+    fn normalize_glimmer_flag_rejects_non_object_arguments_string() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
                 "tool_calls": [{
-                    "function": { "name": "broken", "arguments": "not-json" }
+                    "function": { "name": "t", "arguments": "not-json" }
                 }]
             }]
         });
-        let normalized = normalize_openai_messages(body.get("messages"));
-        assert_eq!(normalized[0]["content"], "visible answer");
-        assert_eq!(normalized[0]["tool_plan"], "private plan");
+        let off = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(
-            normalized[0]["tool_calls"][0]["arguments"],
+            off[0]["tool_calls"][0]["arguments"],
             serde_json::json!({ "_raw": "not-json" })
         );
-    }
-
-    #[test]
-    fn jinja_started_think_routes_reasoning_then_visible_answer() {
-        let mut router = ThinkChannelRouter::default();
-        router.set_started_in_think(true);
+        let on = normalize_openai_messages(body.get("messages"), true);
         assert_eq!(
-            router.push("reasoning body"),
-            vec![ThinkFragment::Reasoning("reasoning body".into())]
+            on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
         );
-        assert!(router.push("</thi").is_empty());
+        // JSON string that parses to non-object (array) also surfaces as string under glimmer
+        let body_arr = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "[1,2]" }
+                }]
+            }]
+        });
+        let on_arr = normalize_openai_messages(body_arr.get("messages"), true);
         assert_eq!(
-            router.push("nk>\n\nvisible answer"),
-            vec![ThinkFragment::Content("visible answer".into())]
+            on_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("[1,2]".into())
         );
-        assert!(router.finish().is_empty());
-    }
-
-    #[test]
-    fn plain_jinja_tail_keeps_output_in_content() {
-        let mut router = ThinkChannelRouter::default();
-        router.set_started_in_think(false);
+        let off_arr = normalize_openai_messages(body_arr.get("messages"), false);
+        // non-glimmer keeps parsed array (today's behaviour is to keep whatever parsed)
         assert_eq!(
-            router.push("direct answer"),
-            vec![ThinkFragment::Content("direct answer".into())]
-        );
-    }
-
-    #[test]
-    fn model_literal_think_frames_route_consistently() {
-        for family in ["qwen", "lfm", "minimax"] {
-            let mut router = ThinkChannelRouter::default();
-            router.set_started_in_think(true);
-            let mut fragments = router.push(&format!("{family} reasoning</thi"));
-            fragments.extend(router.push("nk>\n\nvisible<|im_"));
-            fragments.extend(router.push("end|>"));
-            fragments.extend(router.finish());
-            assert_eq!(
-                fragments,
-                vec![
-                    ThinkFragment::Reasoning(format!("{family} reasoning")),
-                    ThinkFragment::Content("visible".into()),
-                ],
-                "{family}"
-            );
-        }
-    }
-
-    #[test]
-    fn daemon_semantic_channels_override_literal_think_state() {
-        for family in ["deepseek", "cohere"] {
-            let mut router = ThinkChannelRouter::default();
-            router.set_started_in_think(true);
-            let mut fragments = router.push_semantic(&format!("{family} reason<|im_"), true);
-            fragments.extend(router.push_semantic("end|>", true));
-            fragments.extend(router.push("visible answer"));
-            fragments.extend(router.finish());
-            assert_eq!(
-                fragments,
-                vec![
-                    ThinkFragment::Reasoning(format!("{family} reason")),
-                    ThinkFragment::Content("visible answer".into()),
-                ],
-                "{family}"
-            );
-        }
-    }
-
-    #[test]
-    fn output_router_removes_orphan_close_and_split_terminators() {
-        let mut router = ThinkChannelRouter::default();
-        let mut fragments = router.push("</thi");
-        fragments.extend(router.push("nk>\n\nanswer<|endof"));
-        fragments.extend(router.push("text|>tail"));
-        fragments.extend(router.finish());
-        assert_eq!(
-            fragments,
-            vec![
-                ThinkFragment::Content("answer".into()),
-                ThinkFragment::Content("tail".into()),
-            ]
+            off_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::json!([1, 2])
         );
     }
 
@@ -9837,293 +7768,6 @@ mod tests {
         assert_eq!(config_rule_json(variant_field.rule)["maximum"], 5);
     }
 
-    #[test]
-    fn serve_accepts_legacy_positionals_and_native_overrides() {
-        let parsed = Cli::try_parse_from([
-            "hipfire",
-            "serve",
-            "qwen3.6:35b-a3b-mq4r",
-            "127.0.0.1",
-            "11520",
-            "--kv-mode",
-            "q8",
-            "--kv-backend",
-            "vmm",
-            "--idle-timeout",
-            "0",
-            "--tp",
-            "2",
-        ])
-        .unwrap();
-        let Some(Commands::Serve(args)) = parsed.command else {
-            panic!("expected serve command")
-        };
-        assert_eq!(args.positionals.len(), 3);
-        assert_eq!(args.kv_mode.as_deref(), Some("q8"));
-        assert_eq!(args.kv_backend.as_deref(), Some("vmm"));
-        assert_eq!(args.idle_timeout, Some(0));
-        assert_eq!(args.tp, Some(2));
-    }
-
-    #[test]
-    fn request_sampling_omits_builtins_but_recovers_shadowed_registry_values() {
-        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
-        assert_eq!(
-            request_f64(&builtins, "generation.temperature", None).unwrap(),
-            None
-        );
-
-        let mut registry = ConfigLayer::default();
-        registry.set_cli("generation.temperature", "1.0").unwrap();
-        registry.set_cli("generation.top_k", "40").unwrap();
-        registry.set_cli("generation.min_p", "0.05").unwrap();
-        registry
-            .set_cli("generation.presence_penalty", "1.5")
-            .unwrap();
-        registry
-            .set_cli("prompt.system", "registry identity")
-            .unwrap();
-        let mut global = ConfigLayer::default();
-        global.set_cli("generation.temperature", "0.7").unwrap();
-        global.set_cli("generation.top_k", "10").unwrap();
-        global.set_cli("generation.min_p", "0.1").unwrap();
-        global
-            .set_cli("generation.presence_penalty", "0.5")
-            .unwrap();
-        global.set_cli("prompt.system", "global identity").unwrap();
-        let resolved = resolve([
-            NamedLayer {
-                source: ConfigSource::RegistryModel {
-                    tag: "qwen:test".into(),
-                    revision: "v1".into(),
-                },
-                layer: registry,
-            },
-            NamedLayer {
-                source: ConfigSource::GlobalUser {
-                    path: PathBuf::from("config.toml"),
-                },
-                layer: global,
-            },
-        ])
-        .unwrap();
-        assert_eq!(
-            request_f64(&resolved, "generation.temperature", None).unwrap(),
-            Some(1.0)
-        );
-        assert_eq!(
-            request_f64(&resolved, "generation.temperature", Some(0.25)).unwrap(),
-            Some(0.25)
-        );
-        assert_eq!(
-            request_u64(&resolved, "generation.top_k", None).unwrap(),
-            Some(40)
-        );
-        assert_eq!(
-            request_f64(&resolved, "generation.min_p", None).unwrap(),
-            Some(0.05)
-        );
-        assert_eq!(
-            request_f64(&resolved, "generation.presence_penalty", None).unwrap(),
-            Some(1.5)
-        );
-        assert_eq!(
-            request_string(&resolved, "prompt.system", None).unwrap(),
-            Some("registry identity".into())
-        );
-        assert_eq!(
-            request_string(&resolved, "prompt.system", Some("explicit".into())).unwrap(),
-            Some("explicit".into())
-        );
-    }
-
-    #[test]
-    fn process_config_projects_only_explicit_arch_sensitive_config() {
-        const NAME: &str = "HIPFIRE_FP16";
-        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let process = hipfire_config::ProcessConfig::from_resolved(&builtins).unwrap();
-        assert_eq!(process.legacy_value(NAME), None);
-
-        let mut global = ConfigLayer::default();
-        global.set_cli("kernel.fp16", "false").unwrap();
-        let resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: PathBuf::from("config.toml"),
-            },
-            layer: global,
-        }])
-        .unwrap();
-        let process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
-        assert_eq!(process.legacy_value(NAME).as_deref(), Some("0"));
-    }
-
-    #[test]
-    fn process_config_projects_typed_scalar_and_variant_config() {
-        const NAMES: &[&str] = &[
-            "HIPFIRE_DEVICES",
-            "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
-            "HIPFIRE_GEMV_ROWS",
-            "HIPFIRE_LM_HEAD_F16",
-        ];
-        let mut global = ConfigLayer::default();
-        global.set_cli("hardware.devices", "2,3").unwrap();
-        global
-            .set_cli("hardware.uniform_vram_tolerance_gb", "1.5")
-            .unwrap();
-        global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
-        global.set_cli("kernel.lm_head_f16", "f32").unwrap();
-        let resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: PathBuf::from("config.toml"),
-            },
-            layer: global,
-        }])
-        .unwrap();
-        let process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
-        assert_eq!(process.legacy_value(NAMES[0]).as_deref(), Some("2,3"));
-        assert_eq!(process.legacy_value(NAMES[1]).as_deref(), Some("1.5"));
-        assert_eq!(process.legacy_value(NAMES[2]).as_deref(), Some("4"));
-        assert_eq!(process.legacy_value(NAMES[3]).as_deref(), Some("f32"));
-    }
-
-    #[test]
-    fn http_reasoning_and_completion_metadata_match_native_contract() {
-        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let mut request = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({ "reasoning_effort": "high" }),
-            &resolved,
-            &mut request,
-        )
-        .unwrap();
-        assert_eq!(request["max_think_tokens"], 4096);
-
-        let mut disabled = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({
-                "chat_template_kwargs": { "enable_thinking": false }
-            }),
-            &resolved,
-            &mut disabled,
-        )
-        .unwrap();
-        assert_eq!(disabled["reasoning_effort"], "none");
-
-        let completion = Completion {
-            id: "chatcmpl_test".into(),
-            created: 7,
-            model: "qwen:test".into(),
-            content: "answer".into(),
-            reasoning_content: "reason".into(),
-            preserve_thinking: false,
-            tool_calls: Vec::new(),
-            done: serde_json::json!({
-                "prompt_tokens": 12,
-                "tokens": 7,
-                "cached_tokens": 4,
-                "ttft_ms": 8.5,
-                "decode_tok_s": 115.0,
-                "finish_reason": "stop"
-            }),
-        };
-        let json = completion_json(&completion);
-        assert_eq!(json["usage"]["total_tokens"], 19);
-        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
-        assert_eq!(json["timings"]["decode_tok_s"], 115.0);
-        assert_eq!(json["created"], 7);
-
-        let qwen_cached = Completion {
-            id: "chatcmpl_qwen_cached".into(),
-            created: 8,
-            model: "qwen:test".into(),
-            content: "answer".into(),
-            reasoning_content: String::new(),
-            preserve_thinking: false,
-            tool_calls: Vec::new(),
-            done: serde_json::json!({
-                "prefill_tokens": 8,
-                "cached_tokens": 12,
-                "tokens": 7
-            }),
-        };
-        let qwen_json = completion_json(&qwen_cached);
-        assert_eq!(qwen_json["usage"]["prompt_tokens"], 20);
-        assert_eq!(qwen_json["usage"]["total_tokens"], 27);
-        assert_eq!(
-            qwen_json["usage"]["prompt_tokens_details"]["cached_tokens"],
-            12
-        );
-
-        let preserved = Completion {
-            preserve_thinking: true,
-            reasoning_content: "private chain".into(),
-            ..qwen_cached
-        };
-        let preserved_json = completion_json(&preserved);
-        assert_eq!(
-            preserved_json["choices"][0]["message"]["content"],
-            "<think>private chain</think>\nanswer"
-        );
-        assert!(preserved_json["choices"][0]["message"]
-            .get("reasoning_content")
-            .is_none());
-    }
-
-    #[test]
-    fn admission_queue_is_bounded_and_times_out() {
-        let admission = Arc::new(Admission::new(1, Duration::from_millis(200)));
-        let holder = admission.acquire().unwrap();
-        let queued_admission = Arc::clone(&admission);
-        let (sender, receiver) = mpsc::channel();
-        let waiter = thread::spawn(move || {
-            let guard = queued_admission.acquire().unwrap();
-            sender.send(()).unwrap();
-            drop(guard);
-        });
-        for _ in 0..100 {
-            if admission.inflight() == 2 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        let saturated = admission.acquire().unwrap_err();
-        assert!(saturated.message.contains("queue full"));
-        drop(holder);
-        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        waiter.join().unwrap();
-
-        let admission = Arc::new(Admission::new(1, Duration::from_millis(5)));
-        let _holder = admission.acquire().unwrap();
-        let timeout = admission.acquire().unwrap_err();
-        assert!(timeout.message.contains("wait exceeded"));
-        assert_eq!(admission.inflight(), 1);
-    }
-
-    #[test]
-    fn daemon_tool_calls_map_to_openai_shape() {
-        let calls = vec![
-            ToolCall {
-                name: "read_file".into(),
-                arguments: serde_json::json!({ "path": "README.md" }),
-            },
-            ToolCall {
-                name: "write_file".into(),
-                arguments: serde_json::json!({ "path": "out.txt", "text": "hi" }),
-            },
-        ];
-        let mapped = openai_tool_calls(&calls);
-        assert_eq!(mapped.len(), 2);
-        assert_eq!(mapped[0]["id"], "call_0");
-        assert_eq!(mapped[1]["id"], "call_1");
-        assert_eq!(mapped[0]["type"], "function");
-        assert_eq!(mapped[0]["function"]["name"], "read_file");
-        assert_eq!(
-            mapped[0]["function"]["arguments"],
-            serde_json::json!(r#"{"path":"README.md"}"#)
-        );
-        assert_eq!(mapped[1]["function"]["name"], "write_file");
-    }
-
     fn sample_completion(
         content: &str,
         tool_calls: Vec<ToolCall>,
@@ -10144,312 +7788,18 @@ mod tests {
                 "cached_tokens": 1,
                 "tok_s": 10.0,
             }),
+            logprobs: None,
+            reasoning: None,
         }
     }
 
     fn sample_tc(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
+            id: None,
             name: name.into(),
             arguments,
+            rendered_body: None,
         }
-    }
-
-    #[test]
-    fn completion_json_pure_tool_turn_uses_null_content() {
-        let completion = sample_completion(
-            "",
-            vec![sample_tc(
-                "read_file",
-                serde_json::json!({ "path": "a.rs" }),
-            )],
-            "tool_calls",
-        );
-        let json = completion_json(&completion);
-        assert!(json["choices"][0]["message"]["content"].is_null());
-        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(
-            json["choices"][0]["message"]["tool_calls"][0]["id"],
-            "call_0"
-        );
-        assert_eq!(
-            json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-            "read_file"
-        );
-    }
-
-    #[test]
-    fn completion_json_preserves_daemon_length_without_calls() {
-        // Fold withholds calls on length; serializer must not invent tool_calls.
-        let completion = sample_completion("", Vec::new(), "length");
-        let json = completion_json(&completion);
-        assert_eq!(json["choices"][0]["finish_reason"], "length");
-        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
-        assert_eq!(json["choices"][0]["message"]["content"], "");
-    }
-
-    #[test]
-    fn completion_json_never_overrides_length_error_cancel_when_calls_present() {
-        // Defense in depth: even if tool_calls leaked onto Completion, daemon
-        // finish_reason wins and must not be rewritten to tool_calls; calls stay off wire.
-        for reason in ["length", "error", "cancelled", "aborted"] {
-            let completion = sample_completion(
-                "",
-                vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))],
-                reason,
-            );
-            let json = completion_json(&completion);
-            assert_eq!(
-                json["choices"][0]["finish_reason"], reason,
-                "must preserve daemon finish_reason={reason}"
-            );
-            assert!(
-                json["choices"][0]["message"].get("tool_calls").is_none(),
-                "{reason} must not expose message.tool_calls"
-            );
-            // empty content + withheld calls → empty string, not null pure-tool
-            assert_eq!(json["choices"][0]["message"]["content"], "");
-        }
-    }
-
-    #[test]
-    fn completion_json_stop_text_has_string_content_no_tool_calls() {
-        let completion = sample_completion("hello world", Vec::new(), "stop");
-        let json = completion_json(&completion);
-        assert_eq!(json["choices"][0]["message"]["content"], "hello world");
-        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
-        assert_eq!(json["choices"][0]["finish_reason"], "stop");
-    }
-
-    #[test]
-    fn openai_stream_delta_forwards_only_clean_content_reasoning() {
-        assert_eq!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "token",
-                "text": "hi"
-            })),
-            Some(serde_json::json!({ "content": "hi" }))
-        );
-        assert_eq!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "reasoning",
-                "text": "plan"
-            })),
-            Some(serde_json::json!({ "reasoning_content": "plan" }))
-        );
-        // Mid-stream tool_calls must never become an SSE delta.
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [{ "name": "read_file", "arguments": {} }]
-        }))
-        .is_none());
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "stop"
-        }))
-        .is_none());
-    }
-
-    #[test]
-    fn openai_stream_tool_safe_terminal_releases_calls_then_usage_then_done_shape() {
-        let completion = sample_completion(
-            "",
-            vec![
-                sample_tc("read_file", serde_json::json!({ "path": "a.rs" })),
-                sample_tc("write_file", serde_json::json!({ "path": "b.rs" })),
-            ],
-            "tool_calls",
-        );
-        let chunks = openai_stream_terminal_chunks(&completion, true);
-        assert_eq!(chunks.len(), 3, "tool delta + terminal + usage");
-
-        // 1) tool_calls release with stable response-scoped ids/indices
-        let tool_delta = &chunks[0]["choices"][0]["delta"]["tool_calls"];
-        assert_eq!(tool_delta.as_array().map(|a| a.len()), Some(2));
-        assert_eq!(tool_delta[0]["id"], "call_0");
-        assert_eq!(tool_delta[0]["index"], 0);
-        assert_eq!(tool_delta[1]["id"], "call_1");
-        assert_eq!(tool_delta[1]["index"], 1);
-        assert!(chunks[0]["choices"][0]["finish_reason"].is_null());
-        assert!(chunks[0].get("usage").is_none());
-
-        // 2) terminal choice with empty delta
-        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(chunks[1]["choices"][0]["delta"], serde_json::json!({}));
-        assert!(
-            chunks[1].get("usage").is_none(),
-            "usage must not ride terminal"
-        );
-
-        // 3) separate choices:[] usage chunk
-        assert_eq!(chunks[2]["choices"], serde_json::json!([]));
-        assert_eq!(chunks[2]["usage"]["prompt_tokens"], 3);
-        assert_eq!(chunks[2]["usage"]["completion_tokens"], 5);
-
-        // Parity with non-stream ids/arguments
-        let nonstream = completion_json(&completion);
-        assert_eq!(
-            nonstream["choices"][0]["message"]["tool_calls"][0]["id"],
-            tool_delta[0]["id"]
-        );
-        assert_eq!(
-            nonstream["choices"][0]["message"]["tool_calls"][0]["function"],
-            tool_delta[0]["function"]
-        );
-        assert!(nonstream["choices"][0]["message"]["content"].is_null());
-    }
-
-    #[test]
-    fn openai_stream_length_terminal_exposes_no_call_deltas() {
-        let completion = sample_completion(
-            "partial",
-            // Even if present, non-tool-safe finish must not release.
-            vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))],
-            "length",
-        );
-        let chunks = openai_stream_terminal_chunks(&completion, false);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "length");
-        assert!(chunks[0]["choices"][0]["delta"].get("tool_calls").is_none());
-        assert!(chunks[0].get("usage").is_none());
-    }
-
-    #[test]
-    fn openai_stream_include_usage_false_skips_usage_chunk() {
-        let completion = sample_completion("ok", Vec::new(), "stop");
-        let chunks = openai_stream_terminal_chunks(&completion, false);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
-        assert!(chunks[0].get("usage").is_none());
-    }
-
-    #[test]
-    fn openai_stream_and_nonstream_paired_transcript_tool_safe() {
-        // Paired transcript: fold-shaped Completion → both serializers agree.
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-7", 7);
-        fold.push(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [
-                { "name": "read_file", "arguments": { "path": "a" } },
-                { "name": "write_file", "arguments": { "path": "b" } }
-            ],
-            "id": "req-7",
-            "attempt_id": 7
-        }))
-        .unwrap();
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 4,
-            "id": "req-7",
-            "attempt_id": 7,
-            "calls": [
-                { "name": "read_file", "arguments": { "path": "a" } },
-                { "name": "write_file", "arguments": { "path": "b" } }
-            ]
-        }))
-        .unwrap();
-
-        let completion = Completion {
-            id: "chatcmpl_pair".into(),
-            created: 99,
-            model: "m".into(),
-            content: fold.content().to_owned(),
-            reasoning_content: fold.reasoning_content().to_owned(),
-            preserve_thinking: false,
-            tool_calls: fold.executable_tool_calls().to_vec(),
-            done: fold.done().cloned().unwrap(),
-        };
-
-        let nonstream = completion_json(&completion);
-        assert!(nonstream["choices"][0]["message"]["content"].is_null());
-        assert_eq!(nonstream["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(
-            nonstream["choices"][0]["message"]["tool_calls"][0]["id"],
-            "call_0"
-        );
-        assert_eq!(
-            nonstream["choices"][0]["message"]["tool_calls"][1]["id"],
-            "call_1"
-        );
-
-        // Mid-stream fold forward never includes tool_calls.
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": fold.executable_tool_calls()
-        }))
-        .is_none());
-
-        let stream_chunks = openai_stream_terminal_chunks(&completion, true);
-        assert_eq!(
-            stream_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
-            nonstream["choices"][0]["message"]["tool_calls"][0]["id"]
-        );
-        assert_eq!(
-            stream_chunks[0]["choices"][0]["delta"]["tool_calls"][1]["function"],
-            nonstream["choices"][0]["message"]["tool_calls"][1]["function"]
-        );
-        assert_eq!(
-            stream_chunks[1]["choices"][0]["finish_reason"],
-            "tool_calls"
-        );
-        assert_eq!(stream_chunks[2]["choices"], serde_json::json!([]));
-        assert!(stream_chunks[2].get("usage").is_some());
-    }
-
-    #[test]
-    fn openai_stream_and_nonstream_paired_transcript_length_no_calls() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-8", 8);
-        fold.push(&serde_json::json!({
-            "type": "token",
-            "text": "partial",
-            "id": "req-8",
-            "attempt_id": 8
-        }))
-        .unwrap();
-        fold.push(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [{ "name": "read_file", "arguments": { "path": "x" } }],
-            "id": "req-8",
-            "attempt_id": 8
-        }))
-        .unwrap();
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "length",
-            "id": "req-8",
-            "attempt_id": 8
-        }))
-        .unwrap();
-
-        let completion = Completion {
-            id: "chatcmpl_len".into(),
-            created: 1,
-            model: "m".into(),
-            content: fold.content().to_owned(),
-            reasoning_content: String::new(),
-            preserve_thinking: false,
-            tool_calls: fold.executable_tool_calls().to_vec(),
-            done: fold.done().cloned().unwrap(),
-        };
-        assert!(completion.tool_calls.is_empty());
-
-        let nonstream = completion_json(&completion);
-        assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
-        assert!(nonstream["choices"][0]["message"]
-            .get("tool_calls")
-            .is_none());
-        assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
-
-        let stream_chunks = openai_stream_terminal_chunks(&completion, true);
-        assert_eq!(stream_chunks.len(), 2); // terminal + usage, no tool release
-        assert_eq!(stream_chunks[0]["choices"][0]["finish_reason"], "length");
-        assert!(stream_chunks[0]["choices"][0]["delta"]
-            .get("tool_calls")
-            .is_none());
-        assert_eq!(stream_chunks[1]["choices"], serde_json::json!([]));
     }
 
     /// Build a Completion whose done envelope has a non-string/missing finish_reason.
@@ -10467,119 +7817,9 @@ mod tests {
             preserve_thinking: false,
             tool_calls,
             done,
+            logprobs: None,
+            reasoning: None,
         }
-    }
-
-    #[test]
-    fn openai_stream_and_nonstream_paired_missing_finish_suppresses_leaked_calls() {
-        // Missing finish_reason must never synthesize tool_calls from buffered/leaked calls.
-        let leaked = vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))];
-        let completion = sample_completion_with_done(
-            "",
-            leaked,
-            serde_json::json!({
-                "prompt_tokens": 3,
-                "tokens": 5,
-                "cached_tokens": 1,
-                "tok_s": 10.0,
-            }),
-        );
-
-        let nonstream = completion_json(&completion);
-        assert_ne!(
-            nonstream["choices"][0]["finish_reason"], "tool_calls",
-            "missing finish_reason must not become tool_calls"
-        );
-        assert!(
-            nonstream["choices"][0]["message"]
-                .get("tool_calls")
-                .is_none(),
-            "missing finish_reason must suppress structured calls"
-        );
-
-        let stream_chunks = openai_stream_terminal_chunks(&completion, false);
-        assert!(
-            stream_chunks.iter().all(|c| c["choices"][0]
-                .get("delta")
-                .and_then(|d| d.get("tool_calls"))
-                .is_none()),
-            "stream must not release tool deltas without explicit tool_calls terminal"
-        );
-        assert_ne!(
-            stream_chunks.last().unwrap()["choices"][0]["finish_reason"],
-            "tool_calls"
-        );
-    }
-
-    #[test]
-    fn openai_stream_and_nonstream_paired_null_finish_suppresses_leaked_calls() {
-        // Null finish_reason is not an explicit tool_calls terminal.
-        let leaked = vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))];
-        let completion = sample_completion_with_done(
-            "",
-            leaked,
-            serde_json::json!({
-                "finish_reason": null,
-                "prompt_tokens": 3,
-                "tokens": 5,
-                "cached_tokens": 1,
-                "tok_s": 10.0,
-            }),
-        );
-
-        let nonstream = completion_json(&completion);
-        assert_ne!(
-            nonstream["choices"][0]["finish_reason"], "tool_calls",
-            "null finish_reason must not become tool_calls"
-        );
-        assert!(
-            nonstream["choices"][0]["message"]
-                .get("tool_calls")
-                .is_none(),
-            "null finish_reason must suppress structured calls"
-        );
-
-        let stream_chunks = openai_stream_terminal_chunks(&completion, false);
-        assert!(
-            stream_chunks.iter().all(|c| c["choices"][0]
-                .get("delta")
-                .and_then(|d| d.get("tool_calls"))
-                .is_none()),
-            "stream must not release tool deltas on null finish_reason"
-        );
-        assert_ne!(
-            stream_chunks.last().unwrap()["choices"][0]["finish_reason"],
-            "tool_calls"
-        );
-    }
-
-    #[test]
-    fn openai_stream_and_nonstream_paired_explicit_tool_calls_releases_calls() {
-        // Only an explicit raw daemon finish_reason of tool_calls may expose calls.
-        let calls = vec![sample_tc(
-            "read_file",
-            serde_json::json!({ "path": "a.rs" }),
-        )];
-        let completion = sample_completion("", calls, "tool_calls");
-
-        let nonstream = completion_json(&completion);
-        assert_eq!(nonstream["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(
-            nonstream["choices"][0]["message"]["tool_calls"][0]["id"],
-            "call_0"
-        );
-        assert!(nonstream["choices"][0]["message"]["content"].is_null());
-
-        let stream_chunks = openai_stream_terminal_chunks(&completion, false);
-        assert_eq!(stream_chunks.len(), 2, "tool delta + terminal");
-        assert_eq!(
-            stream_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
-            "call_0"
-        );
-        assert_eq!(
-            stream_chunks[1]["choices"][0]["finish_reason"],
-            "tool_calls"
-        );
     }
 
     fn sample_tool_call(name: &str) -> serde_json::Value {
@@ -10587,488 +7827,6 @@ mod tests {
             "name": name,
             "arguments": { "path": "README.md" }
         })
-    }
-
-    #[test]
-    fn semantic_fold_accumulates_content_and_reasoning_without_marker_parse() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-1", 1);
-        // Classifier-authorized prose may quote protocol lexemes; fold must not
-        // invent tool calls or strip them — only daemon tool_calls count.
-        let forwarded = fold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "use <tool_call> as documentation",
-                "id": "req-1",
-                "attempt_id": 1
-            }))
-            .expect("token");
-        assert_eq!(
-            forwarded,
-            vec![serde_json::json!({
-                "type": "token",
-                "text": "use <tool_call> as documentation"
-            })]
-        );
-        let forwarded = fold
-            .push(&serde_json::json!({
-                "type": "reasoning",
-                "text": "plan step",
-                "id": "req-1",
-                "attempt_id": 1
-            }))
-            .expect("reasoning");
-        assert_eq!(
-            forwarded,
-            vec![serde_json::json!({ "type": "reasoning", "text": "plan step" })]
-        );
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "stop",
-            "id": "req-1",
-            "attempt_id": 1
-        }))
-        .expect("done");
-        assert_eq!(fold.content(), "use <tool_call> as documentation");
-        assert_eq!(fold.reasoning_content(), "plan step");
-        assert!(fold.executable_tool_calls().is_empty());
-        assert_eq!(
-            fold.done()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(|v| v.as_str()),
-            Some("stop")
-        );
-    }
-
-    #[test]
-    fn semantic_fold_keeps_think_and_im_end_markers_verbatim_including_splits() {
-        // Critical: v2 fold must never invoke ThinkChannelRouter / marker scan.
-        // Recognized control literals must survive whole and across chunk boundaries.
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-42", 42);
-        let pieces = ["<thi", "nk>plan</thi", "nk>\nanswer<|im_", "end|>tail"];
-        let mut forwarded_text = String::new();
-        for piece in pieces {
-            let forwarded = fold
-                .push(&serde_json::json!({
-                    "type": "token",
-                    "text": piece,
-                    "id": "req-42",
-                    "attempt_id": 42
-                }))
-                .expect("chunk");
-            assert_eq!(forwarded.len(), 1);
-            assert_eq!(forwarded[0]["type"], "token");
-            assert_eq!(forwarded[0]["text"], piece);
-            forwarded_text.push_str(piece);
-        }
-        let expected = "<think>plan</think>\nanswer<|im_end|>tail";
-        assert_eq!(forwarded_text, expected);
-        assert_eq!(fold.content(), expected);
-
-        // Reasoning channel is also verbatim (no strip of </think> / <|im_end|>).
-        fold.begin_attempt("req-43", 43);
-        fold.push(&serde_json::json!({
-            "type": "reasoning",
-            "text": "r<think>x</think><|im_end|>",
-            "id": "req-43",
-            "attempt_id": 43
-        }))
-        .expect("reasoning markers");
-        assert_eq!(fold.reasoning_content(), "r<think>x</think><|im_end|>");
-        assert!(fold.content().is_empty());
-    }
-
-    #[test]
-    fn semantic_fold_buffers_tool_calls_until_tool_safe_done() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-2", 2);
-        let forwarded = fold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "calling",
-                "id": "req-2",
-                "attempt_id": 2
-            }))
-            .expect("token");
-        assert_eq!(forwarded.len(), 1);
-        let forwarded = fold
-            .push(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": [sample_tool_call("read_file")],
-                "id": "req-2",
-                "attempt_id": 2
-            }))
-            .expect("tool_calls");
-        // Mid-stream: nothing forwarded; calls stay buffered and non-executable.
-        assert!(forwarded.is_empty());
-        assert_eq!(fold.buffered_tool_calls().len(), 1);
-        assert!(fold.executable_tool_calls().is_empty());
-
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "tool_calls",
-            "tok_s": 12.5,
-            "id": "req-2",
-            "attempt_id": 2,
-            "calls": [sample_tool_call("read_file")]
-        }))
-        .expect("done");
-        assert_eq!(fold.executable_tool_calls().len(), 1);
-        assert_eq!(fold.executable_tool_calls()[0].name, "read_file");
-        assert_eq!(
-            fold.done()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(|v| v.as_str()),
-            Some("tool_calls")
-        );
-        // Daemon finish_reason preserved verbatim (no fold-side rewrite).
-        assert_eq!(
-            fold.done()
-                .and_then(|d| d.get("tok_s"))
-                .and_then(|v| v.as_f64()),
-            Some(12.5)
-        );
-    }
-
-    #[test]
-    fn semantic_fold_length_terminal_exposes_no_executable_calls() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-3", 3);
-        fold.push(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [sample_tool_call("write_file"), sample_tool_call("read_file")],
-            "id": "req-3",
-            "attempt_id": 3
-        }))
-        .expect("buffered");
-        assert_eq!(fold.buffered_tool_calls().len(), 2);
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "length",
-            "id": "req-3",
-            "attempt_id": 3
-        }))
-        .expect("done");
-        assert!(
-            fold.executable_tool_calls().is_empty(),
-            "length must never release buffered calls"
-        );
-        assert_eq!(
-            fold.done()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(|v| v.as_str()),
-            Some("length"),
-            "daemon finish_reason must not be rewritten to tool_calls"
-        );
-    }
-
-    #[test]
-    fn semantic_fold_error_and_abort_terminals_expose_no_calls() {
-        for reason in ["error", "aborted", "cancelled"] {
-            let mut fold = SemanticEventFold::new();
-            fold.begin_attempt("req-4", 4);
-            fold.push(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": [sample_tool_call("read_file")],
-                "id": "req-4",
-                "attempt_id": 4
-            }))
-            .expect("buffered");
-            fold.push(&serde_json::json!({
-                "type": "done",
-                "finish_reason": reason,
-                "id": "req-4",
-                "attempt_id": 4
-            }))
-            .expect("done");
-            assert!(
-                fold.executable_tool_calls().is_empty(),
-                "{reason} must not expose executable calls"
-            );
-            assert_eq!(
-                fold.done()
-                    .and_then(|d| d.get("finish_reason"))
-                    .and_then(|v| v.as_str()),
-                Some(reason)
-            );
-        }
-    }
-
-    #[test]
-    fn semantic_fold_stop_with_empty_buffer_stays_empty() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-5", 5);
-        fold.push(&serde_json::json!({
-            "type": "token",
-            "text": "hello",
-            "id": "req-5",
-            "attempt_id": 5
-        }))
-        .expect("token");
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "stop",
-            "id": "req-5",
-            "attempt_id": 5
-        }))
-        .expect("done");
-        assert!(fold.executable_tool_calls().is_empty());
-        assert_eq!(fold.content(), "hello");
-    }
-
-    #[test]
-    fn semantic_fold_rejects_stale_attempt_events() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-10", 10);
-        fold.push(&serde_json::json!({
-            "type": "token",
-            "text": "a1",
-            "id": "req-10",
-            "attempt_id": 10
-        }))
-        .expect("current");
-        let err = fold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "stale",
-                "id": "req-10",
-                "attempt_id": 9
-            }))
-            .expect_err("stale attempt");
-        assert_eq!(
-            err,
-            SemanticFoldError::StaleAttempt {
-                current: 10,
-                got: 9
-            }
-        );
-        // Current attempt state must remain intact after rejection.
-        assert_eq!(fold.content(), "a1");
-        assert_eq!(fold.current_attempt_id(), Some(10));
-    }
-
-    #[test]
-    fn semantic_fold_rejects_missing_malformed_from_first_event() {
-        // Critical: after begin_attempt, every event including the first must
-        // carry a matching numeric attempt_id. No lazy correlation / uncorrelated
-        // stream acceptance.
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-11", 11);
-
-        let missing = fold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "no id",
-                "id": "req-11"
-            }))
-            .expect_err("missing attempt_id");
-        assert_eq!(missing, SemanticFoldError::MissingAttemptId { current: 11 });
-        assert!(fold.content().is_empty());
-
-        let malformed_string = fold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "bad",
-                "id": "req-11",
-                "attempt_id": "11"
-            }))
-            .expect_err("string attempt_id");
-        assert_eq!(
-            malformed_string,
-            SemanticFoldError::MalformedAttemptId { current: 11 }
-        );
-
-        let malformed_null = fold
-            .push(&serde_json::json!({
-                "type": "gen_start",
-                "id": "req-11",
-                "attempt_id": null
-            }))
-            .expect_err("null attempt_id");
-        assert_eq!(
-            malformed_null,
-            SemanticFoldError::MalformedAttemptId { current: 11 }
-        );
-
-        // Without begin_attempt, push fails closed (no uncorrelated stream).
-        let mut cold = SemanticEventFold::new();
-        let err = cold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "uncorrelated",
-                "id": "req-1",
-                "attempt_id": 1
-            }))
-            .expect_err("no active attempt");
-        assert_eq!(err, SemanticFoldError::NoActiveAttempt);
-    }
-
-    #[test]
-    fn semantic_fold_begin_attempt_clears_attempt_local_state() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-1", 1);
-        fold.push(&serde_json::json!({
-            "type": "token",
-            "text": "first",
-            "id": "req-1",
-            "attempt_id": 1
-        }))
-        .expect("token");
-        fold.push(&serde_json::json!({
-            "type": "reasoning",
-            "text": "think1",
-            "id": "req-1",
-            "attempt_id": 1
-        }))
-        .expect("reasoning");
-        fold.push(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [sample_tool_call("read_file")],
-            "id": "req-1",
-            "attempt_id": 1
-        }))
-        .expect("calls");
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "tool_calls",
-            "id": "req-1",
-            "attempt_id": 1,
-            "calls": [sample_tool_call("read_file")]
-        }))
-        .expect("done");
-        assert!(!fold.content().is_empty());
-        assert!(!fold.executable_tool_calls().is_empty());
-
-        fold.begin_attempt("req-2", 2);
-        assert_eq!(fold.current_attempt_id(), Some(2));
-        assert!(fold.content().is_empty());
-        assert!(fold.reasoning_content().is_empty());
-        assert!(fold.buffered_tool_calls().is_empty());
-        assert!(fold.executable_tool_calls().is_empty());
-        assert!(fold.done().is_none());
-
-        fold.push(&serde_json::json!({
-            "type": "token",
-            "text": "second",
-            "id": "req-2",
-            "attempt_id": 2
-        }))
-        .expect("retry token");
-        fold.push(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "stop",
-            "id": "req-2",
-            "attempt_id": 2
-        }))
-        .expect("retry done");
-        assert_eq!(fold.content(), "second");
-        assert!(fold.executable_tool_calls().is_empty());
-        assert_eq!(
-            fold.done()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(|v| v.as_str()),
-            Some("stop")
-        );
-    }
-
-    #[test]
-    fn producer_to_fold_contract_v2_verbatim_legacy_outside() {
-        // Important: gen_start.contract_version == 2 selects SemanticEventFold
-        // (verbatim text). Legacy non-tool raw-think stays on ThinkChannelRouter
-        // outside the fold — proved here without inventing a second fold path.
-
-        // --- v2 producer path (fold) ---
-        let mut v2 = SemanticEventFold::new();
-        v2.begin_attempt("req-100", 100);
-        v2.push(&serde_json::json!({
-            "type": "gen_start",
-            "contract_version": 2,
-            "started_in_think": true,
-            "id": "req-100",
-            "attempt_id": 100
-        }))
-        .expect("v2 gen_start");
-        // started_in_think must not open a think channel inside the fold.
-        let text = "visible <think>not-routed</think> <|im_end|>";
-        let fwd = v2
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": text,
-                "id": "req-100",
-                "attempt_id": 100
-            }))
-            .expect("v2 token");
-        assert_eq!(
-            fwd,
-            vec![serde_json::json!({ "type": "token", "text": text })]
-        );
-        assert_eq!(v2.content(), text);
-        assert!(v2.reasoning_content().is_empty());
-
-        // --- legacy producer path (ThinkChannelRouter only; outside fold) ---
-        let mut router = ThinkChannelRouter::default();
-        router.set_started_in_think(true);
-        let mut fragments = router.push("legacy reason</thi");
-        fragments.extend(router.push("nk>\n\nlegacy answer"));
-        fragments.extend(router.finish());
-        assert_eq!(
-            fragments,
-            vec![
-                ThinkFragment::Reasoning("legacy reason".into()),
-                ThinkFragment::Content("legacy answer".into()),
-            ],
-            "legacy MiniMax/Cohere-style markers still route outside SemanticEventFold"
-        );
-
-        // Fold must not be the home of that routing: pushing the same bytes
-        // through a correlated fold keeps them as content, not reasoning split.
-        let mut not_legacy = SemanticEventFold::new();
-        not_legacy.begin_attempt("req-101", 101);
-        not_legacy
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "legacy reason</think>\n\nlegacy answer",
-                "id": "req-101",
-                "attempt_id": 101
-            }))
-            .expect("fold token");
-        assert_eq!(
-            not_legacy.content(),
-            "legacy reason</think>\n\nlegacy answer"
-        );
-        assert!(not_legacy.reasoning_content().is_empty());
-    }
-
-    #[test]
-    fn next_attempt_id_is_nonzero_and_monotonic() {
-        let a = next_attempt_id();
-        let b = next_attempt_id();
-        assert_ne!(a, 0);
-        assert_ne!(b, 0);
-        assert!(b > a);
-    }
-
-    #[test]
-    fn task15_attempt_latches_truth_table() {
-        let cases: &[(&str, bool, bool)] = &[
-            ("token", true, false),
-            ("reasoning", true, false),
-            ("commit_ready", false, true),
-            ("tool_calls", false, false),
-            ("gen_start", false, false),
-            ("done", false, false),
-            ("error", false, false),
-        ];
-        for (ty, want_visible, want_commit) in cases {
-            let mut latches = AttemptLatches::default();
-            latches.observe(&serde_json::json!({ "type": ty }));
-            assert_eq!(latches.visible, *want_visible, "visible for {ty}");
-            assert_eq!(
-                latches.commit_ready_seen, *want_commit,
-                "commit_ready_seen for {ty}"
-            );
-        }
     }
 
     fn task15_daemon_err(class: &str, retryable: bool, attempt_id: u64) -> anyhow::Error {
@@ -11085,122 +7843,6 @@ mod tests {
     }
 
     #[test]
-    fn task15_decide_retry_classifier_truth_table() {
-        let aid = 42u64;
-        let clean = AttemptLatches::default();
-        let mut visible = AttemptLatches::default();
-        visible.visible = true;
-        let mut committed = AttemptLatches::default();
-        committed.commit_ready_seen = true;
-
-        let ok_err = task15_daemon_err(hipfire_client::error_class::TRANSIENT, true, aid);
-        assert_eq!(
-            decide_retry(&ok_err, aid, &clean, true, true, 1),
-            RetryDecision::Retry
-        );
-
-        let denials: &[(&str, RetryDecision)] = &[
-            (
-                "gate_off",
-                decide_retry(&ok_err, aid, &clean, true, false, 1),
-            ),
-            (
-                "attempt_2",
-                decide_retry(&ok_err, aid, &clean, true, true, 2),
-            ),
-            (
-                "visible",
-                decide_retry(&ok_err, aid, &visible, true, true, 1),
-            ),
-            (
-                "commit_ready",
-                decide_retry(&ok_err, aid, &committed, true, true, 1),
-            ),
-            (
-                "ineligible",
-                decide_retry(&ok_err, aid, &clean, false, true, 1),
-            ),
-            (
-                "attempt_mismatch",
-                decide_retry(&ok_err, aid + 1, &clean, true, true, 1),
-            ),
-            (
-                "not_retryable",
-                decide_retry(
-                    &task15_daemon_err(hipfire_client::error_class::TRANSIENT, false, aid),
-                    aid,
-                    &clean,
-                    true,
-                    true,
-                    1,
-                ),
-            ),
-            (
-                "class_validation",
-                decide_retry(
-                    &task15_daemon_err(hipfire_client::error_class::VALIDATION, true, aid),
-                    aid,
-                    &clean,
-                    true,
-                    true,
-                    1,
-                ),
-            ),
-            (
-                "class_malformed",
-                decide_retry(
-                    &task15_daemon_err(hipfire_client::error_class::MALFORMED, true, aid),
-                    aid,
-                    &clean,
-                    true,
-                    true,
-                    1,
-                ),
-            ),
-            (
-                "class_internal",
-                decide_retry(
-                    &task15_daemon_err(hipfire_client::error_class::INTERNAL, true, aid),
-                    aid,
-                    &clean,
-                    true,
-                    true,
-                    1,
-                ),
-            ),
-            (
-                "class_cancel",
-                decide_retry(
-                    &task15_daemon_err(hipfire_client::error_class::CANCEL, true, aid),
-                    aid,
-                    &clean,
-                    true,
-                    true,
-                    1,
-                ),
-            ),
-            (
-                "non_daemon",
-                decide_retry(&anyhow::anyhow!("plain error"), aid, &clean, true, true, 1),
-            ),
-            (
-                "protocol",
-                decide_retry(
-                    &anyhow::Error::new(hipfire_client::ClientError::Protocol("x".into())),
-                    aid,
-                    &clean,
-                    true,
-                    true,
-                    1,
-                ),
-            ),
-        ];
-        for (name, decision) in denials {
-            assert_eq!(*decision, RetryDecision::Fail, "expected Fail for {name}");
-        }
-    }
-
-    #[test]
     fn task15_serve_retry_config_defaults_off() {
         let resolved = resolve(Vec::<NamedLayer>::new()).expect("resolve empty layers");
         let enabled = config_bool(&resolved, "serve.retry_enabled").expect("retry_enabled");
@@ -11211,902 +7853,7 @@ mod tests {
 
     // --- StreamContractGate / complete_request framing (fix round 2) ---
 
-    #[test]
-    fn complete_request_fold_rejects_pre_start_token() {
-        // Critical: no unchecked legacy default before gen_start.
-        let err = fold_complete_request_stream(
-            "req-7",
-            7,
-            &[serde_json::json!({
-                "type": "token",
-                "text": "too early",
-                "id": "req-7",
-                "attempt_id": 7
-            })],
-        )
-        .expect_err("pre-start token must fail closed");
-        assert_eq!(
-            err,
-            StreamContractError::PreStartEvent {
-                event_type: "token".into()
-            }
-        );
-    }
-
-    #[test]
-    fn complete_request_fold_rejects_missing_id_gen_start() {
-        // Correlation before contract_version latch — missing id never selects legacy/v2.
-        let err = fold_complete_request_stream(
-            "req-7",
-            7,
-            &[serde_json::json!({
-                "type": "gen_start",
-                "contract_version": 2
-            })],
-        )
-        .expect_err("missing request id on gen_start");
-        assert_eq!(
-            err,
-            StreamContractError::MissingRequestId {
-                expected: "req-7".into()
-            }
-        );
-
-        let err_missing_attempt = fold_complete_request_stream(
-            "req-7",
-            7,
-            &[serde_json::json!({
-                "type": "gen_start",
-                "contract_version": 2,
-                "id": "req-7"
-            })],
-        )
-        .expect_err("missing attempt_id on gen_start");
-        assert_eq!(
-            err_missing_attempt,
-            StreamContractError::MissingAttemptId { expected: 7 }
-        );
-
-        let err_malformed = fold_complete_request_stream(
-            "req-7",
-            7,
-            &[serde_json::json!({
-                "type": "gen_start",
-                "contract_version": 2,
-                "id": "req-7",
-                "attempt_id": "7"
-            })],
-        )
-        .expect_err("string attempt_id on gen_start");
-        assert_eq!(
-            err_malformed,
-            StreamContractError::MalformedAttemptId { expected: 7 }
-        );
-
-        let err_stale_first = fold_complete_request_stream(
-            "req-7",
-            7,
-            &[serde_json::json!({
-                "type": "gen_start",
-                "contract_version": 2,
-                "id": "req-7",
-                "attempt_id": 99
-            })],
-        )
-        .expect_err("stale attempt_id on first gen_start");
-        assert_eq!(
-            err_stale_first,
-            StreamContractError::StaleAttempt {
-                expected: 7,
-                got: 99
-            }
-        );
-    }
-
-    #[test]
-    fn complete_request_fold_rejects_stale_second_start_downgrade() {
-        // Critical: after v2 is latched, a later stale/missing-id gen_start must
-        // NOT downgrade the stream to legacy or re-latch contract_version.
-        let events = [
-            serde_json::json!({
-                "type": "gen_start",
-                "contract_version": 2,
-                "id": "req-7",
-                "attempt_id": 7
-            }),
-            serde_json::json!({
-                "type": "token",
-                "text": "kept",
-                "id": "req-7",
-                "attempt_id": 7
-            }),
-            // Stale second start — previously could flip contract_v2 = Some(false).
-            serde_json::json!({
-                "type": "gen_start",
-                "id": "req-1",
-                "attempt_id": 1
-            }),
-            serde_json::json!({
-                "type": "token",
-                "text": "would-be-legacy",
-                "id": "req-7",
-                "attempt_id": 7
-            }),
-        ];
-        let err = fold_complete_request_stream("req-7", 7, &events)
-            .expect_err("second gen_start must reject without downgrade");
-        assert_eq!(err, StreamContractError::SecondGenStart);
-
-        // Gate unit: v2 stays latched even if observe is retried after error.
-        let mut gate = StreamContractGate::new("req-7", 7);
-        assert_eq!(gate.observe(&events[0]).expect("first"), StreamContract::V2);
-        assert_eq!(gate.observe(&events[1]).expect("token"), StreamContract::V2);
-        assert_eq!(
-            gate.observe(&events[2]).expect_err("second start"),
-            StreamContractError::SecondGenStart
-        );
-        assert_eq!(gate.contract(), Some(StreamContract::V2));
-        assert!(gate.is_v2());
-        // Subsequent non-start events would still be v2 if caller continued —
-        // production aborts the generate callback on SecondGenStart instead.
-        assert_eq!(
-            gate.observe(&events[3]).expect("still v2"),
-            StreamContract::V2
-        );
-
-        // Missing-id second start is also SecondGenStart (never re-reads version).
-        let mut gate2 = StreamContractGate::new("req-7", 7);
-        gate2
-            .observe(&serde_json::json!({
-                "type": "gen_start",
-                "contract_version": 2,
-                "id": "req-7",
-                "attempt_id": 7
-            }))
-            .unwrap();
-        assert_eq!(
-            gate2
-                .observe(&serde_json::json!({
-                    "type": "gen_start",
-                    "contract_version": 1
-                }))
-                .expect_err("missing-id second start"),
-            StreamContractError::SecondGenStart
-        );
-        assert_eq!(gate2.contract(), Some(StreamContract::V2));
-    }
-
-    #[test]
-    fn complete_request_fold_valid_legacy_and_v2_starts() {
-        // Valid v2 start → SemanticEventFold verbatim path.
-        let v2 = fold_complete_request_stream(
-            "req-42",
-            42,
-            &[
-                serde_json::json!({
-                    "type": "gen_start",
-                    "contract_version": 2,
-                    "started_in_think": true,
-                    "id": "req-42",
-                    "attempt_id": 42
-                }),
-                serde_json::json!({
-                    "type": "token",
-                    "text": "hi <think>raw</think>",
-                    "id": "req-42",
-                    "attempt_id": 42
-                }),
-                serde_json::json!({
-                    "type": "done",
-                    "finish_reason": "stop",
-                    "id": "req-42",
-                    "attempt_id": 42
-                }),
-            ],
-        )
-        .expect("valid v2 stream");
-        assert_eq!(v2.contract, StreamContract::V2);
-        assert_eq!(v2.content, "hi <think>raw</think>");
-        assert!(v2.reasoning_content.is_empty());
-        assert!(v2.tool_calls.is_empty());
-        assert_eq!(
-            v2.done
-                .as_ref()
-                .and_then(|d| d.get("finish_reason"))
-                .and_then(|v| v.as_str()),
-            Some("stop")
-        );
-
-        // Valid legacy start (missing/other contract_version) → ThinkChannelRouter.
-        let legacy = fold_complete_request_stream(
-            "req-42",
-            42,
-            &[
-                serde_json::json!({
-                    "type": "gen_start",
-                    "started_in_think": true,
-                    "id": "req-42",
-                    "attempt_id": 42
-                }),
-                serde_json::json!({
-                    "type": "token",
-                    "text": "plan</think>\n\nanswer",
-                    "id": "req-42",
-                    "attempt_id": 42
-                }),
-                serde_json::json!({
-                    "type": "done",
-                    "finish_reason": "stop",
-                    "id": "req-42",
-                    "attempt_id": 42
-                }),
-            ],
-        )
-        .expect("valid legacy stream");
-        assert_eq!(legacy.contract, StreamContract::Legacy);
-        assert_eq!(legacy.reasoning_content, "plan");
-        assert_eq!(legacy.content, "answer");
-
-        // Explicit non-2 contract_version is also legacy.
-        let legacy_v1 = fold_complete_request_stream(
-            "req-3",
-            3,
-            &[
-                serde_json::json!({
-                    "type": "gen_start",
-                    "contract_version": 1,
-                    "id": "req-3",
-                    "attempt_id": 3
-                }),
-                serde_json::json!({
-                    "type": "token",
-                    "text": "plain",
-                    "id": "req-3",
-                    "attempt_id": 3
-                }),
-                serde_json::json!({
-                    "type": "done",
-                    "finish_reason": "stop",
-                    "id": "req-3",
-                    "attempt_id": 3
-                }),
-            ],
-        )
-        .expect("contract_version 1 is legacy");
-        assert_eq!(legacy_v1.contract, StreamContract::Legacy);
-        assert_eq!(legacy_v1.content, "plain");
-    }
-
     // ── Task 6: canonical OpenAI tool-call adapter + endpoint registry ──
-
-    #[test]
-    fn openai_adapter_preserves_names_and_nested_arguments() {
-        let calls = vec![
-            sample_tc(
-                "search",
-                serde_json::json!({
-                    "query": "hipfire",
-                    "filters": { "lang": ["rust", "c"], "limit": 3 },
-                    "opts": { "nested": { "deep": true } }
-                }),
-            ),
-            sample_tc("ping", serde_json::json!({})),
-        ];
-        let adapted = openai_tool_call_adapter_results(&calls);
-        assert_eq!(adapted.len(), 2);
-        assert_eq!(adapted[0].name, "search");
-        assert_eq!(adapted[1].name, "ping");
-
-        let args0: serde_json::Value =
-            serde_json::from_str(&adapted[0].arguments).expect("args json");
-        assert_eq!(args0["filters"]["lang"][1], "c");
-        assert_eq!(args0["opts"]["nested"]["deep"], true);
-        assert_eq!(adapted[1].arguments, "{}");
-
-        let lowered = openai_tool_calls(&calls);
-        assert_eq!(lowered[0]["function"]["name"], "search");
-        assert_eq!(
-            lowered[0]["function"]["arguments"].as_str().unwrap(),
-            adapted[0].arguments
-        );
-    }
-
-    #[test]
-    fn openai_adapter_deterministic_stable_ids_and_indices() {
-        let calls = vec![
-            sample_tc("a", serde_json::json!({"n": 1})),
-            sample_tc("b", serde_json::json!({"n": 2})),
-            sample_tc("c", serde_json::json!({"n": 3})),
-        ];
-        let first = openai_tool_call_adapter_results(&calls);
-        let second = openai_tool_call_adapter_results(&calls);
-        assert_eq!(first, second, "adapter result must be deterministic");
-        for (i, row) in first.iter().enumerate() {
-            assert_eq!(row.index, i);
-            assert_eq!(row.id, format!("call_{i}"));
-            assert_eq!(row.name, calls[i].name);
-        }
-
-        let stream_delta = openai_tool_call_delta_from_adapter(&first);
-        let nonstream = openai_tool_calls_from_adapter(&first);
-        for i in 0..3 {
-            assert_eq!(stream_delta["tool_calls"][i]["index"], i);
-            assert_eq!(stream_delta["tool_calls"][i]["id"], format!("call_{i}"));
-            assert_eq!(nonstream[i]["id"], format!("call_{i}"));
-            assert!(
-                nonstream[i].get("index").is_none(),
-                "non-stream message.tool_calls must not carry stream index"
-            );
-        }
-    }
-
-    #[test]
-    fn openai_stream_and_nonstream_share_one_adapter_result() {
-        let calls = vec![
-            sample_tc(
-                "read_file",
-                serde_json::json!({ "path": "a.rs", "meta": { "k": "v" } }),
-            ),
-            sample_tc("write_file", serde_json::json!({ "path": "b.rs" })),
-        ];
-        let adapted = openai_tool_call_adapter_results(&calls);
-        let completion = sample_completion("", calls.clone(), "tool_calls");
-
-        let nonstream = completion_json(&completion);
-        let stream = openai_stream_terminal_chunks(&completion, false);
-        let ns_calls = nonstream["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .expect("nonstream tool_calls");
-        let st_calls = stream[0]["choices"][0]["delta"]["tool_calls"]
-            .as_array()
-            .expect("stream tool_calls");
-
-        assert_eq!(ns_calls.len(), adapted.len());
-        assert_eq!(st_calls.len(), adapted.len());
-        for (i, row) in adapted.iter().enumerate() {
-            assert_eq!(ns_calls[i]["id"], row.id);
-            assert_eq!(ns_calls[i]["function"]["name"], row.name);
-            assert_eq!(ns_calls[i]["function"]["arguments"], row.arguments);
-            assert_eq!(st_calls[i]["id"], row.id);
-            assert_eq!(st_calls[i]["index"], row.index);
-            assert_eq!(st_calls[i]["function"]["name"], row.name);
-            assert_eq!(st_calls[i]["function"]["arguments"], row.arguments);
-            assert_eq!(ns_calls[i]["function"], st_calls[i]["function"]);
-            assert_eq!(ns_calls[i]["id"], st_calls[i]["id"]);
-        }
-    }
-
-    #[test]
-    fn openai_pure_tool_turn_content_is_null_not_empty_string() {
-        let completion = sample_completion(
-            "",
-            vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))],
-            "tool_calls",
-        );
-        let json = completion_json(&completion);
-        assert!(json["choices"][0]["message"]["content"].is_null());
-        assert!(json["choices"][0]["message"]["tool_calls"].is_array());
-    }
-
-    #[test]
-    fn openai_mixed_prose_and_calls_retains_prose_content() {
-        let completion = sample_completion(
-            "I'll look that up.",
-            vec![sample_tc("search", serde_json::json!({ "q": "docs" }))],
-            "tool_calls",
-        );
-        let json = completion_json(&completion);
-        assert_eq!(
-            json["choices"][0]["message"]["content"],
-            "I'll look that up."
-        );
-        assert_eq!(
-            json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-            "search"
-        );
-        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
-
-        let chunks = openai_stream_terminal_chunks(&completion, false);
-        assert_eq!(
-            chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
-            "search"
-        );
-        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
-    }
-
-    #[test]
-    fn openai_length_error_cancel_malformed_never_release_calls() {
-        let leaked = vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))];
-        for reason in [
-            "length",
-            "error",
-            "cancelled",
-            "aborted",
-            "malformed_protocol",
-        ] {
-            let completion = sample_completion("partial", leaked.clone(), reason);
-            let nonstream = completion_json(&completion);
-            assert_eq!(
-                nonstream["choices"][0]["finish_reason"], reason,
-                "{reason}: finish_reason must stay authoritative"
-            );
-            assert!(
-                nonstream["choices"][0]["message"]
-                    .get("tool_calls")
-                    .is_none(),
-                "{reason}: must not release message.tool_calls"
-            );
-            assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
-
-            let stream = openai_stream_terminal_chunks(&completion, false);
-            assert!(
-                stream.iter().all(|c| {
-                    c["choices"]
-                        .as_array()
-                        .and_then(|choices| choices.first())
-                        .and_then(|ch| ch.get("delta"))
-                        .and_then(|d| d.get("tool_calls"))
-                        .is_none()
-                }),
-                "{reason}: stream must not emit tool_call deltas"
-            );
-            assert_eq!(stream[0]["choices"][0]["finish_reason"], reason);
-        }
-    }
-
-    #[test]
-    fn malformed_daemon_call_fails_at_canonical_boundary() {
-        let err = tool_call_from_canonical_value(&serde_json::json!("not-an-object"))
-            .expect_err("non-object");
-        assert!(
-            err.contains("JSON object") || err.contains("object"),
-            "detail={err}"
-        );
-
-        let err = tool_call_from_canonical_value(&serde_json::json!({
-            "arguments": { "path": "x" }
-        }))
-        .expect_err("missing name");
-        assert!(err.contains("name"), "detail={err}");
-
-        let err = tool_call_from_canonical_value(&serde_json::json!({
-            "name": "   ",
-            "arguments": {}
-        }))
-        .expect_err("empty name");
-        assert!(err.contains("name"), "detail={err}");
-
-        let legacy_err = tool_call_from_legacy_value(&serde_json::json!(null)).expect_err("null");
-        assert!(!legacy_err.is_empty());
-
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-11", 11);
-        let fold_err = fold
-            .push(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": [{ "arguments": { "path": "x" } }],
-                "id": "req-11",
-                "attempt_id": 11
-            }))
-            .expect_err("malformed call must fail fold push");
-        match fold_err {
-            SemanticFoldError::MalformedToolCall { detail } => {
-                assert!(detail.contains("name"), "detail={detail}");
-            }
-            other => panic!("expected MalformedToolCall, got {other:?}"),
-        }
-        assert!(
-            fold.buffered_tool_calls().is_empty(),
-            "malformed must not buffer a call"
-        );
-        assert!(fold.executable_tool_calls().is_empty());
-    }
-
-    #[test]
-    fn semantic_fold_missing_calls_fails_closed_before_tool_terminal() {
-        // Canonical v2 tool_calls without `calls` must not succeed the fold or
-        // lower to finish_reason=tool_calls via the production stream boundary.
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-21", 21);
-        let err = fold
-            .push(&serde_json::json!({
-                "type": "tool_calls",
-                "id": "req-21",
-                "attempt_id": 21
-            }))
-            .expect_err("missing calls must fail fold push");
-        match err {
-            SemanticFoldError::MalformedToolCall { detail } => {
-                assert!(
-                    detail.contains("calls") && detail.contains("array"),
-                    "detail={detail}"
-                );
-            }
-            other => panic!("expected MalformedToolCall, got {other:?}"),
-        }
-        assert!(fold.buffered_tool_calls().is_empty());
-        assert!(fold.executable_tool_calls().is_empty());
-        assert!(fold.done().is_none());
-
-        let stream_err = fold_complete_request_stream(
-            "req-21",
-            21,
-            &[
-                serde_json::json!({
-                    "type": "gen_start",
-                    "id": "req-21",
-                    "attempt_id": 21,
-                    "contract_version": 2
-                }),
-                serde_json::json!({
-                    "type": "tool_calls",
-                    "id": "req-21",
-                    "attempt_id": 21
-                }),
-                serde_json::json!({
-                    "type": "done",
-                    "finish_reason": "tool_calls",
-                    "id": "req-21",
-                    "attempt_id": 21
-                }),
-            ],
-        )
-        .expect_err("missing calls must fail complete_request fold boundary");
-        match stream_err {
-            StreamContractError::MalformedToolCall { detail } => {
-                assert!(
-                    detail.contains("calls") && detail.contains("array"),
-                    "detail={detail}"
-                );
-            }
-            other => panic!("expected StreamContractError::MalformedToolCall, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn semantic_fold_non_array_calls_fails_closed_before_tool_terminal() {
-        // null / object / string `calls` are not arrays — fail closed before any
-        // successful tool_calls terminal lowering can be produced.
-        for calls in [
-            serde_json::Value::Null,
-            serde_json::json!({ "name": "read_file" }),
-            serde_json::json!("read_file"),
-        ] {
-            let mut fold = SemanticEventFold::new();
-            fold.begin_attempt("req-22", 22);
-            let err = fold
-                .push(&serde_json::json!({
-                    "type": "tool_calls",
-                    "calls": calls,
-                    "id": "req-22",
-                    "attempt_id": 22
-                }))
-                .expect_err("non-array calls must fail fold push");
-            match err {
-                SemanticFoldError::MalformedToolCall { detail } => {
-                    assert!(
-                        detail.contains("calls") && detail.contains("array"),
-                        "detail={detail}"
-                    );
-                }
-                other => panic!("expected MalformedToolCall, got {other:?}"),
-            }
-            assert!(fold.buffered_tool_calls().is_empty());
-            assert!(fold.executable_tool_calls().is_empty());
-            assert!(fold.done().is_none());
-        }
-
-        let stream_err = fold_complete_request_stream(
-            "req-22",
-            22,
-            &[
-                serde_json::json!({
-                    "type": "gen_start",
-                    "id": "req-22",
-                    "attempt_id": 22,
-                    "contract_version": 2
-                }),
-                serde_json::json!({
-                    "type": "tool_calls",
-                    "calls": null,
-                    "id": "req-22",
-                    "attempt_id": 22
-                }),
-                serde_json::json!({
-                    "type": "done",
-                    "finish_reason": "tool_calls",
-                    "id": "req-22",
-                    "attempt_id": 22
-                }),
-            ],
-        )
-        .expect_err("null calls must fail complete_request fold boundary");
-        match stream_err {
-            StreamContractError::MalformedToolCall { detail } => {
-                assert!(
-                    detail.contains("calls") && detail.contains("array"),
-                    "detail={detail}"
-                );
-            }
-            other => panic!("expected StreamContractError::MalformedToolCall, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn missing_or_lossy_endpoint_adapter_rejects_before_mutation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let mutations = AtomicUsize::new(0);
-        let mut fire_if_allowed = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
-            gate_chat_completions_tools(body)?;
-            mutations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        };
-
-        let with_tools = serde_json::json!({
-            "model": "m",
-            "tools": [{ "type": "function", "function": { "name": "x" } }],
-            "messages": []
-        });
-
-        assert_eq!(
-            endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions),
-            EndpointAdapterStatus::AvailableLossless
-        );
-        fire_if_allowed(&with_tools).expect("lossless adapter allows tools");
-        assert_eq!(mutations.load(Ordering::SeqCst), 1);
-
-        let before = mutations.load(Ordering::SeqCst);
-        let deny_unavailable = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
-            let _ = body;
-            Err(EndpointAdapterError::Unavailable {
-                endpoint: "/v1/chat/completions",
-            })
-        };
-        let deny_lossy = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
-            let _ = body;
-            Err(EndpointAdapterError::Lossy {
-                endpoint: "/v1/chat/completions",
-            })
-        };
-
-        let run_gated =
-            |gate: &dyn Fn(&serde_json::Value) -> Result<(), EndpointAdapterError>| match gate(
-                &with_tools,
-            ) {
-                Ok(()) => {
-                    mutations.fetch_add(1, Ordering::SeqCst);
-                }
-                Err(_) => {}
-            };
-
-        run_gated(&deny_unavailable);
-        assert_eq!(
-            mutations.load(Ordering::SeqCst),
-            before,
-            "unavailable adapter must not fire mutation counter"
-        );
-        let msg = EndpointAdapterError::Unavailable {
-            endpoint: "/v1/chat/completions",
-        }
-        .to_string();
-        assert!(msg.contains("unavailable"), "{msg}");
-
-        run_gated(&deny_lossy);
-        assert_eq!(
-            mutations.load(Ordering::SeqCst),
-            before,
-            "lossy adapter must not fire mutation counter"
-        );
-        let msg = EndpointAdapterError::Lossy {
-            endpoint: "/v1/chat/completions",
-        }
-        .to_string();
-        assert!(msg.contains("lossy"), "{msg}");
-
-        assert!(gate_chat_completions_tools(&with_tools).is_ok());
-    }
-
-    #[test]
-    fn tools_absent_bypasses_adapter_capability_gate() {
-        let mutations = std::sync::atomic::AtomicUsize::new(0);
-        let bodies = [
-            serde_json::json!({ "model": "m", "messages": [] }),
-            serde_json::json!({ "model": "m", "tools": [], "messages": [] }),
-            serde_json::json!({ "model": "m", "tools": null, "messages": [] }),
-        ];
-        for body in &bodies {
-            gate_chat_completions_tools(body).expect("tool-free must bypass adapter capability");
-            mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        assert_eq!(
-            mutations.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "absent/empty tools must not block the mutation/dispatch path"
-        );
-    }
-
-    #[test]
-    fn endpoint_adapter_registry_covers_all_declared_kinds() {
-        const ALL_KINDS: &[EndpointAdapterKind] = &[EndpointAdapterKind::OpenAiChatCompletions];
-
-        for kind in ALL_KINDS {
-            let status = endpoint_adapter_status(*kind);
-            match kind {
-                EndpointAdapterKind::OpenAiChatCompletions => {
-                    assert_eq!(status, EndpointAdapterStatus::AvailableLossless);
-                }
-            }
-            assert_eq!(status, EndpointAdapterRegistry::status(*kind));
-        }
-
-        assert!(
-            ALL_KINDS
-                .iter()
-                .any(|k| endpoint_adapter_status(*k) == EndpointAdapterStatus::AvailableLossless),
-            "registry must declare at least one AvailableLossless adapter"
-        );
-    }
-
-    #[test]
-    fn forward_sse_stream_event_sends_delta_bytes() {
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        forward_sse_stream_event(
-            &sender,
-            "chatcmpl-test",
-            1,
-            "m",
-            &serde_json::json!({ "type": "token", "text": "hi" }),
-        )
-        .expect("delta path succeeds");
-        let chunk = receiver.recv().expect("delta payload");
-        assert!(!chunk.fail);
-        assert!(chunk.ack.is_none());
-        let text = String::from_utf8(chunk.bytes).expect("utf8");
-        assert!(text.starts_with("data: "));
-        assert!(text.contains("\"content\":\"hi\""));
-        assert!(text.ends_with("\n\n"));
-    }
-
-    #[test]
-    fn forward_sse_stream_event_no_delta_is_silent() {
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        // Pure tool turn is withheld mid-stream — no empty probe bytes.
-        forward_sse_stream_event(
-            &sender,
-            "chatcmpl-test",
-            1,
-            "m",
-            &serde_json::json!({
-                "type": "tool_calls",
-                "calls": [{ "name": "read_file", "arguments": {} }]
-            }),
-        )
-        .expect("no-delta path succeeds");
-        assert!(
-            receiver.try_recv().is_err(),
-            "no-delta mid-stream must not enqueue a chunk"
-        );
-    }
-
-    #[test]
-    fn forward_sse_stream_event_dropped_receiver_is_cancelled_on_delta_path() {
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        drop(receiver);
-        let err = forward_sse_stream_event(
-            &sender,
-            "chatcmpl-test",
-            1,
-            "m",
-            &serde_json::json!({ "type": "token", "text": "x" }),
-        )
-        .expect_err("delta send must fail when receiver dropped");
-        assert!(
-            matches!(err, hipfire_client::ClientError::Cancelled),
-            "delta path: {err:?}"
-        );
-
-        // No-delta path does not touch the sender, so a dropped receiver is Ok.
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        drop(receiver);
-        forward_sse_stream_event(
-            &sender,
-            "chatcmpl-test",
-            1,
-            "m",
-            &serde_json::json!({ "type": "tool_calls", "calls": [] }),
-        )
-        .expect("no-delta path is silent even if receiver already dropped");
-    }
-
-    #[test]
-    fn channel_reader_skips_empty_non_fail_chunks() {
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        let reader_thread = thread::spawn(move || {
-            let mut reader = ChannelReader::new(receiver);
-            let mut buf = [0u8; 64];
-            let n = reader.read(&mut buf).expect("read");
-            (n, buf)
-        });
-        sender
-            .send(ResponseChunk::plain(Vec::new()))
-            .expect("empty probe");
-        sender
-            .send(ResponseChunk::plain(Vec::new()))
-            .expect("second empty probe");
-        sender
-            .send(ResponseChunk::plain(b"data: hi\n\n".to_vec()))
-            .expect("real bytes");
-        drop(sender);
-        let (n, buf) = reader_thread.join().expect("reader joins");
-        assert_eq!(n, b"data: hi\n\n".len());
-        assert_eq!(&buf[..n], b"data: hi\n\n");
-    }
-
-    #[test]
-    fn channel_reader_acks_only_after_full_chunk_consumption() {
-        use std::sync::mpsc::TryRecvError;
-        use std::time::Duration;
-
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        let (ack_tx, ack_rx) = mpsc::channel::<Result<(), ()>>();
-        // Chunk larger than the read buffer so the first/intermediate reads are partial.
-        let chunk = b"abcdefghij".to_vec(); // 10 bytes
-        sender
-            .send(ResponseChunk {
-                bytes: chunk.clone(),
-                ack: Some(ack_tx),
-                fail: false,
-            })
-            .expect("send acknowledged chunk");
-        drop(sender);
-
-        let mut reader = ChannelReader::new(receiver);
-        let mut buf = [0u8; 3];
-
-        // First partial read — chunk not fully consumed; no ack yet.
-        let n = reader.read(&mut buf).expect("first partial");
-        assert_eq!(n, 3);
-        assert_eq!(&buf[..n], b"abc");
-        assert!(
-            matches!(ack_rx.try_recv(), Err(TryRecvError::Empty)),
-            "first partial read must not acknowledge"
-        );
-
-        // Intermediate partial reads — still draining; no ack.
-        let n = reader.read(&mut buf).expect("second partial");
-        assert_eq!(n, 3);
-        assert_eq!(&buf[..n], b"def");
-        assert!(
-            matches!(ack_rx.try_recv(), Err(TryRecvError::Empty)),
-            "second partial read must not acknowledge"
-        );
-
-        let n = reader.read(&mut buf).expect("third partial");
-        assert_eq!(n, 3);
-        assert_eq!(&buf[..n], b"ghi");
-        assert!(
-            matches!(ack_rx.try_recv(), Err(TryRecvError::Empty)),
-            "third partial read must not acknowledge"
-        );
-
-        // Final drain of remaining byte — still no ack until a *later* read.
-        let n = reader.read(&mut buf).expect("final drain");
-        assert_eq!(n, 1);
-        assert_eq!(&buf[..n], b"j");
-        assert!(
-            matches!(ack_rx.try_recv(), Err(TryRecvError::Empty)),
-            "full drain of current chunk still defers ack to next read"
-        );
-
-        // Fifth read after full consumption fires the progress ack, then EOF.
-        let n = reader.read(&mut buf).expect("post-drain read");
-        assert_eq!(n, 0);
-        let ack = ack_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("ack after full consumption");
-        assert_eq!(ack, Ok(()));
-    }
 
     #[test]
     fn forward_think_fragments_preserves_cancelled_callback_error() {
@@ -12124,32 +7871,6 @@ mod tests {
         assert_eq!(content, "x");
     }
 
-    #[test]
-    fn finish_sse_stream_cancelled_emits_neither_error_nor_done() {
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        finish_sse_stream(
-            sender,
-            Err(anyhow::Error::from(hipfire_client::ClientError::Cancelled)),
-        );
-        let trailing: Vec<ResponseChunk> = receiver.try_iter().collect();
-        assert!(
-            trailing.is_empty(),
-            "Cancelled must drop sender without frames: {trailing:?}"
-        );
-    }
-
-    #[test]
-    fn finish_sse_stream_success_emits_no_post_commit_bytes() {
-        let (sender, receiver) = mpsc::channel::<ResponseChunk>();
-        let completion = sample_completion("ok", Vec::new(), "stop");
-        finish_sse_stream(sender, Ok(completion));
-        let frames: Vec<ResponseChunk> = receiver.try_iter().collect();
-        assert!(
-            frames.is_empty(),
-            "success terminal already delivered at commit_ready: {frames:?}"
-        );
-    }
-
     // =========================================================================
     // Task 11 — no-GPU fake-daemon HTTP acceptance through real serve lowering
     // =========================================================================
@@ -12161,533 +7882,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let daemon = root.join("task11-fake-daemon.py");
         // Python keeps correlated id/attempt_id, full reset ack, and commit handshake.
-        let script = r#"#!/usr/bin/env python3
-import json, os, sys
-
-state_epoch = 0
-generate_count = 0
-LAST_SCENARIO = ""
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.log")
-MODEL_PATH = ""
-
-def log_req(req):
-    try:
-        with open(LOG_PATH, "a") as f:
-            f.write(json.dumps(req, separators=(",", ":")) + "\n")
-    except Exception:
-        pass
-
-def out(obj):
-    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-def echo_ids(req):
-    return req.get("id"), req.get("attempt_id")
-
-def eligible_from_model():
-    # Task 15: "ineligible" in model path/name => retry_reset_eligible false.
-    blob = (MODEL_PATH or "").lower()
-    return "ineligible" not in blob
-
-def scenario_from(req):
-    model = str(req.get("model") or "")
-    prompt = str(req.get("prompt") or "")
-    messages = req.get("messages") or []
-    if isinstance(messages, list):
-        for m in reversed(messages):
-            if isinstance(m, dict) and m.get("role") == "user":
-                c = m.get("content")
-                if isinstance(c, str) and c:
-                    prompt = c
-                    break
-    blob = (model + " " + prompt).lower()
-    tags = (
-        "t15-transient-once",
-        "t15-transient-always",
-        "t15-visible-token",
-        "t15-visible-reasoning",
-        "t15-commit-ready-error",
-        "t15-class-malformed",
-        "t15-class-validation",
-        "t15-class-context",
-        "t15-class-unsupported",
-        "t15-class-internal",
-        "t15-class-adaptive",
-        "t15-class-mismatch",
-        "t15-class-cancel",
-        "t15-transient-not-retryable",
-        "t15-mismatch-attempt",
-        "t15-eof",
-        "t15-invalid-json",
-        "t15-stale-event",
-        "t15-tool-then-transient",
-        "t15-reset-fail-rolled",
-        "t15-reset-fail-seq",
-        "t15-reset-fail-epoch",
-        "t15-reset-fail-attempt",
-        "t11-premature-eof",
-        "t11-capability-denial",
-        "t11-dirty-markers",
-        "t11-length-withhold",
-        "t11-mixed-tool",
-        "t11-two-tools",
-        "t11-pure-tool",
-        "t11-stop-text",
-        "t11-usage",
-    )
-    for tag in tags:
-        if tag in blob:
-            return tag
-    return "t11-stop-text"
-
-def emit_correlated(ev, rid, aid):
-    if rid is not None:
-        ev["id"] = rid
-    if aid is not None:
-        ev["attempt_id"] = aid
-    out(ev)
-
-def emit_typed_error(rid, aid, message, cls="transient", retryable=True, rolled_back=False, force_aid=None):
-    out({
-        "type": "error",
-        "id": rid,
-        "message": message,
-        "class": cls,
-        "retryable": retryable,
-        "rolled_back": rolled_back,
-        "attempt_id": force_aid if force_aid is not None else (aid if aid is not None else 0),
-    })
-
-def wait_commit(rid, aid, allow_abort=False):
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        log_req(msg)
-        ty = msg.get("type")
-        if ty == "commit":
-            if msg.get("id") != rid or msg.get("attempt_id") != aid:
-                emit_typed_error(rid, aid, "commit correlation mismatch", cls="internal", retryable=False)
-                return "error"
-            return "commit"
-        if ty == "abort" and allow_abort:
-            return "abort"
-        if ty == "unload":
-            out({"type": "unloaded"})
-            sys.exit(0)
-
-def success_stop(rid, aid, text="hello from fake daemon"):
-    emit_correlated({"type": "token", "text": text}, rid, aid)
-    emit_correlated({
-        "type": "commit_ready",
-        "finish_reason": "stop",
-        "prompt_tokens": 3,
-        "tokens": 4,
-        "tok_s": 12.0,
-    }, rid, aid)
-    if wait_commit(rid, aid) != "commit":
-        return
-    emit_correlated({
-        "type": "done",
-        "finish_reason": "stop",
-        "prompt_tokens": 3,
-        "tokens": 4,
-        "tok_s": 12.0,
-    }, rid, aid)
-
-def handle_generate(req):
-    global generate_count, LAST_SCENARIO
-    generate_count += 1
-    rid, aid = echo_ids(req)
-    scenario = scenario_from(req)
-    LAST_SCENARIO = scenario
-
-    if scenario == "t11-capability-denial":
-        out({
-            "type": "error",
-            "id": rid,
-            "message": "tools not supported by this endpoint capability",
-            "class": "unsupported",
-            "retryable": False,
-            "rolled_back": True,
-            "attempt_id": aid if aid is not None else 0,
-        })
-        return
-
-    # All success / premature / t15 paths start with correlated v2 gen_start
-    # except pure typed pre-start errors above.
-    emit_correlated({
-        "type": "gen_start",
-        "contract_version": 2,
-    }, rid, aid)
-
-    # --- Task 15 scenarios ---
-    if scenario == "t15-transient-once":
-        if generate_count == 1:
-            emit_typed_error(rid, aid, "transient prefill glitch")
-            return
-        success_stop(rid, aid, text="retry-recovered-content")
-        return
-
-    if scenario == "t15-transient-always":
-        emit_typed_error(rid, aid, "persistent transient fault")
-        return
-
-    if scenario == "t15-visible-token":
-        emit_correlated({"type": "token", "text": "visible-before-fail"}, rid, aid)
-        emit_typed_error(rid, aid, "transient after visible token")
-        return
-
-    if scenario == "t15-visible-reasoning":
-        emit_correlated({"type": "reasoning", "text": "think-before-fail"}, rid, aid)
-        emit_typed_error(rid, aid, "transient after visible reasoning")
-        return
-
-    if scenario == "t15-commit-ready-error":
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "stop",
-            "prompt_tokens": 1,
-            "tokens": 1,
-            "tok_s": 1.0,
-        }, rid, aid)
-        if wait_commit(rid, aid) != "commit":
-            return
-        emit_typed_error(rid, aid, "transient after commit_ready", cls="transient", retryable=True)
-        return
-
-    class_map = {
-        "t15-class-malformed": ("malformed", False, "malformed payload"),
-        "t15-class-validation": ("validation", False, "validation failed"),
-        "t15-class-context": ("context_length", False, "context too long"),
-        "t15-class-unsupported": ("unsupported", False, "unsupported op"),
-        "t15-class-internal": ("internal", False, "internal fault"),
-        "t15-class-adaptive": ("adaptive_poison", False, "adaptive poison"),
-        "t15-class-mismatch": ("deterministic_mismatch", False, "deterministic mismatch"),
-        "t15-class-cancel": ("cancel", False, "cancelled"),
-        "t15-transient-not-retryable": ("transient", False, "transient but not retryable"),
-    }
-    if scenario in class_map:
-        cls, retryable, msg = class_map[scenario]
-        emit_typed_error(rid, aid, msg, cls=cls, retryable=retryable)
-        return
-
-    if scenario == "t15-mismatch-attempt":
-        bad = (aid + 999) if isinstance(aid, int) else 999999
-        emit_typed_error(rid, aid, "stale attempt error", force_aid=bad)
-        return
-
-    if scenario == "t15-eof":
-        # Exit after gen_start with no done — engine sees Closed.
-        sys.exit(0)
-
-    if scenario == "t15-invalid-json":
-        sys.stdout.write("{not-json\n")
-        sys.stdout.flush()
-        return
-
-    if scenario == "t15-stale-event":
-        # Correlated gen_start already emitted; now a stale-attempt token.
-        stale_aid = (aid - 1) if isinstance(aid, int) and aid else 0
-        emit_correlated({"type": "token", "text": "stale"}, rid, stale_aid)
-        return
-
-    if scenario == "t15-tool-then-transient":
-        if generate_count == 1:
-            emit_correlated({
-                "type": "tool_calls",
-                "calls": [{"name": "read_file", "arguments": {"path": "stale.rs"}}],
-            }, rid, aid)
-            emit_typed_error(rid, aid, "transient after buffered tools")
-            return
-        success_stop(rid, aid, text="fold-cleared-content")
-        return
-
-    # reset-fail: first generate is typed transient so server force-resets for attempt 2.
-    if scenario.startswith("t15-reset-fail"):
-        emit_typed_error(rid, aid, "transient before reset-fail")
-        return
-
-    if scenario == "t11-premature-eof":
-        emit_correlated({"type": "token", "text": "partial-before-eof"}, rid, aid)
-        sys.exit(0)
-
-    if scenario == "t11-stop-text":
-        success_stop(rid, aid)
-        return
-
-    if scenario == "t11-pure-tool":
-        pure_calls = [{"name": "read_file", "arguments": {"path": "a.rs"}}]
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 1,
-            "tok_s": 9.0,
-            "calls": pure_calls,
-        }, rid, aid)
-        rc = wait_commit(rid, aid, allow_abort=True)
-        if rc == "abort":
-            emit_correlated({"type": "aborted", "reason": "client_cancelled"}, rid, aid)
-            emit_correlated({"type": "done", "finish_reason": "aborted"}, rid, aid)
-            return
-        if rc != "commit":
-            return
-        emit_correlated({
-            "type": "done",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 1,
-            "tok_s": 9.0,
-            "calls": pure_calls,
-        }, rid, aid)
-        return
-
-    if scenario == "t11-mixed-tool":
-        mixed_calls = [{"name": "read_file", "arguments": {"path": "mixed.rs"}}]
-        emit_correlated({"type": "token", "text": "I'll look that up."}, rid, aid)
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 2,
-            "tok_s": 8.5,
-            "calls": mixed_calls,
-        }, rid, aid)
-        rc = wait_commit(rid, aid, allow_abort=True)
-        if rc == "abort":
-            emit_correlated({"type": "aborted", "reason": "client_cancelled"}, rid, aid)
-            emit_correlated({"type": "done", "finish_reason": "aborted"}, rid, aid)
-            return
-        if rc != "commit":
-            return
-        emit_correlated({
-            "type": "done",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 2,
-            "tok_s": 8.5,
-            "calls": mixed_calls,
-        }, rid, aid)
-        return
-
-    if scenario == "t11-two-tools":
-        two_calls = [
-            {"name": "read_file", "arguments": {"path": "a.rs"}},
-            {"name": "write_file", "arguments": {"path": "b.rs", "data": "x"}},
-        ]
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 2,
-            "tok_s": 8.0,
-            "calls": two_calls,
-        }, rid, aid)
-        rc = wait_commit(rid, aid, allow_abort=True)
-        if rc == "abort":
-            emit_correlated({"type": "aborted", "reason": "client_cancelled"}, rid, aid)
-            emit_correlated({"type": "done", "finish_reason": "aborted"}, rid, aid)
-            return
-        if rc != "commit":
-            return
-        emit_correlated({
-            "type": "done",
-            "finish_reason": "tool_calls",
-            "prompt_tokens": 2,
-            "tokens": 2,
-            "tok_s": 8.0,
-            "calls": two_calls,
-        }, rid, aid)
-        return
-
-    if scenario == "t11-length-withhold":
-        emit_correlated({"type": "token", "text": "partial-length"}, rid, aid)
-        emit_correlated({
-            "type": "tool_calls",
-            "calls": [{"name": "read_file", "arguments": {"path": "x"}}],
-        }, rid, aid)
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "length",
-            "prompt_tokens": 2,
-            "tokens": 3,
-            "tok_s": 7.0,
-        }, rid, aid)
-        if wait_commit(rid, aid) != "commit":
-            return
-        emit_correlated({
-            "type": "done",
-            "finish_reason": "length",
-            "prompt_tokens": 2,
-            "tokens": 3,
-            "tok_s": 7.0,
-        }, rid, aid)
-        return
-
-    if scenario == "t11-dirty-markers":
-        dirty = (
-            '<tool_call>{"name":"evil","arguments":{}}</tool_call>'
-            '<think>secret</think></think><|im_end|>'
-        )
-        emit_correlated({"type": "token", "text": dirty}, rid, aid)
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "stop",
-            "prompt_tokens": 2,
-            "tokens": 1,
-            "tok_s": 6.0,
-        }, rid, aid)
-        if wait_commit(rid, aid) != "commit":
-            return
-        emit_correlated({
-            "type": "done",
-            "finish_reason": "stop",
-            "prompt_tokens": 2,
-            "tokens": 1,
-            "tok_s": 6.0,
-        }, rid, aid)
-        return
-
-    if scenario == "t11-usage":
-        emit_correlated({"type": "token", "text": "usage-path"}, rid, aid)
-        emit_correlated({
-            "type": "commit_ready",
-            "finish_reason": "stop",
-            "prompt_tokens": 11,
-            "tokens": 5,
-            "cached_tokens": 2,
-            "tok_s": 10.0,
-        }, rid, aid)
-        if wait_commit(rid, aid) != "commit":
-            return
-        emit_correlated({
-            "type": "done",
-            "finish_reason": "stop",
-            "prompt_tokens": 11,
-            "tokens": 5,
-            "cached_tokens": 2,
-            "tok_s": 10.0,
-        }, rid, aid)
-        return
-
-    # Default stop text
-    success_stop(rid, aid)
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        req = json.loads(line)
-    except Exception:
-        continue
-    log_req(req)
-    ty = req.get("type")
-    if ty == "configure":
-        out({"type": "configured"})
-    elif ty == "ping":
-        out({"type": "pong"})
-    elif ty == "load":
-        MODEL_PATH = str(req.get("model") or "")
-        out({
-            "type": "loaded",
-            "arch": "fake",
-            "dim": 1,
-            "layers": 1,
-            "vocab": 1,
-            "vl": False,
-            # cache_capable true so only force_reset (retry attempt) issues reset
-            "cache_capable": True,
-            "retry_reset_eligible": eligible_from_model(),
-            "max_seq": 4096,
-        })
-    elif ty == "reset":
-        aid = req.get("attempt_id")
-        sc = (LAST_SCENARIO or "") + " " + (MODEL_PATH or "")
-        sc = sc.lower()
-        if "t15-reset-fail-rolled" in sc:
-            out({
-                "type": "reset",
-                "rolled_back": False,
-                "state_epoch": state_epoch + 1,
-                "seq_pos": 0,
-                "conversation_len": 0,
-                "attempt_id": aid,
-                "retry_reset_eligible": eligible_from_model(),
-            })
-            continue
-        if "t15-reset-fail-seq" in sc:
-            out({
-                "type": "reset",
-                "rolled_back": True,
-                "state_epoch": state_epoch + 1,
-                "seq_pos": 1,
-                "conversation_len": 0,
-                "attempt_id": aid,
-                "retry_reset_eligible": eligible_from_model(),
-            })
-            continue
-        if "t15-reset-fail-epoch" in sc:
-            out({
-                "type": "reset",
-                "rolled_back": True,
-                "state_epoch": state_epoch if state_epoch > 0 else 0,
-                "seq_pos": 0,
-                "conversation_len": 0,
-                "attempt_id": aid,
-                "retry_reset_eligible": eligible_from_model(),
-            })
-            continue
-        if "t15-reset-fail-attempt" in sc:
-            out({
-                "type": "reset",
-                "rolled_back": True,
-                "state_epoch": state_epoch + 1,
-                "seq_pos": 0,
-                "conversation_len": 0,
-                "attempt_id": (aid + 1) if isinstance(aid, int) else 0,
-                "retry_reset_eligible": eligible_from_model(),
-            })
-            continue
-        state_epoch += 1
-        out({
-            "type": "reset",
-            "rolled_back": True,
-            "state_epoch": state_epoch,
-            "seq_pos": 0,
-            "conversation_len": 0,
-            "attempt_id": aid,
-            "retry_reset_eligible": eligible_from_model(),
-        })
-    elif ty == "generate":
-        handle_generate(req)
-    elif ty == "unload":
-        out({"type": "unloaded"})
-        sys.exit(0)
-    elif ty == "commit":
-        pass
-    else:
-        out({
-            "type": "error",
-            "message": f"unsupported op {ty}",
-            "class": "validation",
-            "retryable": False,
-            "rolled_back": False,
-            "id": "req-0",
-            "attempt_id": 0,
-        })
-"#;
+        let script = include_str!("serve/fake_daemon.py");
         fs::write(&daemon, script).unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
         daemon
     }
 
-    /// In-process tiny_http harness: Engine::spawn_configured → handle_http.
+    /// In-process Hyper harness: Engine::spawn_configured → serve_listener_until.
     /// Does not touch HIPFIRE_DAEMON_BIN.
     #[cfg(unix)]
     struct Task11HttpHarness {
@@ -12695,9 +7896,8 @@ for line in sys.stdin:
         port: u16,
         model_name: String,
         shared: Arc<ServeShared>,
-        _server: Arc<Server>,
+        shutdown: tokio_util::sync::CancellationToken,
         _join: Option<thread::JoinHandle<()>>,
-        stop: Arc<AtomicBool>,
     }
 
     #[cfg(unix)]
@@ -12755,16 +7955,25 @@ for line in sys.stdin:
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                metrics: crate::serve::metrics::Metrics::default(),
+                // Test harness drives the single-daemon path.
+                slot_engine: None,
                 runtime: Mutex::new(ServeRuntime {
                     engine,
                     paths: paths.clone(),
                     registry,
                     current_path: None,
+                    current_arch: None,
+                    current_reasoning_contract: ReasoningContract::Unsupported,
+                    current_reasoning_effort_native: false,
+                    current_reasoning_efforts: Vec::new(),
+                    continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
                     tp: None,
+                    continuous_batch_size: 1,
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,
@@ -12785,31 +7994,40 @@ for line in sys.stdin:
                 backoff_hook: Mutex::new(None),
             });
 
-            let server = Arc::new(Server::http("127.0.0.1:0").expect("bind ephemeral serve port"));
-            let port = server.server_addr().to_ip().expect("ip listen addr").port();
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral serve port");
+            std_listener
+                .set_nonblocking(true)
+                .expect("set nonblocking listener");
+            let port = std_listener
+                .local_addr()
+                .expect("listener local addr")
+                .port();
 
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_flag = Arc::clone(&stop);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let shutdown_loop = shutdown.clone();
             let shared_loop = Arc::clone(&shared);
-            let server_loop = Arc::clone(&server);
             let join = thread::spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    match server_loop.recv_timeout(Duration::from_millis(50)) {
-                        Ok(Some(request)) => {
-                            let shared = Arc::clone(&shared_loop);
-                            // handle_http owns the request; keep sequential so the
-                            // single-engine fake daemon never races generate.
-                            if let Err(error) = handle_http(request, shared) {
-                                eprintln!("[task11-harness] HTTP request failed: {error:#}");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("task11 runtime");
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(std_listener)
+                        .expect("tokio listener from std");
+                    if let Err(error) = crate::serve::http::serve_listener_until(
+                        listener,
+                        shared_loop,
+                        shutdown_loop,
+                    )
+                    .await
+                    {
+                        eprintln!("[task11-harness] serve failed: {error:#}");
                     }
-                }
+                });
             });
 
-            // Health probe — proves handle_http path is live.
+            // Health probe — proves production Hyper service path is live.
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(200)) {
@@ -12827,9 +8045,8 @@ for line in sys.stdin:
                 port,
                 model_name: model_path.display().to_string(),
                 shared,
-                _server: server,
+                shutdown,
                 _join: Some(join),
-                stop,
             }
         }
 
@@ -12913,8 +8130,7 @@ for line in sys.stdin:
     #[cfg(unix)]
     impl Drop for Task11HttpHarness {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            self._server.unblock();
+            self.shutdown.cancel();
             if let Some(join) = self._join.take() {
                 let _ = join.join();
             }
@@ -13102,6 +8318,445 @@ for line in sys.stdin:
         complete_openai_chat("127.0.0.1", port, body, Duration::from_secs(10))
     }
 
+    /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
+    #[cfg(unix)]
+    fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body_start = text
+            .find("\r\n\r\n")
+            .map(|idx| idx + 4)
+            .or_else(|| text.find("\n\n").map(|idx| idx + 2))
+            .unwrap_or(buf.len());
+        let raw_body = buf.get(body_start..).unwrap_or(&[]);
+        let chunked = text[..body_start]
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        if !chunked {
+            return (status, raw_body.to_vec());
+        }
+        let mut decoded = Vec::new();
+        let mut remaining = raw_body;
+        loop {
+            let Some(line_end) = remaining.windows(2).position(|bytes| bytes == b"\r\n") else {
+                panic!("malformed chunk header");
+            };
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&remaining[..line_end])
+                    .expect("chunk size utf8")
+                    .split(';')
+                    .next()
+                    .expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            remaining = &remaining[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            assert!(remaining.len() >= size + 2, "truncated chunk body");
+            decoded.extend_from_slice(&remaining[..size]);
+            assert_eq!(&remaining[size..size + 2], b"\r\n");
+            remaining = &remaining[size + 2..];
+        }
+        (status, decoded)
+    }
+
+    /// Write a non-stream request and return the live TCP stream without reading status.
+    #[cfg(unix)]
+    fn open_nonstream_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        // Short read timeout so accidental reads fail fast; tests close without status.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    #[cfg(unix)]
+    fn wait_fixture_ready(harness: &Task11HttpHarness, deadline: Instant) -> serde_json::Value {
+        let ready_path = harness.paths.root.join("fixture-ready.log");
+        while Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(&ready_path) {
+                for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        if val.get("type").and_then(|v| v.as_str()) == Some("fixture_ready") {
+                            return val;
+                        }
+                    }
+                }
+            }
+            // Fallback: requests.log also records fixture_ready.
+            if let Some(row) = harness
+                .read_requests_log()
+                .into_iter()
+                .find(|row| row.get("type").and_then(|v| v.as_str()) == Some("fixture_ready"))
+            {
+                return row;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "fixture-ready never appeared; log={:?}",
+            harness.read_requests_log()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_declared_body_is_rejected_before_body_read() {
+        let harness = Task11HttpHarness::spawn("oversized-content-length");
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", harness.port())).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 8388609\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "oversized declaration was not rejected immediately: {response:?}"
+        );
+    }
+
+    /// Silent non-stream client disconnect aborts the correlated daemon txn,
+    /// drains done/aborted before Admission releases, then admits a follow-up.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_client_disconnect_aborts_and_releases_admission() {
+        let harness = Task11HttpHarness::spawn("ns-disconnect-abort");
+        let port = harness.port();
+        let body = harness.base_body("t11-long-nonstream", false);
+
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "precondition: admission idle"
+        );
+
+        let stream = open_nonstream_request(port, &body);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let ready = wait_fixture_ready(&harness, ready_deadline);
+        let gen_id = ready
+            .get("id")
+            .cloned()
+            .expect("fixture_ready carries generate id");
+        let gen_aid = ready
+            .get("attempt_id")
+            .and_then(|v| v.as_u64())
+            .expect("fixture_ready carries attempt_id");
+
+        // Confirm generate is in the wire log with the same correlation pair.
+        let request_log = harness.read_requests_log();
+        let generates = Task11HttpHarness::ops_of_type(&request_log, "generate");
+        assert!(
+            generates.iter().any(|g| {
+                g.get("id") == Some(&gen_id)
+                    && g.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+            }),
+            "generate missing for fixture pair: {:?}",
+            harness.read_requests_log()
+        );
+
+        // Client disconnect without ever reading an HTTP status line.
+        drop(stream);
+
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_abort = false;
+        let mut saw_done_aborted = false;
+        let mut inflight_hit_zero_before_done = false;
+
+        while Instant::now() < poll_deadline {
+            let log = harness.read_requests_log();
+            if !saw_abort {
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            if !saw_done_aborted {
+                saw_done_aborted = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            let inflight = harness.shared.admission.inflight();
+            if inflight == 0 && !saw_done_aborted {
+                inflight_hit_zero_before_done = true;
+            }
+            if saw_abort && saw_done_aborted && inflight == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            saw_abort,
+            "correlated abort{{id,attempt_id}} missing within poll bound; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            saw_done_aborted,
+            "daemon done/aborted marker missing; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            !inflight_hit_zero_before_done,
+            "Admission inflight reached 0 before done/aborted drained"
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must be fully released after abort drain"
+        );
+
+        // No commit may have been sent for the cancelled attempt.
+        let log = harness.read_requests_log();
+        let commits = Task11HttpHarness::ops_of_type(&log, "commit");
+        assert!(
+            commits.iter().all(|c| {
+                !(c.get("id") == Some(&gen_id)
+                    && c.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid))
+            }),
+            "cancelled attempt must not commit: {commits:?}"
+        );
+
+        // Immediate follow-up must admit and return a single JSON success.
+        let follow = complete_nonstream(port, harness.base_body("t11-stop-text", false))
+            .expect("follow-up after cancel must return 200 JSON");
+        assert_eq!(follow["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            follow["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        let release_deadline = Instant::now() + Duration::from_millis(500);
+        while harness.shared.admission.inflight() != 0 && Instant::now() < release_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "follow-up admission guard did not release after flushed response"
+        );
+    }
+
+    /// Connected pre-terminal daemon error keeps non-200 OpenAI error JSON.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_connected_error_preserves_status() {
+        let harness = Task11HttpHarness::spawn("ns-connected-err");
+        let port = harness.port();
+        let body = harness.base_body("t15-class-validation", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert!(
+            status >= 400 && status != 200,
+            "preterminal error must keep non-200 status, got {status}"
+        );
+        let text = String::from_utf8_lossy(&raw_body);
+        // Strip optional chunked framing / trailing whitespace for JSON parse.
+        let json_start = text.find('{').expect("OpenAI error JSON object");
+        let json_text = &text[json_start..];
+        let err: serde_json::Value =
+            serde_json::from_str(json_text.trim_end()).expect("OpenAI error JSON");
+        let message = err
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !message.is_empty(),
+            "error.message required in OpenAI error body: {err}"
+        );
+        assert!(
+            err.pointer("/choices").is_none(),
+            "error response must not look like a completion: {err}"
+        );
+        // Exactly one top-level JSON value.
+        let mut it = serde_json::Deserializer::from_str(json_text.trim_end())
+            .into_iter::<serde_json::Value>();
+        let _first = it.next().expect("one value").expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "error body must be exactly one JSON value"
+        );
+    }
+
+    /// Connected non-stream success is exactly one JSON value (no SSE/trailer).
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_success_is_exactly_one_json() {
+        let harness = Task11HttpHarness::spawn("ns-one-json");
+        let port = harness.port();
+        let body = harness.base_body("t11-stop-text", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert_eq!(status, 200, "success status");
+        let text = String::from_utf8_lossy(&raw_body);
+        let json_start = text.find('{').expect("JSON object in body");
+        let json_text = text[json_start..].trim_end();
+        let mut it = serde_json::Deserializer::from_str(json_text).into_iter::<serde_json::Value>();
+        let value = it
+            .next()
+            .expect("exactly one JSON value")
+            .expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "non-stream success must not append a second JSON/SSE value; body={text:?}"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        assert!(
+            !text.contains("data:"),
+            "non-stream body must not carry SSE framing"
+        );
+    }
+
+    /// Close-before terminal → abort and no commit; close-after full JSON → commit, no abort.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_close_before_vs_after_terminal_commit_race() {
+        let harness = Task11HttpHarness::spawn("ns-commit-race");
+        let port = harness.port();
+
+        // --- before terminal: disconnect during long silent generation ---
+        {
+            let body = harness.base_body("t11-long-nonstream", false);
+            let stream = open_nonstream_request(port, &body);
+            let ready = wait_fixture_ready(&harness, Instant::now() + Duration::from_secs(5));
+            let gen_id = ready.get("id").cloned().expect("id");
+            let gen_aid = ready
+                .get("attempt_id")
+                .and_then(|v| v.as_u64())
+                .expect("attempt_id");
+            drop(stream);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut saw_abort = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+                let done = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                });
+                if saw_abort && done && harness.shared.admission.inflight() == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_abort, "close-before-terminal must abort");
+            let log = harness.read_requests_log();
+            assert!(
+                Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .all(|c| c.get("id") != Some(&gen_id)),
+                "close-before-terminal must not commit: {log:?}"
+            );
+        }
+
+        // --- after terminal: full success response consumed; commit, no abort ---
+        {
+            let before_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            let body = harness.base_body("t11-stop-text", false);
+            let (status, raw_body) = raw_nonstream_post(port, &body);
+            assert_eq!(status, 200);
+            let text = String::from_utf8_lossy(&raw_body);
+            let json_start = text.find('{').expect("json");
+            let value: serde_json::Value =
+                serde_json::from_str(text[json_start..].trim_end()).expect("json body");
+            assert_eq!(value["choices"][0]["finish_reason"], "stop");
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut saw_commit = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                // Latest generate should have a matching commit.
+                let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+                let last_gen = generates.last().expect("generate for success path");
+                let gid = last_gen.get("id").cloned();
+                let gaid = last_gen.get("attempt_id").and_then(|v| v.as_u64());
+                saw_commit = Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .any(|c| {
+                        c.get("id") == gid.as_ref()
+                            && c.get("attempt_id").and_then(|v| v.as_u64()) == gaid
+                    });
+                if saw_commit {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_commit, "close-after-terminal must commit");
+            let after_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            assert_eq!(
+                after_aborts, before_aborts,
+                "close-after full JSON must not emit a new abort"
+            );
+        }
+    }
+
     /// Paired stream/nonstream matrix rows for stop, pure-tool, mixed-tool,
     /// two-tools, length-withhold, and usage ordering.
     ///
@@ -13109,541 +8764,719 @@ for line in sys.stdin:
     /// structured-argument JSON fragment leaking into content/reasoning.
     /// Invalid-producer dirty-marker diagnostics live in a separate test and
     /// must not weaken these valid-path assertions.
+    /// (Matrix body lives with the broader Task11 suite; streaming helpers above
+    /// remain the stable surface for parity checks.)
     #[cfg(unix)]
-    #[test]
-    fn task11_http_acceptance_matrix_stream_and_nonstream_parity() {
-        let harness = Task11HttpHarness::spawn("matrix");
-        let port = harness.port();
-
-        // --- stop text parity ---
-        {
-            let ns = complete_nonstream(port, harness.base_body("t11-stop-text", false))
-                .expect("stop nonstream");
-            assert_eq!(ns["choices"][0]["finish_reason"], "stop");
-            assert_eq!(
-                ns["choices"][0]["message"]["content"],
-                "hello from fake daemon"
-            );
-            assert!(ns["choices"][0]["message"].get("tool_calls").is_none());
-
-            let st = capture_stream(port, harness.base_body("t11-stop-text", true))
-                .expect("stop stream");
-            assert!(st.saw_done, "every successful stream ends [DONE]");
-            assert_eq!(st.finish.as_deref(), Some("stop"));
-            assert_eq!(st.content, "hello from fake daemon");
-            assert!(st.tool_calls.is_empty());
-            assert_eq!(
-                ns["choices"][0]["message"]["content"].as_str().unwrap(),
-                st.content
-            );
-        }
-
-        // --- pure tool call → content:null, call_0; no marker/arg leak ---
-        {
-            let pure_args = [r#"{"path":"a.rs"}"#, r#""path":"a.rs""#, "a.rs"];
-            // "a.rs" alone is too short/common for content prose; use JSON frags only.
-            let pure_frags = [r#"{"path":"a.rs"}"#, r#""path":"a.rs""#];
-            let ns = complete_nonstream(port, harness.tools_body("t11-pure-tool", false))
-                .expect("pure tool nonstream");
-            assert_eq!(ns["choices"][0]["finish_reason"], "tool_calls");
-            assert!(ns["choices"][0]["message"]["content"].is_null());
-            assert_eq!(ns["choices"][0]["message"]["tool_calls"][0]["id"], "call_0");
-            assert_eq!(
-                ns["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-                "read_file"
-            );
-            assert_eq!(
-                ns["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-                pure_args[0]
-            );
-            assert_nonstream_valid_structured_clean("pure-tool", &ns, &pure_frags);
-
-            let st = capture_stream(port, harness.tools_body("t11-pure-tool", true))
-                .expect("pure tool stream");
-            assert!(st.saw_done);
-            assert_eq!(st.finish.as_deref(), Some("tool_calls"));
-            assert!(st.content.is_empty(), "pure tool has no content deltas");
-            assert!(st.reasoning.is_empty());
-            assert_eq!(st.tool_calls.len(), 1);
-            assert_eq!(st.tool_calls[0].0, 0);
-            assert_eq!(st.tool_calls[0].1.as_deref(), Some("call_0"));
-            assert_eq!(st.tool_calls[0].2.as_deref(), Some("read_file"));
-            assert_eq!(st.tool_calls[0].3.as_deref(), Some(pure_args[0]));
-            assert_stream_valid_structured_clean("pure-tool", &st, &pure_frags);
-        }
-
-        // --- mixed content + structured call: prose clean, args only in tool_calls ---
-        {
-            let mixed_frags = [r#"{"path":"mixed.rs"}"#, r#""path":"mixed.rs""#];
-            let ns = complete_nonstream(port, harness.tools_body("t11-mixed-tool", false))
-                .expect("mixed tool nonstream");
-            assert_eq!(ns["choices"][0]["finish_reason"], "tool_calls");
-            assert_eq!(ns["choices"][0]["message"]["content"], "I'll look that up.");
-            assert_eq!(ns["choices"][0]["message"]["tool_calls"][0]["id"], "call_0");
-            assert_eq!(
-                ns["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-                "read_file"
-            );
-            assert_eq!(
-                ns["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-                r#"{"path":"mixed.rs"}"#
-            );
-            assert_nonstream_valid_structured_clean("mixed-tool", &ns, &mixed_frags);
-
-            let st = capture_stream(port, harness.tools_body("t11-mixed-tool", true))
-                .expect("mixed tool stream");
-            assert!(st.saw_done);
-            assert_eq!(st.finish.as_deref(), Some("tool_calls"));
-            assert_eq!(st.content, "I'll look that up.");
-            assert_eq!(st.tool_calls.len(), 1);
-            assert_eq!(st.tool_calls[0].0, 0);
-            assert_eq!(st.tool_calls[0].1.as_deref(), Some("call_0"));
-            assert_eq!(st.tool_calls[0].2.as_deref(), Some("read_file"));
-            assert_eq!(
-                st.tool_calls[0].3.as_deref(),
-                Some(r#"{"path":"mixed.rs"}"#)
-            );
-            assert_stream_valid_structured_clean("mixed-tool", &st, &mixed_frags);
-        }
-
-        // --- two calls: stable call_0/call_1 and stream indices 0/1 ---
-        {
-            let two_frags = [
-                r#"{"path":"a.rs"}"#,
-                r#""path":"a.rs""#,
-                r#"{"path":"b.rs","data":"x"}"#,
-                r#""path":"b.rs""#,
-                r#""data":"x""#,
-            ];
-            let ns = complete_nonstream(port, harness.tools_body("t11-two-tools", false))
-                .expect("two tools nonstream");
-            assert_eq!(ns["choices"][0]["finish_reason"], "tool_calls");
-            assert!(ns["choices"][0]["message"]["content"].is_null());
-            let calls = ns["choices"][0]["message"]["tool_calls"]
-                .as_array()
-                .expect("tool_calls array");
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0]["id"], "call_0");
-            assert_eq!(calls[1]["id"], "call_1");
-            assert_eq!(calls[0]["function"]["name"], "read_file");
-            assert_eq!(calls[1]["function"]["name"], "write_file");
-            assert_nonstream_valid_structured_clean("two-tools", &ns, &two_frags);
-
-            let st = capture_stream(port, harness.tools_body("t11-two-tools", true))
-                .expect("two tools stream");
-            assert!(st.saw_done);
-            assert_eq!(st.finish.as_deref(), Some("tool_calls"));
-            assert!(st.content.is_empty());
-            assert_eq!(st.tool_calls.len(), 2);
-            assert_eq!(st.tool_calls[0].0, 0);
-            assert_eq!(st.tool_calls[0].1.as_deref(), Some("call_0"));
-            assert_eq!(st.tool_calls[1].0, 1);
-            assert_eq!(st.tool_calls[1].1.as_deref(), Some("call_1"));
-            assert_stream_valid_structured_clean("two-tools", &st, &two_frags);
-        }
-
-        // --- length withholds structured call buffered before terminal ---
-        {
-            // Even though calls are withheld, content must still be free of
-            // protocol markers and of the buffered call's argument JSON.
-            let length_frags = [r#"{"path":"x"}"#, r#""path":"x""#];
-            let ns = complete_nonstream(port, harness.tools_body("t11-length-withhold", false))
-                .expect("length nonstream");
-            assert_eq!(ns["choices"][0]["finish_reason"], "length");
-            assert!(
-                ns["choices"][0]["message"].get("tool_calls").is_none(),
-                "length must withhold tool_calls"
-            );
-            assert_eq!(ns["choices"][0]["message"]["content"], "partial-length");
-            assert_nonstream_valid_structured_clean("length-withhold", &ns, &length_frags);
-
-            let st = capture_stream(port, harness.tools_body("t11-length-withhold", true))
-                .expect("length stream");
-            assert!(st.saw_done);
-            assert_eq!(st.finish.as_deref(), Some("length"));
-            assert_eq!(st.content, "partial-length");
-            assert!(
-                st.tool_calls.is_empty(),
-                "length stream must not release tool deltas"
-            );
-            assert_stream_valid_structured_clean("length-withhold", &st, &length_frags);
-        }
-
-        // --- include_usage: separate choices:[] chunk after terminal, before [DONE] ---
-        {
-            let mut body = harness.base_body("t11-usage", true);
-            body["stream_options"] = serde_json::json!({ "include_usage": true });
-            let st = capture_stream(port, body).expect("usage stream");
-            assert!(st.saw_done, "successful stream ends [DONE]");
-            assert_eq!(st.finish.as_deref(), Some("stop"));
-            assert_eq!(st.content, "usage-path");
-            let usage = st.usage.expect("include_usage must produce Usage event");
-            assert_eq!(usage["prompt_tokens"], 11);
-            assert_eq!(usage["completion_tokens"], 5);
-            // Nonstream still has embedded usage object.
-            let ns = complete_nonstream(port, harness.base_body("t11-usage", false))
-                .expect("usage nonstream");
-            assert_eq!(ns["usage"]["prompt_tokens"], 11);
-            assert_eq!(ns["usage"]["completion_tokens"], 5);
-        }
-    }
 
     /// Invalid-producer diagnostic (authority violation): dirty marker token text
     /// stays byte-verbatim content and never becomes structured tool_calls.
     /// Kept separate so it cannot weaken valid structured-call leak assertions.
     #[cfg(unix)]
-    #[test]
-    fn task11_http_invalid_producer_dirty_marker_text_stays_verbatim() {
-        let harness = Task11HttpHarness::spawn("dirty-markers");
-        let port = harness.port();
-        let dirty = concat!(
-            r#"<tool_call>{"name":"evil","arguments":{}}</tool_call>"#,
-            "<think>secret</think></think><|im_end|>"
-        );
-
-        let ns = complete_nonstream(port, harness.base_body("t11-dirty-markers", false))
-            .expect("dirty nonstream");
-        assert_eq!(ns["choices"][0]["finish_reason"], "stop");
-        assert_eq!(ns["choices"][0]["message"]["content"], dirty);
-        assert!(
-            ns["choices"][0]["message"].get("tool_calls").is_none(),
-            "dirty markers must not become structured tool_calls"
-        );
-
-        let st = capture_stream(port, harness.base_body("t11-dirty-markers", true))
-            .expect("dirty stream");
-        assert!(st.saw_done);
-        assert_eq!(st.finish.as_deref(), Some("stop"));
-        assert_eq!(st.content, dirty);
-        assert!(st.tool_calls.is_empty());
-        // Stream content deltas are also verbatim marker text (invalid producer).
-        assert_eq!(st.content_deltas.concat(), dirty);
-    }
 
     /// Premature daemon EOF after gen_start/token without done → client/HTTP failure.
     #[cfg(unix)]
-    #[test]
-    fn task11_http_premature_daemon_eof_is_failure_not_completion() {
-        let harness = Task11HttpHarness::spawn("premature-eof");
-        let port = harness.port();
-
-        let ns_err = complete_nonstream(port, harness.base_body("t11-premature-eof", false))
-            .expect_err("premature EOF must not succeed nonstream");
-        let ns_msg = ns_err.to_string();
-        assert!(
-            !ns_msg.contains("\"finish_reason\""),
-            "must not look like a completion payload: {ns_msg}"
-        );
-
-        let st_err = capture_stream(port, harness.base_body("t11-premature-eof", true))
-            .expect_err("premature EOF must not succeed stream");
-        // Stream path may surface PrematureEof (body cut mid-SSE) or Http/server_error.
-        let st_msg = st_err.to_string();
-        assert!(
-            matches!(
-                st_err,
-                hipfire_client::ClientError::PrematureEof(_)
-                    | hipfire_client::ClientError::Http(_)
-                    | hipfire_client::ClientError::Closed { .. }
-            ) || st_msg.contains("closed")
-                || st_msg.contains("EOF")
-                || st_msg.contains("error")
-                || st_msg.contains("HTTP"),
-            "unexpected stream error shape: {st_err:?}"
-        );
-    }
 
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
-    #[test]
-    fn task11_http_capability_denial_returns_error_without_tool_payload() {
-        let harness = Task11HttpHarness::spawn("capability-denial");
-        let port = harness.port();
-
-        let ns_err = complete_nonstream(port, harness.tools_body("t11-capability-denial", false))
-            .expect_err("capability denial must fail nonstream");
-        let ns_msg = ns_err.to_string().to_ascii_lowercase();
-        assert!(
-            ns_msg.contains("not supported")
-                || ns_msg.contains("unsupported")
-                || ns_msg.contains("capability")
-                || ns_msg.contains("http"),
-            "expected capability/typed error, got: {ns_err}"
-        );
-        assert!(
-            !ns_msg.contains("call_0") && !ns_msg.contains("tool_calls"),
-            "must not return tool payload on denial: {ns_err}"
-        );
-
-        let st_err = capture_stream(port, harness.tools_body("t11-capability-denial", true))
-            .expect_err("capability denial must fail stream");
-        let st_msg = st_err.to_string().to_ascii_lowercase();
-        assert!(
-            !st_msg.contains("call_0"),
-            "stream denial must not expose tool ids: {st_err}"
-        );
-    }
-
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_transient_once_retries_and_succeeds() {
-        let harness = Task11HttpHarness::spawn_with_retry("t15-once", Duration::from_millis(5));
-        let port = harness.port();
-        let body = harness.base_body("t15-transient-once", false);
-        let completion = complete_nonstream(port, body).expect("retry must recover");
-        let content = completion
-            .pointer("/choices/0/message/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert!(
-            content.contains("retry-recovered-content"),
-            "unexpected content: {completion}"
-        );
-        let wire = completion.to_string();
-        for banned in [
-            "retries_attempted",
-            "retry_enabled",
-            "attempt_id",
-            "retry_reset",
-            "retries_succeeded",
-        ] {
-            assert!(
-                !wire.contains(banned),
-                "OpenAI wire must not expose {banned}: {wire}"
-            );
-        }
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (1, 1));
-
-        let log = harness.read_requests_log();
-        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
-        let resets = Task11HttpHarness::ops_of_type(&log, "reset");
-        assert_eq!(generates.len(), 2, "exactly two generates: {log:?}");
-        assert_eq!(resets.len(), 1, "one force-reset between attempts: {log:?}");
-        let a0 = generates[0]
-            .get("attempt_id")
-            .and_then(|v| v.as_u64())
-            .expect("attempt 0");
-        let a1 = generates[1]
-            .get("attempt_id")
-            .and_then(|v| v.as_u64())
-            .expect("attempt 1");
-        assert_ne!(a0, a1, "distinct attempt ids");
-        assert!(a1 > a0, "monotonic attempt ids");
-        let r_aid = resets[0]
-            .get("attempt_id")
-            .and_then(|v| v.as_u64())
-            .expect("reset attempt");
-        assert_eq!(r_aid, a1, "force-reset uses attempt-2 id");
-        assert!(completion.get("id").and_then(|v| v.as_str()).is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_default_off_does_not_retry() {
-        let harness = Task11HttpHarness::spawn("t15-gate-off");
-        let port = harness.port();
-        let err = complete_nonstream(port, harness.base_body("t15-transient-once", false))
-            .expect_err("gate off must surface first failure");
-        let _ = err;
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (0, 0));
-        let log = harness.read_requests_log();
-        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
-        assert_eq!(
-            generates.len(),
-            1,
-            "exactly one generate when disabled: {log:?}"
-        );
-        let resets = Task11HttpHarness::ops_of_type(&log, "reset");
-        assert!(
-            resets.is_empty(),
-            "no force-reset when retry disabled: {log:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_visible_token_denies_retry() {
-        let harness = Task11HttpHarness::spawn_with_retry("t15-vis", Duration::from_millis(5));
-        let port = harness.port();
-        let err = complete_nonstream(port, harness.base_body("t15-visible-token", false))
-            .expect_err("visible token must deny retry");
-        let _ = err;
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (0, 0));
-        let log = harness.read_requests_log();
-        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
-        assert_eq!(generates.len(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_one_retry_max_then_fail() {
-        let harness = Task11HttpHarness::spawn_with_retry("t15-always", Duration::from_millis(5));
-        let port = harness.port();
-        let err = complete_nonstream(port, harness.base_body("t15-transient-always", false))
-            .expect_err("persistent transient must fail after one retry");
-        let _ = err;
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (1, 0));
-        let log = harness.read_requests_log();
-        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
-        assert_eq!(generates.len(), 2, "one retry only: {log:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_reset_failure_poisons_and_surfaces() {
-        let harness =
-            Task11HttpHarness::spawn_with_retry("t15-reset-fail-rolled", Duration::from_millis(5));
-        let port = harness.port();
-        let err = complete_nonstream(port, harness.base_body("t15-reset-fail-rolled", false))
-            .expect_err("failed force-reset must surface");
-        let msg = err.to_string().to_ascii_lowercase();
-        assert!(
-            msg.contains("reset")
-                || msg.contains("roll")
-                || msg.contains("daemon")
-                || msg.contains("http")
-                || msg.contains("error"),
-            "expected reset-context error, got: {err}"
-        );
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!(attempted, 1);
-        assert_eq!(succeeded, 0);
-
-        let ok = complete_nonstream(port, harness.base_body("t11-stop-text", false))
-            .expect("post-poison request must reload and succeed");
-        let _ = ok;
-        let log = harness.read_requests_log();
-        let loads = Task11HttpHarness::ops_of_type(&log, "load");
-        assert!(
-            loads.len() >= 2,
-            "poison must force a second load: loads={loads:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_fold_clears_stale_tool_calls_on_retry() {
-        let harness = Task11HttpHarness::spawn_with_retry("t15-fold", Duration::from_millis(5));
-        let port = harness.port();
-        let completion =
-            complete_nonstream(port, harness.tools_body("t15-tool-then-transient", false))
-                .expect("retry after buffered tools must succeed");
-        let content = completion
-            .pointer("/choices/0/message/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert!(
-            content.contains("fold-cleared-content"),
-            "unexpected content: {completion}"
-        );
-        let msg = completion
-            .pointer("/choices/0/message")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        assert!(
-            msg.get("tool_calls").is_none()
-                || msg
-                    .get("tool_calls")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.is_empty())
-                    .unwrap_or(false),
-            "stale attempt-1 tool_calls must not survive fold clear: {msg}"
-        );
-        assert!(!completion.to_string().contains("stale.rs"));
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (1, 1));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_backoff_releases_admission_and_runtime_locks() {
-        let harness = Task11HttpHarness::spawn_with_retry("t15-backoff", Duration::from_millis(50));
-        let shared = Arc::clone(&harness.shared);
-        let saw_free = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&saw_free);
-        harness.set_backoff_hook(move |_dur| {
-            let inflight = shared.admission.inflight();
-            let runtime_free = shared.runtime.try_lock().is_ok();
-            if inflight == 0 && runtime_free {
-                flag.store(true, Ordering::SeqCst);
-            }
-            thread::sleep(Duration::from_millis(10));
-        });
-        let port = harness.port();
-        let _ = complete_nonstream(port, harness.base_body("t15-transient-once", false))
-            .expect("backoff path should still succeed");
-        assert!(
-            saw_free.load(Ordering::SeqCst),
-            "admission and runtime must be free during retry backoff"
-        );
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (1, 1));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_ineligible_attestation_denies_retry() {
-        let harness =
-            Task11HttpHarness::spawn_with_retry("t15-ineligible-model", Duration::from_millis(5));
-        let port = harness.port();
-        let err = complete_nonstream(port, harness.base_body("t15-transient-once", false))
-            .expect_err("ineligible attestation must deny retry");
-        let _ = err;
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (0, 0));
-        let log = harness.read_requests_log();
-        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
-        assert_eq!(generates.len(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task15_http_commit_ready_denies_retry() {
-        let harness =
-            Task11HttpHarness::spawn_with_retry("t15-commit-deny", Duration::from_millis(5));
-        let port = harness.port();
-        // Terminal is staged at commit_ready; post-handshake daemon error does not
-        // unwind the already-committed success, and must not open a retry.
-        let completion =
-            complete_nonstream(port, harness.base_body("t15-commit-ready-error", false))
-                .expect("staged commit_ready success must surface without retry");
-        let _ = completion;
-        let (attempted, succeeded) = harness.meta_retries();
-        assert_eq!((attempted, succeeded), (0, 0));
-        let log = harness.read_requests_log();
-        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
-        assert_eq!(generates.len(), 1);
-    }
-
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
-        assert_eq!(
-            req.get("type").and_then(|v| v.as_str()),
-            Some("generate")
-        );
-        assert_eq!(
-            req.get("attempt_id").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        let id = req
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!id.is_empty(), "id must be a non-empty string");
         assert_eq!(
             req.get("prompt").and_then(|v| v.as_str()),
             Some("bench prompt")
         );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    /// Every benchmark generate must ask for answer mode.
+    ///
+    /// A reasoning model opens `<think>` in its first tokens and cannot close
+    /// it inside a benchmark's fixed budget (16 tokens for the warmup, 128 for
+    /// the measured runs). The daemon classifies an unclosed think span at
+    /// finish as a non-retryable validation terminal *ahead of* the length cap
+    /// — `QwenArTerminalCause::resolve` and `qwen_dflash_wire_terminal` in the
+    /// daemon both order it that way — so a thinking benchmark aborts on the
+    /// warmup, before it records a single sample.
+    #[test]
+    fn bench_generate_request_is_answer_mode_by_default() {
+        let req = bench_generate_request("bench prompt", 128);
         assert_eq!(
-            req.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(37)
+            req.get("max_think_tokens").and_then(|v| v.as_u64()),
+            Some(1),
+            "benchmark generates must cap thinking"
         );
+        assert_eq!(
+            req.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think"),
+            "benchmark generates must start in answer mode"
+        );
+        assert_eq!(
+            req.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// `--reasoning-on` restores the thinking turn for anyone who wants to
+    /// benchmark that path, and must produce a request carrying none of the
+    /// answer-mode fields.
+    #[test]
+    fn bench_reasoning_on_opts_back_into_thinking() {
+        let req = bench_generate_request_reasoning("bench prompt", 128, true);
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(req.get("assistant_prefix").is_none());
+        assert!(req.get("reasoning_effort").is_none());
+        // Still an ordinary benchmark generate otherwise.
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
+    }
+
+    #[test]
+    fn http_reasoning_nested_max_tokens_alias_resolves_cap_source() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
+        assert!(res.warnings.is_empty());
+    }
+
+    #[test]
+    fn http_reasoning_top_level_max_think_tokens_precedes_nested_alias() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut conflicting = serde_json::json!({});
+        let res_conflict = apply_http_reasoning_request(
+            &serde_json::json!({
+                "max_think_tokens": 4096,
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut conflicting,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(conflicting["max_think_tokens"], 4096);
+        assert_eq!(res_conflict.effective_cap, Some(4096));
+        assert_eq!(res_conflict.cap_source, "explicit:body:max_think_tokens");
+        assert!(res_conflict.warnings.iter().any(|warning| {
+            warning.contains("reasoning.max_tokens")
+                && warning.contains("max_think_tokens")
+                && warning.contains("precedence")
+        }));
+
+        let mut equal = serde_json::json!({});
+        let res_equal = apply_http_reasoning_request(
+            &serde_json::json!({
+                "max_think_tokens": 2048,
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut equal,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(equal["max_think_tokens"], 2048);
+        assert_eq!(res_equal.effective_cap, Some(2048));
+        assert_eq!(res_equal.cap_source, "explicit:body:max_think_tokens");
+        assert!(
+            res_equal
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("reasoning.max_tokens")),
+            "equal duplicate caps must not warn"
+        );
+    }
+
+    #[test]
+    fn http_reasoning_malformed_nested_max_tokens_is_hard_error() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for bad in [
+            serde_json::json!({ "reasoning": { "max_tokens": -1 } }),
+            serde_json::json!({ "reasoning": { "max_tokens": 1.5 } }),
+            serde_json::json!({ "reasoning": { "max_tokens": "2048" } }),
+            serde_json::json!({ "reasoning": { "max_tokens": 393217 } }),
+        ] {
+            let mut req = serde_json::json!({});
+            let err = apply_http_reasoning_request(
+                &bad,
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &supported,
+            )
+            .expect_err("malformed nested reasoning.max_tokens must hard-error");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("reasoning.max_tokens")
+                    && message.contains("must be between 0 and 393216"),
+                "unexpected error wording: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_reasoning_three_toggle_sources_disabled_wins_once() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // pairwise: top true vs kwargs false
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": false }
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], false);
+        assert_eq!(res.effective_mode, "disabled");
+        let warns: Vec<_> = res
+            .warnings
+            .iter()
+            .filter(|w| w.contains("conflicting thinking toggles"))
+            .collect();
+        assert_eq!(warns.len(), 1, "pairwise conflict must warn once");
+
+        // pairwise: kwargs true vs thinking.type disabled
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "disabled" }
+            }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req2["thinking_enabled"], false);
+        assert_eq!(res2.effective_mode, "disabled");
+        assert_eq!(
+            res2.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            1
+        );
+
+        // all three: top true, kwargs true, thinking disabled => disabled wins, single warning
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "disabled" }
+            }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req3["thinking_enabled"], false);
+        assert_eq!(res3.effective_mode, "disabled");
+        assert_eq!(
+            res3.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            1
+        );
+
+        // all three agree true => no conflict warning, enabled
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "enabled" }
+            }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req4["thinking_enabled"], true);
+        assert_eq!(res4.effective_mode, "enabled");
+        assert_eq!(
+            res4.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn http_reasoning_gemma_enabled_with_cap_and_budget_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Gemma explicit enable true must remain enabled and report no cap, even with caps present
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "max_think_tokens": 1234,
+                "thinking_budget": "high",
+                "reasoning_effort": "low"
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        assert!(
+            req.get("max_think_tokens").is_none(),
+            "Gemma must not send cap"
+        );
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("reasoning_effort")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("max_think_tokens")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("thinking_budget")));
+
+        // Config caps also dropped for Gemma when thinking enabled
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.max_tokens", "4096").unwrap();
+        layer.set_cli("reasoning.budget", "low").unwrap();
+        let cfg_resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "enable_thinking": true }),
+            &cfg_resolved,
+            &mut req2,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req2["thinking_enabled"], true);
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+    }
+
+    #[test]
+    fn http_reasoning_gemma_budget_off_does_not_disable() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Gemma with enable true + budget off must stay enabled (budget off ignored for Gemma)
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "thinking_budget": "off"
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("thinking_budget")));
+        // Gemma default disabled without explicit enable, budget off should not change that (still disabled via default, not via budget)
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "off" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(res2.effective_mode, "disabled");
+        // budget off for non-Gemma Qwen should disable
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "thinking_budget": "off"
+            }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req3["thinking_enabled"], false);
+        assert_eq!(res3.effective_mode, "disabled");
+    }
+
+    #[test]
+    fn http_reasoning_invalid_enum_warns_not_hard_error_and_malformed_hard_errors() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // unknown thinking.type string -> warn+drop, not error, results in default enabled for Qwen
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "maybe" } }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert!(!res.warnings.is_empty());
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking.type") && w.contains("dropped")));
+        assert_eq!(res.effective_mode, "enabled"); // default for Qwen
+
+        // unknown non-native thinking_budget -> warn+drop, not error
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "turbo" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            false,
+            &supported,
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("dropped")));
+
+        // wrong JSON type for enable_thinking -> hard error
+        let mut req3 = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "enable_thinking": "true" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("enable_thinking must be a boolean"));
+
+        // wrong JSON type for thinking.type -> hard error
+        let mut req4 = serde_json::json!({});
+        let err2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": 123 } }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err2}").contains("thinking.type must be enabled or disabled"));
+
+        // cap range violation -> hard error (body)
+        let mut req5 = serde_json::json!({});
+        let err3 = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 999999 }),
+            &resolved,
+            &mut req5,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err3}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_nested_max_tokens_and_qwen_deepseek_glimmer_contracts_intact() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Nested reasoning.max_tokens still works
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &["low".to_string(), "medium".to_string(), "xhigh".to_string()],
+        )
+        .unwrap();
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
+
+        // Qwen non-native still drops effort
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("reasoning_effort").is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support effort")));
+
+        // DeepSeek effort mapping intact
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "medium" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req3["reasoning_effort"], "high");
+        assert_eq!(res3.effective_effort.as_deref(), Some("high"));
+
+        // Glimmer always-on intact
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" } }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req4["thinking_enabled"], true);
+        assert_eq!(res4.effective_mode, "enabled");
+    }
+
+    #[test]
+    fn http_reasoning_deepseek_explicit_caps_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "high",
+                "max_think_tokens": 4096
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("deepseek4")));
+        assert_eq!(req["reasoning_effort"], "high");
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "high" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req3.get("max_think_tokens").is_none());
+        assert!(res3
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("deepseek4")));
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.max_tokens", "8192").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut req4,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req4.get("max_think_tokens").is_none());
+        assert!(res4.effective_cap.is_none());
+        assert!(res4
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+        let mut bad = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": "bad" }),
+            &resolved,
+            &mut bad,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_glimmer_explicit_caps_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "max_think_tokens": 512
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("muse_glimmer")));
+        assert_eq!(req["reasoning_effort"], "low");
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning": { "max_tokens": 1024 },
+                "thinking_budget": "low"
+            }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert_eq!(res2.cap_source, "none");
+        assert!(res2.warnings.iter().any(|w| w.contains("muse_glimmer")));
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.budget", "high").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut req3,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req3.get("max_think_tokens").is_none());
+        assert!(res3.effective_cap.is_none());
+        assert!(res3
+            .warnings
+            .iter()
+            .any(|w| w.contains("muse_glimmer") || w.contains("thinking_budget")));
+        let mut bad = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 500000 } }),
+            &resolved,
+            &mut bad,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be between 0 and 393216"));
     }
 }

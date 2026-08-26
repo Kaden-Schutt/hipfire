@@ -1,0 +1,15 @@
+The user has provided a detailed, production-oriented request for a benchmark specification around a specific inference scenario on AMD's MI300X (gfx942) hardware. The request is highly technical and covers a specific model architecture (DeepSeek V4 Flash style MoE), a specific inference mode (batch-1, autoregressive, no speculation, Q8 KV), and a specific benchmark fixture (2048 token prompt, 510 token generation, temperature 0, greedy). The user has also provided a series of very specific technical points and questions about the process, including tokenization, prefill, KV cache, and the need for deterministic and reproducible benchmarks.
+
+Given the complexity and the user's clear desire for a "production-grade explanation" and a "measurement contract discussion," the assistant's response should be a comprehensive, technical, and precise explanation that addresses all the user's points. The user has essentially written a detailed specification, and the assistant's role is to validate, expand upon, and provide a cohesive narrative for this specification.
+
+The assistant's response should:
+
+1. **Acknowledge the user's expertise and the specific nature of the request.**
+2. **Provide a structured, step-by-step breakdown of the entire process**, from tokenization to the final measurement, addressing each of the user's points (e.g., the importance of byte-level tokenization, the `--kv-mode q8` and `--speculation off` flags, the need for deterministic prompts, the prefill vs. decode distinction, the role of the MoE router, the need for numerical verification, etc.).
+3. **Emphasize the "contract" aspect** of the benchmark, highlighting the need for reproducibility, deterministic inputs, and clear failure conditions.
+4. **Use a tone that is technical, precise, and avoids marketing fluff.** The user explicitly asked for this.
+5. **Structure the response in a way that mirrors the user's own structure**, perhaps by addressing each of their points in a logical order, or by providing a chronological walkthrough of the inference process.
+
+The user's final "User: What does fail-claced device dispatch mean for this campaign?" is a specific question that needs a direct answer. The assistant should answer this clearly and concially.
+
+Overall, the assistant's response should be a masterclass in technical specification and explanation, demonstrating a deep understanding of the hardware, the model architecture, the inference pipeline, and the benchmarking methodology. It should be a "production-grade" response to a "production-grade

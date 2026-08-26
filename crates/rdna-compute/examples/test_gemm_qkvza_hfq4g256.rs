@@ -2,18 +2,33 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Correctness + perf test for `gemm_qkvza_hfq4g256`, the batched
-//! counterpart of `fused_qkvza_hfq4g256` (Qwen3.5 LA preamble, 4-way).
+//! Correctness + perf oracle for `gemm_qkvza_hfq4g256` (batched QKVZA), with
+//! Muse Glimmer path-specific extension.
 //!
-//! Compares batched GEMM × 1 against the fused GEMV × N on the same
-//! synthetic weights, byte-exact. Uses realistic 0.8B LA shapes by
-//! default: qkv_m=6144, z_m=2048, beta_m=16, alpha_m=16, K=1024.
+//! Original: compares batched GEMM × 1 against fused GEMV × N on Qwen3.5 LA
+//! shapes qkv_m=6144, z=2048, beta=16, alpha=16, K=1024.
+//!
+//! Muse extension: `muse` / `--muse` mode exercises the Muse-exact
+//! prefill QKVG shapes q=4096, k=256, v=256, gate=4096, K=6656 at
+//! B=128,192,256 (configurable) and compares the batched fused QKVG path
+//! (overwrite semantics, gfx1100-gated in production) against four
+//! independent established `gemm_hfq4g256_batched_lmhead` calls.
+//! Reports bit-difference count + max abs/rel error and timing, exits
+//! nonzero on violated declared tolerance, prints reproducible
+//! shape/batch details, and reuses allocations across B.
 
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let is_muse = args.iter().any(|a| a == "muse" || a == "--muse");
+    if is_muse {
+        run_muse_qkvg_oracle(args);
+        return;
+    }
+
+    // ── original Qwen LA path (preserved byte-for-byte behavior) ──
     let qkv_m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(6144);
     let z_m:   usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2048);
     let beta_m: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -146,6 +161,325 @@ fn main() {
     }
 
     eprintln!("\n=== All N passed byte-exact ===");
+}
+
+// ── Muse QKVG oracle ────────────────────────────────────────────────
+//
+// Muse exact prefill QKVG projection family (MQ4G256/HFQ4G256, FWHT-rotated
+// at quantize time):
+//
+//   q_proj      [4096, 6656]
+//   k_proj      [ 256, 6656]
+//   v_proj      [ 256, 6656]
+//   attn_gate   [4096, 6656]   K=6656 for all four.
+//
+// Batches: 128, 192, 256 (prefill chunk sizes used in
+// crates/hipfire-arch-muse-glimmer/src/forward.rs::glimmer_prefill_chunk_size).
+// Command-line shape selection is preferred; the oracle reuses allocations
+// across B (max_n sizing) rather than reallocating per batch.
+//
+// Fused path under test: the established direct
+// `Gpu::gemm_qkvza_hfq4g256_wmma` batched overwrite kernel, called with
+// Muse's exact shape after the production callsite's gfx1100 gate.
+// Numerical ordering must match the established gfx11 WMMA qkvza kernel
+// (kernels/src/gemm_qkvza_hfq4g256_wmma.hip); any deviation needs a
+// bounded tolerance justified in the PR. This oracle is intentionally
+// path-specific: it compares the fused QKVG against the four independent
+// `gemm_hfq4g256_batched_lmhead` calls that constitute the pre-fusion
+// baseline (separate rotates are shared, same as forward.rs shared Rot).
+//
+// Declared tolerance: byte-exact (bitdiff==0, max_abs==0, max_rel==0).
+// Justification: same dequant (scale/zp + 4-bit unpack), same FWHT
+// prerotated activation, same WMMA accumulation order per batch element
+// (16×16×16 f16 WMMA, pairwise combine). The fused kernel only fuses the
+// four GEMMs' grid.y batch dim; per-element arithmetic is unchanged.
+// Override via CLI: --tol-abs=N --tol-rel=N --allow-bitdiff=N
+// Env:  HIPFIRE_MUSE_QKVG_TOL_ABS / HIPFIRE_MUSE_QKVG_TOL_REL / HIPFIRE_MUSE_QKVG_ALLOW_BITDIFF
+//
+// The oracle exits nonzero on violated tolerance and prints reproducible
+// shape/batch/arch details for CI.
+
+fn run_muse_qkvg_oracle(args: Vec<String>) {
+    // Parse CLI: `muse` token may be at any position; remaining numeric tokens are B list.
+    let mut batches: Vec<usize> = Vec::new();
+    let mut tol_abs: f32 = std::env::var("HIPFIRE_MUSE_QKVG_TOL_ABS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mut tol_rel: f32 = std::env::var("HIPFIRE_MUSE_QKVG_TOL_REL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mut allow_bitdiff: usize = std::env::var("HIPFIRE_MUSE_QKVG_ALLOW_BITDIFF").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut help = false;
+    // repeats for timing stability (1 JIT warmup discarded)
+    let mut repeats: usize = 5;
+
+    for a in args.iter().skip(1) {
+        if a == "muse" || a == "--muse" {
+            continue;
+        } else if a == "--help" || a == "-h" {
+            help = true;
+        } else if let Some(v) = a.strip_prefix("--tol-abs=") {
+            tol_abs = v.parse().unwrap_or(tol_abs);
+        } else if let Some(v) = a.strip_prefix("--tol-rel=") {
+            tol_rel = v.parse().unwrap_or(tol_rel);
+        } else if let Some(v) = a.strip_prefix("--allow-bitdiff=") {
+            allow_bitdiff = v.parse().unwrap_or(allow_bitdiff);
+        } else if let Some(v) = a.strip_prefix("--repeats=") {
+            repeats = v.parse().unwrap_or(repeats).clamp(1, 100);
+        } else if let Ok(b) = a.parse::<usize>() {
+            // Numeric batch size. Filter implausible values (keep 1..8192).
+            if b >= 1 && b <= 8192 {
+                batches.push(b);
+            }
+        } else if a.starts_with('-') {
+            eprintln!("unknown flag {a}");
+            help = true;
+        } else {
+            eprintln!("unknown arg {a}");
+            help = true;
+        }
+    }
+    if help {
+        eprintln!("Usage: test_gemm_qkvza_hfq4g256 muse [B...] [--tol-abs=N --tol-rel=N --allow-bitdiff=N --repeats=N]");
+        eprintln!("  Muse exact shapes: q=4096 k=256 v=256 gate=4096 K=6656 (HFQ4G256/MQ4G256, FWHT-rotated)");
+        eprintln!("  Default B: 128 192 256   (use e.g. `muse 128` for single batch)");
+        eprintln!("  Compares fused batched QKVG (overwrite) vs 4× gemm_hfq4g256_batched_lmhead");
+        eprintln!("  Declared tolerance: bitdiff==0, max_abs==0, max_rel==0 (byte-exact WMMA ordering)");
+        std::process::exit(0);
+    }
+    if batches.is_empty() {
+        batches = vec![128, 192, 256];
+    }
+    batches.sort_unstable();
+    batches.dedup();
+
+    const Q_M: usize = 4096;
+    const K_M: usize = 256;
+    const V_M: usize = 256;
+    const GATE_M: usize = 4096;
+    const K: usize = 6656;
+    assert!(K % 256 == 0);
+    let groups_per_row = K / 256;
+    let row_bytes = groups_per_row * 136;
+
+    eprintln!("=== Muse QKVG batched oracle (gfx1100 path-specific) ===");
+    eprintln!("shapes: q={Q_M} k={K_M} v={V_M} gate={GATE_M} K={K}  (HFQ4G256/MQ4G256, FWHT-rotated)");
+    eprintln!("batches: {:?}  groups_per_row={} row_bytes={}", batches, groups_per_row, row_bytes);
+    eprintln!("fused: single batched QKVG (overwrite) vs 4× gemm_hfq4g256_batched_lmhead");
+    eprintln!("tolerance: bitdiff<={}  max_abs<={:.3e}  max_rel<={:.3e}  repeats={}", allow_bitdiff, tol_abs, tol_rel, repeats);
+    eprintln!("note: numerical ordering must match gfx11 WMMA qkvza kernel (kernels/src/gemm_qkvza_hfq4g256_wmma.hip); bounded tolerance only if justified");
+
+    let mut gpu = Gpu::init().expect("gpu init");
+    let arch = gpu.arch.clone();
+    let is_gfx1100 = gpu.arch_caps.is_gfx1100();
+    let has_wmma = gpu.arch_caps.has_wmma_w32();
+    let has_wmma_gfx12 = gpu.arch_caps.has_wmma_w32_gfx12();
+    eprintln!("arch={arch} is_gfx1100={} has_wmma_w32={} has_wmma_w32_gfx12={} device_id={}", is_gfx1100, has_wmma, has_wmma_gfx12, gpu.device_id);
+    // Muse production gate is `is_gfx1100 && exact Muse dims && MQ4/HFQ4`. This oracle runs on any
+    // arch for CI but flags when the production Muse method would be ineligible.
+    if !is_gfx1100 {
+        eprintln!("info: production Muse batched QKVG is gfx1100-gated (gpu.arch_caps.is_gfx1100() && exact dims && MQ4/HFQ4, returns false when ineligible); oracle still validates numerics on this arch");
+    }
+
+    // Synthetic HFQ4G256 weights (136 B/group: f32 scale, f32 zp, 128 packed nibbles).
+    // Same generator as bench_glimmer_wmma_ceiling.rs; deterministic per shape.
+    let w_q    = gpu.upload_raw(&synth(Q_M,    groups_per_row, 0x51), &[Q_M    * row_bytes]).unwrap();
+    let w_k    = gpu.upload_raw(&synth(K_M,    groups_per_row, 0x52), &[K_M    * row_bytes]).unwrap();
+    let w_v    = gpu.upload_raw(&synth(V_M,    groups_per_row, 0x53), &[V_M    * row_bytes]).unwrap();
+    let w_gate = gpu.upload_raw(&synth(GATE_M, groups_per_row, 0x54), &[GATE_M * row_bytes]).unwrap();
+
+    let max_n = *batches.iter().max().unwrap();
+    // Host activation: deterministic f32 in [-0.5, 0.5), same across B for reproducibility.
+    let x_host: Vec<f32> = (0..max_n * K).map(|i| {
+        let mut s = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }).collect();
+
+    // Reused allocation: one set sized to max_n, sub-ranges used per B.
+    // Avoids enormous redundant allocations across the B sweep.
+    let x_raw = gpu.alloc_tensor(&[max_n * K], DType::F32).unwrap();
+    let x_rot = gpu.alloc_tensor(&[max_n * K], DType::F32).unwrap();
+    gpu.hip.memcpy_htod(&x_raw.buf, bytes_of(&x_host)).unwrap();
+
+    // Fused outputs (overwrite semantics).
+    let y_q_fused    = gpu.alloc_tensor(&[max_n * Q_M], DType::F32).unwrap();
+    let y_k_fused    = gpu.alloc_tensor(&[max_n * K_M], DType::F32).unwrap();
+    let y_v_fused    = gpu.alloc_tensor(&[max_n * V_M], DType::F32).unwrap();
+    let y_gate_fused = gpu.alloc_tensor(&[max_n * GATE_M], DType::F32).unwrap();
+
+    // Separate baseline outputs.
+    let y_q_sep    = gpu.alloc_tensor(&[max_n * Q_M], DType::F32).unwrap();
+    let y_k_sep    = gpu.alloc_tensor(&[max_n * K_M], DType::F32).unwrap();
+    let y_v_sep    = gpu.alloc_tensor(&[max_n * V_M], DType::F32).unwrap();
+    let y_gate_sep = gpu.alloc_tensor(&[max_n * GATE_M], DType::F32).unwrap();
+
+    // Helper to compute per-projection error metrics.
+    let compute_metrics = |a: &[f32], b: &[f32]| -> (usize, f32, f32) {
+        let mut bitdiff = 0usize;
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            if x.to_bits() != y.to_bits() {
+                bitdiff += 1;
+            }
+            let abs = (x - y).abs();
+            if abs > max_abs { max_abs = abs; }
+            // relative: |x-y| / max(|x|,|y|,1e-6) to avoid div-by-zero blowup
+            let denom = x.abs().max(y.abs()).max(1e-6);
+            let rel = abs / denom;
+            if rel > max_rel { max_rel = rel; }
+        }
+        (bitdiff, max_abs, max_rel)
+    };
+
+    let mut any_failure = false;
+
+    for &b in &batches {
+        eprintln!("\n--- Muse QKVG B={b}  q={Q_M} k={K_M} v={V_M} gate={GATE_M} K={K} arch={arch} ---");
+
+        // Rotate activation once per B (shared across all four projections, matching
+        // forward.rs::fused_rmsnorm_rotate_mq_batched_for / rotate_x_mq_batched_for).
+        // Only the first b*K elements are rotated; tail remains zeroed.
+        gpu.hip.device_synchronize().unwrap();
+        // Ensure x_raw contains fresh host data for this b (prefix already uploaded; full max_n uploaded once).
+        // Rotate batched: x_raw[0..b*K] -> x_rot[0..b*K]
+        gpu.rotate_x_mq_batched(&x_raw, &x_rot, K, b).expect("rotate_x_mq_batched failed — is MQ sign table available?");
+
+        gpu.hip.device_synchronize().unwrap();
+
+        // Warmup both paths once to JIT and populate caches.
+        gpu.gemm_hfq4g256_batched_lmhead(&w_q, &x_rot, &y_q_sep, Q_M, K, b)
+            .unwrap();
+        gpu.gemm_hfq4g256_batched_lmhead(&w_k, &x_rot, &y_k_sep, K_M, K, b)
+            .unwrap();
+        gpu.gemm_hfq4g256_batched_lmhead(&w_v, &x_rot, &y_v_sep, V_M, K, b)
+            .unwrap();
+        gpu.gemm_hfq4g256_batched_lmhead(&w_gate, &x_rot, &y_gate_sep, GATE_M, K, b)
+            .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+
+        // The Muse production callsite exact-gates gfx1100 and then invokes this
+        // direct WMMA method. Do not use generic dispatch on gfx1100 here: it may
+        // select MMQ before WMMA and would not validate the shipped path.
+        if gpu.arch_caps.is_gfx1100() {
+            gpu.gemm_qkvza_hfq4g256_wmma(
+                &w_q, &w_k, &w_v, &w_gate, &x_rot, &y_q_fused, &y_k_fused,
+                &y_v_fused, &y_gate_fused, Q_M, K_M, V_M, GATE_M, K, b,
+            )
+            .unwrap();
+        } else {
+            gpu.gemm_qkvza_hfq4g256(
+                &w_q, &w_k, &w_v, &w_gate, &x_rot, &y_q_fused, &y_k_fused,
+                &y_v_fused, &y_gate_fused, Q_M, K_M, V_M, GATE_M, K, b,
+            )
+            .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+
+        // Timed separate: 4× batched lmhead
+        let mut sep_us: f64 = 0.0;
+        let mut fused_us: f64 = 0.0;
+        // Do `repeats` timed iterations, discarding the warmup above.
+        for _ in 0..repeats {
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = Instant::now();
+            gpu.gemm_hfq4g256_batched_lmhead(&w_q, &x_rot, &y_q_sep, Q_M, K, b).unwrap();
+            gpu.gemm_hfq4g256_batched_lmhead(&w_k, &x_rot, &y_k_sep, K_M, K, b).unwrap();
+            gpu.gemm_hfq4g256_batched_lmhead(&w_v, &x_rot, &y_v_sep, V_M, K, b).unwrap();
+            gpu.gemm_hfq4g256_batched_lmhead(&w_gate, &x_rot, &y_gate_sep, GATE_M, K, b).unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            sep_us += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        sep_us /= repeats as f64;
+
+        for _ in 0..repeats {
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = Instant::now();
+            if gpu.arch_caps.is_gfx1100() {
+                gpu.gemm_qkvza_hfq4g256_wmma(&w_q, &w_k, &w_v, &w_gate, &x_rot, &y_q_fused, &y_k_fused, &y_v_fused, &y_gate_fused, Q_M, K_M, V_M, GATE_M, K, b).unwrap();
+            } else {
+                gpu.gemm_qkvza_hfq4g256(&w_q, &w_k, &w_v, &w_gate, &x_rot, &y_q_fused, &y_k_fused, &y_v_fused, &y_gate_fused, Q_M, K_M, V_M, GATE_M, K, b).unwrap();
+            }
+            gpu.hip.device_synchronize().unwrap();
+            fused_us += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        fused_us /= repeats as f64;
+
+        // Download and compare per projection. Use only first b*m elements (prefix).
+        let q_fused_v = gpu.download_f32(&y_q_fused).unwrap();
+        let k_fused_v = gpu.download_f32(&y_k_fused).unwrap();
+        let v_fused_v = gpu.download_f32(&y_v_fused).unwrap();
+        let gate_fused_v = gpu.download_f32(&y_gate_fused).unwrap();
+        let q_sep_v = gpu.download_f32(&y_q_sep).unwrap();
+        let k_sep_v = gpu.download_f32(&y_k_sep).unwrap();
+        let v_sep_v = gpu.download_f32(&y_v_sep).unwrap();
+        let gate_sep_v = gpu.download_f32(&y_gate_sep).unwrap();
+
+        let q_fused = &q_fused_v[..b * Q_M];
+        let q_sep = &q_sep_v[..b * Q_M];
+        let k_fused = &k_fused_v[..b * K_M];
+        let k_sep = &k_sep_v[..b * K_M];
+        let v_fused = &v_fused_v[..b * V_M];
+        let v_sep = &v_sep_v[..b * V_M];
+        let gate_fused = &gate_fused_v[..b * GATE_M];
+        let gate_sep = &gate_sep_v[..b * GATE_M];
+
+        let (q_bd, q_abs, q_rel) = compute_metrics(q_sep, q_fused);
+        let (k_bd, k_abs, k_rel) = compute_metrics(k_sep, k_fused);
+        let (v_bd, v_abs, v_rel) = compute_metrics(v_sep, v_fused);
+        let (g_bd, g_abs, g_rel) = compute_metrics(gate_sep, gate_fused);
+
+        let total_bd = q_bd + k_bd + v_bd + g_bd;
+        let max_abs = q_abs.max(k_abs).max(v_abs).max(g_abs);
+        let max_rel = q_rel.max(k_rel).max(v_rel).max(g_rel);
+
+        let flops = 2.0 * ((Q_M + K_M + V_M + GATE_M) as f64) * (K as f64) * (b as f64);
+        let tflops_fused = flops / (fused_us * 1e-6) / 1e12;
+        let tflops_sep = flops / (sep_us * 1e-6) / 1e12;
+        let speedup = sep_us / fused_us;
+
+        eprintln!("  separate 4× : {:8.1} µs  ({:5.2} TFLOP/s)", sep_us, tflops_sep);
+        eprintln!("  fused   1×  : {:8.1} µs  ({:5.2} TFLOP/s)  speedup {:5.2}x", fused_us, tflops_fused, speedup);
+        eprintln!("  q_proj   bitdiff {}/{}  max_abs {:.3e}  max_rel {:.3e}", q_bd, b*Q_M, q_abs, q_rel);
+        eprintln!("  k_proj   bitdiff {}/{}  max_abs {:.3e}  max_rel {:.3e}", k_bd, b*K_M, k_abs, k_rel);
+        eprintln!("  v_proj   bitdiff {}/{}  max_abs {:.3e}  max_rel {:.3e}", v_bd, b*V_M, v_abs, v_rel);
+        eprintln!("  gate     bitdiff {}/{}  max_abs {:.3e}  max_rel {:.3e}", g_bd, b*GATE_M, g_abs, g_rel);
+        eprintln!("  total    bitdiff {}/{}  max_abs {:.3e}  max_rel {:.3e}", total_bd, b*(Q_M+K_M+V_M+GATE_M), max_abs, max_rel);
+
+        let tol_ok = total_bd <= allow_bitdiff && max_abs <= tol_abs && max_rel <= tol_rel;
+        // Byte-exact expectation: if any bitdiff, also report first divergent element per projection.
+        if !tol_ok || total_bd != 0 {
+            for (label, sep, fused, m) in [
+                ("q", q_sep, q_fused, Q_M),
+                ("k", k_sep, k_fused, K_M),
+                ("v", v_sep, v_fused, V_M),
+                ("gate", gate_sep, gate_fused, GATE_M),
+            ] {
+                let mut first = None;
+                for i in 0..b*m {
+                    if sep[i].to_bits() != fused[i].to_bits() {
+                        first = Some((i, sep[i], fused[i]));
+                        break;
+                    }
+                }
+                if let Some((idx, s, f)) = first {
+                    let batch = idx / m;
+                    let row = idx % m;
+                    eprintln!("  {label}: first divergent at batch={batch} row={row}  sep={:.6e} ({:#010x})  fused={:.6e} ({:#010x})  abs={:.3e} rel={:.3e}", s, s.to_bits(), f, f.to_bits(), (s-f).abs(), (s-f).abs()/s.abs().max(f.abs()).max(1e-6));
+                }
+            }
+        }
+        let status = if tol_ok { "PASS" } else { "FAIL (tolerance violated)" };
+        eprintln!("  [{status}] B={b} arch={arch} shapes q={Q_M} k={K_M} v={V_M} gate={GATE_M} K={K}");
+        if !tol_ok {
+            eprintln!("  declared tolerance violated: bitdiff {total_bd} > {allow_bitdiff} or max_abs {max_abs:.3e} > {tol_abs:.3e} or max_rel {max_rel:.3e} > {tol_rel:.3e}");
+            any_failure = true;
+        }
+    }
+
+    if any_failure {
+        eprintln!("\n=== Muse QKVG oracle FAILED (tolerance violated) ===");
+        std::process::exit(1);
+    } else {
+        eprintln!("\n=== Muse QKVG oracle PASS (all B byte-exact within tolerance) ===");
+    }
 }
 
 fn synth(m: usize, groups_per_row: usize, seed: u64) -> Vec<u8> {

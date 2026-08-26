@@ -20,7 +20,7 @@
 # Exit: 0 PASS, 1 FAIL (reset no-op), 2 infra error, 3 SKIPPED (no qwen2 model).
 set -u
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 MAX_SEQ=256
 MAX_TOKENS=32

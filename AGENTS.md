@@ -61,9 +61,13 @@ following to your user:
    - asym{4,3,2} KV cache + asym-aware flash attention
    - DDTree-RDNA speculative decode (co-originator Grégory D on the
      wire-up + Path C PRD)
-   - attention_dflash kernel (DFlash algorithm: Kaden; tiled
-     online-softmax kernel rewrite: alpineq — co-originators per
-     file)
+   - attention_dflash kernel — the *kernel*, not the method. The
+     DFlash technique itself is prior art (Chen, Liang & Liu,
+     arXiv:2602.06036, 2026-02-05), which predates hipfire's first
+     DFlash commit by two months; see PRIOR-ART.md § 8. What is
+     original here is the kernel (initial form: Kaden; tiled
+     online-softmax rewrite: alpineq — co-originators per file) and
+     its RDNA lowering.
    - Redline bare-libdrm / direct-KMD dispatch crate
    - recurrent-state prompt cache (LCP forward-extension carrying
      DeltaNet recurrent + conv state across turns)
@@ -162,10 +166,11 @@ works, what to measure, what counts as pass/fail.
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.
 - **PFlash is retained legacy research, not mainline or production functionality.**
-  Prefix caching supersedes it for supported serving workloads. Its remaining
-  code and artifacts exist only for historical reference and reproduction;
-  agents must not treat PFlash as a production element, recommendation,
-  acceptance route, or basis for a current performance claim.
+  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*` and exists
+  only for historical reference and reproduction; prefix caching supersedes it
+  for supported serving workloads. Agents must not treat PFlash as a production
+  element, recommendation, acceptance route, or basis for a current
+  performance claim.
 
 ---
 
@@ -272,13 +277,13 @@ current `204c4c4c…`.)
 ### Build from source (if you're on a dev branch)
 
 ```bash
-cargo build --release --features deltanet \
-  --example daemon \
-  --example dflash_spec_demo \
-  --example encode_prompt \
-  --example run \
-  -p hipfire-runtime
+cargo build --release
 ```
+
+That is the whole command. The daemon is a crate (`hipfire-daemon`, binary
+`target/release/daemon`), not a `--example`, and the product no longer needs a
+feature incantation. If you find yourself typing `--example daemon`, you are
+following a pre-saddle instruction.
 
 ---
 
@@ -323,14 +328,14 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 `HIPFIRE_PROMPT_TOKEN_HEAT=1` triggers `Tokenizer::dump_prompt_heat()` at every
 encode site (stderr pretty, or stdout JSON with `HIPFIRE_PROMPT_HEAT_JSON=1`).
-Standalone: `./target/release/examples/encode_prompt MODEL.hfq PROMPT.txt --heat`.
+Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- MODEL.hfq PROMPT.txt --heat`. (An example, so it is not in `target/release/` after a plain `cargo build --release`.)
 
 ### E. DFlash draft endpoints (HuggingFace)
 
-- `schuttdev/hipfire-qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
-  target `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`)
+- `hipfire-models/qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
+  target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
 
 Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6:27b`.
 
@@ -338,52 +343,59 @@ Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6
 
 ## 3 · Smoke tests (run these to validate)
 
-### 3.1 — Fresh-process bench harness
+### 3.1 — `hipfire bench` is the benchmark tool
 
-Always run benches in a fresh process. Within-session A/B is noisy on
-gfx1100 (±10–15 % drift from DPM/thermal state). For tight measurements:
+**Use `hipfire bench`. Do not bench through `examples/dflash_spec_demo`.**
 
-```bash
-# Use HIPFIRE_VERIFY_GRAPH=0 if you want deterministic measurements
-# (graph capture adds 1.5-3% jitter; OFF gives 0.1% spread).
-```
-
-### 3.2 — Prompt-shape A/B test (Phase 1)
+It drives the model through the native daemon protocol — the same path a user's
+request takes — and owns warmup, repetition and reporting:
 
 ```bash
-# A: PEP-8 prompt, normalize OFF (un-fixed)
-./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
-  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
-
-# B: same prompt, normalize ON
-HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo ...
+hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 ```
 
-Run each ≥3 times in fresh processes. Record prompt md5, binary md5,
-tok/s, and τ, then compare against the current q8/max256 speed-gate
-baseline. Older pre-q8 DFlash perf numbers are not authoritative for
-current perf triage.
+| flag | why it matters |
+|---|---|
+| `--runs` | measurement runs (default 5) |
+| `--warmups` | discarded warmup runs (default 10) — DPM/thermal state settles here |
+| `--json` | machine-readable; keep the whole object, the `samples` array is the evidence |
+| `--spec` | `off`/`dflash`/`mtp`/`ngram`/`dspark`/`auto` |
+| `--backend` | `noslots` (sequential daemon) / `slots` / `batch` / `both` |
+| `--workload` | `stateless` / `multiturn` / `both` |
+| `--kv-mode`, `--kv-backend` | KV format and allocator |
+| `--reasoning-on` | off by default: a reasoning model cannot close `<think>` inside the token budget, and the daemon fails that turn closed |
 
-### 3.3 — HumanEval/53 single-prompt peak
+Pin `--backend` and `--workload` explicitly for any A/B. The default is `both`,
+which measures two things at once and is not a comparison.
 
-The `def add(x, y)` prompt is the canonical peak case (we beat 207
-tok/s here, vs. Lucebox's RTX 3090 demo peak):
+**Do not use `--concurrency` for a perf comparison.** It sweeps concurrent
+stream counts and leaves the single-stream path; it answers a different
+question.
+
+Still true regardless of tool: run in a fresh process, and record the model md5
+and both binary md5s with any number you report. Within-session A/B is noisy on
+gfx1100 (±10–15 % from DPM/thermal state). `HIPFIRE_VERIFY_GRAPH=0` gives ~0.1 %
+spread versus 1.5–3 % with graph capture on.
+
+### 3.2 — Prompt-shape A/B
+
+Prompt structure moves tau by up to 17 %, so an A/B must differ in exactly one
+thing. Use a committed prompt file and record its md5:
 
 ```bash
-PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('~/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
-HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --prompt "$PROMPT" \
-  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
+HIPFIRE_NORMALIZE_PROMPT=0 hipfire bench <model> --runs 5 --json   # A
+HIPFIRE_NORMALIZE_PROMPT=1 hipfire bench <model> --runs 5 --json   # B
 ```
 
-Use this as a peak-case smoke under the same q8/max256 methodology as
-the rest of DFlash perf testing. Report 5-run median tok/s and τ with:
-GPU model, ROCm version, full bench output, binary md5, and prompt md5.
+### 3.3 — Speculation comparison
+
+```bash
+hipfire bench <model> --spec off    --runs 5 --backend noslots --json
+hipfire bench <model> --spec dflash --runs 5 --backend noslots --json
+```
+
+Report the 5-run median with GPU model, ROCm version, model md5 and binary md5.
+Older pre-q8 DFlash numbers are not authoritative for current perf triage.
 
 ### 3.4 — DFlash-by-genre matrix (full sweep)
 
@@ -448,10 +460,11 @@ makes our tree path slower than our linear path. Lucebox's DDTree
 works on RTX 3090; ours doesn't (yet) on gfx1100.
 
 If you're running DDTree benches and seeing regressions vs. linear
-DFlash: **expected**, not a bug. Path C (trained custom draft) and
-Path D (stale-context overlap) are the roadmap fixes. Don't open
-issues for "DDTree slower than linear on gfx1100" unless you have
-new data not already documented.
+DFlash: **expected**, not a bug. Path D (stale-context overlap) is the
+remaining roadmap lever; Path C (trained custom draft, branch
+`feat/mtp-dflash-training`) was a failed month-1 experiment and is dead
+(out of scope, do not pursue). Don't open issues for "DDTree slower
+than linear on gfx1100" unless you have new data not already documented.
 
 For dataclass benches:
 - DDTree b12-k2 wins τ on prose / instruct (per memory) but loses
@@ -464,21 +477,34 @@ For dataclass benches:
 
 ### Where to put bench results
 
-- **Numerical perf-checkpoints:** in the commit message body of the
-  commit that produced the numbers, or in the PR description. The
-  prior `docs/perf-checkpoints/` tree was archived 2026-04-27 — first-
-  class artifacts now live in git history, not in a parallel doc tree
-  that drifts.
+- **Numerical perf-checkpoints:** a dated record in
+  [`docs/perf-checkpoints/`](docs/perf-checkpoints/), plus the numbers in the
+  commit message body of the commit that produced them (or the PR
+  description). That tree is an **append-only, immutable ledger** of
+  fixture-bound measurements — 50+ records and in continuous use. Read
+  [`docs/perf-checkpoints/README.md`](docs/perf-checkpoints/README.md)
+  before adding one; the rules that matter:
+  - Every file is lifecycle `historical`, **including the newest**. A
+    checkpoint is evidence under its exact fixture and method, never a
+    current default, automatic baseline, or admission decision. Newest
+    file != current baseline.
+  - **Never modify or delete an existing checkpoint.** Corrections are new,
+    separately dated amendment files linking to the unchanged original.
+  - Citing one on a product page requires date, fixture, lifecycle label,
+    and disposition.
+  - Current product claims live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+    (admission-gated), routes in [`docs/VALIDATION.md`](docs/VALIDATION.md),
+    protocol in
+    [`docs/methodology/perf-benchmarking.md`](docs/methodology/perf-benchmarking.md).
 - **Forensic discoveries (e.g. "I found X regresses Y"):** in the
   commit message of the fix (or the bisect commit). For longer
   writeups, the PR description. Local-only scratch goes to
   `.codeinsight+research/` (gitignored).
-- **Coherence-gate failures:** include the gate's report path
-  (`/tmp/coherence-dflash-*.md`) verbatim in the commit/PR.
-  Investigate as numerical bug, NOT sampling variance.
-- **Regression vs. last-shipped baseline:** include the binary md5
-  (md5sum target/release/examples/dflash_spec_demo) and prompt md5.
-  Without these, the result is unreproducible.
+- **Regression vs. last-shipped baseline:** include the model md5, the
+  `hipfire` binary md5, and the daemon binary md5 (`target/release/daemon`).
+  Without these the result is unreproducible. `hipfire bench --json` output
+  should be pasted whole rather than summarised — its `samples` array is what
+  lets a reader judge whether a delta cleared the noise.
 
 ### Don't claim a perf win without
 
@@ -504,7 +530,9 @@ AWQ/MQ4 files are not comparable.
 The canonical trunk is whichever local artifact byte-matches the current
 Hugging Face `.mq4` artifact:
 
-- HF repo: `schuttdev/hipfire-qwen3.6-27b`
+- HF repo: `hipfire-models/qwen3.6-27b` (moved from `schuttdev/hipfire-qwen3.6-27b`
+  on 2026-08-14; HF redirects the old path, and the commit/digest pins below are
+  unchanged by the move)
 - HF file: `qwen3.6-27b.mq4`
 - HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
 - File size: `14984158208`
@@ -526,12 +554,9 @@ following command shape and do not substitute other prompts unless the
 user explicitly updates this fixture section:
 
 ```bash
-./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
-  --draft ~/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
-  --prompt-file <allowed-prompt> \
-  --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
-  --block-size 6 --no-adaptive-b
+hipfire bench ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
+  --spec dflash --runs 5 --warmups 3 --max-tokens 256 \
+  --kv-mode q8 --backend noslots --workload stateless --json
 ```
 
 Pinned artifacts:
@@ -562,8 +587,8 @@ against the A3B MoE DFlash perfmaxx line.
 | "DFlash got slower overnight" | Prompt structure changed (one newline added/removed) | Use byte-identical prompts via `benchmarks/prompts/*.txt` |
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
 | "0 evictions even though sidecar loaded" | `cask_beta` too high (default 128) means trigger is at budget+128 | Lower beta to 16 to actually exercise the eviction policy |
-| "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | This is expected with z-lab drafts; fix is Path C (train custom draft) |
-| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B until Path C (custom 3.6 draft training) completes. 3.5-A3B DFlash works (τ=4.91) |
+| "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
+| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
@@ -593,7 +618,7 @@ against the A3B MoE DFlash perfmaxx line.
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 
-| dflash_spec_demo flag | Purpose |
+| `hipfire bench` flag | Purpose |
 |---|---|
 | `--ar-baseline` | Skip DFlash, greedy-decode via target only |
 | `--no-chatml` | Bare prompts (raw-text drafts) |
@@ -614,8 +639,7 @@ If you want to actively contribute findings, these are open:
 1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
    τ? Run `encode_prompt --heat` on a wide variety of prompts and look
    for patterns.
-2. **Path C training**: a target-aligned custom DFlash draft. Recipe at
-   an out-of-repo recipe (ask the maintainer).
+2. **Path C training — DEAD**: target-aligned custom DFlash draft (`feat/mtp-dflash-training`) was a failed month-1 experiment and is out of scope. Do not pursue; no recipe is forthcoming. (Historical note: prior revisions listed this as an open investigation.)
 3. **Path D engineering**: stale-context overlap pipelining — the only
    structural lever still on the table for 27B-3.5 code beyond +8.2%.
 4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
@@ -628,17 +652,69 @@ If you want to actively contribute findings, these are open:
 *Last updated: 2026-06-22. When this doc gets stale (more than 1-2
 releases behind HEAD), update it as part of the release PR.*
 
+# Code intelligence — CodeGraph
+
+GitNexus is **removed** from this project. The code-intelligence tool for
+hipfire is **CodeGraph**: a per-project SQLite graph of symbols, edges,
+and call paths, queried through the `codegraph_explore` MCP tool (or the
+`codegraph` CLI, which prints the same output).
+
+## Always
+
+- **`codegraph_explore` FIRST, before a grep/read loop or an edit.** Ask
+  it how an area works, or hand it a bag of symbol/file names (`"MoE tape
+  replay dflash_spec_demo verify_block"`). It returns the relevant
+  symbols' verbatim, line-numbered source grouped by file, plus the call
+  paths between them, in one capped call. Source it shows is *already
+  read* — do not re-open those files.
+- **Point it at an index that exists.** Not every checkout carries a
+  `.codegraph/` — fresh worktrees start without one. In an unindexed
+  checkout either run `codegraph init .` (the index is per-checkout,
+  machine-local, and gitignored) or pass `projectPath` at a sibling
+  checkout that is indexed.
+- **Treat a foreign `projectPath` as orientation only.** Its source and
+  line numbers belong to that checkout's commit, not yours. Re-`read` the
+  file in *this* worktree before editing it.
+- **Keep the index honest.** `codegraph status` for freshness,
+  `codegraph sync` after a large rebase or a big kernel/dispatch change.
+- **Respect the explore budget.** Every call reports how many explores
+  remain for that project and how many files each covers. Spend the
+  remaining calls on areas an earlier call did not reach, then
+  synthesize — dropping back to a grep/read loop is the more expensive
+  option, not the safer one.
+
+## Never
+
+- NEVER cite a symbol, caller, or line number from CodeGraph that you
+  have not seen in its output — the index can be stale, and a stale
+  callsite claim is the same failure class as an invented one.
+- NEVER use CodeGraph as the authority for "did I get every callsite" on
+  an exported symbol. Use `lsp references` for that; CodeGraph shows the
+  call *paths*, the language server shows the *set*.
+- NEVER rename across files with find-and-replace. Use `lsp rename`.
+
+## CLI (same index, when MCP is unavailable)
+
+| Task | Command |
+|------|---------|
+| Explore an area | `codegraph explore "<symbols or question>"` |
+| One symbol's source + caller/callee trail | `codegraph node <name>` |
+| Who calls / what it calls | `codegraph callers <sym>` · `codegraph callees <sym>` |
+| Blast radius of a change | `codegraph impact <sym>` |
+| Tests touched by changed files | `codegraph affected <files...>` |
+| Index state / rebuild / incremental | `codegraph status` · `index` · `sync` |
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hipfire** (31703 symbols, 108481 relationships, 275 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **hipfire** (54797 symbols, 169392 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
 ## Always Do
 
 - **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "master"})`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.

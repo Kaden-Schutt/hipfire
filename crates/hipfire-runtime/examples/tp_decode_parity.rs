@@ -29,7 +29,9 @@ use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps_tp, GemvInput, Step, TpCollective};
 use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
 use hipfire_hardware::{DeviceMesh, DimKind};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::{
+    self, ForwardScratch, KvCache, KvCacheExt, LlamaConfig, LlamaWeights,
+};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
 use hipfire_runtime::weight_store::{fulfill_manifest, WeightHandle, WeightStore};

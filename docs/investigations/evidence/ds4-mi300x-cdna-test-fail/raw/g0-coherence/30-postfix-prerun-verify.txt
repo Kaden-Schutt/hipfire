@@ -1,0 +1,1 @@
+838034a0efa6acdd172311f5aabe65e61370f59882b2840aa0f158120a800ca8  /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon

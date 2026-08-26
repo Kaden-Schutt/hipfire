@@ -13,7 +13,7 @@
 //!    normalisation (COMP-001).
 //! 3. **Legacy remap** — DeepSeek4 / MiniMax TP→EP (preserves degrees).
 //! 4. **Policy lookup** — `(variant, effective_axis)` checked against the
-//!    architecture-id matrix (`docs/architecture-ids.md` lines 14–28). Cells
+//!    architecture-id matrix (`docs/architecture-ids.md` lines 14–30). Cells
 //!    marked `NormalizeToSingle` canonicalise effective degrees to `(1,1,1)`
 //!    and re-evaluate the `Single` cell — no separate dense-normalisation step.
 
@@ -106,12 +106,16 @@ pub enum ModelVariant {
     Lfm2Moe,
     /// Cohere2-MoE / North-Mini-Code (arch_id=12).
     Cohere2Moe,
+    /// Gemma 4 text, dense or MoE (arch_id=13).
+    Gemma4,
+    /// Muse Glimmer dense text (arch_id=14).
+    MuseGlimmer,
 }
 
 /// Per-cell policy outcome returned by the policy table.
 ///
 /// Every cell in the architecture-id matrix (`docs/architecture-ids.md`
-/// lines 14–28) maps to exactly one variant. See that table for the
+/// lines 14–30) maps to exactly one variant. See that table for the
 /// canonical mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellPolicy {
@@ -500,7 +504,7 @@ fn cell_info(variant: ModelVariant, axis: ParallelAxis) -> CellPolicy {
     use ModelVariant::*;
     use ParallelAxis::*;
 
-    // Policy categories from docs/architecture-ids.md lines 14-28:
+    // Policy categories from docs/architecture-ids.md lines 14-30:
     //   "implemented" / "implemented code; HW-XXX pending"  → Admitted
     //   "partial (GEN-XXX; HW-XXX pending)"                 → Planned { owner: "GEN-XXX" }
     //   "planned (AXIS-XXX; HW-XXX pending)"                → Planned { owner: "AXIS-XXX" }
@@ -658,6 +662,29 @@ fn cell_info(variant: ModelVariant, axis: ParallelAxis) -> CellPolicy {
         (Cohere2Moe, Ep) => Planned {
             owner: "AXIS-003",
             reason: "Cohere2-MoE EP: planned; AXIS-003",
+        },
+        // ── Gemma 4 text, dense or MoE (arch_id 13) ───────────────
+        (Gemma4, Single) => Admitted,
+        (Gemma4, Pp) => Unsupported {
+            reason: "Gemma4 PP: pp>1 unsupported",
+        },
+        (Gemma4, Tp) => Unsupported {
+            reason: "Gemma4 TP: no tensor-parallel path; single-device decode only",
+        },
+        (Gemma4, Ep) => Unsupported {
+            reason: "Gemma4 EP: no expert-parallel path",
+        },
+
+        // ── Muse Glimmer dense text (arch_id 14) ─────────────────
+        (MuseGlimmer, Single) => Admitted,
+        (MuseGlimmer, Pp) => Unsupported {
+            reason: "Muse Glimmer PP: pp>1 unsupported",
+        },
+        (MuseGlimmer, Tp) => Unsupported {
+            reason: "Muse Glimmer TP: no tensor-parallel path; single-device dense decode only",
+        },
+        (MuseGlimmer, Ep) => Unsupported {
+            reason: "Muse Glimmer EP: no expert-parallel path; dense EP is not normalized",
         },
     }
 }
@@ -954,10 +981,11 @@ mod tests {
         assert!(msg.contains("Qwen35Dense"), "msg={msg}");
     }
 
-    // ── Complete 13×4 golden policy matrix ───────────────────────
+    // ── Original 13×4 golden policy matrix ───────────────────────
 
-    /// Full 13 variant × 4 axis policy matrix. Every cell asserts the
-    /// expected `CellPolicy` (including embedded owner/reason).
+    /// Original 13 variant × 4 axis matrix. Gemma4 and Muse Glimmer are
+    /// exhaustively pinned by `full_policy_table_new_primary_variants`.
+    /// Every cell asserts exact policy, owner, and reason.
     #[test]
     fn full_policy_table() {
         use CellPolicy::*;
@@ -1220,5 +1248,215 @@ mod tests {
                 reason: "Cohere2-MoE EP: planned; AXIS-003",
             },
         );
+    }
+
+    // ── Gemma4 / Muse Glimmer primary rows (arch_ids 13 / 14) ──
+
+    /// Full policy contract for the new-primary variants `Gemma4`
+    /// (arch_id 13) and `MuseGlimmer` (arch_id 14), per
+    /// `docs/architecture-ids.md` "Primary model ids".
+    ///
+    /// Gemma4 is a dense-or-MoE text family and Muse Glimmer is dense text.
+    /// Both are single-device: `Single` is admitted; PP, TP, and EP are each
+    /// an explicit `Unsupported` cell — never a wildcard fall-through, never
+    /// a silent dense-EP normalisation, and never swept into the
+    /// DeepSeek4/MiniMax TP→EP remap. Muse Glimmer's
+    /// `pp > 1` refusal is production reality (loader carrier gate); Gemma4
+    /// has the same carrier gate. Sidecar ids 22 (Gemma4 EAGLE) and 23
+    /// (Glimmer DFlash draft) are NOT primary topology rows and have no
+    /// variant here.
+    #[test]
+    fn full_policy_table_new_primary_variants() {
+        use CellPolicy::*;
+        use ModelVariant::*;
+        use ParallelAxis::*;
+
+        fn check(v: ModelVariant, a: ParallelAxis, expected: CellPolicy) {
+            let got = cell_info(v, a);
+            assert_eq!(got, expected, "cell_info({v:?}, {a:?}) mismatch");
+        }
+
+        // ── Gemma4 (arch_id 13, dense or MoE text) ───────────────
+        check(Gemma4, Single, Admitted);
+        check(
+            Gemma4,
+            Pp,
+            Unsupported {
+                reason: "Gemma4 PP: pp>1 unsupported",
+            },
+        );
+        check(
+            Gemma4,
+            Tp,
+            Unsupported {
+                reason: "Gemma4 TP: no tensor-parallel path; single-device decode only",
+            },
+        );
+        check(
+            Gemma4,
+            Ep,
+            Unsupported {
+                reason: "Gemma4 EP: no expert-parallel path",
+            },
+        );
+
+        // ── Muse Glimmer (arch_id 14, dense text) ───────────────
+        check(MuseGlimmer, Single, Admitted);
+        check(
+            MuseGlimmer,
+            Pp,
+            Unsupported {
+                reason: "Muse Glimmer PP: pp>1 unsupported",
+            },
+        );
+        check(
+            MuseGlimmer,
+            Tp,
+            Unsupported {
+                reason: "Muse Glimmer TP: no tensor-parallel path; single-device dense decode only",
+            },
+        );
+        check(
+            MuseGlimmer,
+            Ep,
+            Unsupported {
+                reason: "Muse Glimmer EP: no expert-parallel path; dense EP is not normalized",
+            },
+        );
+    }
+
+    #[test]
+    fn gemma4_single_admitted() {
+        let admission = resolve(ModelVariant::Gemma4, req(1, 1, 1)).unwrap();
+        assert_eq!(admission.variant(), ModelVariant::Gemma4);
+        assert_eq!(admission.effective(), req(1, 1, 1));
+        assert!(!admission.was_normalized());
+    }
+
+    /// Every non-Single Gemma4 axis is an explicit `Unsupported` cell:
+    /// PP carries the carrier's `pp>1` refusal; TP must not be remapped to
+    /// EP (the DeepSeek4/MiniMax legacy remap is variant-scoped); EP must
+    /// not be normalised to (1,1,1) (Gemma4 has no CAP-001 dense-EP cell).
+    #[test]
+    fn gemma4_pp_tp_ep_explicitly_unsupported() {
+        for (pp, tp, ep, reason, axis) in [
+            (2, 1, 1, "pp>1 unsupported", ParallelAxis::Pp),
+            (1, 2, 1, "no tensor-parallel path", ParallelAxis::Tp),
+            (1, 1, 2, "no expert-parallel path", ParallelAxis::Ep),
+        ] {
+            let err = assert_refused(ModelVariant::Gemma4, pp, tp, ep, "CAP-001", reason);
+            assert_eq!(err.effective_axis(), Some(axis));
+            match &err {
+                AdmissionError::Unsupported { effective, .. } => {
+                    // Effective degrees are preserved verbatim: no TP→EP
+                    // remap and no dense-EP normalisation for Gemma4.
+                    assert_eq!(*effective, req(pp, tp, ep));
+                }
+                other => panic!("expected Unsupported variant, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn museglimmer_single_admitted() {
+        let admission = resolve(ModelVariant::MuseGlimmer, req(1, 1, 1)).unwrap();
+        assert_eq!(admission.variant(), ModelVariant::MuseGlimmer);
+        assert_eq!(admission.effective(), req(1, 1, 1));
+        assert!(!admission.was_normalized());
+    }
+
+    /// Every non-Single Muse Glimmer axis is an explicit `Unsupported`
+    /// cell: PP carries the arch's `pp>1` refusal; TP must not be remapped
+    /// to EP; EP must not be normalised to (1,1,1) (Muse Glimmer has no
+    /// CAP-001 dense-EP cell).
+    #[test]
+    fn museglimmer_pp_tp_ep_explicitly_unsupported() {
+        for (pp, tp, ep, reason, axis) in [
+            (2, 1, 1, "pp>1 unsupported", ParallelAxis::Pp),
+            (1, 2, 1, "no tensor-parallel path", ParallelAxis::Tp),
+            (1, 1, 2, "no expert-parallel path", ParallelAxis::Ep),
+        ] {
+            let err = assert_refused(ModelVariant::MuseGlimmer, pp, tp, ep, "CAP-001", reason);
+            assert_eq!(err.effective_axis(), Some(axis));
+            match &err {
+                AdmissionError::Unsupported { effective, .. } => {
+                    // Effective degrees are preserved verbatim: no TP→EP
+                    // remap and no dense-EP normalisation for Muse Glimmer.
+                    assert_eq!(*effective, req(pp, tp, ep));
+                }
+                other => panic!("expected Unsupported variant, got {other:?}"),
+            }
+        }
+    }
+
+    // ── Qwen3.8 family coverage (primary ids 5 / 6) ─────────────
+
+    /// Qwen3.8 has no runtime id of its own: dense Qwen3.8 rides primary
+    /// id 5 and MoE/A3B Qwen3.8 rides id 6 (`docs/architecture-ids.md`,
+    /// "Qwen3.5 / 3.6 / 3.8 dense" and "Qwen3.5 / 3.6 / 3.8 MoE (A3B)").
+    /// Its admission contract is therefore exactly the `Qwen35Dense` /
+    /// `Qwen35Moe` rows — no new variant, no new policy row, no invented
+    /// id. This pin keeps a future "Qwen3.8" variant (which would invent an
+    /// id) from silently changing Qwen3.8 admission.
+    #[test]
+    fn qwen38_family_is_covered_by_qwen35_rows() {
+        // Single: admitted on both dense (id 5) and MoE (id 6) rows.
+        for v in [ModelVariant::Qwen35Dense, ModelVariant::Qwen35Moe] {
+            let admission = resolve(v, req(1, 1, 1)).unwrap();
+            assert_eq!(admission.variant(), v);
+            assert_eq!(admission.effective(), req(1, 1, 1));
+        }
+
+        // Dense EP (id 5): CAP-001 normalisation to (1,1,1), no EP claim.
+        let admission = resolve(ModelVariant::Qwen35Dense, req(1, 1, 2)).unwrap();
+        assert_eq!(admission.effective(), req(1, 1, 1));
+        assert!(admission.was_normalized());
+
+        // MoE EP (id 6): planned under AXIS-002 — refused with owner+reason.
+        let err = assert_refused(
+            ModelVariant::Qwen35Moe,
+            1,
+            1,
+            2,
+            "CAP-001",
+            "planned; AXIS-002",
+        );
+        match &err {
+            AdmissionError::Planned {
+                owner, effective, ..
+            } => {
+                assert_eq!(*owner, "AXIS-002");
+                assert_eq!(*effective, req(1, 1, 2));
+            }
+            other => panic!("expected Planned variant, got {other:?}"),
+        }
+
+        // PP (id 5): partial under GEN-001 — refused with owner+reason.
+        let err = assert_refused(
+            ModelVariant::Qwen35Dense,
+            2,
+            1,
+            1,
+            "CAP-001",
+            "GEN-001 pending",
+        );
+        match &err {
+            AdmissionError::Planned { owner, .. } => assert_eq!(*owner, "GEN-001"),
+            other => panic!("expected Planned variant, got {other:?}"),
+        }
+
+        // TP (id 5): planned under AXIS-002 — refused with owner+reason.
+        let err = assert_refused(
+            ModelVariant::Qwen35Dense,
+            1,
+            2,
+            1,
+            "CAP-001",
+            "planned; AXIS-002",
+        );
+        match &err {
+            AdmissionError::Planned { owner, .. } => assert_eq!(*owner, "AXIS-002"),
+            other => panic!("expected Planned variant, got {other:?}"),
+        }
     }
 }

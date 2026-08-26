@@ -8,31 +8,36 @@ Bring-up narrative is historical:
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-07-19 |
-| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
+| Inventory date | 2026-08-26 (post-merge mainline) |
+| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` (pre-merge pin, historical); current surface: post-merge mainline crate split |
 | Page state | **shipped / ref-pinned** for source-wired multi-device behavior (see [`INDEX.md`](INDEX.md)); performance tables in the appendix are **historical** only |
-| Orchestration | `crates/hipfire-runtime/src/multi_gpu.rs` |
+| Orchestration | `crates/hipfire-hardware/src/lib.rs` (`Gpus` + device resolution; `hipfire_runtime::multi_gpu` re-exports) |
 | PP load path | `crates/hipfire-loader/src/carriers.rs` (`load_qwen35_pp`) |
-| Daemon load / refusals | `crates/hipfire-runtime/examples/daemon.rs` |
+| Daemon load / refusals | `crates/hipfire-daemon/src/main.rs` |
+| Load admission | daemon `daemon_load_plan` → `hipfire_loader::admit_path` (incl. non-HFQ mesh-source refusal) — preflight runs **before** any prior-model unload; the admitted load itself runs later via `load_admitted` |
 | Supporting multi-GPU script | [`scripts/pp-gate.sh`](../scripts/pp-gate.sh) (not a VALIDATION selector minimum route) |
 | Admissions | [`admissions.yml`](admissions.yml) — schema v2, exactly one single-GPU retained-PM4 record; no multi-GPU records (fail closed; none inferred) |
 
-## Modes
+Three multi-device modes exist. A load request resolves to **one effective
+axis**: more than one of `pp` / `tp` / `ep` greater than 1 is refused —
+`daemon_load_plan` surfaces the `hipfire_loader::admit_path` error before any
+unload (`tp×ep` = COMP-001, `pp×{tp|ep}` = CAP-001). Admission runs
+**before** any prior model or PFlash drafter is unloaded, so a request refused
+at admission leaves the previous model loaded.
 
-Two multi-device modes exist. They are **mutually exclusive** at load
-(`tp > 1 && pp > 1` → error).
-
-| Mode | Load knob | What it does | Source-wired runtime surface (audited ref) |
+| Mode | Load knob | What it does | Runtime surface |
 |---|---|---|---|
-| **Pipeline parallel (PP)** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; residual stream crosses bands via `boundary_copy` | Qwen3.5 / 3.6 **HFQ** only (`arch_id` 5 dense, 6 MoE/A3B) via `load_qwen35_pp` |
-| **Expert parallel (EP / `tp`)** | `params.tp`, or CLI `hipfire serve --tp N` → `HIPFIRE_TP` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9) via `load_model_ep` |
+| **Pipeline parallel (PP)** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; residual stream crosses bands via `boundary_copy` | Qwen3.5 / 3.6 **HFQ** (`arch_id` 5 dense, 6 MoE/A3B) via the legacy `load_qwen35_pp` path; admitted dense cells — LLaMA QK-norm and no-QK-norm (`arch_id` 0), plain Qwen3 (`arch_id` 1) — via `load_admitted` → `pp_model` (MeshCarrier, **HFQ-only**) |
+| **Tensor parallel (TP)** | daemon load `params.tp` | Within-layer weight/attention sharding for admitted dense cells | Admitted dense cells only, **HFQ-only**: LLaMA QK-norm (`arch_id` 0) and plain Qwen3 (`arch_id` 1) via `load_admitted` → `tp_model` (MeshCarrier). Every other cell is Planned/unsupported and refuses at admission |
+| **Expert parallel (EP)** | daemon load `params.tp` **or** `params.ep` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | Admitted EP cells only: MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9). `tp`/`ep` ≥ 2 folds into the admitted parallel request; other arches refuse at admission (e.g. Qwen3.5 MoE `ep`/`tp` = 2 is Planned `AXIS-002` → `[CAP-001]` refusal, prior model kept). No Qwen3.5 EP admission is claimed |
 
-`pp = 1` and `tp = 1` are single-GPU. Behavior matches the pre-multi-GPU paths.
+`pp = 1`, `tp = 1`, and `ep` absent/1 are single-GPU. Behavior matches the
+pre-multi-GPU paths.
 
-**None of the listed PP/EP routes is an admission or product default.**
+**None of the listed PP/TP/EP routes is an admission or product default.**
 [`admissions.yml`](admissions.yml) has no multi-GPU records at schema v2 (the sole earned row is single-GPU `pp=tp=1`).
-Source-wired means the load path exists in runtime at the audited ref — not that
-it is promoted.
+Source-wired means the load path exists in the merged mainline — not that it is
+promoted.
 
 **PP is not tensor-parallel serving.** It does not give multi-user throughput.
 It is a **capacity** tool: fit larger context / larger HFQ weights by splitting
@@ -40,14 +45,16 @@ layers. **No speedup is promised** for models that already fit on one card;
 current historical measurements on one 2× gfx1100 station were slower under
 sequential PP=2 (see [Appendix A](#appendix-a-historical-pp-evidence-immutable)).
 
-**CLI note:** the shipped CLI forwards **`tp`** (`HIPFIRE_TP` / `--tp`) on serve
-load messages. **`params.pp` is not a first-class CLI flag today** — set it on a
+**CLI note:** the shipped CLI forwards **`tp`** (`hipfire serve --tp N` →
+`params.tp` in the serve load message). There is no `HIPFIRE_TP` env read in
+the current control plane (retired with the pre-merge CLI). **`params.pp` and
+`params.ep` are not first-class CLI flags today** — set them on a
 raw daemon JSONL `load` (or any client that builds that message). Examples and
 `scripts/pp-gate.sh` do this directly.
 
 ## Topology (PP)
 
-Source of truth: `Gpus` in `multi_gpu.rs`.
+Source of truth: `Gpus` in `crates/hipfire-hardware` (re-exported as `hipfire_runtime::multi_gpu`).
 
 1. **Device pick** — `hardware.devices = "0,1,..."` is the physical visibility
    list. Startup installs it as `ROCR_VISIBLE_DEVICES` and gives HIP the
@@ -70,7 +77,7 @@ Source of truth: `Gpus` in `multi_gpu.rs`.
    (slower, still correct). Partial pair failure does not abort capable pairs.
 6. **Preflight**
    - Default: **exact `Gpu.arch` string match** across devices
-     (`d.arch != arch0` in `preflight_vram` / `multi_gpu.rs`). This is not a
+     (`d.arch != arch0` in `preflight_vram` / `crates/hipfire-hardware`). This is not a
      loose “family” compare.
    - Free-VRAM delta ≤ `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` (default **2.0**) for
      `init_uniform` / `init_tp` only.
@@ -116,7 +123,7 @@ hipfire config set hardware.devices 0,1
 # Bit-stable k-split reduction for pp=1 vs pp=2 parity work
 export HIPFIRE_DETERMINISTIC=1
 
-cargo run --release --features deltanet -p hipfire-runtime --example daemon
+cargo run --release -p hipfire-daemon
 # then send the load JSON above on stdin
 ```
 
@@ -124,11 +131,30 @@ cargo run --release --features deltanet -p hipfire-runtime --example daemon
 
 ```sh
 HIP_VISIBLE_DEVICES=0,1 hipfire serve <minimax-or-deepseek4-tag> --tp 2
-# equivalent: HIPFIRE_TP=2 …
+# --tp forwards params.tp in the serve load message; HIPFIRE_TP is not read
 ```
 
-EP does not honor a non-default `--kv-mode` the same way single-GPU load does
-today — the CLI warns when both are set. Reload without a DFlash draft for EP.
+`params.ep` is accepted on raw daemon JSONL loads and folds into the same
+admitted EP request (`ep` ≥ 2 on arch 9/10 → EP loader). EP does not honor a
+non-default `--kv-mode` the same way single-GPU load does today — the CLI
+warns when both are set. Reload without a DFlash draft for EP.
+
+### Emulation (`HIPFIRE_EMULATE_GPUS`) — debug hardware resolution
+
+`HIPFIRE_EMULATE_GPUS=N` is a **debug hardware-resolution emulation enable
+switch**: any parsed value ≥ 2 (unset, `< 2`, or unparseable = off) turns on
+aliasing of the requested logical device ids onto the physical devices present
+(`resolve_device_ids` maps each id by `rem_euclid` into the physical range —
+`[0,1] → [0,0]` on a one-GPU box), so the multi-GPU paths (PP/TP/EP) run on
+one card for development and parity work.
+
+**The value is not a degree.** The rank count comes from the explicit axis
+request: `params.pp=2` creates two PP ranks (aliased), `params.tp=2` two EP/TP
+ranks — `HIPFIRE_EMULATE_GPUS=4` with `params.pp=2` still aliases exactly two
+ranks, and the variable alone creates no ranks. It does not default `tp` or
+any other degree (the pre-merge “default mode is TP” promotion was deleted
+with `resolve_parallelism`). It is env-only — there is no
+`hardware.emulate_gpus` TOML key.
 
 ### Environment (operator-facing)
 
@@ -143,7 +169,7 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | `init_uniform` / `init_tp` free-VRAM delta |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
-| `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
+| `HIPFIRE_EMULATE_GPUS` | Debug hardware-resolution emulation — see [Emulation](#emulation-hipfire_emulate_gpus--debug-hardware-resolution). Not a TP/EP request |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
 | `HIPFIRE_PP_PFLASH=1` | **Experimental** — accept PFlash compose with `pp>1` (not a product default; not route-certified) |
 | `HIPFIRE_PP_DFLASH=1` | **Experimental** — accept DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text) |
@@ -159,18 +185,22 @@ string or a blanket “always refuse at load.”
 
 | Condition | Behavior |
 |---|---|
-| `tp > 1` and `pp > 1` | Error: mutually exclusive |
+| More than one of `pp` / `tp` / `ep` > 1 | Error: mutually exclusive (`tp×ep` = COMP-001, `pp×{tp|ep}` = CAP-001); refused at admission, prior model kept |
+| Admission refusal (`[CAP-001]` / `[COMP-001]` / Planned cell) | **Preflight-before-unload:** `daemon_load_plan` runs `admit_path` before any unload — the previous model + PFlash drafter stay loaded. Effective-TP/EP loads additionally defer the prior-model unload until the new model is loaded; Single/PP unload eagerly. Dense TP/PP are **HFQ-only**: `daemon_load_plan` refuses non-HFQ mesh sources in preflight (before any unload); the loader-internal checks (`load_tp_admitted` / `load_pp_admitted`) are defensive backstops |
 | DFlash `draft` set and `HIPFIRE_PP_DFLASH` unset | Error: DFlash requires `pp=1` |
 | DFlash `draft` set and `HIPFIRE_PP_DFLASH=1` | **Experimental exception:** load may accept; cross-card speculative generate is **not** fully implemented (daemon message states PR2–4 of the hetero PFlash/DFlash plan are incomplete). Not an admission. |
 | CASK / TriAttention sidecar set | Error: requires `pp=1` |
 | PFlash drafter / mode on and `HIPFIRE_PP_PFLASH` unset | Error: PFlash requires `pp=1` |
 | PFlash on and `HIPFIRE_PP_PFLASH=1` | **Experimental exception:** opt-in only; not a product default and not route-certified performance. |
-| Non-PP carriers at `pp>1` | Carrier-specific error strings (not one universal quote). Examples at the audited ref: `qwen2: pipeline-parallel (pp>1) unsupported`; `llama:` / `dots_ocr:` / `deepseek4:` / `minimax:` / `lfm2moe:` `pipeline-parallel (pp>1) unsupported` on HFQ (and distinct `safetensors + pp>1 unsupported` on dirs); **`cohere2moe: pp>1 unsupported via registry`** (different wording). |
+| Non-admitted carriers at `pp>1` | Carrier-specific error strings (not one universal quote). Examples: `qwen2:` / `dots_ocr:` / `deepseek4:` / `minimax:` / `lfm2moe:` / `cohere2moe:` `pipeline-parallel (pp>1) unsupported` (distinct `safetensors + pp>1 unsupported` on dirs). LLaMA-family (arch 0/1) PP is an **admitted** dense cell and does not refuse. |
 | Qwen3.5 **safetensors directory** + `pp>1` | Error: `qwen35: safetensors + pp>1 unsupported` |
 | Qwen3.5 / 3.6 **VL HFQ** + `pp>1` | **Not a hard refuse.** `load_qwen35_pp` is the text HFQ loader only — vision weights are **not** loaded on that path, so VL artifacts **silently become text-only** under PP. Serve real VL at `pp=1`. |
 | `bench_prefill` / multi-GPU EP | Daemon refuses bench_prefill when `pp>1` or EP is active |
 
-EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
+EP-only: admitted EP loads (`tp`/`ep` ≥ 2 on arch 9/10) refuse a DFlash draft;
+any other `tp>1` / `ep>1` request refuses at admission (`[CAP-001]`, before
+unload) instead of reaching the EP loader — e.g. Qwen3.5 MoE `tp=2` is Planned
+`AXIS-002`. No Qwen3.5 EP admission is claimed.
 
 ### Architectural limits (current)
 
@@ -191,7 +221,7 @@ mode, `max_seq`, and split.
 
 ```sh
 HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
-  -p hipfire-runtime --example pp2_vram_probe -- \
+  -p saddle-lab --example pp2_vram_probe -- \
   ~/.hipfire/models/qwen3.5-9b.mq4 4096
 ```
 
@@ -314,7 +344,7 @@ sampler in place.
 ## Memory budget (per-card, PP=2)
 
 Numbers below are **measured** on 2× Radeon RX 7900 XTX (gfx1100, 25.8 GiB VRAM
-each) via `crates/hipfire-runtime/examples/pp2_vram_probe.rs` —
+each) via `crates/saddle-lab/examples/pp2_vram_probe.rs` —
 `hipMemGetInfo` deltas captured at each allocation stage
 (`load_weights_multi`, `Qwen35ScratchSet`,
 `KvCache::new_gpu_asym3_capped_multi`, `DeltaNetState`). Per-card columns
@@ -361,7 +391,7 @@ To reproduce on your hardware:
 
 ```sh
 HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
-    -p hipfire-runtime --example pp2_vram_probe -- \
+    -p saddle-lab --example pp2_vram_probe -- \
     ~/.hipfire/models/qwen3.5-9b.mq4 4096
 ```
 
@@ -409,15 +439,15 @@ enforcement for planned and unsupported cells; it is not implemented here.
 
 | Axis/cell | Current policy | Production gate or owner |
 |-----------|----------------|--------------------------|
-| Plain Qwen PP/TP | Existing code; pending applicable physical proof | `HW-003` / `HW-006` |
-| LLaMA PP | Existing code; physical proof pending | `HW-003` |
-| LLaMA TP | Partial; narrow eligible-artifact support | `AXIS-001`, then `HW-006` for production closure |
+| Plain Qwen PP/TP | Implemented (admitted dense route); physical proof pending | `HW-003` / `HW-006` |
+| LLaMA PP | Implemented (admitted dense route, incl. no-QK-norm); physical proof pending | `HW-003` |
+| LLaMA TP | Implemented for admitted QK-norm artifacts; non-QK-norm refused | `AXIS-001`, then `HW-006` for production closure |
 | Qwen2/VibeThinker PP/TP | Planned; not currently supported | `AXIS-001`, then `HW-003` / `HW-006` |
 | Qwen35 arch-resident PP | Partial; generation remains arch-resident | `GEN-001`, then `HW-004` |
 | DeepSeek4 EP | Existing code; pending physical proof | `HW-001` |
 | MiniMax EP | Existing code; pending physical proof | `HW-002` |
 | Other planned PP/TP and MoE-EP cells | Current architecture-specific behavior remains under `PAR-001` characterization; consistent early planned/unsupported-cell enforcement belongs to `CAP-001` and the owning `AXIS-*`/`GEN-*` implementation | `AXIS-001`–`AXIS-004`, `GEN-001`, `PAR-002` |
-| Dense `EP > 1` | Governed by existing architecture-specific refusal; no EP support claim | `CAP-001` will normalize to one effective replica before mesh/device/allocation/collective construction |
+| Dense `EP > 1` | Normalized to one effective replica before mesh/device/allocation/collective construction (`CAP-001`; dense rows marked `normalized-to-single`) | `CAP-001` (complete) |
 | `TP > 1` × `EP > 1` | Explicitly refused (COMP-001) | Out-of-scope decision recorded; see `.agent-progress/device-mesh-refactor-tracker.md` |
 
 Each implemented cell requires its applicable named hardware gate (for

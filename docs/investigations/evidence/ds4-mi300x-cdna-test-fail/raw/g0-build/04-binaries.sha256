@@ -1,0 +1,16 @@
+=== binaries ===
+-rwxr-xr-x 2 root root 7974176 Aug  1 12:44 target/release/hipfire
+c1a99f7bd359ac435a1169ba25d85096761a0c757c3c96f6b3381a948acc88d6  target/release/hipfire
+663c60e60301006227a4e468cab07b5f  target/release/hipfire
+-rwxr-xr-x 2 root root 24994136 Aug  1 12:45 target/release/examples/daemon
+6207b9a3fe2be4a7719acb34b992d8e7ca84b965fa83166cff0aeca9ed10bc67  target/release/examples/daemon
+33b09a7c67566c35d1dd8ff3ecd3675d  target/release/examples/daemon
+-rwxr-xr-x 2 root root 2044368 Aug  1 12:45 target/release/examples/test_kernels
+db922883a45557d06f80efc8b9163bd09f751df7f2ec5d8c0b75d80a3a61d272  target/release/examples/test_kernels
+47cb8cef2eb4d28d95645f5f5829d4f9  target/release/examples/test_kernels
+-rwxr-xr-x 2 root root 4152928 Aug  1 12:45 target/release/examples/ds4_prompt_fixture
+01306dcc98606c12aaa9e407ffd923ade4ee20b0c3d1c5e997319759d4d4005a  target/release/examples/ds4_prompt_fixture
+529246273cf3d4a2261bd16eff3fd8f4  target/release/examples/ds4_prompt_fixture
+-rwxr-xr-x 2 root root 9868664 Aug  1 12:45 target/release/examples/deepseek4_prefill_bench
+04eaad37512e59052d68297d407c463f203a97c7b22a05e057fcc4715a82890c  target/release/examples/deepseek4_prefill_bench
+91acba6a779db4dfe5e1ff59ac54db5a  target/release/examples/deepseek4_prefill_bench

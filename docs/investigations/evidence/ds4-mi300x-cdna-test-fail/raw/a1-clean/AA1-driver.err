@@ -1,0 +1,84 @@
+[feed] label=AA1
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.25s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 76.17s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-AA1","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I will use
+[feed] << {"type":"token","id":"g0-AA1","text":"[co","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"inu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ed from u","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ser:","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" ...]I'll ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"co","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ntinue th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"e a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ssis","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"tant'","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"s response","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"in ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"e s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"am","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"e tech","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"nic","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"al,","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" no-nonsly","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"tyle.\n\nTh","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"e a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ssi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"sta","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"nt's r","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"espon","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"se:\n\n..","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":".det","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ection mus","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"t rej","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ect a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ny c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"andida","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"te t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"hat doe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"s not match t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"h","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"e ta","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"rget ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"architect","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"u","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"re. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"For thi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"s c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ampai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"gn","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":", ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" targe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"t is D","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"eepSeek","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" V4","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":" Fla","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"sh cl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"ass ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-AA1","text":"models on AMD Instinct","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-AA1","tokens":64,"tok_s":2.2732116217944163,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20826,"total_ms":48981,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-AA1","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-AA1","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-AA1', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+deepseek4 gfx942 A2 levers: L1 compressor_gate=OFF (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=OFF (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+[daemon-control] received commit for id=g0-AA1 attempt_id=1
+[feed] << {"type":"done","id":"g0-AA1","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":64,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

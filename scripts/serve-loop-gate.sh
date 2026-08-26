@@ -44,7 +44,7 @@ MODEL="$(pick_model)"
 if [ -f "$ROOT/scripts/gpu-lock.sh" ]; then source "$ROOT/scripts/gpu-lock.sh" && gpu_acquire "serve-loop-gate" || true; fi
 cleanup() {
   fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
-  pkill -f "examples/daemon" >/dev/null 2>&1 || true
+  pkill -f "daemon" >/dev/null 2>&1 || true
   command -v gpu_release >/dev/null 2>&1 && gpu_release || true
 }
 trap cleanup EXIT
@@ -55,7 +55,7 @@ HIPFIRE="${HIPFIRE_CLI_BIN:-$ROOT/target/release/hipfire}"
 
 SERVELOG="$(mktemp)"
 start_serve() { # $1 = extra env (e.g. "HIPFIRE_DFLASH_OFF")
-  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; pkill -f "examples/daemon" >/dev/null 2>&1 || true; sleep 1
+  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; pkill -f "daemon" >/dev/null 2>&1 || true; sleep 1
   : > "$SERVELOG"
   local cfg=""; [ "${1:-}" = "ar" ] && cfg="HIPFIRE_DFLASH_DRAFT="  # disable draft auto-detect → AR path
   env $cfg HIPFIRE_MODEL="$MODEL" setsid "$HIPFIRE" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 & disown

@@ -22,7 +22,7 @@ This plan deliberately excludes PP, multi-GPU, CASK/TriAttention compaction, fla
 
 ## Phase 1 — impact map and API boundary
 
-Before editing each named symbol, run GitNexus upstream impact and warn on HIGH/CRITICAL results as required by `AGENTS.md`. Run LSP references before changing exported signatures.
+Before editing each named symbol, run `codegraph_explore` on it to establish the call paths, and `lsp references` to enumerate every callsite. (This line originally required a GitNexus upstream-impact report; GitNexus has since been removed from the project — see CLAUDE.md § "Code intelligence — CodeGraph".) Run LSP references before changing exported signatures.
 
 Establish the narrow API boundary:
 
@@ -175,4 +175,4 @@ The existing measured reference is not a guaranteed floor: contiguous 200.975 to
 
 ## Cleanup admission
 
-Only after the integrated smoke demonstrates the requested behavior may the execution tracker add cleanup tasks for permanent tests, docs reconciliation, rustfmt, clippy, workspace unit checks, GitNexus `detect_changes`, and final adversarial review. This preserves the repository workflow rule that housekeeping cannot steer an unproven implementation.
+Only after the integrated smoke demonstrates the requested behavior may the execution tracker add cleanup tasks for permanent tests, docs reconciliation, rustfmt, clippy, workspace unit checks, CodeGraph change-scope review, and final adversarial review. This preserves the repository workflow rule that housekeeping cannot steer an unproven implementation.

@@ -27,10 +27,10 @@ echo "Model: $MODEL"
 echo "Output: $OUTDIR/"
 
 # Build the diagnostic example if needed
-cargo build --release -p hipfire-runtime --features deltanet --example logit_dump 2>&1 | tail -1
+cargo build --release -p saddle-lab --features arch-qwen35 --example logit_dump 2>&1 | tail -1
 
 # Run it
-cargo run --release -p hipfire-runtime --features deltanet --example logit_dump -- \
+cargo run --release -p saddle-lab --features arch-qwen35 --example logit_dump -- \
     "$MODEL" "$OUTDIR" 2>"$OUTDIR/stderr.log"
 
 echo "Done. Files in $OUTDIR/"

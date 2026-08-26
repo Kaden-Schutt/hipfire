@@ -61,8 +61,10 @@ __pycache__/
 *.log
 /tmp/
 
-# Local Claude agent state
+# Local agent harness state (Claude / Oh My Pi). Per-session bookkeeping,
+# worktrees, and artifact caches — never part of the tracked tree.
 .claude/
+.omp/
 # Personal CLI instructions
 cli/CLAUDE.md
 CLAUDE.local.md
@@ -144,6 +146,43 @@ docs/investigations/*/sources/
 *.rocpd
 *.pftrace
 
+# Agentic review local provider overrides (per-developer, not checked in)
+.github/agentic-review/providers.local.json
+# Harvested corpus index — regenerable from autoresearch/corpus/*.jsonl
+# via scripts/harvest_ledgers.py --ingest
+autoresearch/db/ar.db
+
+# Redline capture-corpus index — regenerable from redline/corpus/*.jsonl
+# via scripts/harvest_redline.py --ingest
+redline/db/redline.db
+
 # Local research scratch (agent surveys, microbenches)
 .research/
+
+# superpowers subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
+
+# Code-intelligence index (per-checkout, machine-local)
+.codegraph/
+# Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate
+# with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
+# in commit messages and docs/investigations/.
+out/
+
+# DeepSeek V4 reference source is third-party and gitignored at
+# .codeinsight+research/; never vendor it into the tracked tree.
+crates/hipfire-arch-deepseek4/reference_oracle/model.py
+crates/hipfire-arch-deepseek4/reference_oracle/kernel.py
+crates/hipfire-arch-deepseek4/reference_oracle/config.json
+crates/hipfire-arch-deepseek4/reference_oracle/__pycache__/
+
+# MI300X calibration deployment bundles (regenerable)
+dist/
+dist_test/
+
+# hipcc ICE reproducer dumps (emitted into CWD on an internal compiler error)
+*.hipi
+*.hipfb
+/*-hip-amdgcn-amd-amdhsa-*.s
+/*-host-x86_64-unknown-linux-gnu.s
 .slim/deepwork/

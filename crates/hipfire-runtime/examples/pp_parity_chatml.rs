@@ -20,6 +20,7 @@ use hipfire_arch_qwen35::qwen35::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
@@ -150,7 +151,7 @@ fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
         4096,
     )
     .expect("kv multi");
-    let mut dn =
+    let (mut dn, _la_to_device) =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 

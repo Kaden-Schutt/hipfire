@@ -58,14 +58,13 @@ use hipfire_runtime::dspark_core::{
     DsparkWeights,
 };
 use hipfire_runtime::gpu_cleanup::{retain_kv_failures, GpuCleanupFailure};
-use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
+use hipfire_runtime::hfq::{load_awq_scale, load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
-    weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights,
-    ModelArch, PrefillBatchScratch, WeightTensor,
+    weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, KvCacheExt, LayerWeights, LlamaConfig,
+    LlamaWeights, ModelArch, PrefillBatchScratch, WeightTensor,
 };
 use hipfire_runtime::weight_backend::{
-    dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
-    HfqBackend,
+    dequant_f32, dequant_norm, dequant_weight_raw, load_embedding, read_first, HfqBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -78,6 +77,38 @@ fn bare_name_candidates(name: &str) -> Vec<String> {
 }
 
 // ── Assets bundle ─────────────────────────────────────────────────────────────
+/// Free a [`DsparkWeights`] bundle's GPU tensors on their owner device.
+///
+/// Merged mainline `hipfire_runtime::dspark_core::DsparkWeights` carries no
+/// `free_gpu`; the qwen3 drafter's rollback (`DsparkLoadStaging::free_gpu`)
+/// and unload (`Qwen3DsparkBody::free`) paths still own such a bundle, so the
+/// real ownership cleanup lives here: every `Option<GpuTensor>` field is
+/// returned to the pool and host metadata (`cfg`, `d2t`) is dropped.
+fn free_dspark_weights(weights: DsparkWeights, gpu: &mut Gpu) {
+    let DsparkWeights {
+        cfg: _,
+        main_proj,
+        main_norm,
+        markov_w1,
+        markov_w2,
+        confidence_proj,
+        confidence_bias,
+        d2t: _,
+    } = weights;
+    for tensor in [
+        main_proj,
+        main_norm,
+        markov_w1,
+        markov_w2,
+        confidence_proj,
+        confidence_bias,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = gpu.free_tensor(tensor);
+    }
+}
 
 /// GPU-resident assets for the 5-layer Qwen3-8B DSpark drafter body.
 ///
@@ -219,7 +250,7 @@ impl DsparkLoadStaging {
         if let Some(t) = self.output {
             t.free_all(gpu);
         }
-        self.globals.free_gpu(gpu);
+        free_dspark_weights(self.globals, gpu);
         if let Some(kv) = self.kv {
             kv.free_gpu(gpu);
         }
@@ -233,6 +264,30 @@ impl DsparkLoadStaging {
 }
 
 // ── Public loader ─────────────────────────────────────────────────────────────
+
+/// Per-tensor adoption hook for the drafter's F32 KV cache. Returns a closure
+/// that runs the generic-DFlash `F32KvAllocation` indexed boundary after each
+/// K/V tensor is adopted inside the KV constructor (layer `l`'s K at index
+/// `2*l`, its V at `2*l + 1`); a fault aborts the construction and the
+/// staging rollback frees every adopted tensor. No-op when the fault feature
+/// is disabled.
+fn f32_kv_adoption_hook() -> impl FnMut(usize) -> hip_bridge::HipResult<()> {
+    #[cfg(feature = "dflash-fault-inject")]
+    {
+        |tensor_index| {
+            hipfire_runtime::dflash_generic::generic_dflash_allocation_boundary(
+                hipfire_runtime::dflash_generic::GenericDflashConstructionStage::F32KvAllocation(
+                    tensor_index,
+                ),
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e))
+        }
+    }
+    #[cfg(not(feature = "dflash-fault-inject"))]
+    {
+        |_tensor_index| Ok(())
+    }
+}
 
 /// Load the Qwen3-8B DSpark sidecar into `(DsparkWeights, Qwen3DrafterAssets)`.
 ///
@@ -388,11 +443,22 @@ pub fn load_qwen3_dspark(
         staged.globals.cfg.confidence_uses_normed = true;
         staged.globals.cfg.rms_norm_eps = cfg.norm_eps;
 
-        // 8. Allocate drafter F32 KV cache.
+        // 8. Allocate drafter F32 KV cache. The per-tensor adoption hook
+        // (generic-DFlash `F32KvAllocation` seam) fires inside the KV
+        // constructor immediately after each K/V tensor is adopted — a fault
+        // rolls the whole sidecar load back through the staging with every
+        // staged tensor freed.
         let block_cap = dspark_cfg.block_size;
         staged.kv = Some(
-            KvCache::new_gpu(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, block_cap)
-                .map_err(|e| format!("qwen3_dspark: KvCache::new_gpu: {e:?}"))?,
+            KvCache::new_gpu_with_hook(
+                gpu,
+                cfg.n_layers,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                block_cap,
+                f32_kv_adoption_hook(),
+            )
+            .map_err(|e| format!("qwen3_dspark: KvCache::new_gpu: {e:?}"))?,
         );
         staged.milestone()?;
 
@@ -513,7 +579,7 @@ fn load_global_proj(
     let mut wt = dequant_weight_raw(gpu, info.quant_type, &data, m, k)
         .map_err(|e| format!("qwen3_dspark: {name}: {e:?}"))?;
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = match load_awq_scale_for(source, gpu, name, k) {
+        wt.awq_scale = match load_awq_scale(source, gpu, name, k) {
             Ok(scale) => scale,
             Err(error) => {
                 wt.free_all(gpu);
@@ -696,6 +762,13 @@ impl Qwen3DsparkScratch {
             kv_cap,
         )
         .map_err(|e| format!("Qwen3DsparkScratch: kv: {e:?}"))?;
+        #[cfg(feature = "dflash-fault-inject")]
+        if let Err(error) = hipfire_runtime::dflash_generic::generic_dflash_allocation_boundary(
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::QwenAuxAllocation(0),
+        ) {
+            let _ = kv.free_gpu(gpu);
+            return Err(error);
+        }
 
         let pbs = match PrefillBatchScratch::new(gpu, config, block_size, kv_cap) {
             Ok(pbs) => pbs,
@@ -704,6 +777,14 @@ impl Qwen3DsparkScratch {
                 return Err(format!("Qwen3DsparkScratch: pbs: {error:?}"));
             }
         };
+        #[cfg(feature = "dflash-fault-inject")]
+        if let Err(error) = hipfire_runtime::dflash_generic::generic_dflash_allocation_boundary(
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::QwenAuxAllocation(1),
+        ) {
+            pbs.free_gpu(gpu);
+            let _ = kv.free_gpu(gpu);
+            return Err(error);
+        }
 
         let kv_dim = config.n_kv_heads * config.head_dim;
 
@@ -724,6 +805,13 @@ impl Qwen3DsparkScratch {
                 }
                 .map_err(|e| format!("Qwen3DsparkScratch: {name}: {e:?}"))?;
                 tensors.push(tensor);
+                #[cfg(feature = "dflash-fault-inject")]
+                hipfire_runtime::dflash_generic::generic_dflash_allocation_boundary(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::QwenAuxAllocation(
+                        2 + tensors.len() - 1,
+                    ),
+                )
+                .map_err(|e| format!("Qwen3DsparkScratch: {name}: {e}"))?;
             }
             Ok(())
         })();
@@ -1507,5 +1595,201 @@ mod send_assertions {
     #[test]
     fn qwen3_dspark_body_is_send() {
         _assert_send::<super::Qwen3DsparkBody>();
+    }
+}
+
+// ── Generic-DFlash construction-fault rollback ─────────────────────────
+/// The `QwenAuxAllocation` indexed fault fires through the REAL
+/// `Qwen3DsparkScratch::new` constructor — the Qwen auxiliary drafter
+/// scratch with transaction staging. Arming index i fails the construction
+/// with every resource adopted up to i freed (q8 KV at 0, PrefillBatchScratch
+/// at 1, then the six tensor buffers at 2..=7), and arming exactly the
+/// allocation count succeeds — the sweep sentinel — so the seam is never a
+/// helper-only exercise.
+#[cfg(all(test, feature = "dflash-fault-inject"))]
+mod construction_faults {
+    use super::*;
+
+    /// The `F32KvAllocation` indexed fault fires at the REAL mid-loop
+    /// adoption point of the drafter's F32 KV cache: `load_qwen3_dspark`
+    /// builds it through `KvCache::new_gpu_with_hook` with
+    /// [`f32_kv_adoption_hook`], which runs the boundary immediately after
+    /// each K/V tensor is adopted inside the constructor (layer `l` K at
+    /// `2*l`, V at `2*l + 1`). Arming index i fails the construction with
+    /// every tensor adopted up to i freed, and arming exactly `2 * n_layers`
+    /// succeeds — the sweep sentinel.
+    #[test]
+    fn f32_kv_allocation_fault_rolls_back_each_drafter_tensor() {
+        // Same gate as the runtime GPU tests: skip cleanly on GPU-less CI.
+        if Gpu::init().is_err() {
+            eprintln!("skip: no GPU");
+            return;
+        }
+        let mut gpu = Gpu::init().expect("GPU required for the F32 KV rollback contract");
+
+        const N_LAYERS: usize = 5;
+        const N_KV_HEADS: usize = 8;
+        const HEAD_DIM: usize = 128;
+        const BLOCK_CAP: usize = 8;
+        const ALLOCATION_COUNT: usize = 2 * N_LAYERS;
+        const VRAM_TOLERANCE_BYTES: usize = 64 * 1024 * 1024;
+
+        // Warm-up cycle: one successful construction + free absorbs one-time
+        // driver / allocator residency, so the measured baseline is stable.
+        {
+            let kv = KvCache::new_gpu(&mut gpu, N_LAYERS, N_KV_HEADS, HEAD_DIM, BLOCK_CAP)
+                .expect("warm-up F32 KV must succeed");
+            let _ = kv.free_gpu(&mut gpu);
+        }
+        gpu.drain_pool();
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM").0;
+
+        let mut success = false;
+        for allocation in 0..=ALLOCATION_COUNT {
+            let result = hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                hipfire_runtime::dflash_generic::GenericDflashConstructionStage::F32KvAllocation(
+                    allocation,
+                ),
+                || {
+                    KvCache::new_gpu_with_hook(
+                        &mut gpu,
+                        N_LAYERS,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                        BLOCK_CAP,
+                        f32_kv_adoption_hook(),
+                    )
+                },
+            );
+            match result {
+                Ok(kv) => {
+                    let _ = kv.free_gpu(&mut gpu);
+                    gpu.drain_pool();
+                    assert_eq!(
+                        allocation, ALLOCATION_COUNT,
+                        "the success sentinel must be exactly one past the last \
+                         F32 KV tensor"
+                    );
+                    let after = gpu.hip.get_vram_info().expect("sentinel VRAM").0;
+                    assert!(
+                        baseline.abs_diff(after) < VRAM_TOLERANCE_BYTES,
+                        "VRAM not recovered at the F32 KV success sentinel: \
+                         baseline={baseline} after={after}"
+                    );
+                    success = true;
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("test fault after generic DFlash"),
+                        "expected the armed F32 KV fault, got: {error}"
+                    );
+                    gpu.drain_pool();
+                    let after = gpu.hip.get_vram_info().expect("rollback VRAM").0;
+                    assert!(
+                        baseline.abs_diff(after) < VRAM_TOLERANCE_BYTES,
+                        "VRAM not reclaimed after F32 KV rollback at allocation \
+                         {allocation}: baseline={baseline} after={after} delta={}",
+                        baseline.saturating_sub(after)
+                    );
+                }
+            }
+        }
+        assert!(
+            success,
+            "F32 KV sweep did not reach the constructor-success sentinel"
+        );
+    }
+
+    #[test]
+    fn qwen_aux_allocation_fault_rolls_back_each_scratch_tensor() {
+        // Same gate as the runtime GPU tests: skip cleanly on GPU-less CI.
+        if Gpu::init().is_err() {
+            eprintln!("skip: no GPU");
+            return;
+        }
+        let mut gpu = Gpu::init().expect("GPU required for the Qwen-aux rollback contract");
+        let config = LlamaConfig {
+            arch: ModelArch::Llama,
+            dim: 4096,
+            hidden_dim: 14_336,
+            n_layers: 5,
+            n_heads: 32,
+            n_kv_heads: 8,
+            vocab_size: 151_936,
+            head_dim: 128,
+            norm_eps: 1e-5,
+            max_seq_len: 1_048_576,
+            rope_freq_base: 10_000.0,
+            bos_token: 1,
+            eos_token: 2,
+            has_qk_norm: false,
+        };
+        const BLOCK_SIZE: usize = 8;
+        const MAX_CTX_LEN: usize = BLOCK_SIZE + 1;
+        // Adoptions: q8 KV (0) + PrefillBatchScratch (1) + all_k/all_v/
+        // positions_kv_all/positions_q_block/positions_compact/bias (2..=7)
+        // = 8; the success sentinel sits exactly at 8.
+        const ALLOCATION_COUNT: usize = 8;
+        const VRAM_TOLERANCE_BYTES: usize = 64 * 1024 * 1024;
+
+        // Warm-up cycle: one successful construction + free absorbs one-time
+        // driver / allocator residency, so the measured baseline is stable.
+        {
+            let scratch = Qwen3DsparkScratch::new(&mut gpu, &config, BLOCK_SIZE, MAX_CTX_LEN)
+                .expect("warm-up Qwen aux scratch must succeed");
+            scratch.free_gpu(&mut gpu);
+        }
+        gpu.drain_pool();
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM").0;
+
+        let mut success = false;
+        for allocation in 0..=ALLOCATION_COUNT {
+            let result = hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                hipfire_runtime::dflash_generic::GenericDflashConstructionStage::QwenAuxAllocation(
+                    allocation,
+                ),
+                || Qwen3DsparkScratch::new(&mut gpu, &config, BLOCK_SIZE, MAX_CTX_LEN),
+            );
+            match result {
+                Ok(scratch) => {
+                    scratch.free_gpu(&mut gpu);
+                    gpu.drain_pool();
+                    assert_eq!(
+                        allocation, ALLOCATION_COUNT,
+                        "the success sentinel must be exactly one past the last \
+                         Qwen-aux allocation"
+                    );
+                    let after = gpu.hip.get_vram_info().expect("sentinel VRAM").0;
+                    assert!(
+                        baseline.abs_diff(after) < VRAM_TOLERANCE_BYTES,
+                        "VRAM not recovered at the Qwen-aux success sentinel: \
+                         baseline={baseline} after={after}"
+                    );
+                    success = true;
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        error.contains("test fault after generic DFlash"),
+                        "expected the armed Qwen-aux fault, got: {error}"
+                    );
+                    gpu.drain_pool();
+                    let after = gpu.hip.get_vram_info().expect("rollback VRAM").0;
+                    assert!(
+                        baseline.abs_diff(after) < VRAM_TOLERANCE_BYTES,
+                        "VRAM not reclaimed after Qwen-aux rollback at allocation \
+                         {allocation}: baseline={baseline} after={after} delta={}",
+                        baseline.saturating_sub(after)
+                    );
+                }
+            }
+        }
+        assert!(
+            success,
+            "Qwen-aux sweep did not reach the constructor-success sentinel"
+        );
     }
 }

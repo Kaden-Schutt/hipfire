@@ -13,8 +13,10 @@
 //! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
+pub mod admission;
 pub mod arch;
-pub mod arch_dispatch;
+pub mod arch_mapping;
+pub mod arch_model;
 pub mod arch_spec;
 pub mod augmentor;
 pub mod bf16_loader;
@@ -36,6 +38,7 @@ pub mod eval_common;
 pub mod gguf;
 pub mod gpu_cleanup;
 pub mod hfq;
+pub mod hfq_parallel;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
@@ -49,14 +52,18 @@ pub mod moe_plan;
 pub mod multi_gpu;
 pub mod paro;
 pub mod pp_serve;
+pub mod prefix;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod serve;
 pub mod spec;
 
+pub mod ngram_mod;
 pub mod spec_ngram;
 pub mod spec_transcript;
 mod stop_quarantine;
+pub mod swap;
 pub mod tp_forward;
 pub mod tp_serve;
 pub mod tp_shard;
@@ -71,9 +78,10 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
-pub mod stream_parser;
+pub mod session_table;
 pub mod tokenizer;
 
+pub mod calibration;
 pub mod tool_call;
 pub mod weight_backend;
 

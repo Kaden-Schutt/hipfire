@@ -19,6 +19,7 @@ max_total_tokens = 0
 [memory]
 # Replaces HIPFIRE_KV_MODE=q8.
 kv_cache = "q8"
+kv_backend = "contiguous"
 max_seq = 32768
 # Replaces HIPFIRE_PROMPT_CACHE_CAP=32.
 prompt_cache_capacity = 32
@@ -48,3 +49,6 @@ port = 11435
 # Replaces HIPFIRE_IDLE_TIMEOUT=300.
 idle_timeout_seconds = 300
 local = false
+# Serve requests concurrently on the multi-slot engine instead of one at a
+# time. Off by default; the single-daemon path is unchanged when false.
+multi_slot = false

@@ -4,43 +4,46 @@
 
 #include <hip/hip_runtime.h>
 
-// Per-row top-K + log-sum-exp over a [B × vocab] logits matrix.
+// Per-row top-K (+ optional log-sum-exp) over a [B × vocab] logits matrix.
 // Used by DDTree's `topk_from_logits` to avoid a 20 ms CPU sort per
 // tree-verify cycle — this kernel does both the top-K selection AND
 // the log-normalization on-device and returns only (B × K) tokens and
-// log-probs to the host.
+// log-probs to the host. DFlash2 CandidateSelector also uses the same
+// entry with raw_values=1 to fetch final top-K logits without log_z.
 //
 // Grid: [B, 1, 1]          — one block per row.
 // Block: [256, 1, 1]       — 256 threads per block (8 waves, RDNA3).
-// Shared memory (dynamic): (nthreads * K + nthreads) * 4 bytes =
-//   (256 * MAX_K + 256) floats ≈ 9 KB at K=8.
+// Shared memory (dynamic): 32 + nth × MAX_K × 2 floats =
+//   32 + 256 × 16 × 2 = 8224 floats ≈ 32.9 KB at MAX_K=16.
 //
 // Inputs:
 //   logits     : [B × vocab] f32  (row-major).
 //   vocab      : row width.
 //   K          : 1..MAX_K.
+//   raw_values : 0 → write logit - log_z (DDTree); 1 → write raw top logits
+//                and skip the full-vocab sum_exp pass.
 //   B          : number of rows (ignored by kernel — grid sets it).
 //
 // Outputs:
-//   top_idx    : [B × K] i32 token indices (descending by log-prob).
-//   top_logp   : [B × K] f32 log-probs (i.e. `logit - log_z`), matched
-//                to `top_idx`.
+//   top_idx    : [B × K] i32 token indices (descending by logit value).
+//   top_logp   : [B × K] f32 — either log-probs (`logit - log_z`) or raw
+//                top logits, matched to `top_idx` / selected by raw_values.
 //
 // Algorithm (per block, single row):
 //   Pass A: running max + per-thread top-K of (val, idx) over the full
 //           vocab with stride nthreads. Each thread keeps K best.
 //   Reduce: all 256 threads' top-K lists drop into LDS. Thread 0 does
 //           one serial top-K merge (256×K candidates → K winners). K is
-//           small (≤8) so this is ~2K comparisons total on one thread.
-//   Pass B: sum_exp using the global max (from pass A reduce).
-//   Final: thread 0 computes log_z = max + ln(sum_exp), writes
-//          (top_idx, top_logp) with log_z subtracted.
+//           small (≤16) so this is ~2K comparisons total on one thread.
+//   Pass B (raw_values==0 only): sum_exp using the global max.
+//   Final: thread 0 writes (top_idx, values). Normalized mode computes
+//          log_z = max + ln(sum_exp) and subtracts; raw mode writes vals.
 //
 // Note on numerics: max is reduced via warp shuffles + LDS. sum_exp is
 // computed in f64 to avoid underflow on large-magnitude logits, then
 // cast to f32 for log_z output.
 
-#define MAX_K 8
+#define MAX_K 16
 
 extern "C" __launch_bounds__(256, 4)
 __global__ void topk_logsumexp_batched_f32(
@@ -48,7 +51,8 @@ __global__ void topk_logsumexp_batched_f32(
     int*         __restrict__ top_idx,   // [B × K]
     float*       __restrict__ top_logp,  // [B × K]
     int vocab,
-    int K
+    int K,
+    int raw_values
 ) {
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
@@ -148,6 +152,18 @@ __global__ void topk_logsumexp_batched_f32(
         }
     }
     __syncthreads();
+
+    // Raw mode: write selected logits and exit before the full-vocab
+    // sum_exp pass (Pass B is only needed for log-normalization).
+    if (raw_values) {
+        if (tid == 0) {
+            for (int j = 0; j < K; j++) {
+                top_idx[(size_t)b * K + j] = final_idx[j];
+                top_logp[(size_t)b * K + j] = final_val[j];
+            }
+        }
+        return;
+    }
 
     // ── Pass B: sum_exp using the global max ──────────────────────────
     // Double-precision accumulator per thread, then wave + LDS reduction.

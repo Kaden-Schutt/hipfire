@@ -20,9 +20,8 @@
 //!         [~/.hipfire/models/qwen3-0.6b-llama.mq4]
 
 use hipfire_arch_llama::Llama;
-use hipfire_hardware::DimKind;
+use hipfire_hardware::{DeviceMesh, DimKind};
 use hipfire_runtime::arch::Architecture;
-use hipfire_runtime::config::resolve_mesh;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{
     self, f16_to_f32, EmbeddingFormat, KvCache, LayerWeights, LlamaWeights, WeightTensor,
@@ -177,7 +176,7 @@ fn main() {
         Llama::load_weights(&mut hfq, &cfg, &mut gpus.devices[0]).expect("bespoke load_weights");
     let ref_logits = forward_logits(&mut gpus.devices[0], &bespoke_w, &cfg);
 
-    let mesh = resolve_mesh(2, 1, 1, Some(2));
+    let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
     assert!(mesh.has_axis(DimKind::Pp), "expected a Pp mesh");
     assert_eq!(mesh.n_devices(), 2);
 

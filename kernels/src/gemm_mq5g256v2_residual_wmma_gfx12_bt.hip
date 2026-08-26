@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: MIT
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
+typedef float __attribute__((ext_vector_type(8))) float8_t;
+#define MQ5_HDR_LOAD(gp) const unsigned int hA=*(const unsigned int*)(gp); const unsigned int hB=*(const unsigned int*)(gp+4); const _Float16 sc0=(_Float16)__half2float(__ushort_as_half((unsigned short)(hA&0xFFFFu))); const _Float16 zp0=(_Float16)__half2float(__ushort_as_half((unsigned short)(hA>>16))); const _Float16 sc1=(_Float16)__half2float(__ushort_as_half((unsigned short)(hB&0xFFFFu))); const _Float16 zp1=(_Float16)__half2float(__ushort_as_half((unsigned short)(hB>>16)))
+#define MQ5_HDR_SEL _Float16 sc=(kt<8)?sc0:sc1; _Float16 zp=(kt<8)?zp0:zp1;
+#define GEN_RES_BT(BV) \
+extern "C" __launch_bounds__(32, 2) __global__ void gemm_mq5g256v2_residual_wmma_gfx12_bt##BV(const char* __restrict__ A, const _Float16* __restrict__ X, float* __restrict__ Y, int M,int K,int N){ \
+    const int rs=blockIdx.x*16, bs=blockIdx.y*(16*BV), tid=threadIdx.x; if(rs>=M||bs>=N) return; const int ml=tid&15, kg=tid>>4; const int sr=(rs+ml<M)?(rs+ml):(M-1); const int gpr=K/256; const char* rb=A+(long long)sr*gpr*168; int sb[BV]; for(int b=0;b<BV;b++){int t=bs+b*16+ml; sb[b]=(t<N)?t:0;} float8_t acc[BV]; for(int b=0;b<BV;b++) acc[b]=float8_t{0,0,0,0,0,0,0,0}; for(int g=0;g<gpr;g++){const char* gp=rb+g*168; MQ5_HDR_LOAD(gp); const _Float16* xg[BV]; for(int b=0;b<BV;b++) xg[b]=X+(long long)sb[b]*K+g*256; for(int kt=0;kt<16;kt+=4){ MQ5_HDR_SEL _Pragma("unroll") for(int ki=0;ki<4;ki++){ int koff=(kt+ki)*10+kg*5; const unsigned char* dp=(const unsigned char*)(gp+8+koff); uint32_t _d0=*(const uint32_t*)dp; uint8_t _d4=*(dp+4); uint64_t _bits=((uint64_t)_d0)|((uint64_t)_d4<<32); half8_t a; a[0]=sc*(_Float16)(float)((_bits>>0)&31u)+zp; a[1]=sc*(_Float16)(float)((_bits>>5)&31u)+zp; a[2]=sc*(_Float16)(float)((_bits>>10)&31u)+zp; a[3]=sc*(_Float16)(float)((_bits>>15)&31u)+zp; a[4]=sc*(_Float16)(float)((_bits>>20)&31u)+zp; a[5]=sc*(_Float16)(float)((_bits>>25)&31u)+zp; a[6]=sc*(_Float16)(float)((_bits>>30)&31u)+zp; a[7]=sc*(_Float16)(float)((_bits>>35)&31u)+zp; _Pragma("unroll") for(int b=0;b<BV;b++){ half8_t bb=*(const half8_t*)(xg[b]+(kt+ki)*16+kg*8); acc[b]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,bb,acc[b]); } } } } for(int b=0;b<BV;b++){ const int oc=bs+b*16+ml; if(oc<N) for(int j=0;j<8;j++){ int orow=rs+8*kg+j; if(orow<M) Y[(long long)oc*M+orow]+=acc[b][j]; } } \
+}
+GEN_RES_BT(4)
+GEN_RES_BT(8)
+GEN_RES_BT(12)

@@ -1,0 +1,18 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+CHANNEL wq_b values=32768 raw_bit_mismatches=25322 max_abs=3.662109375e-3 numerical_violations=0 first_bad=None
+MICRO wq_b M=32768 K=1024 bytes=18350080 repeats=13 trials=5 reference_ms=0.014889 candidate_ms=0.017828 speedup=0.8351x reference_GBps=1232.45 candidate_GBps=1029.27 bytes_per_token=789053440
+CHANNEL indexer_wq_b values=8192 raw_bit_mismatches=6347 max_abs=2.929687500e-3 numerical_violations=0 first_bad=None
+MICRO indexer_wq_b M=8192 K=1024 bytes=4587520 repeats=32 trials=5 reference_ms=0.006990 candidate_ms=0.006068 speedup=1.1520x reference_GBps=656.33 candidate_GBps=756.08 bytes_per_token=96337920
+CHANNEL shared_w2 values=4096 raw_bit_mismatches=3273 max_abs=3.906250000e-3 numerical_violations=0 first_bad=None
+MICRO shared_w2 M=4096 K=2048 bytes=4521984 repeats=32 trials=5 reference_ms=0.007728 candidate_ms=0.007230 speedup=1.0688x reference_GBps=585.18 candidate_GBps=625.43 bytes_per_token=194527232
+CHANNEL wo_b values=4096 raw_bit_mismatches=3562 max_abs=1.562500000e-2 numerical_violations=0 first_bad=None
+MICRO wo_b M=4096 K=8192 bytes=17891328 repeats=14 trials=5 reference_ms=0.017331 candidate_ms=0.042617 speedup=0.4067x reference_GBps=1032.34 candidate_GBps=419.82 bytes_per_token=769294336
+CHANNEL lm_head values=129280 raw_bit_mismatches=107631 max_abs=9.765625000e-3 numerical_violations=1 first_bad=Some((23495, 2.8642578, 2.8574219, 0.0068359375, 0.005286426))
+
+thread 'main' (154545) panicked at crates/rdna-compute/examples/test_mfp4e8_lds8_family_gfx942.rs:209:5:
+assertion `left == right` failed: lm_head tolerance failure: Some((23495, 2.8642578, 2.8574219, 0.0068359375, 0.005286426))
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

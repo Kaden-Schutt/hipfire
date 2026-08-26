@@ -23,7 +23,7 @@
 //! "score mass, similarity, or position-aware" as options; softmax over
 //! score is the score-mass variant with a numerically stable normalizer.
 
-use crate::llama::{f16_to_f32, f32_to_f16, KvCache};
+use crate::llama::{f16_to_f32, f32_to_f16, KvCache, KvCacheExt};
 use crate::triattn::{EvictionCtx, EvictionResult};
 use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -91,6 +91,9 @@ impl CaskCtx {
         kv: &mut KvCache,
         current_physical: usize,
     ) -> HipResult<Option<EvictionResult>> {
+        if !self.base.is_active() {
+            return Ok(None);
+        }
         if current_physical < self.base.budget + self.base.beta {
             return Ok(None);
         }

@@ -23,6 +23,7 @@ use hipfire_arch_qwen35::qwen35::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
@@ -105,7 +106,7 @@ fn run_pp1(path: &str, prompt: &[u32]) -> Vec<u32> {
         tok = argmax(&logits);
         tokens.push(tok);
     }
-    scratch.free_gpu(&mut gpu);
+    scratch.free_gpu(&mut gpu).expect("scratch free");
     dn.free_gpu(&mut gpu);
     let _ = kv.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
@@ -132,7 +133,7 @@ fn run_pp2(path: &str, prompt: &[u32]) -> Vec<u32> {
         4096,
     )
     .expect("kv multi");
-    let mut dn =
+    let (mut dn, _la_to_device) =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 

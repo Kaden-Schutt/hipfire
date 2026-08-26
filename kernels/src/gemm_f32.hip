@@ -25,7 +25,7 @@ __global__ void gemm_f32_batched(
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+        sum += __shfl_down(sum, offset, 32);
 
     if (tid == 0)
         Y[(size_t)n * M + m] = sum;

@@ -17,8 +17,43 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 # Mirror minimax: rdna-compute host-readback helpers and hybrid-state plumbing
 # live behind `deltanet`. The conv/attention/MoE kernels the forward uses are
 # ungated; the new LFM2 short-conv kernel is ungated too.
 default = ["deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "dump_lfm2moe_hidden_states"
+required-features = ["lab"]
+
+[[example]]
+name = "graph_parity_lfm2moe"
+required-features = ["lab"]
+
+[[example]]
+name = "infer_lfm2moe"
+required-features = ["lab"]
+
+[[example]]
+name = "kld_logits"
+required-features = ["lab"]

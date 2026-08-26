@@ -218,7 +218,7 @@ Not in-tree support. Useful when planning; does not admit a route.
 | build_speculator / n-gram gate | `crates/hipfire-loader/src/spec_build.rs` |
 | Carriers (per-arch load + DSpark/build_speculator) | `crates/hipfire-loader/src/carriers.rs` (llama 0/1 DSpark>DFlash>n-gram; deepseek4 DSpark>MTP) |
 | qwen35 DSpark / DFlash / dual MTP load | `crates/hipfire-loader/src/lib.rs` (`dspark_speculator`; `HIPFIRE_QWEN35_MTP` + `.mq4-mtp` → `build_speculator` MTP; native `qwen35_mtp_head` from bundled trailer or sibling `.mtp`) |
-| Daemon generate routing | `crates/hipfire-runtime/examples/daemon.rs` (`generate_dflash`, `generate_spec`, `generate_qwen35_mtp` + `HIPFIRE_QWEN_MTP`/`HIPFIRE_MTP_SAMPLED`, deepseek4/qwen/llama/minimax/lfm/cohere/dots arms) |
+| Daemon generate routing | `crates/hipfire-daemon/src/main.rs` (`generate_dflash`, `generate_spec`, `generate_qwen35_mtp` + `HIPFIRE_QWEN_MTP`/`HIPFIRE_MTP_SAMPLED`, deepseek4/qwen/llama/minimax/lfm/cohere/dots arms) |
 | CLI dflash_mode default | `crates/hipfire-config/src/lib.rs` (`speculation.dflash = "off"`) |
 | Per-arch SpecTarget | `crates/hipfire-arch-*/src/spec_impl.rs` |
 | deepseek4 MTP greedy requirement | `crates/hipfire-arch-deepseek4/src/mtp_speculator.rs` — `requires_greedy` |

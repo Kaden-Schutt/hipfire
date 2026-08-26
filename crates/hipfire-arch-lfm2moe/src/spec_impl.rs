@@ -40,6 +40,20 @@ use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Single-pass argmax over a host logit row.
+// NOTE: deliberately NOT `hipfire_runtime::llama::argmax`, and deliberately
+// duplicated with the other arch crate that carries this function.
+//
+// The runtime's copy adds an `is_finite()` guard (its "O2b-2 finite guard")
+// because it doubles as the degenerate fallback for `sample_top_p` /
+// `sample_full_dist`, where a `+Inf` logit must not beat the real finite max.
+//
+// This copy is on the speculative-decode path and must agree bit-for-bit with
+// the GPU kernel it is checked against — `kernels/src/argmax.hip:13` is a bare
+// `if (data[i] > lmax)`, which *does* select `+Inf`. Adding the finite guard
+// here would make draft and target disagree on `+Inf` logits and produce
+// spurious spec-decode rejections.
+//
+// Both behaviours are correct for their own caller. Do not unify them.
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -69,6 +83,12 @@ pub struct Lfm2MoeBundle {
     pub weights: Lfm2MoeWeights,
     pub state: Lfm2MoeState,
     pub eos_tok: u32,
+    /// Continuous-decode batch state (arch 11 dense, single-GPU). `Some` only
+    /// when continuous batch has been staged via `batch_staging::stage_continuous_batch`;
+    /// `None` is the common AR path. Lives in the bundle (not `LoadedModel`)
+    /// so `LoadedModel` can become arch-free. Previously
+    /// `LoadedModel.lfm2_decode_batch`.
+    pub lfm2_decode_batch: Option<crate::batch::Lfm2DecodeBatchState>,
 }
 
 /// LFM2.5-MoE verify scratch: the pre-verify conv-state snapshot.
@@ -132,8 +152,17 @@ impl BundleTeardown for Lfm2MoeBundle {
             weights,
             state,
             eos_tok: _,
+            lfm2_decode_batch,
         } = self;
         let mut cf = GpuCleanupFailure::empty();
+        // The batch state owns the batched KV cache, conv rings, and every
+        // batched scratch buffer — all GpuTensors with no Drop. `free_gpu` is
+        // infallible, so free it explicitly here (mirrors arch_model.rs and
+        // qwen35's qwen35_decode_batch teardown); ignoring it would orphan
+        // device memory.
+        if let Some(batch) = lfm2_decode_batch {
+            batch.free_gpu(gpu);
+        }
         if let Err(f) = weights.free_checked(gpu) {
             cf.merge(f);
         }

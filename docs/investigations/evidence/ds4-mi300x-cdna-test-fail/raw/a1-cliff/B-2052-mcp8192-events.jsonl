@@ -1,0 +1,4 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"error","message":"deepseek4prefill failed: \"htod n_active_topk_arr: HipError { code: 700, message: \\\"hipMemcpy H2D: an illegal memory access was encountered\\\" }\"","class":"internal","retryable":false,"rolled_back":false,"attempt_id":1,"id":"g0-B-2052-mcp8192"}
+{"type":"unloaded"}

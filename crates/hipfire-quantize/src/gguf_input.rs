@@ -34,6 +34,8 @@ pub enum GgmlType {
     Q6K = 14,
     Q8K = 15,
     BF16 = 30,
+    Q1_0 = 41,
+    Q2_0 = 42,
 }
 
 impl GgmlType {
@@ -54,6 +56,8 @@ impl GgmlType {
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
             30 => Some(Self::BF16),
+            41 => Some(Self::Q1_0),
+            42 => Some(Self::Q2_0),
             _ => None,
         }
     }
@@ -63,6 +67,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q1_0 | Self::Q2_0 => 128,
         }
     }
 
@@ -82,6 +87,8 @@ impl GgmlType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 290,
+            Self::Q1_0 => 18,
+            Self::Q2_0 => 34,
         }
     }
 
@@ -342,6 +349,44 @@ fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_q2_0(data: &[u8], n: usize) -> Vec<f32> {
+    const QK: usize = 128;
+    const BLK: usize = 34;
+    let mut out = Vec::with_capacity(n);
+    let nblocks = n / QK;
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let qs = &data[base + 2..base + BLK];
+        for j in 0..QK {
+            let code = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            out.push((code as i32 - 1) as f32 * d);
+        }
+    }
+    out
+}
+
+fn dequant_q1_0(data: &[u8], n: usize) -> Vec<f32> {
+    const BLK: usize = 18;
+    const QK: usize = 128;
+    let nblocks = (n + QK - 1) / QK;
+    let mut out = Vec::with_capacity(n);
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let neg_d = -d;
+        for j in 0..QK {
+            if out.len() == n {
+                break;
+            }
+            let byte = data[base + 2 + (j >> 3)];
+            let bit = (byte >> (j & 7)) & 1;
+            out.push(if bit == 1 { d } else { neg_d });
+        }
+    }
+    out
+}
+
 fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 144;
@@ -523,6 +568,8 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         }
         GgmlType::Q4_0 => dequant_q4_0(data, n),
         GgmlType::Q8_0 => dequant_q8_0(data, n),
+        GgmlType::Q2_0 => dequant_q2_0(data, n),
+        GgmlType::Q1_0 => dequant_q1_0(data, n),
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
@@ -530,5 +577,64 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
             "GGUF tensor type {:?} not implemented (tensor: {})",
             other, info.name
         ),
+    }
+}
+
+#[cfg(test)]
+mod q2_0_tests {
+    use super::*;
+    #[test]
+    fn q2_0_type_params() {
+        let t = GgmlType::from_u32(42).expect("ggml_type 42 = Q2_0");
+        assert_eq!(t, GgmlType::Q2_0);
+        assert_eq!(t.block_size(), 128);
+        assert_eq!(t.block_bytes(), 34); // 2 (FP16 d) + 32 (2-bit x 128)
+    }
+
+    #[test]
+    fn q2_0_dequant_matches_formula() {
+        let mut block = vec![0u8; 34];
+        block[0] = 0x00;
+        block[1] = 0x40; // FP16 2.0 little-endian
+        block[2] = 0xE4; // codes 0,1,2,3 (LSB-first)
+        let out = dequant_q2_0(&block, 128);
+        assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]); // (code-1)*d
+        assert!(out[4..128].iter().all(|&x| x == -2.0)); // code 0 -> -d
+        assert_eq!(out.len(), 128);
+    }
+}
+
+#[cfg(test)]
+mod q1_0_tests {
+    use super::*;
+
+    #[test]
+    fn q1_0_ggml_type_reads() {
+        let t = GgmlType::from_u32(41).expect("ggml_type 41 = Q1_0");
+        assert_eq!(t, GgmlType::Q1_0);
+        assert_eq!(t.block_size(), 128);
+        assert_eq!(t.block_bytes(), 18);
+    }
+
+    #[test]
+    fn dequant_q1_0_sign_only() {
+        // One block: d=0.5, all-ones bits -> all +0.5; first bit cleared -> element 0 = -0.5.
+        // FP16 0.5 = 0x3800 little-endian ([0x00, 0x38]); no `half` crate dep in this
+        // workspace, so the bit pattern is constructed directly (same style as the
+        // q2_0_dequant_matches_formula test above).
+        let mut blk = vec![0u8; 18];
+        blk[0] = 0x00;
+        blk[1] = 0x38; // FP16 0.5, little-endian
+        for b in blk[2..18].iter_mut() {
+            *b = 0xFF; // all bits set -> all +d
+        }
+        let all_pos = dequant_q1_0(&blk, 128);
+        assert_eq!(all_pos.len(), 128);
+        assert!(all_pos.iter().all(|&v| (v - 0.5).abs() < 1e-3));
+
+        blk[2] &= !1u8; // clear bit 0 of first qs byte -> element 0 = -d
+        let mixed = dequant_q1_0(&blk, 128);
+        assert!((mixed[0] + 0.5).abs() < 1e-3);
+        assert!((mixed[1] - 0.5).abs() < 1e-3);
     }
 }

@@ -1,0 +1,95 @@
+{
+  "schema": "hipfire.agentic-review.capabilities",
+  "version": 1,
+  "capabilities": [
+    {
+      "id": "hipfire/rdna3-smoke@1",
+      "parameters": {},
+      "contract_digest": "sha256:a3399687fc211d9073ed52daa02162cc052c63c79f923fce25acf5409c9852d9",
+      "allowed_suite_revisions": ["rdna3-smoke-v1"],
+      "required_checks": ["build", "smoke"],
+      "eligible_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+      "artifacts": ["test-report.json"],
+      "pass_criteria": {"all_required_checks_pass": true}
+    },
+    {
+      "id": "hipfire/gfx1151-kernel-validation@1",
+      "parameters": {},
+      "contract_digest": "sha256:1a0759dacc12dc31f1da1a7f82cda92d31d91148460fdae104132e01f0e5fb7f",
+      "allowed_suite_revisions": ["gfx1151-kernel-validation-v1"],
+      "required_checks": ["build", "kernel-validation"],
+      "eligible_hardware": ["gfx1151"],
+      "artifacts": ["kernel-validation.json"],
+      "pass_criteria": {"all_required_checks_pass": true}
+    },
+    {
+      "id": "hipfire/dflash-coherence@1",
+      "parameters": {},
+      "contract_digest": "sha256:f1b82cd79f8ed45c196fadb9e5e50c6185a392c9aabc6029bef97f7d85a01243",
+      "allowed_suite_revisions": ["dflash-coherence-v1"],
+      "required_checks": ["build", "coherence-gate"],
+      "eligible_hardware": ["gfx1100", "gfx1151"],
+      "artifacts": ["coherence-report.md"],
+      "pass_criteria": {"all_required_checks_pass": true}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "rdna3-smoke",
+      "capability_id": "hipfire/rdna3-smoke@1",
+      "model_architecture": "qwen3.6-27b",
+      "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+      "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+      "representative_hardware": "gfx1100",
+      "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+    },
+    {
+      "id": "gfx1151-kernel-validation",
+      "capability_id": "hipfire/gfx1151-kernel-validation@1",
+      "model_architecture": "qwen3.6-27b",
+      "fixture_id": "qwen3.6-27b-gfx1151-kernel-validation-v1",
+      "fixture_digest": "sha256:da707e7f7183e74f819e93eb643f49dccb3e29b122f5f0c5145b0b68b5f49134",
+      "representative_hardware": "gfx1151",
+      "covered_hardware": ["gfx1151"]
+    },
+    {
+      "id": "dflash-coherence",
+      "capability_id": "hipfire/dflash-coherence@1",
+      "model_architecture": "qwen3.6-27b",
+      "fixture_id": "qwen3.6-27b-dflash-coherence-v1",
+      "fixture_digest": "sha256:5c54577e83c8a577ad75d8c261f8520b80eb59e9227d4615aff6fd575dde9340",
+      "representative_hardware": "gfx1100",
+      "covered_hardware": ["gfx1100", "gfx1151"]
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+      "model_architecture": "qwen3.6-27b",
+      "artifact_identity": "test-report.json",
+      "source_identity": "benchmarks/quality-baselines/qwen3.6-27b",
+      "suite_revision": "rdna3-smoke-v1",
+      "digest_semantics": "sha256 of the immutable fixture descriptor and artifact identity",
+      "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628"
+    },
+    {
+      "fixture_id": "qwen3.6-27b-gfx1151-kernel-validation-v1",
+      "model_architecture": "qwen3.6-27b",
+      "artifact_identity": "kernel-validation.json",
+      "source_identity": "kernels/validation/gfx1151",
+      "suite_revision": "gfx1151-kernel-validation-v1",
+      "digest_semantics": "sha256 of the immutable fixture descriptor and artifact identity",
+      "fixture_digest": "sha256:da707e7f7183e74f819e93eb643f49dccb3e29b122f5f0c5145b0b68b5f49134"
+    },
+    {
+      "fixture_id": "qwen3.6-27b-dflash-coherence-v1",
+      "model_architecture": "qwen3.6-27b",
+      "artifact_identity": "coherence-report.md",
+      "source_identity": "benchmarks/prompts/dflash-coherence",
+      "suite_revision": "dflash-coherence-v1",
+      "digest_semantics": "sha256 of the immutable fixture descriptor and artifact identity",
+      "fixture_digest": "sha256:5c54577e83c8a577ad75d8c261f8520b80eb59e9227d4615aff6fd575dde9340"
+    }
+  ],
+  "exemptions": []
+}

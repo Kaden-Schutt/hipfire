@@ -240,6 +240,37 @@ pub fn gemv_hfp4g32_bytes(m: usize, k: usize) -> usize {
     hfp4g32_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// MQ5G256V2 weight footprint: 168 B/group
+pub fn mq5g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 168
+}
+pub fn gemv_mq5g256v2_bytes(m: usize, k: usize) -> usize {
+    mq5g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+/// MQ6G256V2
+pub fn mq6g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 200
+}
+pub fn gemv_mq6g256v2_bytes(m: usize, k: usize) -> usize {
+    mq6g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+pub fn mq3g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 104
+}
+pub fn gemv_mq3g256v2_bytes(m: usize, k: usize) -> usize {
+    mq3g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+pub fn mq2g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 72
+}
+pub fn gemv_mq2g256v2_bytes(m: usize, k: usize) -> usize {
+    mq2g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+
 /// FWHT rotation kernel: read x, read two sign tables, write x_rot.
 pub fn mq_rotate_bytes(k: usize) -> usize {
     k * 4 + 256 * 4 * 2 + k * 4
@@ -262,11 +293,7 @@ pub fn elementwise1_bytes(n: usize) -> usize {
 
 /// DeltaNet Q8 recurrence: roughly state in + state out + Q/K/V + gate/beta +
 /// output. Dominated by state read+write.
-pub fn gated_delta_net_q8_bytes(
-    n_tokens: usize,
-    n_heads: usize,
-    head_dim: usize,
-) -> usize {
+pub fn gated_delta_net_q8_bytes(n_tokens: usize, n_heads: usize, head_dim: usize) -> usize {
     let state_bytes = n_heads * head_dim * head_dim; // Q8: 1 byte each
     let state_scales = n_heads * head_dim * 4;
     let qkv = 3 * n_tokens * n_heads * head_dim * 4;
@@ -312,7 +339,7 @@ pub fn conv1d_silu_bytes(n_channels: usize) -> usize {
         + n_channels * state_slots * 4     // state read
         + n_channels * kernel_size * 4     // weight
         + n_channels * 4                   // output
-        + n_channels * state_slots * 4     // state write
+        + n_channels * state_slots * 4 // state write
 }
 
 /// KV cache write (Q8_0 flavor, per token position).

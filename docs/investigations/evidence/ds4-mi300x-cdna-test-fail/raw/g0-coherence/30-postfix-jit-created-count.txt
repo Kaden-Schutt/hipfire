@@ -1,0 +1,53 @@
+jit_files=180
+compressor_add_ape_batched.hash
+compressor_add_ape_batched.hip
+compressor_add_ape_batched.hsaco
+compressor_add_ape_buf.hash
+compressor_add_ape_buf.hip
+compressor_add_ape_buf.hsaco
+compressor_compress_aligned_batched_f32.hash
+compressor_compress_aligned_batched_f32.hip
+compressor_compress_aligned_batched_f32.hsaco
+compressor_overlap_concat.hash
+compressor_overlap_concat.hip
+compressor_overlap_concat.hsaco
+compressor_ring_write_batched_f32.hash
+compressor_ring_write_batched_f32.hip
+compressor_ring_write_batched_f32.hsaco
+compressor_softmax_pool_f32_buf.hash
+compressor_softmax_pool_f32_buf.hip
+compressor_softmax_pool_f32_buf.hsaco
+deepseek4_attn_swa_batched.hash
+deepseek4_attn_swa_batched.hip
+deepseek4_attn_swa_batched.hsaco
+deepseek4_attn_swa_buf.hash
+deepseek4_attn_swa_buf.hip
+deepseek4_attn_swa_buf.hsaco
+deepseek4_attn_swa_topk_batched.hash
+deepseek4_attn_swa_topk_batched.hip
+deepseek4_attn_swa_topk_batched.hsaco
+deepseek4_attn_swa_topk_f32_buf.hash
+deepseek4_attn_swa_topk_f32_buf.hip
+deepseek4_attn_swa_topk_f32_buf.hsaco
+deepseek4_fused_silu_mul_clamp_mq_rotate.hash
+deepseek4_fused_silu_mul_clamp_mq_rotate.hip
+deepseek4_fused_silu_mul_clamp_mq_rotate.hsaco
+deepseek4_moe_topk_bias_aware.hash
+deepseek4_moe_topk_bias_aware.hip
+deepseek4_moe_topk_bias_aware.hsaco
+deepseek4_moe_topk_bias_aware_batched.hash
+deepseek4_moe_topk_bias_aware_batched.hip
+deepseek4_moe_topk_bias_aware_batched.hsaco
+deepseek4_silu_mul_clamp.hash
+-rw-r--r-- 1 root root    16 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_batched.hash
+-rw-r--r-- 1 root root  5949 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_batched.hip
+-rw-r--r-- 1 root root 13720 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_batched.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_buf.hash
+-rw-r--r-- 1 root root  5190 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_buf.hip
+-rw-r--r-- 1 root root 13488 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_buf.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_batched.hash
+-rw-r--r-- 1 root root  9146 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_batched.hip
+-rw-r--r-- 1 root root 14840 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_batched.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_f32_buf.hash
+-rw-r--r-- 1 root root 22863 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_f32_buf.hip
+-rw-r--r-- 1 root root 37688 Aug  1 13:53 /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_f32_buf.hsaco

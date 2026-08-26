@@ -260,6 +260,13 @@ pub struct MoeProgramParts<'step> {
     pub router: RouterPlan<'step>,
     pub execution: ExpertExecutionPlan,
     pub ranks: Vec<RoutedMoeStepPhases<'step>>,
+    /// Explicit deferred-combine marker: the expanded down producer has NO
+    /// local combine because the architecture's next-layer fused consumer
+    /// folds the partial (combine-next-RMS). Only this flag admits a
+    /// zero-combine `ExpandedIndexed` program; ordinary programs must carry
+    /// exactly one combine, and a deferred program carrying one is a
+    /// double-add and is rejected. Never set together with a parallel policy.
+    pub deferred_combine: bool,
 }
 
 /// A lowered MoE program sealed behind a private inner representation: the
@@ -628,6 +635,15 @@ pub enum MoeLowerError {
         what: &'static str,
     },
     I64OnNonAdmittedAxis {
+        group: String,
+        layer: Option<usize>,
+    },
+    /// The deferred-expanded combine protocol (expanded down producer, zero
+    /// local combine, architecture's next-layer fused consumer) is inherently
+    /// rank-local: the consuming fused kernel folds the expanded partial on
+    /// the same device, so a parallel axis has no valid all-reduce anchor.
+    /// Refused instead of silently flattening a partial combine.
+    DeferredCombineOnParallelAxis {
         group: String,
         layer: Option<usize>,
     },
@@ -1239,6 +1255,10 @@ impl fmt::Display for MoeLowerError {
                 f,
                 "MoE group '{group}' layer {layer:?}: int64 down projection is not admitted on a single-rank axis"
             ),
+            Self::DeferredCombineOnParallelAxis { group, layer } => write!(
+                f,
+                "MoE group '{group}' layer {layer:?}: the deferred-expanded combine protocol is rank-local (the next-layer fused consumer folds the expanded partial on the same device); a parallel axis has no combine anchor"
+            ),
             Self::RankProtocolMismatch {
                 group,
                 layer,
@@ -1663,6 +1683,11 @@ enum ValidatedProtocol {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RankProtocolKind {
     ExpandedIndexed,
+    /// Expanded down producer with ZERO local combine: the architecture's
+    /// next-layer fused consumer folds the partial (combine-next-RMS). Only
+    /// admitted when `MoeProgramParts.deferred_combine` explicitly marks the
+    /// deferred consumption; never produced by an ordinary program.
+    ExpandedIndexedDeferred,
     ExpandedGrouped,
     SelfCombiningF32,
     SelfCombiningI64,
@@ -1797,6 +1822,7 @@ struct RankProtocol {
 fn rank_protocol_label(protocol: &RankProtocol) -> String {
     let kind = match protocol.kind {
         RankProtocolKind::ExpandedIndexed => "expanded_indexed",
+        RankProtocolKind::ExpandedIndexedDeferred => "expanded_indexed_deferred",
         RankProtocolKind::ExpandedGrouped => "expanded_grouped",
         RankProtocolKind::SelfCombiningF32 => "self_combining_f32",
         RankProtocolKind::SelfCombiningI64 => "self_combining_i64",
@@ -1856,6 +1882,9 @@ struct RankOps<'a> {
     scatters: Vec<(usize, &'static str, &'a Step<'a>)>,
     gate_ups: Vec<(usize, &'static str, &'a Step<'a>)>,
     indexed_gate_ups: Vec<(usize, &'static str, &'a Step<'a>)>,
+    /// Specialized qwen indexed gate-up (`Step::MoeGateUpIndexed`): the
+    /// mandatory pairing partner for indexed Paro pre-rotation Givens.
+    specialized_gate_ups: Vec<(usize, &'static str, &'a Step<'a>)>,
     gate_up_unscatters: Vec<(usize, &'static str, &'a Step<'a>)>,
     givens: Vec<(usize, &'static str, &'a Step<'a>)>,
     activations: Vec<(usize, &'static str, &'a Step<'a>)>,
@@ -1872,6 +1901,7 @@ fn classify_rank_ops<'a>(phases: &'a RoutedMoePhases<Step<'a>>) -> RankOps<'a> {
         scatters: Vec::new(),
         gate_ups: Vec::new(),
         indexed_gate_ups: Vec::new(),
+        specialized_gate_ups: Vec::new(),
         activations: Vec::new(),
         givens: Vec::new(),
         gate_up_unscatters: Vec::new(),
@@ -1952,6 +1982,9 @@ fn classify_rank_ops<'a>(phases: &'a RoutedMoePhases<Step<'a>>) -> RankOps<'a> {
                     which: MoeProj::GateUp { .. },
                     ..
                 } => ops.indexed_gate_ups.push((absolute, phase, step)),
+                Step::MoeGateUpIndexed { .. } => {
+                    ops.specialized_gate_ups.push((absolute, phase, step))
+                }
                 Step::MoeActivation { .. } => ops.activations.push((absolute, phase, step)),
                 Step::MoeGateUpUnscatter { .. } => {
                     ops.gate_up_unscatters.push((absolute, phase, step))
@@ -2035,14 +2068,26 @@ fn reject_stray_grouped_ops(
         });
     }
     if let Some(&(index, phase, _)) = ops.givens.first() {
-        return Err(MoeLowerError::StrayGroupedOp {
-            group: group.group.clone(),
-            layer: group.layer,
-            rank,
-            index,
-            phase,
-            op: "givens",
-        });
+        // Indexed Paro pre-rotation is admitted ONLY when paired with the
+        // specialized indexed gate-up (`Step::MoeGateUpIndexed`): exactly one
+        // Givens in the decode router phase or the indexed-prefill gate_up
+        // phase, with exactly one specialized gate-up in the gate_up phase.
+        // Every other Givens placement (stray, unpaired, extra, or relocated)
+        // is grouped permutation machinery and stays rejected.
+        let paired = ops.specialized_gate_ups.len() == 1
+            && ops.specialized_gate_ups[0].1 == "gate_up"
+            && ops.givens.len() == 1
+            && (phase == "router" || phase == "gate_up");
+        if !paired {
+            return Err(MoeLowerError::StrayGroupedOp {
+                group: group.group.clone(),
+                layer: group.layer,
+                rank,
+                index,
+                phase,
+                op: "givens",
+            });
+        }
     }
     Ok(())
 }
@@ -2153,6 +2198,7 @@ fn require_grouped_capacity(
 fn parse_rank_protocol<'a, F>(
     group: &ExpertGroupPlan,
     rank: usize,
+    deferred_combine: bool,
     phases: &RoutedMoePhases<Step<'a>>,
     cap: &F,
 ) -> Result<RankProtocol, MoeLowerError>
@@ -2252,152 +2298,188 @@ where
                     index: combine_offset + index,
                 });
             }
-            // Exactly one combine, in the semantic combine phase.
-            let combine_step = match ops.combines.as_slice() {
-                [] => {
+            // Deferred-expanded protocol (explicit `MoeProgramParts`
+            // marker only): the expanded down producer carries NO local
+            // combine because the architecture's next-layer fused consumer
+            // folds it (combine-next-RMS). A local combine under the flag
+            // would double-add and is rejected; ordinary programs keep the
+            // exact-one-combine contract.
+            let deferred =
+                deferred_combine && matches!(evidence, DownEvidence::ExpandedIndexed { .. });
+            let combine_step = if deferred {
+                if let Some(&(_, _, _)) = ops.combines.first() {
                     return Err(MoeLowerError::CombineCountMismatch {
                         group: group.group.clone(),
                         layer: group.layer,
                         rank,
-                        expected: 1,
-                        actual: 0,
+                        expected: 0,
+                        actual: ops.combines.len(),
                     });
                 }
-                [_first, second, ..] => {
-                    return Err(MoeLowerError::DuplicateCombineOp {
-                        group: group.group.clone(),
-                        layer: group.layer,
-                        rank,
-                        index: second.0,
-                    });
-                }
-                [only] if only.1 != "combine" => {
-                    return Err(MoeLowerError::MisplacedCombineOp {
-                        group: group.group.clone(),
-                        layer: group.layer,
-                        rank,
-                        index: only.0,
-                        phase: only.1,
-                    });
-                }
-                [only] => only.2,
+                None
+            } else {
+                // Exactly one combine, in the semantic combine phase.
+                Some(match ops.combines.as_slice() {
+                    [] => {
+                        return Err(MoeLowerError::CombineCountMismatch {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            expected: 1,
+                            actual: 0,
+                        });
+                    }
+                    [_first, second, ..] => {
+                        return Err(MoeLowerError::DuplicateCombineOp {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: second.0,
+                        });
+                    }
+                    [only] if only.1 != "combine" => {
+                        return Err(MoeLowerError::MisplacedCombineOp {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: only.0,
+                            phase: only.1,
+                        });
+                    }
+                    [only] => only.2,
+                })
             };
-            let Step::MoeCombine {
-                down_out,
-                topk_weights: combine_topk_weights,
-                out: combine_out,
-                k,
-                hidden,
-                batch_size: combine_batch_size,
-                inverse_perm,
-                ..
-            } = combine_step
-            else {
-                unreachable!("combine scan only collects MoeCombine steps")
-            };
-            let (down_out, combine_out, combine_topk_weights) =
-                (*down_out, *combine_out, *combine_topk_weights);
-            // The combine must consume the expanded down producer (aliases
-            // with the same non-null pointer and size are accepted).
-            if !same_buffer(down_out, producer) {
-                return Err(MoeLowerError::CombineDownSourceMismatch {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                });
-            }
-            // The combine's shape metadata must match the producer's launch
-            // metadata exactly.
-            if *k != k_top {
-                return Err(MoeLowerError::CombineMetadataMismatch {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    field: "k",
-                    expected: k_top,
-                    actual: *k,
-                });
-            }
-            if *combine_batch_size != batch_size {
-                return Err(MoeLowerError::CombineMetadataMismatch {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    field: "batch_size",
-                    expected: batch_size,
-                    actual: *combine_batch_size,
-                });
-            }
-            if *hidden == 0 || *combine_batch_size == 0 {
-                return Err(MoeLowerError::InvalidCombineDimensions {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    hidden: *hidden,
-                    batch_size: *combine_batch_size,
-                });
-            }
-            // Collective dimension is the checked logical batch_size*hidden,
-            // never inferred from allocation capacity.
-            let dim = hidden.checked_mul(*combine_batch_size).ok_or_else(|| {
-                MoeLowerError::ArithmeticOverflow {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    what: "combine_dim",
-                }
-            })?;
-            // The combine output must hold exactly the collective dimension,
-            // with enough F32 capacity for it.
-            let combine_out_dim = combine_out
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-                .ok_or_else(|| MoeLowerError::ArithmeticOverflow {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    what: "combine_out_shape",
-                })?;
-            if combine_out_dim != dim {
-                return Err(MoeLowerError::CombineOutputShapeMismatch {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    expected: dim,
-                    actual: combine_out_dim,
-                });
-            }
-            let needed = dim
-                .checked_mul(4)
-                .ok_or_else(|| MoeLowerError::ArithmeticOverflow {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    what: "combine_out_bytes",
-                })?;
-            let actual = cap(combine_out);
-            if actual < needed {
-                return Err(MoeLowerError::CapacityMismatch {
-                    group: group.group.clone(),
-                    layer: group.layer,
-                    rank,
-                    index: combine_offset,
-                    expected_bytes: needed,
-                    actual_bytes: actual,
-                });
-            }
+            // Combine metadata validation applies only to the ordinary path;
+            // the deferred path has no combine to validate (dim stays 0: the
+            // Single schedule never consults it). `combine_topk_weights` and
+            // `combine_hidden` additionally feed the grouped chain checks
+            // below; the grouped branch always carries a combine.
+            let (dim, inverse_perm, combine_topk_weights, combine_hidden) =
+                if let Some(combine_step) = combine_step {
+                    let Step::MoeCombine {
+                        down_out,
+                        topk_weights: combine_topk_weights,
+                        out: combine_out,
+                        k,
+                        hidden,
+                        batch_size: combine_batch_size,
+                        inverse_perm,
+                        ..
+                    } = combine_step
+                    else {
+                        unreachable!("combine scan only collects MoeCombine steps")
+                    };
+                    let (down_out, combine_out, combine_topk_weights) =
+                        (*down_out, *combine_out, *combine_topk_weights);
+                    // The combine must consume the expanded down producer
+                    // (aliases with the same non-null pointer and size are
+                    // accepted).
+                    if !same_buffer(down_out, producer) {
+                        return Err(MoeLowerError::CombineDownSourceMismatch {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                        });
+                    }
+                    // The combine's shape metadata must match the producer's
+                    // launch metadata exactly.
+                    if *k != k_top {
+                        return Err(MoeLowerError::CombineMetadataMismatch {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                            field: "k",
+                            expected: k_top,
+                            actual: *k,
+                        });
+                    }
+                    if *combine_batch_size != batch_size {
+                        return Err(MoeLowerError::CombineMetadataMismatch {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                            field: "batch_size",
+                            expected: batch_size,
+                            actual: *combine_batch_size,
+                        });
+                    }
+                    if *hidden == 0 || *combine_batch_size == 0 {
+                        return Err(MoeLowerError::InvalidCombineDimensions {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            hidden: *hidden,
+                            batch_size: *combine_batch_size,
+                        });
+                    }
+                    // Collective dimension is the checked logical
+                    // batch_size*hidden, never inferred from allocation capacity.
+                    let dim = hidden.checked_mul(*combine_batch_size).ok_or_else(|| {
+                        MoeLowerError::ArithmeticOverflow {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                            what: "combine_dim",
+                        }
+                    })?;
+                    // The combine output must hold exactly the collective
+                    // dimension, with enough F32 capacity for it.
+                    let combine_out_dim = combine_out
+                        .shape
+                        .iter()
+                        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+                        .ok_or_else(|| MoeLowerError::ArithmeticOverflow {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                            what: "combine_out_shape",
+                        })?;
+                    if combine_out_dim != dim {
+                        return Err(MoeLowerError::CombineOutputShapeMismatch {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                            expected: dim,
+                            actual: combine_out_dim,
+                        });
+                    }
+                    let needed =
+                        dim.checked_mul(4)
+                            .ok_or_else(|| MoeLowerError::ArithmeticOverflow {
+                                group: group.group.clone(),
+                                layer: group.layer,
+                                rank,
+                                index: combine_offset,
+                                what: "combine_out_bytes",
+                            })?;
+                    let actual = cap(combine_out);
+                    if actual < needed {
+                        return Err(MoeLowerError::CapacityMismatch {
+                            group: group.group.clone(),
+                            layer: group.layer,
+                            rank,
+                            index: combine_offset,
+                            expected_bytes: needed,
+                            actual_bytes: actual,
+                        });
+                    }
+                    (dim, *inverse_perm, Some(combine_topk_weights), *hidden)
+                } else {
+                    (0, None, None, 0)
+                };
             let (kind, grouped_signature) = match evidence {
                 DownEvidence::ExpandedIndexed { .. } => {
-                    // Scatter, gate-up unscatter, and grouped gate-up are
-                    // never admitted on the indexed path.
+                    // Scatter, gate-up unscatter, grouped gate-up, and
+                    // unpaired Givens are never admitted on the indexed path
+                    // (the specialized-gate-up-paired Paro pre-rotation is
+                    // the sole Givens exception, decided inside
+                    // reject_stray_grouped_ops).
                     reject_stray_grouped_ops(group, rank, &ops)?;
                     if inverse_perm.is_some() {
                         return Err(MoeLowerError::UnexpectedCombineInversePerm {
@@ -2407,7 +2489,14 @@ where
                             index: combine_offset,
                         });
                     }
-                    (RankProtocolKind::ExpandedIndexed, None)
+                    (
+                        if deferred {
+                            RankProtocolKind::ExpandedIndexedDeferred
+                        } else {
+                            RankProtocolKind::ExpandedIndexed
+                        },
+                        None,
+                    )
                 }
                 DownEvidence::ExpandedGrouped {
                     y: _,
@@ -2990,8 +3079,9 @@ where
                         });
                     }
                     // The combine output width must equal the grouped down
-                    // output width (expert_k).
-                    if *hidden != down_experts.expert_k {
+                    // output width (expert_k). The grouped chain always
+                    // carries its combine, so the hoisted value is present.
+                    if combine_hidden != down_experts.expert_k {
                         return Err(MoeLowerError::CombineMetadataMismatch {
                             group: group.group.clone(),
                             layer: group.layer,
@@ -2999,7 +3089,7 @@ where
                             index: combine_offset,
                             field: "hidden",
                             expected: down_experts.expert_k,
-                            actual: *hidden,
+                            actual: combine_hidden,
                         });
                     }
                     // Checked slot arithmetic: total_slots must equal the
@@ -3373,12 +3463,13 @@ where
                     require_grouped_capacity(group, rank, down_index, &cap, down_y_tensor, dn_y4)?;
                     // Combine: topk weights (down_out/perm alias gated
                     // buffers; the final output keeps its generic check).
+                    // The grouped chain always carries its combine.
                     require_grouped_capacity(
                         group,
                         rank,
                         combine_offset,
                         &cap,
-                        combine_topk_weights,
+                        combine_topk_weights.expect("grouped chain always carries a combine"),
                         slots4,
                     )?;
                     // Optional per-expert dtype-tag tables: each Some is
@@ -3449,7 +3540,7 @@ where
             Ok(RankProtocol {
                 kind,
                 down_index,
-                combine_index: Some(combine_offset),
+                combine_index: if deferred { None } else { Some(combine_offset) },
                 convert_index: None,
                 dim,
                 batched: None,
@@ -4213,6 +4304,7 @@ fn parse_step_protocol<'a, F>(
     policy: &MoEExecutionPolicy,
     ranks: &[RoutedMoeStepPhases<'a>],
     cap: F,
+    deferred_combine: bool,
 ) -> Result<(ValidatedProtocol, RankProtocolKind), MoeLowerError>
 where
     F: Fn(&GpuTensor) -> usize,
@@ -4252,9 +4344,9 @@ where
         }
     }
 
-    let first = parse_rank_protocol(group, 0, &ranks[0], &cap)?;
+    let first = parse_rank_protocol(group, 0, deferred_combine, &ranks[0], &cap)?;
     for (rank, phases) in ranks.iter().enumerate().skip(1) {
-        let next = parse_rank_protocol(group, rank, phases, &cap)?;
+        let next = parse_rank_protocol(group, rank, deferred_combine, phases, &cap)?;
         if !same_rank_protocol(&first, &next) {
             return Err(MoeLowerError::RankProtocolMismatch {
                 group: group.group.clone(),
@@ -4275,6 +4367,19 @@ where
                 anchor: first.combine_index.unwrap_or(first.down_index),
                 dim: first.dim,
             },
+        },
+        // Deferred-expanded: the zero-combine shape is inherently rank-local
+        // (the next-layer fused consumer folds the partial on the same
+        // device); a parallel axis has no combine anchor, so only the Single
+        // executor is admitted.
+        RankProtocolKind::ExpandedIndexedDeferred => match policy.kind() {
+            MoEExecutionKind::Single => ValidatedProtocol::Single,
+            MoEExecutionKind::Tp | MoEExecutionKind::Ep => {
+                return Err(MoeLowerError::DeferredCombineOnParallelAxis {
+                    group: group.group.clone(),
+                    layer: group.layer,
+                });
+            }
         },
         RankProtocolKind::SelfCombiningI64 => {
             let convert = first
@@ -4312,8 +4417,15 @@ fn validate_step_protocol<'a>(
     group: &ExpertGroupPlan,
     policy: &MoEExecutionPolicy,
     ranks: &[RoutedMoeStepPhases<'a>],
+    deferred_combine: bool,
 ) -> Result<(ValidatedProtocol, RankProtocolKind), MoeLowerError> {
-    parse_step_protocol(group, policy, ranks, |tensor| tensor.buf.size())
+    parse_step_protocol(
+        group,
+        policy,
+        ranks,
+        |tensor| tensor.buf.size(),
+        deferred_combine,
+    )
 }
 
 /// Construct the sealed lowered program from the validated protocol. The
@@ -4448,7 +4560,8 @@ pub fn lower_moe_steps<'mesh, 'step>(
     validate_allowed_executions(group)?;
     select_moe_executor(group, policy)?;
     validate_program_identity(group, parts.router.selection(), parts.execution)?;
-    let (protocol, kind) = validate_step_protocol(group, policy, &parts.ranks)?;
+    let (protocol, kind) =
+        validate_step_protocol(group, policy, &parts.ranks, parts.deferred_combine)?;
     // A concrete grouped protocol requires the GroupedQuantized execution
     // plan, even when IndexedQuantized is also declared: membership alone
     // must never admit a grouped chain mislabeled as indexed.
@@ -5313,7 +5426,17 @@ mod tests {
             },
             execution: ExpertExecutionPlan::IndexedQuantized,
             ranks,
+            deferred_combine: false,
         }
+    }
+
+    fn deferred_parts(
+        ranks: Vec<RoutedMoeStepPhases<'static>>,
+        deferred_combine: bool,
+    ) -> MoeProgramParts<'static> {
+        let mut parts = parts(ranks);
+        parts.deferred_combine = deferred_combine;
+        parts
     }
 
     #[test]
@@ -5347,6 +5470,7 @@ mod tests {
             &policy,
             &[i64_rank(), i64_rank()],
             synthetic_capacity,
+            false,
         )
         .unwrap();
         assert!(matches!(protocol, ValidatedProtocol::TpI64 { .. }));
@@ -6001,6 +6125,7 @@ mod tests {
             &policy,
             &[batched_i64_rank(), batched_i64_rank()],
             synthetic_capacity,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -7757,6 +7882,241 @@ mod tests {
             }
         };
         assert!(lower_moe_steps(&group, &policy, parts(vec![rank(), rank()])).is_ok());
+    }
+
+    /// Indexed expanded rank: `IndexedMoeGemv(DownExpanded)` down with an
+    /// optional combine. `givens_phase` inserts a Paro pre-rotation Givens
+    /// into the named phase and `specialized_gate_up` swaps the plain indexed
+    /// gate-up for the specialized `MoeGateUpIndexed` — mirroring the decode
+    /// router-phase (Givens before the route) and indexed-prefill gate_up-phase
+    /// (Givens preamble before the gate-up) builder shapes.
+    fn expanded_rank(
+        combine: bool,
+        givens_phase: Option<&'static str>,
+        specialized_gate_up: bool,
+    ) -> RoutedMoeStepPhases<'static> {
+        let out = synth_f32(4);
+        // `Step` is not `Clone`, so each placement builds its own rotation.
+        let givens = || Step::GivensRotateBatched {
+            x: synth_f32(4),
+            out: synth_f32(4),
+            pairs: synth_f32(4),
+            theta: synth_f32(4),
+            scales: synth_f32(4),
+            batch: 1,
+            dim: 4,
+            krot: 4,
+        };
+        let mut router = Vec::new();
+        if givens_phase == Some("router") {
+            router.push(givens());
+        }
+        let mut gate_up = if specialized_gate_up {
+            vec![Step::MoeGateUpIndexed {
+                experts: expert_ref(),
+                topk_indices: synth_i64(4),
+                x_rot: synth_f32(4),
+                gate_batch: synth_f32(4),
+                up_batch: synth_f32(4),
+                k_top: 2,
+                batch_size: 1,
+                dtype_tags: None,
+            }]
+        } else {
+            vec![gate_up_step()]
+        };
+        if givens_phase == Some("gate_up") {
+            gate_up.insert(0, givens());
+        }
+        let mut activation = vec![activation_step()];
+        if givens_phase == Some("activation") {
+            activation.insert(0, givens());
+        }
+        RoutedMoePhases {
+            router,
+            gate_up,
+            activation,
+            down: vec![Step::IndexedMoeGemv {
+                experts: expert_ref(),
+                which: MoeProj::DownExpanded,
+                topk_indices: synth_i64(4),
+                input: GemvInput::Raw(synth_f32(4)),
+                out,
+                k_top: 2,
+                batch_size: 1,
+            }],
+            combine: if combine {
+                vec![Step::MoeCombine {
+                    down_out: out,
+                    topk_weights: synth_f32(4),
+                    out: synth_f32(4),
+                    k: 2,
+                    hidden: 4,
+                    batch_size: 1,
+                    inverse_perm: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            finish: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lowering_accepts_deferred_expanded_with_zero_combines() {
+        // The explicit deferred marker admits the combine-less expanded
+        // program (the next-layer fused consumer folds the partial); the
+        // Single schedule carries all three routed steps.
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let lowered = lower_moe_steps(
+            &group,
+            &policy,
+            deferred_parts(vec![expanded_rank(false, None, false)], true),
+        )
+        .unwrap();
+        assert_eq!(lowered.executor_kind(), MoeExecutorKind::SingleMesh);
+        assert_eq!(lowered.step_count(0), Some(3));
+    }
+
+    #[test]
+    fn lowering_rejects_zero_combine_expanded_without_defer() {
+        // Ordinary programs keep the exact-one-combine contract: a missing
+        // combine is still CombineCountMismatch, never silently deferred.
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let err = lower_moe_steps(
+            &group,
+            &policy,
+            parts(vec![expanded_rank(false, None, false)]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MoeLowerError::CombineCountMismatch {
+                expected: 1,
+                actual: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lowering_rejects_deferred_expanded_with_local_combine() {
+        // A deferred producer carrying its own combine would double-add (the
+        // next-layer fused consumer folds the partial again).
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let err = lower_moe_steps(
+            &group,
+            &policy,
+            deferred_parts(vec![expanded_rank(true, None, false)], true),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MoeLowerError::CombineCountMismatch {
+                expected: 0,
+                actual: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lowering_rejects_deferred_expanded_on_parallel_axis() {
+        // The deferred protocol is rank-local: the fused consumer folds the
+        // partial on the same device, so Tp/Ep has no combine anchor.
+        let group = group(ExpertParallelism::TensorParallel, 2);
+        let policy = tp_policy(2);
+        let err = lower_moe_steps(
+            &group,
+            &policy,
+            deferred_parts(
+                vec![
+                    expanded_rank(false, None, false),
+                    expanded_rank(false, None, false),
+                ],
+                true,
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MoeLowerError::DeferredCombineOnParallelAxis { .. }
+        ));
+        let display = err.to_string();
+        assert!(display.contains("test"));
+        assert!(display.contains("Some(0)"));
+    }
+
+    #[test]
+    fn lowering_accepts_indexed_paro_decode_givens() {
+        // Decode Paro: the router-phase Givens pre-rotation paired with the
+        // specialized `MoeGateUpIndexed` gate-up lowers as an indexed
+        // expanded program.
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let lowered = lower_moe_steps(
+            &group,
+            &policy,
+            parts(vec![expanded_rank(true, Some("router"), true)]),
+        )
+        .unwrap();
+        assert_eq!(lowered.executor_kind(), MoeExecutorKind::SingleMesh);
+    }
+
+    #[test]
+    fn lowering_accepts_indexed_paro_prefill_givens() {
+        // Indexed prefill (Path2-disabled Paro): the gate_up-phase Givens
+        // preamble paired with `MoeGateUpIndexed` also lowers.
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let lowered = lower_moe_steps(
+            &group,
+            &policy,
+            parts(vec![expanded_rank(true, Some("gate_up"), true)]),
+        )
+        .unwrap();
+        assert_eq!(lowered.executor_kind(), MoeExecutorKind::SingleMesh);
+    }
+
+    #[test]
+    fn lowering_rejects_router_givens_without_specialized_gate_up() {
+        // The decode router-phase Givens is only admitted when the
+        // specialized indexed gate-up accompanies it; a plain indexed gate-up
+        // keeps the Givens classified as stray grouped machinery.
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let err = lower_moe_steps(
+            &group,
+            &policy,
+            parts(vec![expanded_rank(true, Some("router"), false)]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MoeLowerError::StrayGroupedOp { op: "givens", .. }
+        ));
+    }
+
+    #[test]
+    fn lowering_rejects_relocated_givens_even_with_specialized_gate_up() {
+        // The Givens must sit in the decode router phase or the indexed
+        // prefill gate_up phase; the specialized gate-up does not license an
+        // activation-phase Givens.
+        let group = group(ExpertParallelism::Single, 1);
+        let policy = MoEExecutionPolicy::single();
+        let err = lower_moe_steps(
+            &group,
+            &policy,
+            parts(vec![expanded_rank(true, Some("activation"), true)]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MoeLowerError::StrayGroupedOp { op: "givens", .. }
+        ));
     }
 
     #[test]

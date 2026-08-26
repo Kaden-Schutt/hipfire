@@ -5,14 +5,14 @@
 <h1 align="center">hipfire</h1>
 
 <p align="center">
-  <strong>Fast local LLM inference for AMD GPUs.</strong><br />
+  <strong>Fast, AMD-native LLM inference — RDNA-first, CDNA-supported.</strong><br />
   Rust + HIP + Redline. No Python in the hot path. Ollama-style UX.
 </p>
 
 <p align="center">
   <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
   <a href="CHANGELOG.md"><img alt="Next release v0.3.0 beta" src="https://img.shields.io/badge/next-v0.3.0%20beta-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="54 curated model entries" src="https://img.shields.io/badge/registry-54%20curated%20models-ff8a1f?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="61 curated model entries" src="https://img.shields.io/badge/registry-61%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
@@ -39,8 +39,8 @@ hipfire run qwen3.5:4b "What is the capital of France?"
 The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
 
 Current stable release: **v0.2.1**. The next release is **v0.3.0**,
-headlined by MQ4R and Redline across RDNA. See
-[CHANGELOG.md](CHANGELOG.md).
+headlined by MQ4R and Redline across RDNA, and adding Qwen 3.8 27B and
+Muse Glimmer 30B. See [CHANGELOG.md](CHANGELOG.md).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -117,7 +117,7 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 54 pullable model entries. Run
+The registry currently contains 77 pullable model entries. Run
 `hipfire list -r` to see the authoritative live list.
 
 | Registry family | Pull tags and variants |
@@ -126,6 +126,8 @@ The registry currently contains 54 pullable model entries. Run
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
+| Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
+| Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
 | MiniMax-M2.7 | `minimax-m2.7` |
 | North-Mini-Code-1.0 | `north-mini-code` |
@@ -136,8 +138,8 @@ The registry currently contains 54 pullable model entries. Run
 | NEX N2 Mini | `nex-n2:mini` |
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
 
-Common aliases include `qwen3.5`, `qwen3.6`, `qwen3`, `carnice`,
-`qwopus`, `deepseek4`, `deepseek-v4`, and `vibethinker`.
+Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
+`qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, and `vibethinker`.
 
 Carnice uses the Hermes tool-call format. Plain Qwen 3.5 and 3.6 use
 their native Qwen XML tool-call format.
@@ -150,12 +152,16 @@ bring-your-own-model flows through `hipfire quantize`.
 
 | Family | Representative architectures | Notes |
 |---|---|---|
-| Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Native wave64 HIP paths |
+| Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Wave64 HIP; MQ3 and similar run via per-token GEMV fallback (correct, slower prefill) |
 | RDNA1 | `gfx1010`-`gfx1013` | Portable HIP and Redline dispatch support |
 | RDNA2 | `gfx1030`-`gfx1032` | Portable HIP and Redline dispatch support |
 | RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA4 | `gfx1200`, `gfx1201` | WMMA paths and validated retained-PM4 MQ4R route |
+
+Optimized kernel families are RDNA3/3.5 (gfx11) and RDNA4 (gfx12) via WMMA; other architectures — including `gfx906`/`gfx908` and `gfx94x` (CDNA/MI300X) — run correctly via the portable/fallback path. See `AGENTS.md:157` (MQ3 production on gfx11/gfx12; gfx906/gfx94x fallback) and `crates/rdna-compute/src/arch_caps.rs:124` (`has_wmma = is_rdna3 || is_rdna4`).
+
+hipfire is extracting a substrate layer called **saddle** (`crates/saddle-core`) to make per-target compute backends — RDNA today, CDNA and potentially XDNA later — first-class rather than fallbacks. It is partially built; see [saddle design grounding](docs/governance/2026-08-15-saddle-design-grounding.md) §3 for the proposed layering.
 
 Architecture-specific kernels are selected through typed dispatch tables.
 Unsupported specializations return to the correct portable or architecture
@@ -202,8 +208,17 @@ and methodology notice.
 | Model | Config | Decode tok/s |
 |---|---|---:|
 | Qwen2 1.5B HFQ4 | single GPU | **266** |
-| DeepSeek V4 Flash (82 GB MQ2-Lloyd) | 4× R9700, `hipfire serve --tp 4` (EP) | **25.6** |
+| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 3` (EP) | **53.1** |
+| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 4` (EP) | **54.3** |
+| DeepSeek V4 Flash (82 GB MQ2-Lloyd, superseded SKU) | 4× R9700, `hipfire serve --tp 4` (EP) | 25.6 |
 | Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
+
+The DeepSeek V4 Flash rows are n=3 fresh-process medians on
+`deepseek-v4-flash-0731.mq2r` (sha256 `cbf2bbcf…`), greedy, speculation off,
+`--kv f32`, 2052-token prompt. MQ2R is the current `deepseek-v4-flash` SKU and
+roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
+not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
+389 tok/s) and leaves a fourth card free.
 
 Experimental long-context compression and eviction are opt-in. PFlash is off
 by default, TriAttention sidecars do not auto-attach, and CASK m-folding is

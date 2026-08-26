@@ -6,6 +6,7 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
+use radiowave::{CodeObjectCertification, ExistingCodeObjectRequest, SchedulerProfile};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -257,7 +258,7 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 2;
+const KERNEL_CACHE_ABI: u32 = 3;
 
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
@@ -297,6 +298,9 @@ pub struct KernelCompiler {
     /// ROCM_PATH handed to the spawned compiler so it can find its own LLVM.
     /// None when the environment already sets it.
     rocm_env_root: Option<std::path::PathBuf>,
+    /// Override scheduler profile applied to all kernels when set via
+    /// `HIPFIRE_SCHED_PROFILE`. `None` selects the per-kernel table.
+    sched_profile_override: Option<SchedulerProfile>,
 }
 
 impl KernelCompiler {
@@ -469,6 +473,10 @@ impl KernelCompiler {
             eprintln!("  gfx1151 CU-mode modules: {}", modules.join(","));
         }
 
+        let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
+            .ok()
+            .and_then(|value| SchedulerProfile::parse(&value));
+
         Ok(Self {
             cache_dir,
             arch: arch.to_string(),
@@ -481,6 +489,7 @@ impl KernelCompiler {
             extra_flags,
             gfx1151_cumode_modules,
             toolchain_id,
+            sched_profile_override,
         })
     }
 
@@ -501,27 +510,144 @@ impl KernelCompiler {
         self.compiled.entry(func_name.to_string()).or_insert(path);
     }
 
-    fn module_flags(&self, name: &str) -> Vec<String> {
-        if self.arch == "gfx1151" && self.gfx1151_cumode_modules.contains(name) {
+    fn module_flags_for(
+        arch: &str,
+        name: &str,
+        gfx1151_cumode_modules: &HashSet<String>,
+    ) -> Vec<String> {
+        // Radiowave-selected spill-free RM2/BV6 schedule.
+        if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
+            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+        } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
             vec!["-mcumode".to_owned()]
         } else {
             Vec::new()
         }
     }
 
-    fn cache_hash(&self, name: &str, source: &str) -> String {
+    fn module_flags(&self, name: &str) -> Vec<String> {
+        let mut flags = Self::module_flags_for(&self.arch, name, &self.gfx1151_cumode_modules);
+        let profile = self.scheduler_profile_for(name);
+        flags.extend(profile.llvm_args().iter().map(|flag| flag.to_string()));
+        flags
+    }
+
+    /// Select the scheduler profile for a kernel. The per-kernel table is the
+    /// primary source; `HIPFIRE_SCHED_PROFILE` overrides everything when set.
+    ///
+    /// **The table is deliberately empty.** A kernel was
+    /// briefly mapped to `MemoryClause` on the strength of static counters
+    /// (r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills, and
+    /// strictly better than every ILP profile). Measured device-side with HIP
+    /// events on gfx1201 that produced **no benefit** — multirow medians over
+    /// three runs were 22.32 / 22.88 / 23.56 us under `memory-clause` against
+    /// 22.32 / 22.56 / 22.56 us under `default`, overlapping at the fast end
+    /// and differing by less than the run-to-run spread.
+    ///
+    /// Better static counters are not a performance result. A non-default
+    /// compile policy with no measured win is carried complexity, so the
+    /// selection was withdrawn and the boring baseline kept. The mechanism
+    /// stays, and is worth keeping: the manifest now reports the real profile
+    /// instead of a hardcoded `Default`, the profile participates in the cache
+    /// hash so changing it cannot silently reuse a stale object, and
+    /// `HIPFIRE_SCHED_PROFILE` makes a sweep cheap.
+    ///
+    /// If you add an entry here, gate it on a device-side measurement, not on
+    /// VGPR or clause counts. Note also that `IterativeIlp` spills 138 VGPRs on
+    /// the GL multirow kernel and must never be selected for it.
+    fn scheduler_profile_for(&self, name: &str) -> SchedulerProfile {
+        if let Some(profile) = self.sched_profile_override {
+            return profile;
+        }
+        let _ = name;
+        SchedulerProfile::Default
+    }
+
+    /// Single hashing sequence for all kernel cache keys. Every caller must
+    /// go through this so KERNEL_CACHE_ABI or field order changes cannot
+    /// silently diverge between JIT and packaging paths.
+    fn hash_parts(
+        source: &str,
+        arch: &str,
+        extra_flags: &str,
+        module_flags: &[String],
+        toolchain_id: &str,
+        scheduler_profile: SchedulerProfile,
+    ) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
-        self.arch.hash(&mut hasher);
-        self.extra_flags.hash(&mut hasher);
-        let module_flags = self.module_flags(name);
+        arch.hash(&mut hasher);
+        extra_flags.hash(&mut hasher);
         if !module_flags.is_empty() {
             "module-flags-v1".hash(&mut hasher);
             module_flags.hash(&mut hasher);
         }
-        self.toolchain_id.hash(&mut hasher);
+        toolchain_id.hash(&mut hasher);
+        scheduler_profile.as_str().hash(&mut hasher);
         KERNEL_CACHE_ABI.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+
+    fn cache_hash(&self, name: &str, source: &str) -> String {
+        Self::hash_parts(
+            source,
+            &self.arch,
+            &self.extra_flags,
+            &self.module_flags(name),
+            &self.toolchain_id,
+            self.scheduler_profile_for(name),
+        )
+    }
+
+    /// Hash a kernel as a **packaged** blob will be validated on a
+    /// compiler-free runtime. Identical to `cache_hash` except
+    /// `toolchain_id` is empty — the value `KernelCompiler::new` computes
+    /// when `hipcc --version` cannot be run (`unwrap_or_default()`).
+    ///
+    /// Dropping `toolchain_id` for shipped blobs is sound: that field exists
+    /// to stop different builds sharing one mutable `.hipfire_kernels` dir from
+    /// reusing each other's blobs (the "invalid device image" trap). A baked,
+    /// read-only, shipped-as-a-unit `kernels/compiled/{arch}` directory has no
+    /// such sharing, and the key still binds source + arch + flags + ABI.
+    pub fn packaging_hash(&self, name: &str, source: &str) -> String {
+        Self::hash_parts(
+            source,
+            &self.arch,
+            &self.extra_flags,
+            &self.module_flags(name),
+            "",
+            self.scheduler_profile_for(name),
+        )
+    }
+
+    /// Static packaging hash for the `hipfire-kernel-hash` binary: same inputs
+    /// as `packaging_hash` but without needing a `KernelCompiler` instance.
+    /// Resolves `gfx1151` CU-mode modules from the environment so the key
+    /// matches what a runtime constructed with the same env would compute.
+    pub fn packaging_hash_for(arch: &str, name: &str, source: &str, extra_flags: &str) -> String {
+        let gfx1151_cumode_modules = if arch == "gfx1151" {
+            hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
+                .unwrap_or_default()
+                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let module_flags = Self::module_flags_for(arch, name, &gfx1151_cumode_modules);
+        let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
+            .ok()
+            .and_then(|value| SchedulerProfile::parse(&value));
+        let scheduler_profile = sched_profile_override.unwrap_or(SchedulerProfile::Default);
+        Self::hash_parts(
+            source,
+            arch,
+            extra_flags,
+            &module_flags,
+            "",
+            scheduler_profile,
+        )
     }
 
     /// Persistent install dir for writeback. None when no cold location was
@@ -540,6 +666,50 @@ impl KernelCompiler {
             0,
             &format!("{name}: {action}, but hipcc is unavailable.\n{guidance}"),
         )
+    }
+
+    /// Attach a hash-bound Radiowave inspection to an already validated
+    /// Hipfire kernel-cache artifact. Retained PM4 consumes this adjacent
+    /// manifest for cache-scope and argument-effect proofs; without it the
+    /// replay path correctly fails closed to broad acquires and unknown
+    /// resource effects even when the code object itself is already safe.
+    ///
+    /// Certification never recompiles or replaces the HSACO. It is best-effort
+    /// because packaged installs may intentionally have no ROCm inspection
+    /// tools; those installs retain the conservative replay policy.
+    fn ensure_radiowave_certification(&self, name: &str, artifact: &Path) {
+        if !self.has_hipcc {
+            return;
+        }
+        let manifest = artifact.with_extension("radiowave.json");
+        let already_valid = std::fs::read(artifact)
+            .ok()
+            .zip(std::fs::read_to_string(&manifest).ok())
+            .is_some_and(|(code, encoded)| {
+                CodeObjectCertification::from_json(&code, &encoded).is_ok()
+            });
+        if already_valid {
+            return;
+        }
+
+        let source = artifact.with_extension("hip");
+        if !source.is_file() {
+            return;
+        }
+        let request = ExistingCodeObjectRequest::new(&source, artifact, &self.arch)
+            .hipcc(&self.hipcc_bin)
+            .command(vec![
+                self.hipcc_bin.display().to_string(),
+                "hipfire-kernel-cache".to_owned(),
+                name.to_owned(),
+            ])
+            .manifest(&manifest)
+            .scheduler_profile(self.scheduler_profile_for(name));
+        if let Err(error) = radiowave::Compiler.certify_existing(&request) {
+            eprintln!(
+                "  WARNING: {name}: Radiowave could not certify existing cache artifact: {error}"
+            );
+        }
     }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
@@ -569,6 +739,7 @@ impl KernelCompiler {
                 if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
                     writeback_cold(name, &precompiled, &src_hash, &cold, false);
                 }
+                self.ensure_radiowave_certification(name, &precompiled);
                 self.compiled.insert(name.to_string(), precompiled);
                 return Ok(&self.compiled[name]);
             }
@@ -595,6 +766,7 @@ impl KernelCompiler {
             if let Some(dir) = self.writeback_dir() {
                 writeback_cold(name, &obj_path, &src_hash, dir, false);
             }
+            self.ensure_radiowave_certification(name, &obj_path);
             self.compiled.insert(name.to_string(), obj_path);
             return Ok(&self.compiled[name]);
         }
@@ -627,6 +799,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &module_flags,
         )?;
+        self.ensure_radiowave_certification(name, &obj_path);
 
         // Ensure cold install dir has valid hash + blob (writeback from hot).
         // Must target cold_dir, not the lookup view: when hot is preferred for
@@ -671,6 +844,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &module_flags,
         )?;
+        self.ensure_radiowave_certification(name, &obj_path);
 
         // Force-sync distinct cold only after a successful fresh hot compile.
         if let Some(dir) = self.writeback_dir().map(Path::to_path_buf) {
@@ -752,10 +926,14 @@ impl KernelCompiler {
         obj_path: &Path,
         passthrough: Vec<String>,
     ) -> Vec<String> {
+        // clang ≥19 compresses offload bundles by default. HIP's loader accepts the
+        // compressed container; the public HSA reader Redline uses does not, so a
+        // CCOB blob demotes every retained route to plain HIP.
         let mut args: Vec<String> = vec![
             "--genco".into(),
             format!("--offload-arch={arch}"),
             "-O3".into(),
+            "--no-offload-compress".into(),
         ];
         args.extend(passthrough);
         args.push("-o".into());
@@ -1142,12 +1320,13 @@ mod tests {
             toolchain_id: toolchain_id.to_string(),
             hipcc_bin: PathBuf::from("hipcc"),
             rocm_env_root: None,
+            sched_profile_override: None,
         }
     }
 
     #[test]
     fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
-        assert_eq!(KERNEL_CACHE_ABI, 2);
+        assert_eq!(KERNEL_CACHE_ABI, 3);
     }
 
     #[test]
@@ -1516,6 +1695,7 @@ mod tests {
                 "--genco",
                 "--offload-arch=gfx1100",
                 "-O3",
+                "--no-offload-compress",
                 "-I/opt/rocm/include",
                 "-o",
                 "kernel.hsaco",
@@ -1550,6 +1730,26 @@ mod tests {
 
         candidate.arch = "gfx1100".to_owned();
         assert!(candidate.module_flags("selected").is_empty());
+    }
+
+    #[test]
+    fn gfx1100_muse_rm_bt_uses_iterative_ilp_and_is_cache_keyed() {
+        let source = "__global__ void kernel() {}";
+        let module = "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt";
+        let mut gfx1100 = test_compiler("", "hipcc 7.2");
+        gfx1100.arch = "gfx1100".to_owned();
+        let control = test_compiler("", "hipcc 7.2");
+
+        assert_eq!(
+            gfx1100.module_flags(module),
+            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned(),]
+        );
+        assert!(gfx1100.module_flags("other").is_empty());
+        assert!(control.module_flags(module).is_empty());
+        assert_ne!(
+            control.cache_hash(module, source),
+            gfx1100.cache_hash(module, source)
+        );
     }
 
     /// Write an executable fake hipcc that copies a canned blob to `-o` path,
@@ -1946,6 +2146,79 @@ mod tests {
             "successful hipcc publish must leave no temps: {:?}",
             leftover_temps(&hot)
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn packaging_hash_validates_on_compiler_free_runtime() {
+        // Proves that a blob+hash pair emitted by compile-kernels.sh in
+        // packaging mode (toolchain_id = "") satisfies pair_valid for a
+        // compiler-free runtime (has_hipcc = false, empty toolchain_id) so
+        // compile() uses the silent validated path, not the UNVALIDATED
+        // fallback.
+        let root = temp_root("packaging_hash_validates");
+        let _ = std::fs::remove_dir_all(&root);
+        let precompiled = root.join("precompiled");
+        std::fs::create_dir_all(&precompiled).unwrap();
+
+        let name = "packaged_kernel";
+        let source = "__global__ void packaged_kernel() {}";
+        let arch = "gfx1201";
+
+        // Builder has a real toolchain, but packaging must use empty id.
+        let mut builder = test_compiler("", "hipcc 7.2");
+        builder.arch = arch.to_string();
+        let packaging_via_instance = builder.packaging_hash(name, source);
+        let packaging_via_static = KernelCompiler::packaging_hash_for(arch, name, source, "");
+        assert_eq!(
+            packaging_via_instance, packaging_via_static,
+            "instance and static packaging hashes must agree (same hash_parts)"
+        );
+
+        // Compiler-free runtime computes with empty toolchain_id.
+        let mut runtime = test_compiler("", "");
+        runtime.arch = arch.to_string();
+        let runtime_hash = runtime.cache_hash(name, source);
+        assert_eq!(
+            packaging_via_instance, runtime_hash,
+            "packaging hash must equal what a hipcc-free runtime computes"
+        );
+        // And must differ from a builder's normal cache_hash (which folds in toolchain).
+        let builder_hash = builder.cache_hash(name, source);
+        assert_ne!(
+            packaging_via_instance, builder_hash,
+            "packaging (empty toolchain) must differ from normal cache hash"
+        );
+
+        // Bake blob+hash as the script now does.
+        let hsaco = precompiled.join(format!("{name}.hsaco"));
+        let hash_file = precompiled.join(format!("{name}.hash"));
+        std::fs::write(&hsaco, b"FAKE_HSACO_BLOB").unwrap();
+        std::fs::write(&hash_file, &packaging_via_instance).unwrap();
+
+        // Direct pair_valid check: what compile() checks first.
+        assert!(
+            pair_valid(&hsaco, &hash_file, &runtime_hash),
+            "packaged pair must be pair_valid for compiler-free hash"
+        );
+
+        // End-to-end via KernelCompiler::compile with has_hipcc = false:
+        // must take the validated branch (no UNVALIDATED warning path) and
+        // return the precompiled blob.
+        let mut c = test_compiler("", "");
+        c.arch = arch.to_string();
+        c.has_hipcc = false;
+        c.cache_dir = root.join("hot");
+        std::fs::create_dir_all(&c.cache_dir).unwrap();
+        c.precompiled_dir = Some(precompiled.clone());
+        c.cold_dir = Some(precompiled.clone());
+
+        let path = c
+            .compile(name, source)
+            .expect("packaged blob must validate without hipcc");
+        assert_eq!(path, &hsaco);
+        assert!(c.compiled.contains_key(name));
 
         let _ = std::fs::remove_dir_all(&root);
     }
