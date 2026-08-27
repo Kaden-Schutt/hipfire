@@ -700,6 +700,48 @@ pub static FIELDS: &[ConfigField] = &[
         "Serve requests concurrently on the multi-slot engine instead of one at a time."
     ),
     field!(
+        "serve.multi_slot_slots",
+        "multi_slot_slots",
+        Serve,
+        Process,
+        DefaultValue::Integer(4),
+        ValueRule::Integer { min: 1, max: 64 },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_SLOTS"),
+        "Concurrent slots for the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_ctx",
+        "multi_slot_ctx",
+        Serve,
+        Process,
+        DefaultValue::Integer(8192),
+        ValueRule::Integer {
+            min: 512,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_CTX"),
+        "Per-slot context capacity (tokens) for the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_prefill_chunk",
+        "multi_slot_prefill_chunk",
+        Serve,
+        Process,
+        DefaultValue::Integer(1024),
+        ValueRule::Integer {
+            min: 1,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK"),
+        "Prefill tokens taken from one slot per multi-slot step; batch scratch is sized n_slots x this."
+    ),
+    field!(
         "generation.temperature",
         "temperature",
         Generation,
@@ -3042,19 +3084,6 @@ pub fn synchronized_device_visibility(
 ) -> Result<Option<DeviceVisibility>> {
     let configured = config.legacy_value("HIPFIRE_DEVICES");
     if let Some(configured) = configured.as_deref() {
-        // Only an all-`arch:` selector list skips ordinal-list masking: those
-        // are stable identities resolved against live devices at GPU init
-        // (rdna-compute Gpu::init). uuid:/pci: selectors keep the historical
-        // verbatim passthrough until per-device probes exist, and plain
-        // ordinals take visibility_from_physical exactly as before.
-        let all_arch = !configured.trim().is_empty()
-            && configured.split(',').all(|part| {
-                let part = part.trim();
-                part.len() > "arch:".len() && part.starts_with("arch:")
-            });
-        if all_arch {
-            return Ok(None);
-        }
         return visibility_from_physical(configured).map(Some);
     }
 
