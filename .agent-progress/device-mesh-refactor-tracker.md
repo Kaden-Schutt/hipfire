@@ -30,37 +30,69 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-001` through `COR-006`, `DOC-001`, `STEP-001`, `STEP-002`, `STEP-002R`, `STEP-003`, `STEP-004`, `PAR-001`, `CAP-001`, and `COMP-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, COR-006 eviction physical-cap KV alignment, STEP-001 DeltaNet migration, STEP-002 MoE Step/manifest adoption, STEP-002R owner-preserving bundle teardown, STEP-003 recurrent/conv Step/manifest adoption, STEP-004 remaining-forward-path Step adoption (Qwen35 PP decode, LFM2, Cohere2, MiniMax decode; LFM2/Cohere2 manifest machinery + `lower_moe_steps`; see `.agent-progress/step-004-inventory.md`), PAR-001 policy characterization, CAP-001 capability admission, and COMP-001 TP×EP refusal work are substantial and tested. `GEN-001` was briefly mis-marked complete in `b1d54d5c2`; corrected 2026-08-08 to blocked, then unblocked the same day when STEP-003 completed (see the task's blocked reason). Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-001` through `COR-006`,
+`DOC-001`, `STEP-001`, `STEP-002`, `STEP-002R`, `STEP-003`, `STEP-004`,
+`PAR-001`, `CAP-001`, and `COMP-001` are complete. STEP-004 remains valid
+historical evidence for the forward paths present when it closed, but the
+2026-08-26 mainline absorption added or re-enabled production `SuperOp` and
+bespoke decoder paths that were not represented by that completion claim.
+`STEP-005` now owns retirement of the production `SuperOp` substrate;
+`STEP-006` owns newly absorbed bespoke decoder families; and `GEN-003` owns
+the duplicated prefill and continuous-batch drivers. No earlier completion
+claim waives these correction tasks.
 
-Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements. 2026-08-08 STEP-004 follow-up: an EMULATED-PP correctness bug was root-caused and fixed (`DeltaNetState::new_with_quant_multi` did not wire the error-feedback residual — the recurrence used the stochastic requantization path while the single-GPU ctor wires EF by default; a per-layer hidden-state bisect under `HIPFIRE_EMULATE_GPUS=2` localized the drift to the first state write; `pp_parity` now passes 50/50 under emulation). The fix is hardware-independent and may also bear on the physical token-58 divergence, but HW-003/HW-004 remain BLOCKED and untouched — physical re-validation on distinct GPUs with pinned digests and deterministic mode is still required.
+Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`)
+confirmed balanced Qwen35 PP allocation and peer access, but did not close
+either physical PP gate: dense LLaMA forward hit an unclassified illegal
+access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded
+follow-up are recorded under HW-003 and HW-004; neither changes the current
+execution queue or relaxes exact-parity requirements. 2026-08-08 STEP-004
+follow-up: an EMULATED-PP correctness bug was root-caused and fixed
+(`DeltaNetState::new_with_quant_multi` did not wire the error-feedback
+residual). The fix is hardware-independent and may also bear on the physical
+token-58 divergence, but HW-003/HW-004 remain blocked and untouched.
 
 2026-08-26: the device-mesh feature branch merged into mainline with the crate
 split (`hipfire-hardware`, `hipfire-loader`, `hipfire-daemon`,
 `hipfire-generate`). Tracker statuses remain authoritative; the reconciliation
 notes under "Completed Foundation Evidence", COR-001, COR-004, COMP-001, and
-GEN-002 record where pre-merge evidence referenced deleted artifacts (the
-`examples/daemon.rs` example and the TypeScript/Bun CLI), where landed
-controls supersede design text (`resolve_mesh` → `admit_path` preflight;
-dense TP/PP mesh routing via `load_admitted` → `select_load_mesh`, with
-`effective_load_mesh` only as the normalized-admission branch), and where
-merge context re-scopes an open task
-(GEN-002: DeepSeek4 single-GPU is now the merged default route, but its
-acceptance evidence is still owed on that route).
+GEN-002 record where pre-merge evidence referenced deleted artifacts and where
+landed controls supersede design text. A post-merge execution audit additionally
+found default-on `run_layer_program` routes in Qwen35, DeepSeek4, MiniMax, LFM2,
+and Gemma4, `run_layer_program_ep` use in Qwen35 and DeepSeek4, and a bespoke
+Muse/Glimmer decoder. Those findings are active work under STEP-005 and
+STEP-006, not exceptions retroactively covered by STEP-004.
 
 ## Execution Priority
 
 This is the implementation queue. The dependency graph below remains the
 authoritative constraint; a task is marked `in progress` only when work begins.
 
-1. `STEP-003` — complete as of 2026-08-08 (`9dcb1862a` + increment 2 verification): all DeltaNet recurrent/conv ops run through Steps on the owning device.
-2. `STEP-004` — complete as of 2026-08-08 (commit pending; see `.agent-progress/step-004-inventory.md` for the inventory + parity evidence): every remaining architecture forward path migrated to Step-based dispatch, with justified non-decoder exceptions; LFM2/Cohere2 routed-MoE expert phases now lower through `lower_moe_steps` via new manifest machinery. Gates `AXIS-001` through `AXIS-004`.
-3. `GEN-002` — DeepSeek4 single-GPU acceptance evidence on the merged
-   mainline route (the single-GPU default itself landed in the 2026-08-26
-   merge; deps COR-002 complete). Independent stream.
-4. `SPEC-001` — unify AR and speculative orchestration (ready; deps COR-001..003 complete). Unblocks `SPEC-002` and `VL-002`.
-5. `VL-001` — shared lifecycle for Qwen35-VL (ready; deps COR-002, COR-003 complete). Independent multimodal stream.
+1. `STEP-005` — retire production `SuperOp`, `ForwardBindings`,
+   `run_layer_program`, and `run_layer_program_ep`; make Step execution the one
+   forward spine.
+2. `SPEC-001` — unify AR and speculative orchestration. Independent of
+   STEP-005 and ready now.
+3. `STEP-006` — migrate newly absorbed bespoke decoder families after the
+   executor contract is singular.
+4. `GEN-002` — collect DeepSeek4 single-GPU acceptance evidence only after its
+   production route no longer runs through SuperOp.
+5. `GEN-003` — unify prefill and continuous-batch drivers after STEP-005 and
+   SPEC-001.
+6. `GEN-001` — complete Qwen35 arch-resident PP through the singular Step
+   executor and shared request lifecycle.
+7. `VL-001` — adopt the shared post-prefill lifecycle for Qwen35-VL;
+   independent of the SuperOp retirement stream.
 
-`COMP-001` (TP×EP refusal) and `CAP-001` (capability contract + dense-EP normalization) are complete and are no longer queue items. `STEP-002R` (owner-preserving bundle teardown) is complete as of 2026-08-08 (PR #18 mirror, commits `064e26e0d` + `c7f142af8`). `STEP-003` is complete as of 2026-08-08. `GEN-001` is unblocked and ready — its last pending dependency (STEP-003) is complete; all deps (COR-002, STEP-001, STEP-002, STEP-003) are satisfied. The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013` tasks remain dependency-blocked until their capability, family, implementation, and topology prerequisites are satisfied. Hardware tasks remain blocked until the required distinct-GPU topology is available; emulation does not advance them toward completion.
+`STEP-004` remains complete for its pre-merge inventory and parity evidence,
+but no longer gates new axis work; STEP-005 is the corrected execution-spine
+gate. `GEN-001` and `GEN-002` are blocked on that correction rather than
+collecting acceptance evidence against a route scheduled for deletion. The
+`AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013` tasks
+remain dependency-blocked until their capability, family, implementation, and
+topology prerequisites are satisfied. Hardware tasks remain blocked until the
+required distinct-GPU topology is available; emulation does not advance them
+toward completion.
 
 ## Completed Foundation Evidence
 
@@ -86,7 +118,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### HW-001 DeepSeek4 RCCL EP Validation
 
 - **Status:** blocked
-- **Dependencies:** STEP-002
+- **Dependencies:** STEP-002, STEP-005
 - **Goal:** Validate the production RCCL expert-parallel path for DeepSeek4 without the peer-all-reduce fallback.
 - **Acceptance criteria:** Pin the DeepSeek4 model artifact SHA-256 and prompt-file MD5 before testing; capture the existing peer-all-reduce `ep_decode_parity` committed-token hash as the oracle; on at least two distinct GPUs, the RCCL run must produce the identical committed-token hash, pass the same multi-turn assertions, complete four load/generate/reset/unload cycles without hangs or invalid access, and return each GPU to within 64 MiB of its post-first-unload baseline with no monotonic growth across cycles 2-4.
 - **Validation:** Run `ep_decode_parity` and its multi-turn serving fixture first with `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` to capture the oracle, then with RCCL enabled and `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` unset; record artifact/prompt digests, topology, GPU architecture, ROCm/RCCL versions, exact commands, token hashes, and per-cycle VRAM.
@@ -96,7 +128,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### HW-002 MiniMax RCCL EP Validation
 
 - **Status:** blocked
-- **Dependencies:** STEP-002
+- **Dependencies:** STEP-002, STEP-005
 - **Goal:** Validate the production RCCL expert-parallel path for MiniMax without the peer-all-reduce fallback.
 - **Acceptance criteria:** Pin the MiniMax model artifact SHA-256 and deterministic prompt-file MD5 before testing; capture the emulated/peer EP committed-token hashes for cold prefill, LCP reuse, and the Tokyo-then-Germany multi-turn fixture as oracles; RCCL on at least two distinct GPUs must match every hash, complete four load/generate/unload cycles, and return each GPU to within 64 MiB of its post-first-unload baseline with no monotonic growth across cycles 2-4.
 - **Validation:** Run the existing MiniMax EP deterministic capital/code, LCP, and Tokyo-then-Germany multi-turn fixtures with the peer path to capture oracles, then repeat with RCCL and the peer fallback disabled; record digests, topology, versions, commands, hashes, and per-cycle VRAM.
@@ -156,7 +188,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### HW-008 Physical DeepSeek4 PP/TP Validation
 
 - **Status:** blocked
-- **Dependencies:** AXIS-003, STEP-004
+- **Dependencies:** AXIS-003, STEP-005
 - **Goal:** Prove physical PP/TP parity, placement, and lifecycle for newly enabled DeepSeek4 PP/TP cells; existing DeepSeek4 EP remains HW-001.
 - **Acceptance criteria:** For each admitted DeepSeek4 PP or TP cell, pin the model artifact SHA-256 and prompt-file MD5; physical execution must match the single-device or accepted EP-independent oracle, place trunk/state/shard allocations correctly, pass reset/abort/multi-turn behavior, and complete four load/generate/unload cycles within 64 MiB of the post-first-unload baseline with no monotonic VRAM growth across cycles 2-4.
 - **Validation:** Run deterministic single-device, emulated mesh, and physical PP/TP fixtures; capture parity hashes, placement and boundary/collective traces, topology, exact commands, artifact/prompt/binary digests, first numerical divergence, and per-cycle VRAM/lifecycle diagnostics.
@@ -166,7 +198,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### HW-009 Physical MiniMax PP/TP Validation
 
 - **Status:** blocked
-- **Dependencies:** AXIS-003, STEP-004
+- **Dependencies:** AXIS-003, STEP-005
 - **Goal:** Prove physical PP/TP parity, placement, and lifecycle for newly enabled MiniMax PP/TP cells; existing MiniMax EP remains HW-002.
 - **Acceptance criteria:** For each admitted MiniMax PP or TP cell, pin the model artifact SHA-256 and deterministic prompt-file MD5; physical execution must match the accepted single-device/EP oracle for cold, LCP, and Tokyo-then-Germany multi-turn fixtures, place model/state/shard allocations correctly, pass reset/abort/multi-turn behavior, and complete four load/generate/unload cycles within 64 MiB of the post-first-unload baseline with no monotonic VRAM growth across cycles 2-4.
 - **Validation:** Run deterministic single-device, emulated mesh, and physical PP/TP fixtures; record capital/code, LCP, and Tokyo-then-Germany token hashes, placement and boundary/collective traces, topology, exact commands, artifact/prompt/binary digests, and per-cycle VRAM/lifecycle diagnostics.
@@ -176,7 +208,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### HW-010 Physical LFM2 Dense+MoE/Cohere2-MoE PP/TP/EP Validation
 
 - **Status:** blocked
-- **Dependencies:** AXIS-003, STEP-004
+- **Dependencies:** AXIS-003, STEP-005
 - **Goal:** Prove physical parity, placement, and lifecycle for newly enabled dense LFM2 PP/TP, LFM2-MoE PP/TP/EP, and Cohere2-MoE PP/TP/EP cells.
 - **Acceptance criteria:** For every admitted dense LFM2, LFM2-MoE, or Cohere2-MoE cell, pin the per-family model artifact SHA-256 and prompt-file MD5; physical execution must match the single-device or emulated oracle, place routed experts and PP/TP state/shards correctly, pass reset/abort/multi-turn behavior, and complete four load/generate/unload cycles within 64 MiB of the post-first-unload baseline with no monotonic VRAM growth across cycles 2-4. EP evidence applies only to MoE variants; dense LFM2 `EP>1` is normalized to single via CAP-001 and creates no EP support claim.
 - **Validation:** Run per-family deterministic single-device, emulated mesh, and physical PP/TP fixtures for dense LFM2 and physical PP/TP/EP fixtures for LFM2-MoE and Cohere2-MoE; record capability selection/refusal, token hashes, expert/stage/shard placement, boundary and collective traces, topology, exact commands, artifact/prompt/binary digests, and per-cycle VRAM/lifecycle diagnostics.
@@ -353,23 +385,24 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
 
-- **Status:** ready
-- **Dependencies:** COR-002, STEP-001, STEP-002, STEP-003
+- **Status:** blocked
+- **Dependencies:** COR-002, STEP-001, STEP-002, STEP-003, STEP-005, SPEC-001
 - **Goal:** Own and complete Qwen35 PP for both dense and MoE cells through the arch-resident `ModelParallel::Pp(PipelineImpl::ArchResident)` path for hybrid attention and DeltaNet layers.
 - **Acceptance criteria:** Dense and MoE Qwen35 load, prefill, decode, recurrent/conv state, sampling, and unload use the generic PP ownership and stage interfaces; the Qwen35 adapter implements the COR-002 reset contract without creating a second reset authority; no legacy `pp`/`pp_gpus` side channel or duplicate Qwen35 PP loop remains; dense and MoE emulated PP parity is byte- or token-identical before physical validation.
 - **Validation:** Run dense and MoE Qwen35 single-versus-emulated-PP deterministic parity, COR-002 conformance and recurrent multi-turn/reset tests, placement assertions, and repeated unload tests; then hand off both PP families to HW-004.
 - **Hardware:** One supported AMD GPU for emulated PP; physical closure is HW-004.
-- **Blocked reason (resolved 2026-08-08 — STEP-003 complete; see STEP-003 evidence):** Status correction 2026-08-08 — the `complete` flip in `b1d54d5c2` was premature. STEP-003 (recurrent/conv Step/manifest adoption) is not complete, PR #527's architecture table still records Qwen35 PP as `Partial: Pp(ArchResident), still generate_multi`, and `docs/MODELS.md` still labels PP "partial arch-resident (GEN-001; not production-supported)". The arch-resident PP owner exists but the generation path remains `generate_multi`, not the unified PP loop; the acceptance criteria and validation are unproven.
+- **Blocked reason:** STEP-005 and SPEC-001 are open. Historical correction: the `complete` flip in `b1d54d5c2` was premature because the arch-resident PP owner still used `generate_multi`; STEP-003 later closed its recurrent/conv prerequisite, but the absorbed SuperOp route and shared-lifecycle dependency now gate completion.
 - **Evidence:** Pending
 
 ### GEN-002 Add DeepSeek4 Single-GPU Fallback
 
-- **Status:** ready — re-scoped to the merged mainline route (2026-08-26; see evidence)
-- **Dependencies:** COR-002
+- **Status:** blocked — re-scoped to the merged mainline route (2026-08-26; see evidence)
+- **Dependencies:** COR-002, STEP-005
 - **Goal:** Provide an ordinary single-GPU DeepSeek4 generation path when EP is not selected or available.
 - **Acceptance criteria:** DeepSeek4 selects a single-device ArchDispatch/AR path without constructing EP state; DSML grammar/parser behavior matches the EP path; its adapter implements and proves the COR-002 reset contract; deterministic output, tool calls, and unload are coherent; unsupported model sizes fail explicitly on insufficient VRAM.
 - **Validation:** Run deterministic prose/code/tool-call and multi-turn parity against the accepted DeepSeek4 behavior, COR-002 reset conformance, load/unload, and low-VRAM failure tests.
 - **Hardware:** One supported AMD GPU with enough VRAM for the selected DeepSeek4 fixture.
+- **Blocked reason:** STEP-005 must remove the merged default SuperOp route before acceptance evidence is collected.
 - **Evidence:** Pending for the merged route. 2026-08-26 merge context: the
   mainline merge shipped single-GPU DeepSeek4 as the production default —
   `params.deepseek4_compute_placement` defaults to `single`
@@ -381,6 +414,17 @@ authoritative constraint; a task is marked `in progress` only when work begins.
   the hipfire-generate route; the acceptance evidence itself (DSML parity,
   COR-002 reset conformance, deterministic prose/code/tool-call and multi-turn
   behavior, unload, low-VRAM refusal) is still owed against that route.
+
+
+### GEN-003 Unify Prefill And Continuous-Batch Drivers
+
+- **Status:** blocked
+- **Dependencies:** STEP-005, SPEC-001
+- **Goal:** Run batched prefill and continuous decoding through one scheduler and request-lifecycle driver with architecture adapters, rather than parallel Qwen/LFM and per-architecture prefill loops.
+- **Acceptance criteria:** The architecture-neutral scheduler owns admission, cancellation, accounting, finalization, and batch transitions; architecture adapters provide state, prefill, and token-forward operations without duplicating the driver; supported prefill/decode/verify work uses the Step executor with explicit row counts or an executor-owned fused Step plan; the duplicate Qwen and LFM continuous-batch drivers and obsolete inline request loops are deleted. Architecture-specific kernels and vision preprocessing remain valid below the shared boundary.
+- **Validation:** Run deterministic single-request versus batched parity for Qwen and LFM, mixed-length admission/cancellation/finalization tests, prefill chunk and decode transition tests, multi-turn reset coverage, and source inventory proving one continuous-batch driver and no duplicate production prefill orchestration.
+- **Hardware:** One supported AMD GPU with the canonical Qwen and LFM fixtures; physical multi-GPU closure remains with the named HW tasks.
+- **Evidence:** Pending
 
 ### SPEC-001 Unify AR And Speculative Orchestration
 
@@ -676,12 +720,32 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 ### STEP-004 Migrate Remaining Forward Paths
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** STEP-001, STEP-002, STEP-003, PAR-001
-- **Goal:** Adopt Step/manifest for every remaining architecture forward path that already has a supported Single/PP/TP/EP cell, or record a justified non-decoder exception.
-- **Acceptance criteria:** An inventory names every architecture and forward entry point; existing supported decoder paths use Step/manifest; encode-only or vision-only exceptions have explicit boundaries and ownership; obsolete executors and duplicate placement logic are deleted; each migration has parity evidence. This task does not create support for a new parallel axis; CAP-001 owns capability plumbing, while AXIS-001 through AXIS-004 own concrete family implementations and PAR-002 aggregates their closure.
-- **Validation:** Run an inventory search against architecture registration and forward symbols, per-family deterministic parity/coherence tests for already-supported cells, workspace tests, and checks that no unapproved bespoke decoder executor remains.
-- **Hardware:** Supported AMD GPU coverage for each migrated, already-supported path; exact models/topologies follow PAR-001 decisions.
+- **Goal:** Adopt Step/manifest for every remaining architecture forward path present in the pre-merge branch inventory that already had a supported Single/PP/TP/EP cell, or record a justified non-decoder exception.
+- **Acceptance criteria:** An inventory names every architecture and forward entry point in the STEP-004 snapshot; supported decoder paths in that snapshot use Step/manifest; encode-only or vision-only exceptions have explicit boundaries and ownership; each migration has parity evidence.
+- **Validation:** Historical per-family deterministic parity and inventory evidence is recorded in `.agent-progress/step-004-inventory.md`.
+- **Hardware:** Supported AMD GPU coverage used by the recorded parity fixtures; physical topology closure remains in the named HW tasks.
+- **Evidence:** Complete as of 2026-08-08 for the pre-merge inventory. The 2026-08-26 absorption introduced or re-enabled production SuperOp and bespoke decoder paths outside this snapshot. STEP-005 and STEP-006 are mandatory correction tasks; this historical completion cannot be used as evidence for them.
+
+### STEP-005 Retire Production SuperOp Execution
+
+- **Status:** ready
+- **Dependencies:** STEP-004
+- **Goal:** Make `execute_steps` and its mesh variants the sole production forward executor and retire the parallel `SuperOp` orchestration substrate.
+- **Acceptance criteria:** Qwen35 dense/MoE Single and EP, DeepSeek4 Single and EP, MiniMax Single, LFM2, and Gemma4 no longer reach `run_layer_program`, `run_layer_program_ep`, `ForwardBindings`, `LayerProgram`, `SuperOpKind`, or architecture-owned SuperOp handlers; EP/TP/PP collectives are explicit Step operations owned by the common executor; MLA/compressor/indexer, recurrent/conv, interleaved or partial RoPE, routing, and other real operation gaps become typed Steps or executor-owned fused Step patterns rather than `EscapeKind`/SuperOp bypasses; pre-resolved kernel keys and graph/capture optimization remain executor backends below the Step contract; parity switches and duplicate hand loops are removed after deterministic parity is established; the obsolete SuperOp modules are deleted after their final callers.
+- **Validation:** Inventory every production caller and default-on lowered toggle; migrate Gemma4 and LFM2 first, then MiniMax, Qwen35 Single/EP, and DeepSeek4 Single/EP; run per-family deterministic legacy-versus-Step parity during migration, emulated EP/PP/TP parity where supported, capture/graph parity, lifecycle/reset/unload tests, and a final source inventory proving no production SuperOp symbols or fallback executor remain.
+- **Hardware:** One supported AMD GPU for per-family single and emulated-mesh parity; physical production closure remains with HW-001 through HW-013.
+- **Evidence:** Pending
+
+### STEP-006 Migrate Newly Absorbed Bespoke Decoder Families
+
+- **Status:** blocked
+- **Dependencies:** STEP-005
+- **Goal:** Bring decoder families absorbed after the STEP-004 snapshot, especially Muse/Glimmer, onto the Step/manifest spine without flattening their architecture-specific contracts.
+- **Acceptance criteria:** Muse/Glimmer decode, prefill, and batch forward sequencing is represented by typed Steps or executor-owned fused Step primitives for its NoPE/full-attention schedule, gated attention, split normalization/scaling, output multiplier, and softcap; manifests own its weights and state; deterministic Single behavior is unchanged; PP/TP/EP remain explicitly refused until a separate AXIS task admits them; future architecture onboarding cannot claim Step completion through a bespoke decoder loop or SuperOp substrate. Vision preprocessing and encode-only work remain explicit non-decoder exceptions.
+- **Validation:** Run Muse/Glimmer bespoke-versus-Step deterministic parity for decode, prefill, and batch fixtures, manifest coverage and ownership tests, reset/abort/unload tests, capability-refusal tests, and an architecture inventory proving every post-STEP-004 decoder family is Step-backed or has a named open task.
+- **Hardware:** One supported AMD GPU with the canonical Muse/Glimmer fixtures.
 - **Evidence:** Pending
 
 ### PAR-001 Decide Model-Family PP/TP/EP Support
@@ -707,7 +771,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### PAR-002 Implement Required Additional PP/TP/EP Paths
 
 - **Status:** blocked
-- **Dependencies:** CAP-001, STEP-004, GEN-001, AXIS-001, AXIS-002, AXIS-003, AXIS-004, HW-003, HW-004, HW-005, HW-006, HW-007, HW-008, HW-009, HW-010, HW-011, HW-012, HW-013
+- **Dependencies:** CAP-001, STEP-005, STEP-006, GEN-001, GEN-003, AXIS-001, AXIS-002, AXIS-003, AXIS-004, HW-003, HW-004, HW-005, HW-006, HW-007, HW-008, HW-009, HW-010, HW-011, HW-012, HW-013
 - **Goal:** Aggregate closure for the PP/TP/EP cells that PAR-001 marks planned after CAP-001 and the AXIS implementation tasks are complete.
 - **Acceptance criteria:** This is an aggregate closure task with no family-specific code ownership; every PAR-001 planned cell has implementation evidence from its AXIS task, deterministic emulated parity, and the required named physical evidence from HW-003 through HW-013; PAR-002 completes only when all such cells and physical gates are complete.
 - **Validation:** Review the PAR-001 matrix, CAP-001 contract evidence, AXIS-001 through AXIS-004 implementation/emulation evidence, and every required HW-003 through HW-013 report; reject closure for any missing cell, parity result, placement/lifecycle result, or physical gate.
@@ -717,7 +781,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### AXIS-001 Implement Standard-Attention PP/TP Cells
 
 - **Status:** blocked
-- **Dependencies:** CAP-001, COR-002, STEP-004
+- **Dependencies:** CAP-001, COR-002, STEP-005
 - **Goal:** Implement PP and TP cells for standard-attention LLaMA, plain Qwen, and Qwen2-VibeThinker families only.
 - **Acceptance criteria:** Each admitted standard-attention PP/TP cell has mesh-derived placement and ownership, deterministic emulated parity, and implementation-level lifecycle/reset/abort/multi-turn/unload coverage; production support additionally requires HW-003 for PP and HW-006 for TP.
 - **Validation:** Run per-family loader/dispatch selection, emulated PP/TP placement and deterministic parity, reset/abort/multi-turn/unload, and allocation-inventory tests. This task owns implementation and emulated parity only; physical evidence is owned by HW-003 and HW-006.
@@ -727,7 +791,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### AXIS-002 Implement Qwen35 TP And MoE EP Cells
 
 - **Status:** blocked
-- **Dependencies:** CAP-001, GEN-001
+- **Dependencies:** CAP-001, GEN-001, STEP-005
 - **Goal:** Implement Qwen35 dense and MoE TP cells and Qwen35-MoE EP cells only.
 - **Acceptance criteria:** Qwen35 dense and MoE TP and Qwen35-MoE EP have mesh stage/state or expert ownership, deterministic emulated parity, and lifecycle/reset/unload coverage; this task explicitly does not implement PP, which GEN-001 owns, and does not implement dense EP, which CAP-001 normalizes without an EP support claim; production closure requires HW-007 and HW-011.
 - **Validation:** Run Qwen35 dense/MoE TP and Qwen35-MoE EP selection, emulated placement, deterministic parity, reset, lifecycle, unload, and refusal tests. Do not add PP implementation or dense-EP behavior here; physical evidence is owned by HW-007 and HW-011.
@@ -737,7 +801,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### AXIS-003 Implement Additional Non-Qwen35 PP/TP/EP Cells
 
 - **Status:** blocked
-- **Dependencies:** CAP-001, COR-002, STEP-002, STEP-004
+- **Dependencies:** CAP-001, COR-002, STEP-002, STEP-005, GEN-003
 - **Goal:** Admit the dense LFM2 single path and implement its PP/TP cells, plus LFM2-MoE PP/TP/EP, Cohere2-MoE PP/TP/EP, and the planned PP/TP cells for DeepSeek4 and MiniMax.
 - **Acceptance criteria:** Dense LFM2 is currently refused but has planned single-path admission and PP/TP ownership here; its admitted cells have mesh placement, deterministic emulated parity, reset/lifecycle/unload, and explicit refusal coverage. LFM2-MoE and Cohere2-MoE may additionally admit EP; dense LFM2 `EP>1` normalizes to single via CAP-001 and is not an EP cell. Existing DeepSeek4 and MiniMax EP remains owned by STEP-002 and physically closed by HW-001/HW-002; newly enabled production cells require HW-008, HW-009, and HW-010.
 - **Validation:** Run dense LFM2 single-path admission and PP/TP selection/refusal, emulated placement, deterministic parity, reset, lifecycle, and unload tests; run LFM2-MoE and Cohere2-MoE PP/TP/EP selection/refusal, emulated placement, deterministic parity, reset, lifecycle, and unload tests; run the planned DeepSeek4/MiniMax PP/TP coverage without reimplementing their existing EP. Physical evidence for newly enabled cells is owned by HW-008/HW-009/HW-010.
@@ -747,7 +811,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### AXIS-004 Implement Vision-Family PP/TP Cells
 
 - **Status:** blocked
-- **Dependencies:** CAP-001, VL-001, VL-002, STEP-004
+- **Dependencies:** CAP-001, VL-001, VL-002, STEP-005
 - **Goal:** Implement PP and TP cells for Qwen35-VL and dots.ocr only.
 - **Acceptance criteria:** Each admitted vision PP/TP cell preserves image isolation and text parity and has deterministic emulated PP/TP, reset, abort, and unload coverage; dense EP normalization is CAP-001 behavior and outside AXIS-004 scope; production closure requires HW-012 and HW-013.
 - **Validation:** Run image-isolation and text-parity fixtures, deterministic emulated PP/TP placement/parity, reset/abort/unload, and admitted PP/TP dispatch tests. This task owns implementation and emulated parity only; dense EP normalization is not tested or implemented here; physical VL topology evidence is owned by HW-012/HW-013.
@@ -788,7 +852,7 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 ### DOC-002 Final Validation And Merge Gate
 
 - **Status:** blocked
-- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, HW-006, HW-007, HW-008, HW-009, HW-010, HW-011, HW-012, HW-013, COR-001, COR-002, COR-003, COR-004, COR-005, COR-006, GEN-001, GEN-002, SPEC-001, SPEC-002, SPEC-003, SPEC-004, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, CAP-001, PAR-002, AXIS-001, AXIS-002, AXIS-003, AXIS-004, COMP-001, DOC-001
+- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, HW-006, HW-007, HW-008, HW-009, HW-010, HW-011, HW-012, HW-013, COR-001, COR-002, COR-003, COR-004, COR-005, COR-006, GEN-001, GEN-002, GEN-003, SPEC-001, SPEC-002, SPEC-003, SPEC-004, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, STEP-005, STEP-006, PAR-001, CAP-001, PAR-002, AXIS-001, AXIS-002, AXIS-003, AXIS-004, COMP-001, DOC-001
 - **Goal:** Establish that the completed refactor is correct, production-honest, documented, and ready to merge.
 - **Acceptance criteria:** Every listed dependency and every conditional follow-up created by COMP-001 is `complete` with evidence; every row in the Final Validation Matrix passes against its named fixture/oracle; HW-001 through HW-013 meet the 64 MiB/no-monotonic-growth thresholds; no stale active checklist conflicts with this tracker; PR #527 mirrors all IDs, required CI checks pass, and no blocking review finding remains.
 - **Validation:** Execute and archive every row in the Final Validation Matrix, rerun tracker schema and documentation-link checks, inspect the final branch diff and PR checks/reviews, and attach the physical PP/TP/EP reports with artifact/prompt digests and per-cycle VRAM.
@@ -835,29 +899,30 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 | Reset | COR-002 reset-contract tests and `serve-multiturn-gate.sh` across Single, PP, TP, EP, spec/MTP, recurrent/conv, and VL adapters | Every adapter proves the central contract; abort, overflow, reset-command, and normal-completion cases pass. |
 | Parser | COR-003 pending UTF-8/reasoning/tool-call/injected-EOS/stop/budget/abort fixtures | Final output is emitted exactly once with no cross-turn residue. |
 | AR/spec | Canonical DFlash fixtures from `scripts/coherence-gate-dflash.sh`; fixed PP+MTP fixture/path, prompt, and binary hashes | Coherence gate passes; accepted-token accounting, MTP/DFlash selection/refusal, MTP-disabled AR parity, and PP+MTP fallback tests pass. |
+| Prefill/batching | GEN-003 canonical Qwen and LFM fixtures; mixed-length admission/cancellation fixture | Single-request and batched committed tokens match; one scheduler/lifecycle driver owns transitions and finalization; prefill/decode execute through Steps without per-architecture request loops. |
 | VL | Canonical Qwen35-VL fixture captured by VL-001; dots.ocr canonical `dots_ocr_smoke_001_vllm.json`/demo image oracle | Qwen35-VL AR parity/reset passes; dots.ocr preserves its recorded F1 oracle in AR and n-gram modes; unsupported VL speculation rejects explicitly. |
-| Step/manifest | Architecture inventory produced by STEP-004 with one pinned parity fixture per registered decoder family | Every existing supported forward cell has manifest coverage and deterministic Step parity, or a documented non-decoder exception. |
+| Step/manifest | STEP-004 historical inventory plus STEP-005 SuperOp retirement and STEP-006 absorbed-family inventory, with one pinned parity fixture per registered decoder family | Every supported decoder forward cell has manifest coverage and deterministic Step parity; no production SuperOp executor remains; newly absorbed bespoke families are Step-backed; only documented vision/encode-only boundaries remain exceptions. |
 | Axis matrix | PAR-001 policy matrix/current-refusal characterization, including dense LFM2 current refusal with planned AXIS-003 ownership and `normalized-to-single(CAP-001)` for dense EP; CAP-001 capability contract, AXIS-001 through AXIS-004 implementations, and HW-003 through HW-013 named closure reports | Every cell selects the documented path, records the documented refusal with its planned owner where applicable, or records dense EP as `normalized-to-single(CAP-001)`; every supported multi-GPU cell has the named physical evidence; dense EP creates no EP support claim. |
 | Documentation/PR | DOC-001 named-document list, tracker schema check, PR #527 checklist | Every stale document links here, IDs/fields validate, PR IDs match, and required CI/reviews are green. |
 
 ## Dependency Order
 
-1. HW-001 and HW-002 wait for STEP-002 so physical RCCL validation exercises the final Step/manifest EP path. HW-003 and HW-006 wait for AXIS-001; HW-004 waits for GEN-001, which owns dense and MoE Qwen35 PP; HW-007/HW-011 wait for AXIS-002; HW-008/HW-009/HW-010 wait for AXIS-003 and STEP-004, including dense LFM2 admission and its PP/TP cells; HW-012/HW-013 wait for AXIS-004 and the VL lifecycle adopters; HW-005 aggregates HW-006, HW-007, HW-008, HW-009, HW-010, and HW-013.
+1. HW-001 and HW-002 wait for STEP-002 and STEP-005 so physical RCCL validation exercises the final Step/manifest EP path. HW-003 and HW-006 wait for AXIS-001; HW-004 waits for GEN-001, which owns dense and MoE Qwen35 PP; HW-007/HW-011 wait for AXIS-002; HW-008/HW-009/HW-010 wait for AXIS-003 and STEP-005; HW-012/HW-013 wait for AXIS-004 and the VL lifecycle adopters; HW-005 aggregates HW-006, HW-007, HW-008, HW-009, HW-010, and HW-013.
 2. COR-001, COR-003, COR-004, COR-005, COR-006, PAR-001, STEP-001, and DOC-001 are independent starting points.
-3. COR-004 feeds COR-002; COR-001 through COR-003 feed SPEC-001; SPEC-001 feeds SPEC-002; GEN-001, SPEC-002, and SPEC-003 feed SPEC-004; VL-001 depends only on COR-002 and COR-003. SPEC-003 remains deferred by priority and, together with SPEC-004, blocks DOC-002.
-4. STEP-001 feeds STEP-003; PAR-001 feeds STEP-002; STEP-001, STEP-002, STEP-003, and PAR-001 feed STEP-004.
-5. COR-002 plus STEP-001/STEP-002/STEP-003 feed GEN-001; GEN-001 owns dense and MoE Qwen35 PP and feeds physical Qwen35 validation HW-004.
+3. COR-004 feeds COR-002; COR-001 through COR-003 feed SPEC-001; SPEC-001 feeds SPEC-002, GEN-001, and GEN-003; GEN-001, SPEC-002, and SPEC-003 feed SPEC-004; VL-001 depends only on COR-002 and COR-003. SPEC-003 remains deferred by priority and, together with SPEC-004, blocks DOC-002.
+4. STEP-001 feeds STEP-003; PAR-001 feeds STEP-002; STEP-001, STEP-002, STEP-003, and PAR-001 fed the historical STEP-004 snapshot. STEP-004 feeds STEP-005; STEP-005 feeds STEP-006, GEN-001, GEN-002, GEN-003, and all four AXIS tasks.
+5. GEN-001 begins only after SPEC-001 and STEP-005, owns dense and MoE Qwen35 PP, and feeds physical Qwen35 validation HW-004. GEN-002 collects merged-route evidence only after STEP-005 removes the temporary SuperOp default. GEN-003 begins after SPEC-001 and STEP-005 and gates AXIS-003 plus PAR-002.
 6. PAR-001 owns policy and current-refusal characterization; CAP-001 owns the shared capability contract and dense-EP normalization; AXIS-001 through AXIS-004 own concrete family implementations and emulated parity; HW-003 through HW-013 own named physical closure; PAR-002 aggregates their closure without family-specific code. COMP-001 independently decides TP x EP scope; if required, it creates a conditional COMP implementation follow-up with its own dependencies.
-7. DOC-002 is the only final closure task and cannot complete while any dependency is open.
+7. DOC-002 is the only final closure task and cannot complete while any dependency is open, including STEP-005, STEP-006, and GEN-003.
 
 ## Parallel Streams
 
-- **Physical validation:** HW-001 and HW-002 follow STEP-002; HW-003/HW-006 follow AXIS-001; HW-004 follows GEN-001 for dense and MoE Qwen35 PP; HW-007/HW-011 follow AXIS-002; HW-008/HW-009/HW-010 follow AXIS-003 for planned non-Qwen35 cells including dense LFM2 admission; HW-012/HW-013 follow AXIS-004; HW-005 follows its six aggregate TP reports.
+- **Physical validation:** HW-001 and HW-002 follow STEP-002 plus STEP-005; HW-003/HW-006 follow AXIS-001; HW-004 follows GEN-001 for dense and MoE Qwen35 PP; HW-007/HW-011 follow AXIS-002; HW-008/HW-009/HW-010 follow AXIS-003 for planned non-Qwen35 cells including dense LFM2 admission; HW-012/HW-013 follow AXIS-004; HW-005 follows its six aggregate TP reports.
 - **Correctness ownership:** COR-001, COR-003, COR-004, COR-005, and COR-006 initially; COR-002 follows the eviction decision.
-- **Generation/spec:** GEN-002 (DeepSeek4 single-GPU acceptance, re-scoped to the merged default route) can proceed alongside SPEC-001; SPEC-002 follows metadata and shared orchestration; SPEC-003 remains deferred by priority; SPEC-004 follows GEN-001, SPEC-002, and SPEC-003 for PP+MTP integration.
+- **Generation/spec:** SPEC-001 can proceed alongside STEP-005; GEN-002 waits for STEP-005; GEN-003 waits for both STEP-005 and SPEC-001; SPEC-002 follows metadata and shared orchestration; SPEC-003 remains deferred by priority; SPEC-004 follows GEN-001, SPEC-002, and SPEC-003 for PP+MTP integration.
 - **Multimodal:** VL-001 follows only COR-002/COR-003 and can proceed independently of SPEC-001; VL-002 waits for SPEC-001 because it adopts the existing n-gram strategy through shared speculative orchestration.
-- **Execution/placement:** STEP-001 and PAR-001 can start together; STEP-002 and STEP-003 then proceed largely independently before STEP-004; CAP-001 follows PAR-001, and AXIS implementation follows CAP-001 plus its named architecture prerequisites.
-- **Documentation:** DOC-001 can proceed without runtime or hardware work.
+- **Execution/placement:** STEP-004 is the closed pre-merge inventory; STEP-005 corrects the absorbed SuperOp regression and then unlocks STEP-006, GEN-001, GEN-002, GEN-003, and axis implementation. STEP-006 can proceed in parallel with generation work after STEP-005.
+- **Documentation:** DOC-001 is complete; PR #527 must mirror STEP-005, STEP-006, GEN-003, and the corrected dependency order.
 
 ## Update Protocol
 
