@@ -536,6 +536,56 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// Standalone rmsnorm on one tensor: `out = rmsnorm(x, weight, eps)`.
+    /// Present so sandwich-normed blocks (Gemma4) express the normalization
+    /// as a Step; per-op only, never fused.
+    RmsNorm {
+        x: &'a GpuTensor,
+        weight: &'a GpuTensor,
+        out: &'a GpuTensor,
+        eps: f32,
+    },
+    /// Device-to-device copy of `bytes` from `src` to `dst`. Runs on the
+    /// active stream when one is bound (graph-capture-safe), else
+    /// synchronously. Present for full-layer K=V capture-before-norm
+    /// sequences (Gemma4).
+    Copy {
+        src: &'a GpuTensor,
+        dst: &'a GpuTensor,
+        bytes: usize,
+    },
+    /// In-place scalar scale `x *= scale`. The `scale_f32` backend kernel is
+    /// deltanet-gated in rdna-compute, so this variant exists only under the
+    /// same feature — every consumer (Gemma4 etc.) builds with it on.
+    #[cfg(feature = "deltanet")]
+    Scale {
+        x: &'a GpuTensor,
+        scale: f32,
+    },
+    /// GELU-tanh SwiGLU elementwise: `out = gelu_tanh(gate) * up` over the
+    /// first `n` elements. Present so an FFN block is one contiguous step
+    /// list; per-op only, never fused.
+    GeluTanhMul {
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        out: &'a GpuTensor,
+        n: usize,
+    },
+    /// Partial proportional RoPE on Q and K: of the `head_dim/2` rotate_half
+    /// pairs, only the first `n_rot_pairs` rotate; the rest pass through
+    /// (Gemma4 full attention, head_dim=512, n_rot_pairs=64). `pos_buf` is a
+    /// device buffer holding one i32 position (graph-capture-safe). Validated
+    /// by [`validate_partial_rope`] before launch.
+    RopePartial {
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        pos_buf: &'a hip_bridge::DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot_pairs: usize,
+        theta: f32,
+    },
     #[cfg(feature = "deltanet")]
     /// DeltaNet alpha/beta preparation. All tensors are caller-owned.
     DeltaGatePrep {
@@ -925,6 +975,19 @@ pub enum Step<'a> {
     // completes. minimax's MoE tail (`add_inplace_f32`) reuses `Step::ResidualAdd`.
 }
 
+/// Validate the proportional-RoPE pair count against the head width before
+/// launch. The rotate_half pairing splits `head_dim` into `head_dim/2` pairs;
+/// a program asking for more rotating pairs than the head has is malformed.
+fn validate_partial_rope(head_dim: usize, n_rot_pairs: usize) -> Result<(), String> {
+    let max_pairs = head_dim / 2;
+    if n_rot_pairs > max_pairs {
+        return Err(format!(
+            "RopePartial: n_rot_pairs={n_rot_pairs} exceeds head_dim/2={max_pairs}"
+        ));
+    }
+    Ok(())
+}
+
 /// Op-kind for fusion matching. Total over Step variants.
 fn op_kind(step: &Step) -> PipelineOp {
     match step {
@@ -945,6 +1008,12 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::Rope { .. } => PipelineOp::Rope,
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
+        Step::RmsNorm { .. } => PipelineOp::RmsNorm,
+        Step::Copy { .. } => PipelineOp::Copy,
+        #[cfg(feature = "deltanet")]
+        Step::Scale { .. } => PipelineOp::Scale,
+        Step::GeluTanhMul { .. } => PipelineOp::GeluTanhMul,
+        Step::RopePartial { .. } => PipelineOp::RopePartial,
         Step::SiluMul { .. } => PipelineOp::SiluMul,
         Step::ResidualAdd { .. } => PipelineOp::ResidualAdd,
         #[cfg(feature = "deltanet")]
@@ -1722,6 +1791,14 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         // ConvertI64ToF32: on the EP i64 path (ZeroI64Only→DownResidualI64→ConvertI64ToF32→AllReduce{Ep}),
         // the f32 `dst` IS the EP partial that the AllReduce{Ep} collective must target.
         Step::ConvertI64ToF32 { dst, .. } => Some(&dst.buf),
+        // Gemma4 primitives (Task 2): in-place elementwise, plain copies, and
+        // RoPE — none carry a row-parallel/EP partial output.
+        Step::RmsNorm { .. }
+        | Step::Copy { .. }
+        | Step::GeluTanhMul { .. }
+        | Step::RopePartial { .. } => None,
+        #[cfg(feature = "deltanet")]
+        Step::Scale { .. } => None,
         // ── Qwen MoE Step-native ops (STEP-002 Phase 1) ──
         // MoeSoftmaxTopK / gate-side / shared-down / scaled-add: pre-route or
         // accumulate into the residual (never a collective partial).
@@ -2558,6 +2635,55 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::RmsNorm { x, weight, out, eps } => gpu
+            .rmsnorm_f32(x, weight, out, *eps)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::Copy { src, dst, bytes } => {
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip
+                    .memcpy_dtod_async_at(&dst.buf, 0, &src.buf, 0, *bytes, stream)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            } else {
+                gpu.hip
+                    .memcpy_dtod(&dst.buf, &src.buf, *bytes)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            Ok(())
+        }
+        #[cfg(feature = "deltanet")]
+        Step::Scale { x, scale } => gpu
+            .scale_f32(x, *scale)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::GeluTanhMul { gate, up, out, n } => {
+            gpu.gelu_tanh_f32(gate, out, *n)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.mul_f32(out, up, out)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            Ok(())
+        }
+        Step::RopePartial {
+            q,
+            k,
+            pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_rot_pairs,
+            theta,
+        } => {
+            validate_partial_rope(*head_dim, *n_rot_pairs).map_err(DispatchError::Hip)?;
+            gpu.rope_partial_halved_f32(
+                q,
+                k,
+                pos_buf,
+                *n_heads,
+                *n_kv_heads,
+                *head_dim,
+                *n_rot_pairs,
+                *theta,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
         Step::SiluMul { gate, up, out } => gpu
             .silu_mul_f32(gate, up, out)
             .map_err(|e| DispatchError::Hip(e.to_string())),
@@ -4329,6 +4455,33 @@ mod tests {
         assert!(
             matches!(&e, DispatchError::Hip(msg) if msg.contains("zero_before")),
             "unexpected error: {e:?}"
+        );
+    }
+
+    #[cfg(test)]
+    fn gemma_primitive_kind(step: &Step<'_>) -> Option<PipelineOp> {
+        match step {
+            Step::RmsNorm { .. } => Some(PipelineOp::RmsNorm),
+            Step::Copy { .. } => Some(PipelineOp::Copy),
+            #[cfg(feature = "deltanet")]
+            Step::Scale { .. } => Some(PipelineOp::Scale),
+            Step::GeluTanhMul { .. } => Some(PipelineOp::GeluTanhMul),
+            Step::RopePartial { .. } => Some(PipelineOp::RopePartial),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn gemma_primitives_have_total_pipeline_identity() {
+        let _: fn(&Step<'_>) -> Option<PipelineOp> = gemma_primitive_kind;
+    }
+
+    #[test]
+    fn partial_rope_rejects_pairs_outside_head_width() {
+        assert!(validate_partial_rope(512, 128).is_ok());
+        assert_eq!(
+            validate_partial_rope(512, 257).unwrap_err().to_string(),
+            "RopePartial: n_rot_pairs=257 exceeds head_dim/2=256"
         );
     }
 }
