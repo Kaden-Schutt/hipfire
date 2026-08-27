@@ -11,7 +11,7 @@ Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
 | Qwen35 | EP | `qwen35::ep_batch::forward_ep` | `run_layer_program_ep` | on | emulated EP oracle | Qwen35 EP increment | open |
 | DeepSeek4 | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct MLA + sealed MoE loop | DeepSeek4 increment | open |
-| DeepSeek4 | EP | `deepseek4::ep::forward_ep` | `run_layer_program_ep` | on | emulated EP oracle | DeepSeek4 EP increment | open |
+| DeepSeek4 | EP | `deepseek4::ep::forward_ep` | `run_layer_program_ep` | on — admitted gfx1201 MQ2R TP3/TP4 graph route only; else direct non-SuperOp | emulated EP oracle (`ep_deepseek4` / pinned `DS4_EP2_FNV`) | DeepSeek4 EP increment | open |
 
 ## Row verification against current source (2026-08-27, base `2743acf2`)
 
@@ -114,9 +114,16 @@ retained. Line numbers are exact at this base commit.
   execution; the non-admitted arm `forward_ep_direct` (`:361`) runs the sealed parallel executor
   (`execute_lowered_moe`, `MoeExecutionTarget::Parallel`) and does NOT touch `run_layer_program_ep`.
 - Hand/state oracle — emulated EP oracle: `crates/hipfire-arch-deepseek4/examples/ep_deepseek4.rs`
-  (emulated ranks via `HIPFIRE_EMULATE_GPUS`, peer all-reduce via `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1`)
-  and the `ep_decode_parity` committed-token hash named by tracker HW-001; the peer-all-reduce
-  path is the RCCL-free oracle on boxes without librccl.
+  with the source-pinned `DS4_EP2_FNV = 0x26a13602bedf9926` (`ep_deepseek4.rs:398`:
+  `assert_eq!(fnv, DS4_EP2_FNV, "output drifted from pinned D2a hash")`), run over emulated ranks
+  (`HIPFIRE_EMULATE_GPUS=2`) with the peer all-reduce path (`HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1`,
+  RCCL-free on boxes without librccl) under `HIPFIRE_DETERMINISTIC=1`.
+- Cross-task warning (unverified): tracker HW-001 names the `ep_decode_parity` committed-token
+  hash as the DeepSeek4 EP oracle, but `ep_decode_parity` is a Qwen35-only runtime example
+  (feature `emulated-ep2-harness` wiring `hipfire-arch-qwen35/emulated-ep2-harness`, default
+  prompt `benchmarks/prompts/qwen35_moe_ep_parity.txt`; runtime `Cargo.toml:146-148`). That
+  reference cannot be a DeepSeek4 oracle; it is flagged here for the tracker owner and no
+  DeepSeek4 claim in this inventory derives from it.
 
 ## Shared definitions (not production callers)
 
@@ -176,8 +183,10 @@ Additional results are classified below; none is a production SuperOp caller and
 
 ### Examples (never production routes)
 
-- `crates/hipfire-runtime/examples/ep_decode_parity.rs` — emulated-EP2 parity driver; built only
-  with the non-default `emulated-ep2-harness` feature (runtime `Cargo.toml:146-148`).
+- `crates/hipfire-runtime/examples/ep_decode_parity.rs` — **Qwen35-only** emulated-EP2 parity
+  driver; built only with the non-default `emulated-ep2-harness` feature (which wires
+  `hipfire-arch-qwen35/emulated-ep2-harness`; runtime `Cargo.toml:146-148`). Not a DeepSeek4
+  fixture.
 - `crates/hipfire-arch-deepseek4/examples/ep_deepseek4.rs`, `ep_dspark_topology_probe.rs`,
   `tp_deepseek4.rs`, `ds4_tp_longctx_capacity.rs` (runtime example), `ds4_longctx_probe.rs`
   (sets `HIPFIRE_FORWARD_LOWERED=0`), `ds4_prod_vs_parent_trace.rs` (sets
