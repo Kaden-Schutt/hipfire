@@ -5,7 +5,7 @@ Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 
 | Family | Mode | Production entry | SuperOp route | Default | Hand/state oracle | Replacement owner | Status |
 |---|---|---|---|---|---|---|---|
-| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — fixture-blocked |
+| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — fixture-ready |
 | LFM2 | Single | `decode_step_layers_and_head` | `decode_step_layers_and_head_lowered` -> `run_layer_program` | on | direct layer loop with capture | LFM2 increment | open |
 | MiniMax | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct attention + sealed MoE loop | MiniMax increment | open |
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
@@ -30,8 +30,8 @@ retained. Line numbers are exact at this base commit.
   still says "default OFF" — stale text; the code is the authority.)
 - Hand/state oracle — hand arms in `forward_scratch_inner` call `sliding_layer_decode`
   (`:2742`, defined `:2858`) and `full_layer_decode` (`:2746`, defined `:3301`).
-- Fixture state: BLOCKED (see "Gemma4 fixture state" below) → `fixture-blocked` recorded in the
-  row; baseline md5s cannot be captured.
+- Fixture state: READY (see "Gemma4 fixture state" below) → `fixture-ready` recorded in the
+  row; pre-change hand-route baseline md5s are recorded below.
 
 ### LFM2 / Single — VERIFIED
 
@@ -216,32 +216,110 @@ Additional results are classified below; none is a production SuperOp caller and
   `crates/hipfire-dispatch/src/pipeline/steps.rs:2029-2032` (historical `run_layer_program_mesh`
   reference).
 
-## Gemma4 fixture state (Step 3)
+## Gemma4 fixture state (Step 3 follow-up)
 
-Commands and exact results at base `2743acf2`:
+The following user-provided facts are authoritative and are recorded verbatim. Per the brief, no
+artifact size, metadata, SHA-256, or MD5 checks were rerun or recomputed.
+
+- `~/.hipfire/models/gemma4-12b.mq4`
+  - size: `8,914,591,328` bytes
+  - arch: `13 / gemma4_unified`
+  - tensors: `666`
+  - SHA-256: `4ceb57b558275776680b9acd78fa4e058abefa994a901eb5253654c51e9981c3`
+  - MD5: `a1419f8a5ddbbe70ad5fa7e6a3c2b73a`
+- `~/.hipfire/models/gemma4-26b-a4b.mq4`
+  - size: `15,242,780,732` bytes
+  - arch: `13 / gemma4`
+  - tensors: `8,277`
+  - SHA-256: `6f83d448d4bc089aa18debd6601d34c6fd3ce0bab96ee8519d08f6d65121df63`
+  - MD5: `182eafae7b25386ac9f9b73ce77b1a88`
+
+The committed prompt digest is preserved:
+
+- `benchmarks/prompts/merge_sort_thinking_off.txt` — present, git-tracked (commit `f38918e56`),
+  SHA-256 `d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0` (the committed
+  digest).
+
+Both canonical model paths were used directly for the baselines below; no substitute artifacts or
+prompts were used. Fixture state is `fixture-ready`.
+
+## Gemma4 pre-change hand-route baselines (Steps 4–5)
+
+### Oracle build
+
+Exact command:
+
+```bash
+cargo build --release --locked -p hipfire-arch-gemma4 --example infer_gemma4
+```
+
+Result: exit status `0`; the existing release `infer_gemma4` oracle built successfully. The build
+emitted compiler warnings only; no build error occurred.
+
+### Exact dense hand-route baseline
+
+Command:
 
 ```bash
 export GEMMA4_DENSE="$HOME/.hipfire/models/gemma4-12b.mq4"
 export GEMMA4_MOE="$HOME/.hipfire/models/gemma4-26b-a4b.mq4"
-sha256sum "$GEMMA4_DENSE" "$GEMMA4_MOE" benchmarks/prompts/merge_sort_thinking_off.txt
+HIPFIRE_FORWARD_LOWERED=0 HIPFIRE_GEMMA4_GRAPH=0 HIPFIRE_GEMMA4_EAGLE=0 \
+  target/release/examples/infer_gemma4 --model "$GEMMA4_DENSE" \
+  --token-ids 2,9259,236888,575,106 --max 32 --rep-pen 1.0 \
+  >"$HOME/hipfire-step005/gemma4/baseline/dense-hand.log" 2>&1
 ```
 
-- `$HOME/.hipfire/models/gemma4-12b.mq4` — **MISSING**: `No such file or directory` →
-  `fixture-blocked`.
-- `$HOME/.hipfire/models/gemma4-26b-a4b.mq4` — **MISSING**: `No such file or directory` →
-  `fixture-blocked`.
-- `benchmarks/prompts/merge_sort_thinking_off.txt` — present, git-tracked (commit `f38918e56`),
-  SHA-256 `d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0` (the committed
-  digest).
-- Cross-check: no gemma-named artifact exists under `$HOME/.hipfire/models`
-  (`ls "$HOME/.hipfire/models" | grep -i gemma` → no match). Artifact acquisition is not part of
-  STEP-005; no substitute family/model was used.
+Result: exit status `0`; log persisted at
+`$HOME/hipfire-step005/gemma4/baseline/dense-hand.log`. The run reported `decoded 32 tok in
+1.45s (22.1 tok/s)` and emitted these 32 continuation IDs:
 
-Per the brief, `fixture-blocked` is recorded in the Gemma4 rows above and the fixture-dependent
-steps are NOT begun: Step 4 (build `infer_gemma4`) and Step 5 (dense/MoE hand-path baselines,
-md5-under-rows) are skipped because the oracle cannot run without the pinned models, and the brief
-halts Tasks 3–7 when either model is unavailable. The pre-change baseline md5 slots under the
-Gemma4 rows remain empty pending artifact availability.
+```text
+[45518, 107, 101, 1509, 5724, 1133, 611, 2473, 735, 3265, 496, 11409, 3618, 653, 496, 116896, 167043, 236775, 575, 236775, 1018, 769, 108, 3910, 740, 564, 1601, 611, 3124, 236881, 1637, 611]
+```
+
+### Exact MoE hand-route baseline
+
+Command:
+
+```bash
+export GEMMA4_DENSE="$HOME/.hipfire/models/gemma4-12b.mq4"
+export GEMMA4_MOE="$HOME/.hipfire/models/gemma4-26b-a4b.mq4"
+HIPFIRE_FORWARD_LOWERED=0 HIPFIRE_GEMMA4_GRAPH=0 HIPFIRE_GEMMA4_EAGLE=0 \
+  target/release/examples/infer_gemma4 --model "$GEMMA4_MOE" \
+  --token-ids 2,9259,236888,575,106 --max 32 --rep-pen 1.0 \
+  >"$HOME/hipfire-step005/gemma4/baseline/moe-hand.log" 2>&1
+```
+
+Result: exit status `0`; log persisted at
+`$HOME/hipfire-step005/gemma4/baseline/moe-hand.log`. The run reported `decoded 32 tok in
+0.43s (74.1 tok/s)` and emitted these 32 continuation IDs:
+
+```text
+[236772, 79770, 11542, 237323, 236772, 3643, 569, 68179, 569, 569, 174759, 236811, 121511, 242467, 8946, 1082, 239858, 16314, 498, 239858, 569, 236772, 237122, 1092, 236772, 8155, 231216, 236772, 236772, 236804, 236772, 36283]
+```
+
+### Baseline log hashes and runtime verdict
+
+Exact command:
+
+```bash
+md5sum "$HOME/hipfire-step005/gemma4/baseline/"*.log
+```
+
+Exact result:
+
+```text
+9a90ac8344eeb4024822bde3fbda5096  /home/bjoern/hipfire-step005/gemma4/baseline/dense-hand.log
+4e7a48dd1ef5272324d8314ffa30f0e2  /home/bjoern/hipfire-step005/gemma4/baseline/moe-hand.log
+```
+
+Inspection verdict: PASS — both exact canonical models loaded and ran in separate processes with
+exit status `0`, each produced 32 continuation IDs, and neither log contains a panic or invalid
+access. The dense log notes on-demand recompilation for pre-compiled blobs without hash files;
+that did not prevent a successful baseline.
+
+The prior fixture blocker is fully resolved for Gemma4; the remaining inventory rows and source
+verification are unchanged.
 
 ## Out of scope (later tasks)
 
