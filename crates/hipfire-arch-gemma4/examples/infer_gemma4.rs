@@ -11,6 +11,32 @@
 //! - The embed √dim scale + final logit softcap are applied inside the forward.
 //!
 //! Usage: infer_gemma4 --model <hfq> [--prompt <text>] [--max N] [--rep-pen R]
+#[cfg(feature = "deltanet")]
+fn validate_kv_mode(value: &str) -> Result<(), &'static str> {
+    if value == "fwht3" {
+        Err("infer_gemma4: --kv-mode fwht3 is unsupported by the lowered Gemma parity route; omit --kv-mode")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "deltanet"))]
+mod tests {
+    use super::validate_kv_mode;
+
+    #[test]
+    fn kv_mode_rejects_unsupported_fwht3() {
+        assert_eq!(
+            validate_kv_mode("fwht3").unwrap_err(),
+            "infer_gemma4: --kv-mode fwht3 is unsupported by the lowered Gemma parity route; omit --kv-mode"
+        );
+    }
+
+    #[test]
+    fn kv_mode_accepts_default_route() {
+        assert!(validate_kv_mode("").is_ok());
+    }
+}
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -79,6 +105,10 @@ fn main() {
         }
     }
     let model = model.expect("--model required");
+    if let Err(error) = validate_kv_mode(&kv_mode) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(&model).expect("open model");
@@ -177,7 +207,6 @@ fn main() {
         .expect("prefill");
         logits = gpu.download_f32(&scratch.logits).expect("prefill logits");
     }
-    let _ = kv_mode;
     eprintln!(
         "prefill {} tok in {:.2}s",
         prompt_ids.len(),
