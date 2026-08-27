@@ -17,11 +17,11 @@ use crate::families::moe::{
     launch_grouped_down, launch_grouped_gate_up, launch_indexed_down, launch_indexed_down_residual,
     launch_indexed_down_residual_i64, launch_indexed_down_residual_i64_batched,
     launch_indexed_gate_up, launch_indexed_gate_up_batched, launch_moe_activation,
-    launch_moe_combine, launch_moe_combine_grouped, launch_moe_gate_up_unscatter, launch_moe_route,
-    launch_moe_scatter, launch_moe_softmax_topk, launch_qwen_down_indexed,
-    launch_qwen_gate_up_indexed, launch_scaled_add_gpu_scalar, launch_score_activation,
-    launch_shared_expert_down_body, launch_shared_gate_side, launch_moe_gelu_experts,
-    DeepSeekIndexedForm, MoeExpertRef, MoeGeluExpertsRef,
+    launch_moe_combine, launch_moe_combine_grouped, launch_moe_gate_up_unscatter,
+    launch_moe_route, launch_moe_scatter, launch_moe_softmax_topk, launch_moe_softmax_topk_fused,
+    launch_qwen_down_indexed, launch_qwen_gate_up_indexed, launch_scaled_add_gpu_scalar,
+    launch_score_activation, launch_shared_expert_down_body, launch_shared_gate_side,
+    launch_moe_gelu_experts, DeepSeekIndexedForm, MoeExpertRef, MoeGeluExpertsRef,
     MoeRouterBackend,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -3194,7 +3194,16 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             // Architecture-selected router backends (encoded by the Qwen
             // builder via `select_moe_router_backend`, mirroring the direct
             // `run_moe_decode` rules exactly). `Default` keeps the generic
-            // two-launch route for every non-Qwen caller.
+            // two-launch route; architecture callers may bind the explicit
+            // fused-softmax backend when their reference requires it.
+            MoeRouterBackend::FusedSoftmaxTopK => launch_moe_softmax_topk_fused(
+                gpu,
+                logits,
+                topk_indices,
+                topk_weights,
+                *n_exp,
+                *norm_topk_prob,
+            ),
             MoeRouterBackend::ExactWave64 => gpu
                 .moe_router_softmax_topk_k8_wave64_exact(
                     logits,
@@ -4530,6 +4539,34 @@ mod tests {
     #[test]
     fn gemma_primitives_have_total_pipeline_identity() {
         let _: fn(&Step<'_>) -> Option<PipelineOp> = gemma_primitive_kind;
+    }
+    #[test]
+    fn fused_softmax_topk_backend_is_explicitly_bound_to_steps() {
+        let tensor = |ptr: usize| GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096)
+            },
+            shape: vec![8],
+            dtype: DType::F32,
+        };
+        let logits = tensor(1);
+        let topk_indices = tensor(2);
+        let topk_weights = tensor(3);
+        let step = Step::MoeSoftmaxTopK {
+            logits: &logits,
+            topk_indices: &topk_indices,
+            topk_weights: &topk_weights,
+            n_exp: 128,
+            norm_topk_prob: true,
+            backend: MoeRouterBackend::FusedSoftmaxTopK,
+        };
+        assert!(matches!(
+            step,
+            Step::MoeSoftmaxTopK {
+                backend: MoeRouterBackend::FusedSoftmaxTopK,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -963,6 +963,7 @@ fn load_gemma4_weight(
                 paro: None,
             });
         }
+        3 => DType::Q8_0,
         4 => DType::Q4K,
         6 => DType::HFQ4G256,
         7 => DType::HFQ4G128,
@@ -2460,12 +2461,12 @@ pub fn forward_scratch(
     //     `scale_f32` was on the capture stream but using raw `kernelParams`
     //     (stack pointers that dangle by replay under ROCm 7.x loader).
     //     All three converted to `launch_maybe_blob` in the same commit as
-    //     this comment. HIPFIRE_GRAPH=1 now produces clean output.
+    //     this comment. HIPFIRE_GEMMA4_GRAPH=1 requests the graph path.
     //   - Compact offset != 0 (TriAttention eviction) still breaks capture
     //     for the same reason as Qwen35 — bail to direct in that case.
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     let graph_override =
-        *GRAPH_OVERRIDE_ENV.get_or_init(|| match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {
+        *GRAPH_OVERRIDE_ENV.get_or_init(|| match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
             Some("0") => Some(false),
             Some("1") => Some(true),
             _ => None,
@@ -2550,12 +2551,18 @@ fn forward_scratch_inner(
     kv_full: &mut hipfire_runtime::llama::KvCache,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
-    // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1,
-    // route decode through the lowered super-op executor.
-    if forward_lowered_enabled() {
-        return forward_scratch_inner_lowered(
-            gpu, weights, config, pos, kv_sliding, kv_full, scratch,
-        );
+    // #397 Ship 6 — forward-as-pipeline. The Gemma-local route selector is
+    // intentionally temporary migration scaffolding; Task 6 deletes it once
+    // hand-versus-Step parity has been accepted.
+    match gemma4_forward_route()
+        .map_err(|error| hip_bridge::HipError::new(0, &error))?
+    {
+        Gemma4ForwardRoute::Steps => {
+            return forward_scratch_inner_steps(
+                gpu, weights, config, pos, kv_sliding, kv_full, scratch,
+            );
+        }
+        Gemma4ForwardRoute::Hand => {}
     }
 
     // 3) Per-layer forward (legacy hand path).
@@ -4881,7 +4888,7 @@ fn forward_prefill_batch_v2(
 //
 // Migrates Gemma 4's decode forward from per-token execute_steps resolution
 // to pre-resolved LayerPrograms executed via run_layer_program + ForwardBindings.
-// Behind HIPFIRE_FORWARD_LOWERED gate (default OFF) until byte-parity validated.
+// The temporary Gemma-local route selector below controls parity runs.
 // See docs/plans/gemma4_forward_as_pipeline.md for the full plan.
 
 use hipfire_dispatch::pipeline::superop::{
@@ -5885,7 +5892,7 @@ fn execute_sliding_moe_steps(
             topk_weights: &scratch.moe_topk_weights,
             n_exp: config.num_experts,
             norm_topk_prob: true,
-            backend: MoeRouterBackend::Default,
+            backend: MoeRouterBackend::FusedSoftmaxTopK,
         },
         Step::MoeGeluExperts {
             experts,
@@ -6121,7 +6128,7 @@ fn execute_full_moe_steps(
             topk_weights: &scratch.moe_topk_weights,
             n_exp: config.num_experts,
             norm_topk_prob: true,
-            backend: MoeRouterBackend::Default,
+            backend: MoeRouterBackend::FusedSoftmaxTopK,
         },
         Step::MoeGeluExperts {
             experts,
@@ -6783,17 +6790,99 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
     }
 }
 
-// ── Gate + lowered forward ───────────────────────────────────────────────
+// ── Temporary parity route selector ─────────────────────────────────────
 
-/// Cached `HIPFIRE_FORWARD_LOWERED` toggle. Default OFF until byte-parity
-/// validated. Escape hatch: `HIPFIRE_FORWARD_LOWERED=1` to opt in.
-fn forward_lowered_enabled() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        // Default ON (byte-parity validated 2026-06-08).
-        // Set HIPFIRE_FORWARD_LOWERED=0 to force legacy hand path.
-        std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0")
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gemma4ForwardRoute {
+    Hand,
+    Steps,
+}
+
+fn parse_gemma4_forward_route(value: &str) -> Result<Gemma4ForwardRoute, String> {
+    match value {
+        "steps" => Ok(Gemma4ForwardRoute::Steps),
+        "hand" => Ok(Gemma4ForwardRoute::Hand),
+        value => Err(format!(
+            "HIPFIRE_GEMMA4_STEP_ROUTE must be 'steps' or 'hand', got '{value}'"
+        )),
+    }
+}
+
+fn gemma4_forward_route() -> Result<Gemma4ForwardRoute, String> {
+    match std::env::var("HIPFIRE_GEMMA4_STEP_ROUTE") {
+        Err(std::env::VarError::NotPresent) => Ok(Gemma4ForwardRoute::Steps),
+        Err(error) => Err(format!(
+            "HIPFIRE_GEMMA4_STEP_ROUTE is not valid UTF-8: {error}"
+        )),
+        Ok(value) => parse_gemma4_forward_route(&value),
+    }
+}
+
+/// Task 5 temporary direct-Step route. Unlike the production lowered
+/// SuperOp route below, this calls `execute_gemma4_layer` for each layer so
+/// hand-versus-Step parity compares the preserved hand loop with the new
+/// typed-Step implementation directly.
+fn forward_scratch_inner_steps(
+    gpu: &mut Gpu,
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    pos: usize,
+    kv_sliding: &mut llama::KvCache,
+    kv_full: &mut llama::KvCache,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
+    let mut sliding_kv_idx = 0usize;
+    let mut full_kv_idx = 0usize;
+
+    for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        execute_gemma4_layer(
+            gpu,
+            config,
+            layer_type,
+            &weights.layers[layer_idx],
+            scratch,
+            pos,
+            kv_sliding,
+            kv_full,
+            sliding_kv_idx,
+            full_kv_idx,
+            layer_idx,
+        )?;
+        match layer_type {
+            LayerType::Sliding => sliding_kv_idx += 1,
+            LayerType::Full => full_kv_idx += 1,
+        }
+    }
+
+    // Output stage: final norm + lm_head + softcap (same as hand path).
+    gpu.rmsnorm_f32(
+        &scratch.x,
+        &weights.final_norm,
+        &scratch.tmp,
+        config.norm_eps,
+    )?;
+    {
+        let ctx = DispatchCtx::new(gpu);
+        let wr = weights.lm_head.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::Gemv {
+                w: &wr,
+                input: GemvInput::Raw(&scratch.tmp),
+                out: &scratch.logits,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
+    if config.final_logit_softcapping > 0.0 {
+        gpu.logit_softcap_f32(
+            &scratch.logits,
+            config.vocab_size,
+            config.final_logit_softcapping,
+        )?;
+    }
+    Ok(())
 }
 
 /// Lowered (#397 Ship 6) decode layer loop. Behaviorally equivalent to
@@ -6868,8 +6957,34 @@ fn forward_scratch_inner_lowered(
 }
 #[cfg(test)]
 mod tests {
-    use super::{gemma4_op_sequence, Gemma4Op, Gemma4Variant};
+    use super::{
+        gemma4_op_sequence, parse_gemma4_forward_route, Gemma4Op, Gemma4Variant,
+        Gemma4ForwardRoute,
+    };
 
+    #[test]
+    fn gemma_step_route_accepts_steps() {
+        assert_eq!(
+            parse_gemma4_forward_route("steps"),
+            Ok(Gemma4ForwardRoute::Steps)
+        );
+    }
+
+    #[test]
+    fn gemma_step_route_accepts_hand() {
+        assert_eq!(
+            parse_gemma4_forward_route("hand"),
+            Ok(Gemma4ForwardRoute::Hand)
+        );
+    }
+
+    #[test]
+    fn gemma_step_route_rejects_unknown_value() {
+        assert_eq!(
+            parse_gemma4_forward_route("legacy").unwrap_err(),
+            "HIPFIRE_GEMMA4_STEP_ROUTE must be 'steps' or 'hand', got 'legacy'"
+        );
+    }
     #[test]
     fn sliding_dense_step_order_is_total() {
         assert_eq!(

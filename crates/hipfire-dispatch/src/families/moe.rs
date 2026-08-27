@@ -1692,24 +1692,46 @@ pub fn launch_moe_softmax_topk(
         .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
+/// Fused softmax + renormalized top-K routing. Unlike
+/// [`launch_moe_softmax_topk`], this preserves the hand-route's single
+/// `moe_softmax_topk_renorm_k8` launch and leaves the input logits untouched.
+pub fn launch_moe_softmax_topk_fused(
+    gpu: &mut rdna_compute::Gpu,
+    logits: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    n_exp: usize,
+    norm_topk_prob: bool,
+) -> Result<(), DispatchError> {
+    gpu.moe_softmax_topk_renorm_k8(
+        logits,
+        topk_indices,
+        topk_weights,
+        n_exp,
+        norm_topk_prob,
+    )
+    .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
 /// Architecture-selected Qwen decode router backend. The generic
 /// two-launch route (`softmax_f32` + `moe_topk_renorm_k8`) is numerically
 /// distinct from the wave64 fused routers (different reduction order and
 /// direct division), so the sealed Step path must select the same backend
 /// the direct `run_moe_decode` executor picks — never silently substitute
-/// the generic form. `Default` remains the byte-identical generic route and
-/// is what every non-Qwen `Step::MoeSoftmaxTopK` caller gets.
+/// the generic form. `Default` remains the byte-identical generic route for
+/// callers that need the two-launch semantics; `FusedSoftmaxTopK` is an
+/// explicit opt-in for callers whose reference uses the fused router kernel.
 ///
 /// The optional fused router/shared optimization
 /// (`HIPFIRE_MOE_ROUTER_SHARED_FUSE`) is intentionally NOT exposed on the
 /// sealed Step path: the fused kernel cannot share the `Step::MoeSoftmaxTopK`
-/// signature (it also consumes the shared gate/up + rotation operands), and
-/// the sealed lowered program admits exactly one execution route. The opt-in
-/// remains effective only in the direct/hand executors (`run_moe_decode`'s
-/// inline block in pipeline/mod.rs); on the sealed route the env is inert and
-/// the exact non-fused backend Steps always run.
+/// signature (it also consumes the shared gate/up + rotation operands). The
+/// `FusedSoftmaxTopK` backend is the standalone router kernel and does not
+/// enable that shared optimization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRouterBackend {
+    /// `moe_softmax_topk_renorm_k8` (one fused launch, leaves logits raw).
+    FusedSoftmaxTopK,
     /// `softmax_f32(logits)` + `moe_topk_renorm_k8` (two launches).
     Default,
     /// `moe_router_softmax_topk_k8_wave64` (gfx1201 default, gfx1100

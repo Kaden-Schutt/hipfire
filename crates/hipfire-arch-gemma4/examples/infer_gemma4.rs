@@ -19,10 +19,9 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_gemma4::config::Gemma4Config;
-    use hipfire_arch_gemma4::forward::{decode_step, decode_step_with_graph};
-    use hipfire_arch_gemma4::gemma4::{Gemma4State, Gemma4Weights};
+    use hipfire_arch_gemma4::lowered;
     use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::llama::KvCache;
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::path::PathBuf;
 
@@ -82,16 +81,21 @@ fn main() {
     let model = model.expect("--model required");
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let hfq = HfqFile::open(&model).expect("open model");
-    let cfg = Gemma4Config::from_hfq(&hfq).expect("config");
+    let mut hfq = HfqFile::open(&model).expect("open model");
+    let cfg = lowered::config_from_hfq(&hfq).expect("config");
+    let n_sliding = cfg
+        .layer_types
+        .iter()
+        .filter(|layer| matches!(layer, lowered::LayerType::Sliding))
+        .count();
+    let n_full = cfg
+        .layer_types
+        .iter()
+        .filter(|layer| matches!(layer, lowered::LayerType::Full))
+        .count();
     eprintln!(
         "gemma4 dim={} layers={} sliding={} full={} vocab={} softcap={}",
-        cfg.dim,
-        cfg.n_layers,
-        cfg.n_sliding_layers(),
-        cfg.n_full_layers(),
-        cfg.vocab_size,
-        cfg.final_logit_softcapping
+        cfg.dim, cfg.n_layers, n_sliding, n_full, cfg.vocab_size, cfg.final_logit_softcapping
     );
     // Tokenizer only needed for text encode/decode; --token-ids bypasses it.
     let tok = if token_ids.is_none() {
@@ -100,7 +104,7 @@ fn main() {
         None
     };
     let t_load = std::time::Instant::now();
-    let weights = Gemma4Weights::load(&hfq, &cfg, &mut gpu).expect("weights");
+    let weights = lowered::load_weights(&mut hfq, &cfg, &mut gpu).expect("weights");
     eprintln!("loaded weights in {:.1}s", t_load.elapsed().as_secs_f64());
 
     // Prepend BOS (2) if absent.
@@ -113,12 +117,26 @@ fn main() {
     }
     eprintln!("prompt {:?} → {} tokens", prompt, prompt_ids.len());
     let max_seq = prompt_ids.len() + max + 16;
-    let mut state = if kv_mode == "fwht3" {
-        eprintln!("kv_mode=fwht3: full-attention layers use FWHT-512 3-bit K + Q8_0 V");
-        Gemma4State::new_with_fwht3_max_seq(&mut gpu, &cfg, max_seq).expect("state (fwht3)")
-    } else {
-        Gemma4State::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state")
-    };
+    let scratch = lowered::Gemma4Scratch::new(&mut gpu, &cfg, 1).expect("scratch");
+    lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
+        .expect("scratch constants");
+    let mut kv_sliding = KvCache::new_gpu_q8_capped(
+        &mut gpu,
+        cfg.n_layers,
+        cfg.sliding_n_kv_heads,
+        cfg.sliding_head_dim,
+        max_seq,
+        max_seq,
+    )
+    .expect("sliding KV");
+    let mut kv_full = KvCache::new_gpu_asym3_gemma4(
+        &mut gpu,
+        cfg.n_layers,
+        cfg.full_n_kv_heads,
+        cfg.full_head_dim,
+        max_seq,
+    )
+    .expect("full KV");
 
     // Greedy argmax with a repetition penalty over already-emitted tokens.
     let argmax_with_penalty = |v: &mut [f32], history: &[u32], pen: f32| -> u32 {
@@ -146,8 +164,20 @@ fn main() {
     let t0 = std::time::Instant::now();
     let mut logits = Vec::new();
     for (pos, &t) in prompt_ids.iter().enumerate() {
-        logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
+        lowered::forward_scratch(
+            &mut gpu,
+            &weights,
+            &cfg,
+            t,
+            pos,
+            &mut kv_sliding,
+            &mut kv_full,
+            &scratch,
+        )
+        .expect("prefill");
+        logits = gpu.download_f32(&scratch.logits).expect("prefill logits");
     }
+    let _ = kv_mode;
     eprintln!(
         "prefill {} tok in {:.2}s",
         prompt_ids.len(),
@@ -167,10 +197,18 @@ fn main() {
         }
         gen.push(next);
         history.push(next);
-        // Decode loop uses the hipGraph path when HIPFIRE_GEMMA4_GRAPH=1
-        // (default off → falls through to eager decode_step internally).
-        logits = decode_step_with_graph(&cfg, &weights, &mut state, &mut gpu, next, pos as u32)
-            .expect("decode");
+        lowered::forward_scratch(
+            &mut gpu,
+            &weights,
+            &cfg,
+            next,
+            pos,
+            &mut kv_sliding,
+            &mut kv_full,
+            &scratch,
+        )
+        .expect("decode");
+        logits = gpu.download_f32(&scratch.logits).expect("decode logits");
         pos += 1;
     }
     let dt = t1.elapsed().as_secs_f64();
@@ -188,4 +226,12 @@ fn main() {
         None => println!("=== GENERATION token ids ===\n{:?}", gen),
     }
     eprintln!("token ids: {:?}", &gen[..gen.len().min(60)]);
+    let mut final_logit_hash = 0xcbf29ce484222325u64;
+    for value in &logits {
+        for byte in value.to_bits().to_le_bytes() {
+            final_logit_hash ^= u64::from(byte);
+            final_logit_hash = final_logit_hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    eprintln!("final logits fnv1a64: 0x{final_logit_hash:016x}");
 }
