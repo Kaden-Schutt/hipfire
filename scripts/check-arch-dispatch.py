@@ -61,6 +61,26 @@ ARCH_KEYS = [
     "muse_glimmer",
 ]
 
+GEMMA4_FORBIDDEN = (
+    "Gemma4Bindings",
+    "g4_superop",
+    "run_layer_program",
+    "HIPFIRE_GEMMA4_STEP_ROUTE",
+    "HIPFIRE_FORWARD_LOWERED",
+)
+
+
+def scan_gemma4_forbidden() -> list[tuple[str, int, str]]:
+    path = ROOT / "crates/hipfire-arch-gemma4/src/lowered.rs"
+    hits: list[tuple[str, int, str]] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        for symbol in GEMMA4_FORBIDDEN:
+            if symbol in line:
+                hits.append((symbol, lineno, line.strip()[:96]))
+    return hits
+
+
+
 _ALT = "|".join(re.escape(k) for k in ARCH_KEYS)
 DISPATCH = re.compile(
     r'("(?:' + _ALT + r')"\s*=>)'      # match arm
@@ -103,6 +123,13 @@ def main(argv: list[str]) -> int:
     if "--verbose" in argv:
         for rel, lineno, text in hits:
             print(f"  {rel}:{lineno}: {text}")
+
+    forbidden = scan_gemma4_forbidden()
+    if forbidden:
+        print(f"gemma4_forbidden           {len(forbidden)}")
+        for symbol, lineno, text in forbidden:
+            print(f"  crates/hipfire-arch-gemma4/src/lowered.rs:{lineno}: {symbol}: {text}")
+        return 1
     return 0
 
 
