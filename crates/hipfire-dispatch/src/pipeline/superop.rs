@@ -260,11 +260,19 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
-            // Rope/QkNorm/BiasAdd are per-op-only Step vocabulary: never fused,
-            // never lowered via superop. Emitting them into a lowered program
-            // is a bug (no SuperOpKind exists for them).
-            PipelineOp::Rope | PipelineOp::QkNorm | PipelineOp::BiasAdd => {
-                unreachable!("Rope/QkNorm/BiasAdd are per-op only; not lowerable via superop")
+            // Rope/QkNorm/BiasAdd and the five Gemma4 primitives are per-op-only
+            // Step vocabulary: never fused, never lowered via superop. Emitting
+            // them into a lowered program is a bug (no SuperOpKind exists for
+            // them) — rejected explicitly so none falls to the catch-all.
+            PipelineOp::Rope
+            | PipelineOp::QkNorm
+            | PipelineOp::BiasAdd
+            | PipelineOp::RmsNorm
+            | PipelineOp::Copy
+            | PipelineOp::Scale
+            | PipelineOp::GeluTanhMul
+            | PipelineOp::RopePartial => {
+                unreachable!("per-op-only Step vocabulary is not lowerable via superop")
             }
             // Remaining PipelineOp values are not producible from a Step.
             _ => SuperOpKind::Norm,
@@ -587,12 +595,89 @@ mod tests {
         assert_eq!(prog.len(), 1);
         assert_eq!(prog[0].binding.key, Some(fk()));
     }
-
     #[test]
     fn lower_walk_zero_span_does_not_stall() {
         // A defensive (key, 0) must not infinite-loop: falls to single-step.
         let prog = lower_walk(2, |_| SuperOpKind::Proj, |_| Some((fk(), 0)));
         assert_eq!(prog.len(), 2);
         assert!(prog.iter().all(|op| op.binding.key.is_none()));
+    }
+
+    // ── Per-op-only Step vocabulary must never lower via superop ─────────
+    // The five Gemma4 primitives join Rope/QkNorm/BiasAdd in the explicit
+    // rejection branch: emitting any of them into a lowered program is a
+    // bug, so lower_layer must panic (never reach the `_ => Norm` catch-all).
+
+    fn meta_tensor(ptr: usize) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
+            shape: vec![8],
+            dtype: rdna_compute::DType::F32,
+        }
+    }
+
+    fn assert_lower_rejects(step: Step<'_>) {
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lower_layer(std::slice::from_ref(&step), &ctx)
+        }));
+        assert!(
+            result.is_err(),
+            "per-op Step must be rejected by lower_layer, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lower_layer_rejects_rmsnorm() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::RmsNorm {
+            x: &x,
+            weight: &x,
+            out: &x,
+            eps: 1e-6,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_copy() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::Copy {
+            src: &x,
+            dst: &x,
+            bytes: 32,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_scale() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::Scale { x: &x, scale: 2.0 });
+    }
+
+    #[test]
+    fn lower_layer_rejects_gelu_tanh_mul() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::GeluTanhMul {
+            gate: &x,
+            up: &x,
+            out: &x,
+            n: 8,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_rope_partial() {
+        let x = meta_tensor(1);
+        let pos = unsafe { hip_bridge::DeviceBuffer::from_raw(8 as *mut std::ffi::c_void, 4) };
+        assert_lower_rejects(Step::RopePartial {
+            q: &x,
+            k: &x,
+            pos_buf: &pos,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 512,
+            n_rot_pairs: 64,
+            theta: 1e4,
+        });
     }
 }

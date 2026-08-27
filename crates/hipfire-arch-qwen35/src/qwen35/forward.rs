@@ -548,7 +548,6 @@ fn step_kind_label(step: &Step<'_>) -> &'static str {
         Step::BiasAdd { .. } => "BiasAdd",
         Step::RmsNorm { .. } => "RmsNorm",
         Step::Copy { .. } => "Copy",
-        #[cfg(feature = "deltanet")]
         Step::Scale { .. } => "Scale",
         Step::GeluTanhMul { .. } => "GeluTanhMul",
         Step::RopePartial { .. } => "RopePartial",

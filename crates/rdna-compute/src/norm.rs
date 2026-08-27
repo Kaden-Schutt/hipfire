@@ -3941,7 +3941,6 @@ impl Gpu {
     }
 
     /// Scale vector by constant: x[i] *= scale. Replaces 48µs CPU roundtrip.
-    #[cfg(feature = "deltanet")]
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;

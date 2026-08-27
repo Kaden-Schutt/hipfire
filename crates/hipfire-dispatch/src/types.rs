@@ -62,10 +62,7 @@ pub enum PipelineOp {
     /// Device-to-device copy of `bytes` from `src` to `dst` (per-op only).
     /// Async on the active stream when one is bound, else synchronous.
     Copy,
-    /// In-place scalar scale `x *= scale` (per-op only). The `scale_f32`
-    /// backend kernel is deltanet-gated in rdna-compute; the variant is
-    /// compiled only under the same feature (all consumers build it on).
-    #[cfg(feature = "deltanet")]
+    /// In-place scalar scale `x *= scale` (per-op only).
     Scale,
     /// GELU-tanh SwiGLU elementwise: `out = gelu_tanh(gate) * up` over `n`.
     GeluTanhMul,

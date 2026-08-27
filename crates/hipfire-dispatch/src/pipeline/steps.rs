@@ -554,10 +554,8 @@ pub enum Step<'a> {
         dst: &'a GpuTensor,
         bytes: usize,
     },
-    /// In-place scalar scale `x *= scale`. The `scale_f32` backend kernel is
-    /// deltanet-gated in rdna-compute, so this variant exists only under the
-    /// same feature — every consumer (Gemma4 etc.) builds with it on.
-    #[cfg(feature = "deltanet")]
+    /// In-place scalar scale `x *= scale`. Present for layer-scalar and
+    /// Q-prescale steps (Gemma4); per-op only, never fused.
     Scale {
         x: &'a GpuTensor,
         scale: f32,
@@ -1010,7 +1008,6 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
         Step::RmsNorm { .. } => PipelineOp::RmsNorm,
         Step::Copy { .. } => PipelineOp::Copy,
-        #[cfg(feature = "deltanet")]
         Step::Scale { .. } => PipelineOp::Scale,
         Step::GeluTanhMul { .. } => PipelineOp::GeluTanhMul,
         Step::RopePartial { .. } => PipelineOp::RopePartial,
@@ -1795,10 +1792,9 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         // RoPE — none carry a row-parallel/EP partial output.
         Step::RmsNorm { .. }
         | Step::Copy { .. }
+        | Step::Scale { .. }
         | Step::GeluTanhMul { .. }
         | Step::RopePartial { .. } => None,
-        #[cfg(feature = "deltanet")]
-        Step::Scale { .. } => None,
         // ── Qwen MoE Step-native ops (STEP-002 Phase 1) ──
         // MoeSoftmaxTopK / gate-side / shared-down / scaled-add: pre-route or
         // accumulate into the residual (never a collective partial).
@@ -2650,7 +2646,6 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             }
             Ok(())
         }
-        #[cfg(feature = "deltanet")]
         Step::Scale { x, scale } => gpu
             .scale_f32(x, *scale)
             .map_err(|e| DispatchError::Hip(e.to_string())),
@@ -4463,7 +4458,6 @@ mod tests {
         match step {
             Step::RmsNorm { .. } => Some(PipelineOp::RmsNorm),
             Step::Copy { .. } => Some(PipelineOp::Copy),
-            #[cfg(feature = "deltanet")]
             Step::Scale { .. } => Some(PipelineOp::Scale),
             Step::GeluTanhMul { .. } => Some(PipelineOp::GeluTanhMul),
             Step::RopePartial { .. } => Some(PipelineOp::RopePartial),

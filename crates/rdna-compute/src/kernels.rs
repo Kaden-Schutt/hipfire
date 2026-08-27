@@ -5743,7 +5743,6 @@ pub const GATED_DELTA_NET_Q4_SRC: &str =
 pub const ALPHA_GATE_SRC: &str = include_str!("../../../kernels/src/alpha_gate.hip");
 
 /// Scale vector by constant: x[i] *= scale. Eliminates 48µs CPU roundtrip.
-#[cfg(feature = "deltanet")]
 pub const SCALE_F32_SRC: &str = include_str!("../../../kernels/src/scale_f32.hip");
 
 /// Fused conv1d (kernel_size=4) + SiLU. Eliminates one kernel launch.
