@@ -12,29 +12,29 @@
 //!
 //! Usage: infer_gemma4 --model <hfq> [--prompt <text>] [--max N] [--rep-pen R]
 #[cfg(feature = "deltanet")]
-fn validate_kv_mode(value: &str) -> Result<(), &'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullKvMode {
+    Asym3,
+    Fwht3,
+}
+
+#[cfg(feature = "deltanet")]
+fn full_kv_mode(value: &str) -> FullKvMode {
     if value == "fwht3" {
-        Err("infer_gemma4: --kv-mode fwht3 is unsupported by the lowered Gemma parity route; omit --kv-mode")
+        FullKvMode::Fwht3
     } else {
-        Ok(())
+        FullKvMode::Asym3
     }
 }
 
 #[cfg(all(test, feature = "deltanet"))]
 mod tests {
-    use super::validate_kv_mode;
+    use super::{full_kv_mode, FullKvMode};
 
     #[test]
-    fn kv_mode_rejects_unsupported_fwht3() {
-        assert_eq!(
-            validate_kv_mode("fwht3").unwrap_err(),
-            "infer_gemma4: --kv-mode fwht3 is unsupported by the lowered Gemma parity route; omit --kv-mode"
-        );
-    }
-
-    #[test]
-    fn kv_mode_accepts_default_route() {
-        assert!(validate_kv_mode("").is_ok());
+    fn kv_mode_selects_fwht3_full_cache() {
+        assert_eq!(full_kv_mode("fwht3"), FullKvMode::Fwht3);
+        assert_eq!(full_kv_mode(""), FullKvMode::Asym3);
     }
 }
 
@@ -105,10 +105,6 @@ fn main() {
         }
     }
     let model = model.expect("--model required");
-    if let Err(error) = validate_kv_mode(&kv_mode) {
-        eprintln!("{error}");
-        std::process::exit(2);
-    }
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(&model).expect("open model");
@@ -159,14 +155,30 @@ fn main() {
         max_seq,
     )
     .expect("sliding KV");
-    let mut kv_full = KvCache::new_gpu_asym3_gemma4(
-        &mut gpu,
-        cfg.n_layers,
-        cfg.full_n_kv_heads,
-        cfg.full_head_dim,
-        max_seq,
-    )
-    .expect("full KV");
+    let mut kv_full = match full_kv_mode(&kv_mode) {
+        FullKvMode::Fwht3 => {
+            eprintln!("kv_mode=fwht3: full-attention layers use FWHT-512 3-bit K + Q8_0 V");
+            gpu.ensure_mq_signs().expect("fwht3 signs");
+            let all_true = vec![true; n_full];
+            KvCache::new_gpu_fwht3_capped_filtered_gemma4(
+                &mut gpu,
+                &all_true,
+                cfg.full_n_kv_heads,
+                cfg.full_head_dim,
+                max_seq,
+                max_seq,
+            )
+            .expect("full KV (fwht3)")
+        }
+        FullKvMode::Asym3 => KvCache::new_gpu_asym3_gemma4(
+            &mut gpu,
+            cfg.n_layers,
+            cfg.full_n_kv_heads,
+            cfg.full_head_dim,
+            max_seq,
+        )
+        .expect("full KV"),
+    };
 
     // Greedy argmax with a repetition penalty over already-emitted tokens.
     let argmax_with_penalty = |v: &mut [f32], history: &[u32], pen: f32| -> u32 {
