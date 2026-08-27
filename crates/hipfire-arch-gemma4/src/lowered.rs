@@ -23,7 +23,9 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemm::GemmParams;
 use hipfire_dispatch::families::gemv::WeightRef;
-use hipfire_dispatch::families::moe::{launch_moe_gelu_experts, MoeGeluExpertsRef};
+use hipfire_dispatch::families::moe::{
+    launch_moe_gelu_experts, MoeGeluExpertsRef, MoeRouterBackend,
+};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
@@ -4911,6 +4913,180 @@ fn gemma4_variant_of(layer_type: LayerType, layer: &LayerWeights) -> Gemma4Varia
     }
 }
 
+/// Architecture-local metadata for the typed Gemma4 layer lowering.
+///
+/// These descriptors are deliberately separate from dispatch's `Step` IR:
+/// they pin the semantic order without becoming an opcode or a runtime value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gemma4Op {
+    NormInput,
+    ProjQ,
+    ProjK,
+    ProjV,
+    CopyKToV,
+    NormQ,
+    NormK,
+    NormV,
+    ScaleQ,
+    RopeFull,
+    RopePartial,
+    Attend,
+    ProjO,
+    NormPostAttn,
+    ResidualAddAttn,
+    SaveResidual,
+    NormPreFfn,
+    ProjGate,
+    ProjUp,
+    GeluTanhMul,
+    ProjDown,
+    NormPostFfn,
+    NormPostFfn1,
+    NormPreFfn2,
+    NormRouter,
+    ScaleRouter,
+    ProjRouter,
+    MoeSoftmaxTopK,
+    MoeExperts,
+    NormPostFfn2,
+    ResidualAddMoe,
+    NormOuterFfn,
+    RestoreResidual,
+    ResidualAddFfn,
+    ScaleLayer,
+}
+
+static SLIDING_DENSE_OPS: [Gemma4Op; 23] = [
+    Gemma4Op::NormInput,
+    Gemma4Op::ProjQ,
+    Gemma4Op::ProjK,
+    Gemma4Op::ProjV,
+    Gemma4Op::NormQ,
+    Gemma4Op::NormK,
+    Gemma4Op::NormV,
+    Gemma4Op::ScaleQ,
+    Gemma4Op::RopeFull,
+    Gemma4Op::Attend,
+    Gemma4Op::ProjO,
+    Gemma4Op::NormPostAttn,
+    Gemma4Op::ResidualAddAttn,
+    Gemma4Op::SaveResidual,
+    Gemma4Op::NormPreFfn,
+    Gemma4Op::ProjGate,
+    Gemma4Op::ProjUp,
+    Gemma4Op::GeluTanhMul,
+    Gemma4Op::ProjDown,
+    Gemma4Op::NormPostFfn,
+    Gemma4Op::RestoreResidual,
+    Gemma4Op::ResidualAddFfn,
+    Gemma4Op::ScaleLayer,
+];
+
+static FULL_DENSE_OPS: [Gemma4Op; 23] = [
+    Gemma4Op::NormInput,
+    Gemma4Op::ProjQ,
+    Gemma4Op::ProjK,
+    Gemma4Op::CopyKToV,
+    Gemma4Op::NormQ,
+    Gemma4Op::NormK,
+    Gemma4Op::NormV,
+    Gemma4Op::ScaleQ,
+    Gemma4Op::RopePartial,
+    Gemma4Op::Attend,
+    Gemma4Op::ProjO,
+    Gemma4Op::NormPostAttn,
+    Gemma4Op::ResidualAddAttn,
+    Gemma4Op::SaveResidual,
+    Gemma4Op::NormPreFfn,
+    Gemma4Op::ProjGate,
+    Gemma4Op::ProjUp,
+    Gemma4Op::GeluTanhMul,
+    Gemma4Op::ProjDown,
+    Gemma4Op::NormPostFfn,
+    Gemma4Op::RestoreResidual,
+    Gemma4Op::ResidualAddFfn,
+    Gemma4Op::ScaleLayer,
+];
+
+static SLIDING_MOE_OPS: [Gemma4Op; 32] = [
+    Gemma4Op::NormInput,
+    Gemma4Op::ProjQ,
+    Gemma4Op::ProjK,
+    Gemma4Op::ProjV,
+    Gemma4Op::NormQ,
+    Gemma4Op::NormK,
+    Gemma4Op::NormV,
+    Gemma4Op::ScaleQ,
+    Gemma4Op::RopeFull,
+    Gemma4Op::Attend,
+    Gemma4Op::ProjO,
+    Gemma4Op::NormPostAttn,
+    Gemma4Op::ResidualAddAttn,
+    Gemma4Op::SaveResidual,
+    Gemma4Op::NormPreFfn,
+    Gemma4Op::ProjGate,
+    Gemma4Op::ProjUp,
+    Gemma4Op::GeluTanhMul,
+    Gemma4Op::ProjDown,
+    Gemma4Op::NormPostFfn1,
+    Gemma4Op::NormPreFfn2,
+    Gemma4Op::NormRouter,
+    Gemma4Op::ScaleRouter,
+    Gemma4Op::ProjRouter,
+    Gemma4Op::MoeSoftmaxTopK,
+    Gemma4Op::MoeExperts,
+    Gemma4Op::NormPostFfn2,
+    Gemma4Op::ResidualAddMoe,
+    Gemma4Op::NormOuterFfn,
+    Gemma4Op::RestoreResidual,
+    Gemma4Op::ResidualAddFfn,
+    Gemma4Op::ScaleLayer,
+];
+
+static FULL_MOE_OPS: [Gemma4Op; 32] = [
+    Gemma4Op::NormInput,
+    Gemma4Op::ProjQ,
+    Gemma4Op::ProjK,
+    Gemma4Op::CopyKToV,
+    Gemma4Op::NormQ,
+    Gemma4Op::NormK,
+    Gemma4Op::NormV,
+    Gemma4Op::ScaleQ,
+    Gemma4Op::RopePartial,
+    Gemma4Op::Attend,
+    Gemma4Op::ProjO,
+    Gemma4Op::NormPostAttn,
+    Gemma4Op::ResidualAddAttn,
+    Gemma4Op::SaveResidual,
+    Gemma4Op::NormPreFfn,
+    Gemma4Op::ProjGate,
+    Gemma4Op::ProjUp,
+    Gemma4Op::GeluTanhMul,
+    Gemma4Op::ProjDown,
+    Gemma4Op::NormPostFfn1,
+    Gemma4Op::NormPreFfn2,
+    Gemma4Op::NormRouter,
+    Gemma4Op::ScaleRouter,
+    Gemma4Op::ProjRouter,
+    Gemma4Op::MoeSoftmaxTopK,
+    Gemma4Op::MoeExperts,
+    Gemma4Op::NormPostFfn2,
+    Gemma4Op::ResidualAddMoe,
+    Gemma4Op::NormOuterFfn,
+    Gemma4Op::RestoreResidual,
+    Gemma4Op::ResidualAddFfn,
+    Gemma4Op::ScaleLayer,
+];
+
+fn gemma4_op_sequence(variant: Gemma4Variant) -> &'static [Gemma4Op] {
+    match variant {
+        Gemma4Variant::SlidingDense => &SLIDING_DENSE_OPS,
+        Gemma4Variant::SlidingMoe => &SLIDING_MOE_OPS,
+        Gemma4Variant::FullDense => &FULL_DENSE_OPS,
+        Gemma4Variant::FullMoe => &FULL_MOE_OPS,
+    }
+}
+
 // ── Opcodes ───────────────────────────────────────────────────────────────
 
 /// Arch-local opcodes encoded into `OpBinding.weights[0]` as `WeightSlot(code)`.
@@ -5020,6 +5196,982 @@ fn lower_variant(v: Gemma4Variant) -> LayerProgram {
             g4_superop(ResidualGemv, RESID_POST_FFN),
         ],
     }
+}
+
+// ── Borrowed Step lowering ───────────────────────────────────────────────
+
+fn execute_bound_gemma4_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    steps: &[Step<'_>],
+) -> HipResult<()> {
+    execute_steps(gpu, ctx, steps).map_err(|error| {
+        hip_bridge::HipError::new(0, &format!("Gemma4 layer {layer_idx}: {error}"))
+    })
+}
+
+fn validate_gemma4_layer(
+    layer_idx: usize,
+    layer_type: LayerType,
+    layer: &LayerWeights,
+    config: &Gemma4Config,
+) -> HipResult<()> {
+    let actual = match layer {
+        LayerWeights::Sliding(_) => LayerType::Sliding,
+        LayerWeights::Full(_) => LayerType::Full,
+    };
+    if actual != layer_type {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "Gemma4 layer {layer_idx}: configured {layer_type:?} but weights are {actual:?}"
+            ),
+        ));
+    }
+    if matches!(
+        gemma4_variant_of(layer_type, layer),
+        Gemma4Variant::SlidingMoe | Gemma4Variant::FullMoe
+    ) && config.top_k_experts != 8
+    {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "Gemma4 layer {layer_idx}: top_k_experts={} unsupported (expected 8)",
+                config.top_k_experts
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn gemma4_attention_params<'a>(
+    gpu: &Gpu,
+    config: &Gemma4Config,
+    pos: usize,
+    kv: &'a mut llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &'a Gemma4Scratch,
+    head_dim: usize,
+    n_kv_heads: usize,
+    window: usize,
+) -> HipResult<(KvTierPlan, AttnParams<'a>)> {
+    let tier_inputs = KvTierInputs {
+        quant_asym4: kv.quant_asym4,
+        quant_asym3: kv.quant_asym3,
+        quant_asym2: kv.quant_asym2,
+        quant_q8: kv.quant_q8,
+        quant_fwht: kv.quant_fwht,
+        quant_hfq4: false,
+        quant_q4: false,
+        quant_int8: false,
+        quant_hfq8: false,
+        f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
+        v_mode_bits: kv.v_mode_bits(),
+        pos,
+        flash_mode: 2,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: 1,
+        is_tree: false,
+        is_boundary: false,
+        q8_windowed: false,
+        window: window as i32,
+    };
+    let plan = KvTierPlan::derive(tier_inputs)
+        .map_err(|error| hip_bridge::HipError::new(0, &format!("{error:?}")))?;
+    let io = AttnParams {
+        q: &scratch.q,
+        k: &scratch.k,
+        v: &scratch.v,
+        k_cache: &kv.k_gpu[kv_layer_idx],
+        v_cache: &kv.v_gpu[kv_layer_idx],
+        k_scales: None,
+        v_scales: None,
+        pos_buf: &scratch.pos_buf,
+        pos,
+        positions: None,
+        n_heads: config.n_heads,
+        n_kv_heads,
+        head_dim,
+        physical_cap: kv.max_seq,
+        batch_size: 1,
+        max_ctx_len: 0,
+        flash_partials: Some(&scratch.flash_partials),
+        givens_cos: kv.givens_cos.as_ref(),
+        givens_sin: kv.givens_sin.as_ref(),
+        tree_bias: None,
+        block_start: 0,
+        block_cols: 0,
+        output_gate: None,
+        output: &scratch.attn_out,
+    };
+    Ok((plan, io))
+}
+
+fn execute_gemma4_layer(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    layer_type: LayerType,
+    layer: &LayerWeights,
+    scratch: &Gemma4Scratch,
+    pos: usize,
+    kv_sliding: &mut llama::KvCache,
+    kv_full: &mut llama::KvCache,
+    sliding_kv_idx: usize,
+    full_kv_idx: usize,
+    layer_idx: usize,
+) -> HipResult<()> {
+    validate_gemma4_layer(layer_idx, layer_type, layer, config)?;
+    let ctx = DispatchCtx::new(gpu);
+    match (gemma4_variant_of(layer_type, layer), layer) {
+        (Gemma4Variant::SlidingDense, LayerWeights::Sliding(weights)) => {
+            execute_sliding_dense_steps(
+                gpu,
+                &ctx,
+                layer_idx,
+                weights,
+                config,
+                scratch,
+                pos,
+                kv_sliding,
+                sliding_kv_idx,
+            )
+        }
+        (Gemma4Variant::SlidingMoe, LayerWeights::Sliding(weights)) => {
+            execute_sliding_moe_steps(
+                gpu,
+                &ctx,
+                layer_idx,
+                weights,
+                config,
+                scratch,
+                pos,
+                kv_sliding,
+                sliding_kv_idx,
+            )
+        }
+        (Gemma4Variant::FullDense, LayerWeights::Full(weights)) => {
+            execute_full_dense_steps(
+                gpu,
+                &ctx,
+                layer_idx,
+                weights,
+                config,
+                scratch,
+                pos,
+                kv_full,
+                full_kv_idx,
+            )
+        }
+        (Gemma4Variant::FullMoe, LayerWeights::Full(weights)) => {
+            execute_full_moe_steps(
+                gpu,
+                &ctx,
+                layer_idx,
+                weights,
+                config,
+                scratch,
+                pos,
+                kv_full,
+                full_kv_idx,
+            )
+        }
+        _ => unreachable!("validate_gemma4_layer rejected the mismatch"),
+    }
+}
+
+fn execute_sliding_dense_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    weights: &SlidingLayerWeights,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    kv_layer_idx: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let head_dim = config.sliding_head_dim;
+    let n_kv_heads = config.sliding_n_kv_heads;
+    let (plan, io) = gemma4_attention_params(
+        gpu,
+        config,
+        pos,
+        kv_cache,
+        kv_layer_idx,
+        scratch,
+        head_dim,
+        n_kv_heads,
+        config.sliding_window,
+    )?;
+    let wr_q = weights.q_proj.dispatch_ref();
+    let wr_k = weights.k_proj.dispatch_ref();
+    let wr_v = weights.v_proj.dispatch_ref();
+    let wr_o = weights.o_proj.dispatch_ref();
+    let wr_gate = weights.gate_proj.dispatch_ref();
+    let wr_up = weights.up_proj.dispatch_ref();
+    let wr_down = weights.down_proj.dispatch_ref();
+    let steps: [Step<'_>; 23] = [
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.input_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_q,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.q,
+        },
+        Step::Gemv {
+            w: &wr_k,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.k,
+        },
+        Step::Gemv {
+            w: &wr_v,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.v,
+        },
+        Step::QkNorm {
+            x: &scratch.q,
+            weight: &weights.q_norm,
+            n_groups: config.n_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.k,
+            weight: &weights.k_norm,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.v,
+            weight: &scratch.v_norm_ones_full,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::Scale {
+            x: &scratch.q,
+            scale: (head_dim as f32).sqrt(),
+        },
+        Step::Rope {
+            q: &scratch.q,
+            k: &scratch.k,
+            pos_buf: &scratch.pos_buf,
+            n_heads: config.n_heads,
+            n_kv_heads,
+            head_dim,
+            theta: config.sliding_rope_theta,
+        },
+        Step::Attend { plan, io },
+        Step::Gemv {
+            w: &wr_o,
+            input: GemvInput::Raw(&scratch.attn_out),
+            out: &scratch.tmp,
+        },
+        Step::RmsNorm {
+            x: &scratch.tmp,
+            weight: &weights.post_attention_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Copy {
+            src: &scratch.x,
+            dst: &scratch.residual,
+            bytes: dim * 4,
+        },
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.pre_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_gate,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.gate_ffn,
+        },
+        Step::Gemv {
+            w: &wr_up,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.up_ffn,
+        },
+        Step::GeluTanhMul {
+            gate: &scratch.gate_ffn,
+            up: &scratch.up_ffn,
+            out: &scratch.ffn_hidden,
+            n: config.hidden_dim,
+        },
+        Step::Gemv {
+            w: &wr_down,
+            input: GemvInput::Raw(&scratch.ffn_hidden),
+            out: &scratch.ffn_out,
+        },
+        Step::RmsNorm {
+            x: &scratch.ffn_out,
+            weight: &weights.post_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Copy {
+            src: &scratch.residual,
+            dst: &scratch.x,
+            bytes: dim * 4,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Scale {
+            x: &scratch.x,
+            scale: weights.layer_scalar_host,
+        },
+    ];
+    execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
+}
+
+fn execute_full_dense_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    weights: &FullLayerWeights,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    kv_layer_idx: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let head_dim = config.full_head_dim;
+    let n_kv_heads = config.full_n_kv_heads;
+    let (plan, io) = gemma4_attention_params(
+        gpu,
+        config,
+        pos,
+        kv_cache,
+        kv_layer_idx,
+        scratch,
+        head_dim,
+        n_kv_heads,
+        0,
+    )?;
+    let wr_q = weights.q_proj.dispatch_ref();
+    let wr_k = weights.k_proj.dispatch_ref();
+    let wr_o = weights.o_proj.dispatch_ref();
+    let wr_gate = weights.gate_proj.dispatch_ref();
+    let wr_up = weights.up_proj.dispatch_ref();
+    let wr_down = weights.down_proj.dispatch_ref();
+    let steps: [Step<'_>; 23] = [
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.input_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_q,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.q,
+        },
+        Step::Gemv {
+            w: &wr_k,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.k,
+        },
+        Step::Copy {
+            src: &scratch.k,
+            dst: &scratch.v,
+            bytes: n_kv_heads * head_dim * 4,
+        },
+        Step::QkNorm {
+            x: &scratch.q,
+            weight: &weights.q_norm,
+            n_groups: config.n_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.k,
+            weight: &weights.k_norm,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.v,
+            weight: &scratch.v_norm_ones_full,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::Scale {
+            x: &scratch.q,
+            scale: (head_dim as f32).sqrt(),
+        },
+        Step::RopePartial {
+            q: &scratch.q,
+            k: &scratch.k,
+            pos_buf: &scratch.pos_buf,
+            n_heads: config.n_heads,
+            n_kv_heads,
+            head_dim,
+            n_rot_pairs: ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize,
+            theta: config.full_rope_theta,
+        },
+        Step::Attend { plan, io },
+        Step::Gemv {
+            w: &wr_o,
+            input: GemvInput::Raw(&scratch.attn_out),
+            out: &scratch.tmp,
+        },
+        Step::RmsNorm {
+            x: &scratch.tmp,
+            weight: &weights.post_attention_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Copy {
+            src: &scratch.x,
+            dst: &scratch.residual,
+            bytes: dim * 4,
+        },
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.pre_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_gate,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.gate_ffn,
+        },
+        Step::Gemv {
+            w: &wr_up,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.up_ffn,
+        },
+        Step::GeluTanhMul {
+            gate: &scratch.gate_ffn,
+            up: &scratch.up_ffn,
+            out: &scratch.ffn_hidden,
+            n: config.hidden_dim,
+        },
+        Step::Gemv {
+            w: &wr_down,
+            input: GemvInput::Raw(&scratch.ffn_hidden),
+            out: &scratch.ffn_out,
+        },
+        Step::RmsNorm {
+            x: &scratch.ffn_out,
+            weight: &weights.post_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Copy {
+            src: &scratch.residual,
+            dst: &scratch.x,
+            bytes: dim * 4,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Scale {
+            x: &scratch.x,
+            scale: weights.layer_scalar_host,
+        },
+    ];
+    execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
+}
+
+fn execute_sliding_moe_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    weights: &SlidingLayerWeights,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    kv_layer_idx: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let head_dim = config.sliding_head_dim;
+    let n_kv_heads = config.sliding_n_kv_heads;
+    let moe = weights.moe.as_ref().expect("validated MoE layer");
+    let (plan, io) = gemma4_attention_params(
+        gpu,
+        config,
+        pos,
+        kv_cache,
+        kv_layer_idx,
+        scratch,
+        head_dim,
+        n_kv_heads,
+        config.sliding_window,
+    )?;
+    let wr_q = weights.q_proj.dispatch_ref();
+    let wr_k = weights.k_proj.dispatch_ref();
+    let wr_v = weights.v_proj.dispatch_ref();
+    let wr_o = weights.o_proj.dispatch_ref();
+    let wr_gate = weights.gate_proj.dispatch_ref();
+    let wr_up = weights.up_proj.dispatch_ref();
+    let wr_down = weights.down_proj.dispatch_ref();
+    let wr_router = moe.router_proj.dispatch_ref();
+    let experts = MoeGeluExpertsRef {
+        gate_up_pool: &moe.experts_gate_up_pool,
+        down_pool: &moe.experts_down_pool,
+        gate_up_ptrs: &moe.experts_gate_up_ptrs,
+        down_ptrs: &moe.experts_down_ptrs,
+        gate_up_dtype: moe.experts[0].gate_up_proj.gpu_dtype,
+        down_dtype: moe.experts[0].down_proj.gpu_dtype,
+        gate_up_bytes: moe.gate_up_bytes,
+        down_bytes: moe.down_bytes,
+        n_experts: config.num_experts,
+    };
+    let steps: [Step<'_>; 32] = [
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.input_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_q,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.q,
+        },
+        Step::Gemv {
+            w: &wr_k,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.k,
+        },
+        Step::Gemv {
+            w: &wr_v,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.v,
+        },
+        Step::QkNorm {
+            x: &scratch.q,
+            weight: &weights.q_norm,
+            n_groups: config.n_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.k,
+            weight: &weights.k_norm,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.v,
+            weight: &scratch.v_norm_ones_full,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::Scale {
+            x: &scratch.q,
+            scale: (head_dim as f32).sqrt(),
+        },
+        Step::Rope {
+            q: &scratch.q,
+            k: &scratch.k,
+            pos_buf: &scratch.pos_buf,
+            n_heads: config.n_heads,
+            n_kv_heads,
+            head_dim,
+            theta: config.sliding_rope_theta,
+        },
+        Step::Attend { plan, io },
+        Step::Gemv {
+            w: &wr_o,
+            input: GemvInput::Raw(&scratch.attn_out),
+            out: &scratch.tmp,
+        },
+        Step::RmsNorm {
+            x: &scratch.tmp,
+            weight: &weights.post_attention_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Copy {
+            src: &scratch.x,
+            dst: &scratch.residual,
+            bytes: dim * 4,
+        },
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.pre_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_gate,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.gate_ffn,
+        },
+        Step::Gemv {
+            w: &wr_up,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.up_ffn,
+        },
+        Step::GeluTanhMul {
+            gate: &scratch.gate_ffn,
+            up: &scratch.up_ffn,
+            out: &scratch.ffn_hidden,
+            n: config.hidden_dim,
+        },
+        Step::Gemv {
+            w: &wr_down,
+            input: GemvInput::Raw(&scratch.ffn_hidden),
+            out: &scratch.ffn_out,
+        },
+        Step::RmsNorm {
+            x: &scratch.ffn_out,
+            weight: &moe.post_feedforward_layernorm_1,
+            out: &scratch.moe_cur_mlp,
+            eps: config.norm_eps,
+        },
+        Step::RmsNorm {
+            x: &scratch.residual,
+            weight: &moe.pre_feedforward_layernorm_2,
+            out: &scratch.moe_pre2,
+            eps: config.norm_eps,
+        },
+        Step::RmsNorm {
+            x: &scratch.residual,
+            weight: &moe.router_scale,
+            out: &scratch.moe_router_in,
+            eps: config.norm_eps,
+        },
+        Step::Scale {
+            x: &scratch.moe_router_in,
+            scale: 1.0 / (dim as f32).sqrt(),
+        },
+        Step::Gemv {
+            w: &wr_router,
+            input: GemvInput::Raw(&scratch.moe_router_in),
+            out: &scratch.moe_router_logits,
+        },
+        Step::MoeSoftmaxTopK {
+            logits: &scratch.moe_router_logits,
+            topk_indices: &scratch.moe_topk_indices,
+            topk_weights: &scratch.moe_topk_weights,
+            n_exp: config.num_experts,
+            norm_topk_prob: true,
+            backend: MoeRouterBackend::Default,
+        },
+        Step::MoeGeluExperts {
+            experts,
+            input: &scratch.moe_pre2,
+            input_rot: &scratch.moe_pre2_rot,
+            topk_indices: &scratch.moe_topk_indices,
+            topk_weights: &scratch.moe_topk_weights,
+            expert_scales: &moe.per_expert_scale,
+            expert_scales_host: &moe.per_expert_scale_host,
+            gate: &scratch.moe_expert_gate_batch,
+            up: &scratch.moe_expert_up_batch,
+            hidden: &scratch.moe_expert_hidden_batch,
+            out: &scratch.moe_cur_moe,
+            hidden_dim: dim,
+            expert_dim: config.moe_intermediate_size,
+            k_top: config.top_k_experts,
+        },
+        Step::RmsNorm {
+            x: &scratch.moe_cur_moe,
+            weight: &moe.post_feedforward_layernorm_2,
+            out: &scratch.moe_cur_moe,
+            eps: config.norm_eps,
+        },
+        Step::ResidualAdd {
+            x: &scratch.moe_cur_mlp,
+            y: &scratch.moe_cur_moe,
+            dim,
+        },
+        Step::RmsNorm {
+            x: &scratch.moe_cur_mlp,
+            weight: &weights.post_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Copy {
+            src: &scratch.residual,
+            dst: &scratch.x,
+            bytes: dim * 4,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Scale {
+            x: &scratch.x,
+            scale: weights.layer_scalar_host,
+        },
+    ];
+    execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
+}
+
+fn execute_full_moe_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    weights: &FullLayerWeights,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    kv_layer_idx: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let head_dim = config.full_head_dim;
+    let n_kv_heads = config.full_n_kv_heads;
+    let moe = weights.moe.as_ref().expect("validated MoE layer");
+    let (plan, io) = gemma4_attention_params(
+        gpu,
+        config,
+        pos,
+        kv_cache,
+        kv_layer_idx,
+        scratch,
+        head_dim,
+        n_kv_heads,
+        0,
+    )?;
+    let wr_q = weights.q_proj.dispatch_ref();
+    let wr_k = weights.k_proj.dispatch_ref();
+    let wr_o = weights.o_proj.dispatch_ref();
+    let wr_gate = weights.gate_proj.dispatch_ref();
+    let wr_up = weights.up_proj.dispatch_ref();
+    let wr_down = weights.down_proj.dispatch_ref();
+    let wr_router = moe.router_proj.dispatch_ref();
+    let experts = MoeGeluExpertsRef {
+        gate_up_pool: &moe.experts_gate_up_pool,
+        down_pool: &moe.experts_down_pool,
+        gate_up_ptrs: &moe.experts_gate_up_ptrs,
+        down_ptrs: &moe.experts_down_ptrs,
+        gate_up_dtype: moe.experts[0].gate_up_proj.gpu_dtype,
+        down_dtype: moe.experts[0].down_proj.gpu_dtype,
+        gate_up_bytes: moe.gate_up_bytes,
+        down_bytes: moe.down_bytes,
+        n_experts: config.num_experts,
+    };
+    let steps: [Step<'_>; 32] = [
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.input_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_q,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.q,
+        },
+        Step::Gemv {
+            w: &wr_k,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.k,
+        },
+        Step::Copy {
+            src: &scratch.k,
+            dst: &scratch.v,
+            bytes: n_kv_heads * head_dim * 4,
+        },
+        Step::QkNorm {
+            x: &scratch.q,
+            weight: &weights.q_norm,
+            n_groups: config.n_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.k,
+            weight: &weights.k_norm,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::QkNorm {
+            x: &scratch.v,
+            weight: &scratch.v_norm_ones_full,
+            n_groups: n_kv_heads,
+            head_dim,
+            eps: config.norm_eps,
+        },
+        Step::Scale {
+            x: &scratch.q,
+            scale: (head_dim as f32).sqrt(),
+        },
+        Step::RopePartial {
+            q: &scratch.q,
+            k: &scratch.k,
+            pos_buf: &scratch.pos_buf,
+            n_heads: config.n_heads,
+            n_kv_heads,
+            head_dim,
+            n_rot_pairs: ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize,
+            theta: config.full_rope_theta,
+        },
+        Step::Attend { plan, io },
+        Step::Gemv {
+            w: &wr_o,
+            input: GemvInput::Raw(&scratch.attn_out),
+            out: &scratch.tmp,
+        },
+        Step::RmsNorm {
+            x: &scratch.tmp,
+            weight: &weights.post_attention_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Copy {
+            src: &scratch.x,
+            dst: &scratch.residual,
+            bytes: dim * 4,
+        },
+        Step::RmsNorm {
+            x: &scratch.x,
+            weight: &weights.pre_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Gemv {
+            w: &wr_gate,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.gate_ffn,
+        },
+        Step::Gemv {
+            w: &wr_up,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.up_ffn,
+        },
+        Step::GeluTanhMul {
+            gate: &scratch.gate_ffn,
+            up: &scratch.up_ffn,
+            out: &scratch.ffn_hidden,
+            n: config.hidden_dim,
+        },
+        Step::Gemv {
+            w: &wr_down,
+            input: GemvInput::Raw(&scratch.ffn_hidden),
+            out: &scratch.ffn_out,
+        },
+        Step::RmsNorm {
+            x: &scratch.ffn_out,
+            weight: &moe.post_feedforward_layernorm_1,
+            out: &scratch.moe_cur_mlp,
+            eps: config.norm_eps,
+        },
+        Step::RmsNorm {
+            x: &scratch.residual,
+            weight: &moe.pre_feedforward_layernorm_2,
+            out: &scratch.moe_pre2,
+            eps: config.norm_eps,
+        },
+        Step::RmsNorm {
+            x: &scratch.residual,
+            weight: &moe.router_scale,
+            out: &scratch.moe_router_in,
+            eps: config.norm_eps,
+        },
+        Step::Scale {
+            x: &scratch.moe_router_in,
+            scale: 1.0 / (dim as f32).sqrt(),
+        },
+        Step::Gemv {
+            w: &wr_router,
+            input: GemvInput::Raw(&scratch.moe_router_in),
+            out: &scratch.moe_router_logits,
+        },
+        Step::MoeSoftmaxTopK {
+            logits: &scratch.moe_router_logits,
+            topk_indices: &scratch.moe_topk_indices,
+            topk_weights: &scratch.moe_topk_weights,
+            n_exp: config.num_experts,
+            norm_topk_prob: true,
+            backend: MoeRouterBackend::Default,
+        },
+        Step::MoeGeluExperts {
+            experts,
+            input: &scratch.moe_pre2,
+            input_rot: &scratch.moe_pre2_rot,
+            topk_indices: &scratch.moe_topk_indices,
+            topk_weights: &scratch.moe_topk_weights,
+            expert_scales: &moe.per_expert_scale,
+            expert_scales_host: &moe.per_expert_scale_host,
+            gate: &scratch.moe_expert_gate_batch,
+            up: &scratch.moe_expert_up_batch,
+            hidden: &scratch.moe_expert_hidden_batch,
+            out: &scratch.moe_cur_moe,
+            hidden_dim: dim,
+            expert_dim: config.moe_intermediate_size,
+            k_top: config.top_k_experts,
+        },
+        Step::RmsNorm {
+            x: &scratch.moe_cur_moe,
+            weight: &moe.post_feedforward_layernorm_2,
+            out: &scratch.moe_cur_moe,
+            eps: config.norm_eps,
+        },
+        Step::ResidualAdd {
+            x: &scratch.moe_cur_mlp,
+            y: &scratch.moe_cur_moe,
+            dim,
+        },
+        Step::RmsNorm {
+            x: &scratch.moe_cur_mlp,
+            weight: &weights.post_feedforward_layernorm,
+            out: &scratch.tmp,
+            eps: config.norm_eps,
+        },
+        Step::Copy {
+            src: &scratch.residual,
+            dst: &scratch.x,
+            bytes: dim * 4,
+        },
+        Step::ResidualAdd {
+            x: &scratch.x,
+            y: &scratch.tmp,
+            dim,
+        },
+        Step::Scale {
+            x: &scratch.x,
+            scale: weights.layer_scalar_host,
+        },
+    ];
+    execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
 }
 
 // ── Bindings struct ───────────────────────────────────────────────────────
@@ -5713,4 +6865,74 @@ fn forward_scratch_inner_lowered(
         )?;
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::{gemma4_op_sequence, Gemma4Op, Gemma4Variant};
+
+    #[test]
+    fn sliding_dense_step_order_is_total() {
+        assert_eq!(
+            gemma4_op_sequence(Gemma4Variant::SlidingDense),
+            &[
+                Gemma4Op::NormInput,
+                Gemma4Op::ProjQ,
+                Gemma4Op::ProjK,
+                Gemma4Op::ProjV,
+                Gemma4Op::NormQ,
+                Gemma4Op::NormK,
+                Gemma4Op::NormV,
+                Gemma4Op::ScaleQ,
+                Gemma4Op::RopeFull,
+                Gemma4Op::Attend,
+                Gemma4Op::ProjO,
+                Gemma4Op::NormPostAttn,
+                Gemma4Op::ResidualAddAttn,
+                Gemma4Op::SaveResidual,
+                Gemma4Op::NormPreFfn,
+                Gemma4Op::ProjGate,
+                Gemma4Op::ProjUp,
+                Gemma4Op::GeluTanhMul,
+                Gemma4Op::ProjDown,
+                Gemma4Op::NormPostFfn,
+                Gemma4Op::RestoreResidual,
+                Gemma4Op::ResidualAddFfn,
+                Gemma4Op::ScaleLayer,
+            ]
+        );
+    }
+
+    #[test]
+    fn full_attention_copies_k_before_normalization_and_uses_partial_rope() {
+        let ops = gemma4_op_sequence(Gemma4Variant::FullDense);
+        let copy = ops
+            .iter()
+            .position(|op| *op == Gemma4Op::CopyKToV)
+            .unwrap();
+        let norm_k = ops.iter().position(|op| *op == Gemma4Op::NormK).unwrap();
+        let norm_v = ops.iter().position(|op| *op == Gemma4Op::NormV).unwrap();
+        assert!(copy < norm_k && copy < norm_v);
+        assert!(ops.contains(&Gemma4Op::RopePartial));
+        assert!(!ops.contains(&Gemma4Op::ProjV));
+    }
+
+    #[test]
+    fn moe_replaces_dense_post_ffn_norm_once() {
+        for variant in [Gemma4Variant::SlidingMoe, Gemma4Variant::FullMoe] {
+            let ops = gemma4_op_sequence(variant);
+            assert_eq!(
+                ops.iter()
+                    .filter(|op| **op == Gemma4Op::MoeExperts)
+                    .count(),
+                1
+            );
+            assert!(!ops.contains(&Gemma4Op::NormPostFfn));
+            assert_eq!(
+                ops.iter()
+                    .filter(|op| **op == Gemma4Op::NormOuterFfn)
+                    .count(),
+                1
+            );
+        }
+    }
 }
