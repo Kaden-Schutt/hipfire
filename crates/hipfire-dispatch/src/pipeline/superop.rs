@@ -260,10 +260,11 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
-            // Rope/QkNorm/BiasAdd and the five Gemma4 primitives are per-op-only
-            // Step vocabulary: never fused, never lowered via superop. Emitting
-            // them into a lowered program is a bug (no SuperOpKind exists for
-            // them) — rejected explicitly so none falls to the catch-all.
+            // Rope/QkNorm/BiasAdd, the Gemma4 primitives, and the typed GELU
+            // expert Step are per-op-only vocabulary: never fused, never
+            // lowered via superop. Emitting them into a lowered program is a
+            // bug (no SuperOpKind exists for them) — rejected explicitly so
+            // none falls to the catch-all.
             PipelineOp::Rope
             | PipelineOp::QkNorm
             | PipelineOp::BiasAdd
@@ -271,7 +272,8 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             | PipelineOp::Copy
             | PipelineOp::Scale
             | PipelineOp::GeluTanhMul
-            | PipelineOp::RopePartial => {
+            | PipelineOp::RopePartial
+            | PipelineOp::MoeGeluExperts => {
                 unreachable!("per-op-only Step vocabulary is not lowerable via superop")
             }
             // Remaining PipelineOp values are not producible from a Step.
@@ -603,8 +605,8 @@ mod tests {
         assert!(prog.iter().all(|op| op.binding.key.is_none()));
     }
 
-    // ── Per-op-only Step vocabulary must never lower via superop ─────────
-    // The five Gemma4 primitives join Rope/QkNorm/BiasAdd in the explicit
+    // Per-op-only Step vocabulary must never lower via superop
+    // The six Gemma4 primitives join Rope/QkNorm/BiasAdd in the explicit
     // rejection branch: emitting any of them into a lowered program is a
     // bug, so lower_layer must panic (never reach the `_ => Norm` catch-all).
 
@@ -678,6 +680,46 @@ mod tests {
             head_dim: 512,
             n_rot_pairs: 64,
             theta: 1e4,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_moe_gelu_experts() {
+        let x = meta_tensor(1);
+        let pool = GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(2 as *mut std::ffi::c_void, 4096)
+            },
+            shape: vec![4096],
+            dtype: rdna_compute::DType::Raw,
+        };
+        let scales_host = [1.0_f32];
+        let experts = crate::families::moe::MoeGeluExpertsRef {
+            gate_up_pool: &pool,
+            down_pool: &pool,
+            gate_up_ptrs: &x,
+            down_ptrs: &x,
+            gate_up_dtype: rdna_compute::DType::MQ4G256,
+            down_dtype: rdna_compute::DType::Q8_0,
+            gate_up_bytes: 16,
+            down_bytes: 16,
+            n_experts: 1,
+        };
+        assert_lower_rejects(Step::MoeGeluExperts {
+            experts,
+            input: &x,
+            input_rot: &x,
+            topk_indices: &x,
+            topk_weights: &x,
+            expert_scales: &x,
+            expert_scales_host: &scales_host,
+            gate: &x,
+            up: &x,
+            hidden: &x,
+            out: &x,
+            hidden_dim: 8,
+            expert_dim: 4,
+            k_top: 1,
         });
     }
 }

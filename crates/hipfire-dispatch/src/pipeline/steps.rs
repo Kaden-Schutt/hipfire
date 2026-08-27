@@ -20,7 +20,8 @@ use crate::families::moe::{
     launch_moe_combine, launch_moe_combine_grouped, launch_moe_gate_up_unscatter, launch_moe_route,
     launch_moe_scatter, launch_moe_softmax_topk, launch_qwen_down_indexed,
     launch_qwen_gate_up_indexed, launch_scaled_add_gpu_scalar, launch_score_activation,
-    launch_shared_expert_down_body, launch_shared_gate_side, DeepSeekIndexedForm, MoeExpertRef,
+    launch_shared_expert_down_body, launch_shared_gate_side, launch_moe_gelu_experts,
+    DeepSeekIndexedForm, MoeExpertRef, MoeGeluExpertsRef,
     MoeRouterBackend,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -716,6 +717,28 @@ pub enum Step<'a> {
         /// before dispatch. DownExpanded consumes it as before.
         batch_size: usize,
     },
+    /// Evaluate the selected Gemma GELU-tanh experts and accumulate their
+    /// top-K/per-expert-scaled down projections into `out`.
+    ///
+    /// Indexed pointer tables are an optimization.  The pooled raw storage
+    /// and byte strides in `experts` keep the generic per-expert fallback
+    /// available without transferring ownership into dispatch.
+    MoeGeluExperts {
+        experts: MoeGeluExpertsRef<'a>,
+        input: &'a GpuTensor,
+        input_rot: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        expert_scales: &'a GpuTensor,
+        expert_scales_host: &'a [f32],
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        hidden: &'a GpuTensor,
+        out: &'a GpuTensor,
+        hidden_dim: usize,
+        expert_dim: usize,
+        k_top: usize,
+    },
     /// Weighted combine of per-expert expanded down outputs into the EP partial.
     /// Delegates to [`launch_moe_combine`] (decode) or [`launch_moe_combine_grouped`]
     /// (prefill grouped path, when `inverse_perm` is `Some`).
@@ -1028,6 +1051,8 @@ fn op_kind(step: &Step) -> PipelineOp {
         // MoE decode ops (Task 4). Not fusible — no entry in FUSED_TABLE.
         Step::MoeRoute { .. } => PipelineOp::MoeRoute,
         Step::IndexedMoeGemv { .. } => PipelineOp::IndexedMoeGemv,
+        // Gemma GELU experts are a distinct non-fusible semantic unit.
+        Step::MoeGeluExperts { .. } => PipelineOp::MoeGeluExperts,
         Step::MoeCombine { .. } => PipelineOp::MoeCombine,
         // MoE prefill grouped ops (Task 5). Not fusible.
         Step::MoeScatter { .. } => PipelineOp::MoeScatter,
@@ -1785,6 +1810,9 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         Step::ScoreActivation { .. } => None,
         // MoeActivation is an intermediate (not an EP partial).
         Step::MoeActivation { .. } => None,
+        // Gemma GELU experts accumulate into a local branch buffer; the
+        // enclosing layer handles its residual/collective semantics.
+        Step::MoeGeluExperts { .. } => None,
         // ConvertI64ToF32: on the EP i64 path (ZeroI64Only→DownResidualI64→ConvertI64ToF32→AllReduce{Ep}),
         // the f32 `dst` IS the EP partial that the AllReduce{Ep} collective must target.
         Step::ConvertI64ToF32 { dst, .. } => Some(&dst.buf),
@@ -2975,6 +3003,39 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 }
             }
         }
+        Step::MoeGeluExperts {
+            experts,
+            input,
+            input_rot,
+            topk_indices,
+            topk_weights,
+            expert_scales,
+            expert_scales_host,
+            gate,
+            up,
+            hidden,
+            out,
+            hidden_dim,
+            expert_dim,
+            k_top,
+        } => launch_moe_gelu_experts(
+            gpu,
+            ctx,
+            experts,
+            input,
+            input_rot,
+            topk_indices,
+            topk_weights,
+            expert_scales,
+            expert_scales_host,
+            gate,
+            up,
+            hidden,
+            out,
+            *hidden_dim,
+            *expert_dim,
+            *k_top,
+        ),
         Step::ConvertI64ToF32 { src, dst, n } => gpu
             .moe_i64_residual_to_f32(src, dst, *n)
             .map_err(|e| DispatchError::Hip(e.to_string())),
@@ -4461,6 +4522,7 @@ mod tests {
             Step::Scale { .. } => Some(PipelineOp::Scale),
             Step::GeluTanhMul { .. } => Some(PipelineOp::GeluTanhMul),
             Step::RopePartial { .. } => Some(PipelineOp::RopePartial),
+            Step::MoeGeluExperts { .. } => Some(PipelineOp::MoeGeluExperts),
             _ => None,
         }
     }
@@ -4477,5 +4539,71 @@ mod tests {
             validate_partial_rope(512, 257).unwrap_err().to_string(),
             "RopePartial: n_rot_pairs=257 exceeds head_dim/2=256"
         );
+    }
+    #[test]
+    fn gelu_expert_step_has_indexed_identity_and_no_collective_output() {
+        let f32_tensor = |ptr: usize| GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    ptr as *mut std::ffi::c_void,
+                    4096,
+                )
+            },
+            shape: vec![1024],
+            dtype: DType::F32,
+        };
+        let raw_tensor = |ptr: usize| GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    ptr as *mut std::ffi::c_void,
+                    4096,
+                )
+            },
+            shape: vec![4096],
+            dtype: DType::Raw,
+        };
+        let gate_up_pool = raw_tensor(1);
+        let down_pool = raw_tensor(2);
+        let gate_up_ptrs = f32_tensor(3);
+        let down_ptrs = f32_tensor(4);
+        let input = f32_tensor(5);
+        let input_rot = f32_tensor(6);
+        let topk_indices = f32_tensor(7);
+        let topk_weights = f32_tensor(8);
+        let expert_scales = f32_tensor(9);
+        let gate = f32_tensor(10);
+        let up = f32_tensor(11);
+        let hidden = f32_tensor(12);
+        let out = f32_tensor(13);
+        let scales_host = [1.0_f32];
+        let experts = MoeGeluExpertsRef {
+            gate_up_pool: &gate_up_pool,
+            down_pool: &down_pool,
+            gate_up_ptrs: &gate_up_ptrs,
+            down_ptrs: &down_ptrs,
+            gate_up_dtype: DType::MQ4G256,
+            down_dtype: DType::Q8_0,
+            gate_up_bytes: 16,
+            down_bytes: 16,
+            n_experts: 1,
+        };
+        let step = Step::MoeGeluExperts {
+            experts,
+            input: &input,
+            input_rot: &input_rot,
+            topk_indices: &topk_indices,
+            topk_weights: &topk_weights,
+            expert_scales: &expert_scales,
+            expert_scales_host: &scales_host,
+            gate: &gate,
+            up: &up,
+            hidden: &hidden,
+            out: &out,
+            hidden_dim: 8,
+            expert_dim: 4,
+            k_top: 1,
+        };
+        assert_eq!(step_op_kind(&step), PipelineOp::MoeGeluExperts);
+        assert!(tp_step_out_buf(&step).is_none());
     }
 }

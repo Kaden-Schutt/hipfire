@@ -21,14 +21,13 @@ use rdna_compute::DType;
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
-use crate::families::gemv::{GivensRef, WeightRef};
+use crate::families::gemv::{GemvFamily, GemvParams, GivensRef, WeightRef};
 use crate::tables::moe_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
-use crate::families::gemv::GemvFamily;
 use crate::pipeline::steps::{MoeActivationVariant, MoeProj, QwenDownMode, ScoreActKind, Step};
 
 // ── MoE eligibility lattice ────────────────────────────
@@ -1136,6 +1135,422 @@ pub struct MoeExpertRef<'a> {
     /// Locally-owned expert indices for EP context. Empty slice = all owned
     /// (single-GPU or non-EP path).
     pub owned: &'a [usize],
+}
+
+/// Complete borrowed storage view for Gemma's GELU-routed experts.
+///
+/// The pointer tables serve the indexed fast path.  The raw pools and their
+/// byte strides are retained so the same Step can fall back to non-owning
+/// per-expert views when a dtype pair has no indexed kernel.
+pub struct MoeGeluExpertsRef<'a> {
+    pub gate_up_pool: &'a GpuTensor,
+    pub down_pool: &'a GpuTensor,
+    pub gate_up_ptrs: &'a GpuTensor,
+    pub down_ptrs: &'a GpuTensor,
+    pub gate_up_dtype: DType,
+    pub down_dtype: DType,
+    pub gate_up_bytes: usize,
+    pub down_bytes: usize,
+    pub n_experts: usize,
+}
+
+/// Dispatch backend for the typed Gemma GELU expert Step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeGeluBackend {
+    Indexed,
+    PerExpert,
+}
+
+/// Select the indexed backend only for the Gemma expert pairs backed by real
+/// indexed kernels.  HFQ4G128 has an API-shaped launcher, but that launcher is
+/// still a Phase-4 stub; routing it here would turn a valid model into a
+/// known dispatch error, so it intentionally stays on the generic fallback.
+pub fn select_moe_gelu_backend(gate_up_dtype: DType, down_dtype: DType) -> MoeGeluBackend {
+    match (gate_up_dtype, down_dtype) {
+        (DType::MQ4G256, DType::Q8_0) | (DType::Q8_0, DType::Q8_0) => {
+            MoeGeluBackend::Indexed
+        }
+        _ => MoeGeluBackend::PerExpert,
+    }
+}
+
+/// Validate the shape-independent invariants required by the typed GELU
+/// expert step before any GPU work or top-K download.
+pub fn validate_moe_gelu_shape(
+    k_top: usize,
+    hidden_dim: usize,
+    expert_dim: usize,
+    n_experts: usize,
+) -> Result<(), String> {
+    if k_top == 0 {
+        return Err("MoeGeluExperts: k_top must be nonzero".to_owned());
+    }
+    if hidden_dim == 0 {
+        return Err("MoeGeluExperts: hidden_dim must be nonzero".to_owned());
+    }
+    if expert_dim == 0 {
+        return Err("MoeGeluExperts: expert_dim must be nonzero".to_owned());
+    }
+    if n_experts == 0 {
+        return Err("MoeGeluExperts: n_experts must be nonzero".to_owned());
+    }
+    if k_top > n_experts {
+        return Err(format!(
+            "MoeGeluExperts: k_top={k_top} exceeds n_experts={n_experts}"
+        ));
+    }
+    k_top
+        .checked_mul(expert_dim)
+        .ok_or_else(|| "MoeGeluExperts: k_top * expert_dim overflows".to_owned())?;
+    hidden_dim
+        .checked_mul(4)
+        .ok_or_else(|| "MoeGeluExperts: hidden_dim byte size overflows".to_owned())?;
+    Ok(())
+}
+
+/// Return a non-owning raw-byte view for one expert in a pooled allocation.
+/// The explicit bounds check keeps malformed metadata from reaching
+/// `GpuTensor::sub_offset`, whose assertion is intentionally infallible.
+fn moe_pool_expert_view(
+    pool: &GpuTensor,
+    bytes_per_expert: usize,
+    expert: usize,
+    n_experts: usize,
+    kind: &str,
+) -> Result<GpuTensor, DispatchError> {
+    if bytes_per_expert == 0 {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} bytes_per_expert must be nonzero"
+        )));
+    }
+    if expert >= n_experts {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} expert index {expert} out of range (n_experts={n_experts})"
+        )));
+    }
+    if pool.dtype != DType::Raw {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} pool must be Raw, got {:?}",
+            pool.dtype
+        )));
+    }
+    let offset = expert.checked_mul(bytes_per_expert).ok_or_else(|| {
+        DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} expert byte offset overflows"
+        ))
+    })?;
+    let end = offset.checked_add(bytes_per_expert).ok_or_else(|| {
+        DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} expert byte range overflows"
+        ))
+    })?;
+    if end > pool.buf.size() {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} expert view [{offset}, {end}) exceeds pool bytes {}",
+            pool.buf.size()
+        )));
+    }
+    Ok(pool.sub_offset(offset, bytes_per_expert))
+}
+
+fn f32_prefix_view(
+    tensor: &GpuTensor,
+    elements: usize,
+    kind: &str,
+) -> Result<GpuTensor, DispatchError> {
+    if tensor.dtype != DType::F32 {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} scratch must be F32, got {:?}",
+            tensor.dtype
+        )));
+    }
+    let bytes = elements.checked_mul(4).ok_or_else(|| {
+        DispatchError::Hip(format!("MoeGeluExperts: {kind} byte size overflows"))
+    })?;
+    if bytes > tensor.buf.size() {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: {kind} scratch needs {bytes} bytes, has {}",
+            tensor.buf.size()
+        )));
+    }
+    Ok(tensor.sub_offset(0, elements))
+}
+
+fn zero_moe_output(
+    gpu: &mut Gpu,
+    out: &GpuTensor,
+    hidden_dim: usize,
+) -> Result<(), DispatchError> {
+    let bytes = hidden_dim.checked_mul(4).ok_or_else(|| {
+        DispatchError::Hip("MoeGeluExperts: output byte size overflows".to_owned())
+    })?;
+    if out.buf.size() < bytes {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: output needs {bytes} bytes, has {}",
+            out.buf.size()
+        )));
+    }
+    if let Some(stream) = gpu.active_stream.as_ref() {
+        gpu.hip
+            .memset_async(&out.buf, 0, bytes, stream)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    } else {
+        gpu.hip
+            .memset(&out.buf, 0, bytes)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+}
+
+fn launch_moe_weight(
+    gemv: &GemvFamily,
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    input: &GpuTensor,
+    output: &GpuTensor,
+    prerotated: bool,
+) -> Result<(), DispatchError> {
+    if prerotated {
+        return gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w: weight,
+                x: input,
+                y: output,
+                variant: crate::types::GemvVariant::Prerotated,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        );
+    }
+    if crate::types::dtype_rotation_plan(weight.dtype) == crate::types::RotationPlan::None {
+        gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w: weight,
+                x: input,
+                y: output,
+                variant: crate::types::GemvVariant::Plain,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        )
+    } else {
+        gemv.run_auto(ctx, gpu, weight, input, output)
+    }
+}
+
+/// Execute Gemma's selected GELU-tanh experts through one typed Step
+/// contract.  Indexed pairs stay entirely on device; all other pairs use the
+/// legacy top-K download and non-owning pool-view fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_moe_gelu_experts(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    experts: &MoeGeluExpertsRef<'_>,
+    input: &GpuTensor,
+    input_rot: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    expert_scales: &GpuTensor,
+    expert_scales_host: &[f32],
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    hidden: &GpuTensor,
+    out: &GpuTensor,
+    hidden_dim: usize,
+    expert_dim: usize,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    validate_moe_gelu_shape(k_top, hidden_dim, expert_dim, experts.n_experts)
+        .map_err(DispatchError::Hip)?;
+    if expert_scales_host.len() < experts.n_experts {
+        return Err(DispatchError::Hip(format!(
+            "MoeGeluExperts: expert_scales_host has {} entries, needs {}",
+            expert_scales_host.len(),
+            experts.n_experts
+        )));
+    }
+    let backend = if k_top == 8 {
+        select_moe_gelu_backend(experts.gate_up_dtype, experts.down_dtype)
+    } else {
+        MoeGeluBackend::PerExpert
+    };
+    match backend {
+        MoeGeluBackend::Indexed => {
+            zero_moe_output(gpu, out, hidden_dim)?;
+            match experts.gate_up_dtype {
+                DType::MQ4G256 => {
+                    gpu.rotate_x_mq(input, input_rot, hidden_dim)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    gpu.gemv_mq4g256_moe_gate_up_k8_indexed(
+                        experts.gate_up_ptrs,
+                        topk_indices,
+                        input_rot,
+                        gate,
+                        up,
+                        2 * expert_dim,
+                        hidden_dim,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
+                DType::Q8_0 => gpu
+                    .gemv_q8_0_moe_gate_up_k8_indexed(
+                        experts.gate_up_ptrs,
+                        topk_indices,
+                        input,
+                        gate,
+                        up,
+                        2 * expert_dim,
+                        hidden_dim,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?,
+                other => {
+                    return Err(DispatchError::Hip(format!(
+                        "MoeGeluExperts: indexed gate_up dtype {other:?} is unsupported"
+                    )))
+                }
+            }
+            let activation_n = k_top * expert_dim;
+            gpu.gelu_tanh_f32(gate, hidden, activation_n)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.mul_f32(hidden, up, hidden)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            match experts.down_dtype {
+                DType::Q8_0 => gpu
+                    .gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+                        experts.down_ptrs,
+                        topk_indices,
+                        topk_weights,
+                        expert_scales,
+                        hidden,
+                        out,
+                        hidden_dim,
+                        expert_dim,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string())),
+                other => Err(DispatchError::Hip(format!(
+                    "MoeGeluExperts: indexed down dtype {other:?} is unsupported"
+                ))),
+            }
+        }
+        MoeGeluBackend::PerExpert => {
+            let index_data = gpu
+                .download_f32(topk_indices)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let weight_data = gpu
+                .download_f32(topk_weights)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            if index_data.len() < k_top {
+                return Err(DispatchError::Hip(format!(
+                    "MoeGeluExperts: topk_indices has {} entries, needs {k_top}",
+                    index_data.len()
+                )));
+            }
+            if weight_data.len() < k_top {
+                return Err(DispatchError::Hip(format!(
+                    "MoeGeluExperts: topk_weights has {} entries, needs {k_top}",
+                    weight_data.len()
+                )));
+            }
+            let index_words =
+                unsafe { std::slice::from_raw_parts(index_data.as_ptr() as *const i32, k_top) };
+            for &raw in index_words {
+                if raw < 0 || (raw as usize) >= experts.n_experts {
+                    return Err(DispatchError::Hip(format!(
+                        "MoeGeluExperts: topk index {raw} out of range (n_experts={})",
+                        experts.n_experts
+                    )));
+                }
+            }
+            if experts.gate_up_dtype == DType::MQ4G256 {
+                gpu.rotate_x_mq(input, input_rot, hidden_dim)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+
+            zero_moe_output(gpu, out, hidden_dim)?;
+            // The indexed scratch buffers are large enough for one fused
+            // gate||up result and one hidden-dimensional down result.  Reuse
+            // them rather than creating a GPU owner for the fallback.
+            let gate_up_workspace = f32_prefix_view(gate, 2 * expert_dim, "gate")?;
+            let gate_view = gate_up_workspace.sub_offset(0, expert_dim);
+            let up_view = gate_up_workspace.sub_offset(expert_dim, expert_dim);
+            let hidden_view = f32_prefix_view(hidden, expert_dim, "hidden")?;
+            let down_view = f32_prefix_view(up, hidden_dim, "up/down")?;
+            static GEMV: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
+            let gemv: &GemvFamily = &GEMV;
+
+            for slot in 0..k_top {
+                let expert = index_words[slot] as usize;
+                let gate_up_buf = moe_pool_expert_view(
+                    experts.gate_up_pool,
+                    experts.gate_up_bytes,
+                    expert,
+                    experts.n_experts,
+                    "gate_up",
+                )?;
+                let down_buf = moe_pool_expert_view(
+                    experts.down_pool,
+                    experts.down_bytes,
+                    expert,
+                    experts.n_experts,
+                    "down",
+                )?;
+                let gate_up_weight = WeightRef {
+                    buf: &gate_up_buf,
+                    dtype: experts.gate_up_dtype,
+                    m: 2 * expert_dim,
+                    k: hidden_dim,
+                    row_stride: 0,
+                    rotation: None,
+                    awq_scale: None,
+                };
+                let down_weight = WeightRef {
+                    buf: &down_buf,
+                    dtype: experts.down_dtype,
+                    m: hidden_dim,
+                    k: expert_dim,
+                    row_stride: 0,
+                    rotation: None,
+                    awq_scale: None,
+                };
+                launch_moe_weight(
+                    gemv,
+                    ctx,
+                    gpu,
+                    &gate_up_weight,
+                    if experts.gate_up_dtype == DType::MQ4G256 {
+                        input_rot
+                    } else {
+                        input
+                    },
+                    &gate_up_workspace,
+                    experts.gate_up_dtype == DType::MQ4G256,
+                )?;
+                gpu.gelu_tanh_f32(&gate_view, &hidden_view, expert_dim)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.mul_f32(&hidden_view, &up_view, &hidden_view)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                launch_moe_weight(
+                    gemv,
+                    ctx,
+                    gpu,
+                    &down_weight,
+                    &hidden_view,
+                    &down_view,
+                    false,
+                )?;
+                let scale = weight_data[slot] * expert_scales_host[expert];
+                gpu.scaled_add_inplace_cpu_scalar_f32(out, &down_view, scale)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
 }
 
 // ── Step-IR launch helpers ────────────────────────────────
@@ -2852,6 +3267,60 @@ mod tests {
         assert_eq!(
             select_moe_router_backend(&g1201, 256),
             MoeRouterBackend::Wave64
+        );
+    }
+
+    #[test]
+    fn gelu_expert_step_rejects_zero_topk_before_launch() {
+        let err = validate_moe_gelu_shape(0, 2816, 704, 30).unwrap_err();
+        assert_eq!(err.to_string(), "MoeGeluExperts: k_top must be nonzero");
+    }
+
+    #[test]
+    fn gelu_expert_backend_preserves_unknown_dtype_fallback() {
+        assert_eq!(
+            select_moe_gelu_backend(DType::HFQ4G128, DType::MQ4G256),
+            MoeGeluBackend::PerExpert
+        );
+    }
+
+    #[test]
+    fn gelu_expert_backend_selects_only_implemented_pairs() {
+        assert_eq!(
+            select_moe_gelu_backend(DType::MQ4G256, DType::Q8_0),
+            MoeGeluBackend::Indexed
+        );
+        assert_eq!(
+            select_moe_gelu_backend(DType::Q8_0, DType::Q8_0),
+            MoeGeluBackend::Indexed
+        );
+        assert_eq!(
+            select_moe_gelu_backend(DType::MQ4G256, DType::HFQ4G128),
+            MoeGeluBackend::PerExpert
+        );
+    }
+
+    #[test]
+    fn gelu_expert_fallback_views_use_pool_byte_offsets() {
+        let pool = GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    0x1000usize as *mut std::ffi::c_void,
+                    3 * 24,
+                )
+            },
+            shape: vec![3 * 24],
+            dtype: DType::Raw,
+        };
+        let view = moe_pool_expert_view(&pool, 24, 2, 3, "gate_up").unwrap();
+        assert_eq!(view.buf.as_ptr() as usize, 0x1000 + 2 * 24);
+        assert_eq!(view.buf.size(), 24);
+        let down_view = moe_pool_expert_view(&pool, 24, 1, 3, "down").unwrap();
+        assert_eq!(down_view.buf.as_ptr() as usize, 0x1000 + 24);
+        assert_eq!(down_view.buf.size(), 24);
+        assert!(
+            moe_pool_expert_view(&pool, 24, 3, 3, "gate_up").is_err(),
+            "an expert at n_experts must not produce a view"
         );
     }
 }

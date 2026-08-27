@@ -33,6 +33,9 @@ pub enum PipelineOp {
     /// Covers GateUp, DownExpanded, and DownResidual shapes — all three return this tag
     /// so fusion matching treats them uniformly (none participate in any fused pattern).
     IndexedMoeGemv,
+    /// Gemma GELU-tanh top-K expert execution (indexed fast path or
+    /// dispatch-owned pooled per-expert fallback). Not fusible via SuperOp.
+    MoeGeluExperts,
     /// Scatter+histogram for grouped-GEMM prefill (Step-IR [`crate::pipeline::steps::Step::MoeScatter`]).
     /// Builds sorted_slot_index / expert_tile_ids / inverse_perm from topk_indices.
     /// Not fusible.

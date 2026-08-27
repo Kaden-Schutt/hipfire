@@ -603,6 +603,7 @@ fn step_kind_label(step: &Step<'_>) -> &'static str {
         Step::ScaledAdd { .. } => "ScaledAdd",
         Step::MoeGateUpIndexed { .. } => "MoeGateUpIndexed",
         Step::MoeDownIndexed { .. } => "MoeDownIndexed",
+        Step::MoeGeluExperts { .. } => "MoeGeluExperts",
     }
 }
 
