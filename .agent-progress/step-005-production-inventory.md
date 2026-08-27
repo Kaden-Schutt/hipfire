@@ -5,7 +5,7 @@ Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 
 | Family | Mode | Production entry | SuperOp route | Default | Hand/state oracle | Replacement owner | Status |
 |---|---|---|---|---|---|---|---|
-| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — fixture-ready |
+| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — fixture-ready; Task 7 serve/lifecycle blocked |
 | LFM2 | Single | `decode_step_layers_and_head` | `decode_step_layers_and_head_lowered` -> `run_layer_program` | on | direct layer loop with capture | LFM2 increment | open |
 | MiniMax | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct attention + sealed MoE loop | MiniMax increment | open |
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
@@ -320,6 +320,69 @@ that did not prevent a successful baseline.
 
 The prior fixture blocker is fully resolved for Gemma4; the remaining inventory rows and source
 verification are unchanged.
+
+## Task 7 lifecycle and user-facing evidence (2026-08-27)
+
+Task 7 is **BLOCKED**; this row is not `complete`. Evidence is local at
+`/home/bjoern/hipfire-step005/gemma4/final/`. No implementation files were changed.
+- Serving prerequisite command `cargo build --release --locked -p hipfire-cli -p hipfire-daemon`
+  exited `0` with compiler warnings only; it produced `target/release/daemon` used by
+  the isolated runs. No formatter, linter, project-wide suite, or unrelated build was run.
+
+- Task 2–6 commits: `97a9ac0b4`, `ec3775afc`, `59b923437`, `44a5d313d`,
+  `a2fbba955`, `37b5f7a2e`, `321c87370`.
+- Canonical model digests remain the pinned values above:
+  dense SHA-256 `4ceb57b558275776680b9acd78fa4e058abefa994a901eb5253654c51e9981c3`,
+  MoE SHA-256 `6f83d448d4bc089aa18debd6601d34c6fd3ce0bab96ee8519d08f6d65121df63`.
+- Maintained E-series reproduction, with
+  `E2B_MODEL=$HOME/.hipfire/models/gemma4-eseries/gemma4-e2b-it-pr439-q8.hfq`,
+  `E4B_MODEL=$HOME/.hipfire/models/gemma4-eseries/gemma4-e4b-it-pr439-q8.hfq`,
+  exited `2`: `missing model: /home/bjoern/.hipfire/models/gemma4-eseries/gemma4-e2b-it-pr439-q8.hfq`.
+  The E-series directory is absent; this arm is fixture-blocked. Raw output:
+  `final/eseries-command.log`.
+- Direct Step-only decode (`infer_gemma4`, exact
+  `2,9259,236888,575,106`, `--max 32`, `--rep-pen 1.0`,
+  `HIPFIRE_GEMMA4_GRAPH=0`, `HIPFIRE_GEMMA4_EAGLE=0`) exited `0` for both models:
+  dense FNV `0xa081658763517110` (`final/dense-decode.log`) and MoE FNV
+  `0x831756562b0ab110` (`final/moe-decode.log`). These are numerical records only.
+- The prior Task 5 text inspection remains malformed:
+  dense `111-11111111111111111111  1111111`; MoE
+  `-나-111 資랑0나�서와 own나서bed much1 own1 much much나 de1 own way own ownら`.
+  No semantic-quality claim is made from the matching counters.
+- `serve_harness.py` commands as written in the brief use unsupported positional
+  `battery`/`chain` and exited `2` (`final/dense-battery-brief.log`). Equivalent isolated
+  `--mode` runs used the newly built daemon (`target/release/daemon`, observed MD5
+  `4584d2900ead83aea5e96df87e6c01fc`), unique ports, and `--home` directories.
+- Applicable `serve_harness.py` built-in battery prompt MD5s (the exact prompt bytes
+  sent in battery and first chain turns) were observed as: code
+  `43ca0d15712d3dfb777b51ae76d8fd5f`; reason
+  `640e0fd4f55996cb175a422f0a12cef5`; factual
+  `8f66b4c97988825bd8e7840aaf44357e`; prose
+  `8fe0ad36f61bcf4992cc9df81cdf3817`; instruct
+  `8bed8e2d056dc1d47dccae9d32dbecf4`.
+  Dense battery/chain exited `0` and showed coherent visible starts, but every row had
+  `finish=None`, `gen=0`, `ctx=0`, `cached=0` with null timing/usage; this is an invalid
+  user-facing terminal contract, not a pass (`final/dense-{battery,chain}.log/.json`).
+  MoE battery/chain exited `0` but all five rows were empty; the daemon reported
+  `gemma4 lowered/MoE generate not yet wired on this build (eager dense only) ...`
+  for each request (`final/moe-{battery,chain}.log/.json`). MoE production generation
+  is explicitly unwired.
+- Interactive native daemon lifecycle sequence (isolated homes, exact load/generate/
+  unload/diag wire records) completed four cycles per fixture. Dense post-unload free
+  memory was `99961, 99961, 99961, 99961 MB`; each generation emitted `Paris` and a
+  `done` event but omitted `finish_reason`. MoE post-unload free memory was
+  `99826, 99824, 99822, 99820 MB`; generation errored every cycle. The MoE decrease
+  is recorded as raw `2 MB/cycle` drift only: no monotonic-leak pass or new threshold
+  is claimed. Raw records: `final/dense-lifecycle.log`, `final/moe-lifecycle.log`.
+- Dense serve daemon logs observed `[gemma4 hipGraph] captured decode forward — 767
+  kernarg blobs retained`; no replay parity is claimed. MoE produced no capture because
+  generation is unwired. The pre-existing user-owned daemon PID `819407` was not
+  stopped, signaled, or reused.
+
+Because E-series artifacts are absent, dense serving terminals are invalid despite
+coherent visible text, MoE serving is empty/unwired, dense lifecycle terminals omit
+`finish_reason`, and MoE lifecycle free memory decreases by 2 MB each cycle, the row
+remains open.
 
 ## Out of scope (later tasks)
 
