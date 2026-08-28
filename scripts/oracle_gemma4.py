@@ -17,9 +17,9 @@ Usage:
   python3 scripts/oracle_gemma4.py --ids-file ids.txt --out hf_ref.json
   # or an inline short case (self-gate)
   python3 scripts/oracle_gemma4.py --ids 2,9259 --out hf_short.json
+Model selection is --model, then GEMMA4_MODEL, then the historical default.
 """
-import argparse, json, sys
-import torch
+import argparse, json, os, sys
 
 MODEL = "/local/models/google/gemma-4-12B-it"
 
@@ -35,6 +35,7 @@ def load_ids(args):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", help="model path (overrides GEMMA4_MODEL)")
     ap.add_argument("--ids")
     ap.add_argument("--ids-file")
     ap.add_argument("--out")
@@ -43,10 +44,11 @@ def main():
     ap.add_argument("--ids-out")
     ap.add_argument("--max-ids", type=int, default=1200)
     args = ap.parse_args()
+    model_path = args.model or os.environ.get("GEMMA4_MODEL") or MODEL
 
     if args.make_ids:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(MODEL)
+        tok = AutoTokenizer.from_pretrained(model_path)
         text = open(args.make_ids).read()
         ids = tok(text, add_special_tokens=False)["input_ids"]
         ids = [2] + ids[: args.max_ids - 1]  # BOS + body
@@ -57,9 +59,10 @@ def main():
 
     ids = load_ids(args)
     print(f"Loading model (f32 CPU)…  ids={len(ids)} tokens", file=sys.stderr)
+    import torch
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.float32, device_map={"": "cpu"}
+        model_path, torch_dtype=torch.float32, device_map={"": "cpu"}
     ).eval()
     input_ids = torch.tensor([ids], device="cpu")
     print("forward…", file=sys.stderr)
