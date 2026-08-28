@@ -751,6 +751,25 @@ impl std::fmt::Display for SemanticFoldError {
 
 impl std::error::Error for SemanticFoldError {}
 
+/// Normalize a staged terminal into the generic semantic-v2 `done` shape.
+///
+/// Producers publish `commit_ready` before waiting for the client commit. The
+/// HTTP completion path and the test fold seam must consume the same payload
+/// normalization so their terminal projections cannot drift.
+fn normalize_staged_terminal_event(
+    event: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, &'static str> {
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("commit_ready") {
+        return Ok(None);
+    }
+    let mut staged = event.clone();
+    let Some(obj) = staged.as_object_mut() else {
+        return Err("commit_ready must be a JSON object");
+    };
+    obj.insert("type".into(), serde_json::Value::String("done".into()));
+    Ok(Some(staged))
+}
+
 /// Attempt-local pure fold over daemon **contract v2** semantic JSON events.
 ///
 /// Accumulates clean content/reasoning verbatim (no marker scanning), buffers
@@ -1330,20 +1349,11 @@ pub(crate) fn fold_complete_request_stream(
 
     for event in events {
         let contract = gate.observe(event)?;
-        let staged = if event.get("type").and_then(serde_json::Value::as_str)
-            == Some("commit_ready")
-        {
-            let mut staged = event.clone();
-            let Some(obj) = staged.as_object_mut() else {
-                return Err(StreamContractError::MalformedToolCall {
-                    detail: "commit_ready must be a JSON object".into(),
-                });
-            };
-            obj.insert("type".into(), serde_json::Value::String("done".into()));
-            Some(staged)
-        } else {
-            None
-        };
+        let staged = normalize_staged_terminal_event(event).map_err(|detail| {
+            StreamContractError::MalformedToolCall {
+                detail: detail.to_owned(),
+            }
+        })?;
         let event = staged.as_ref().unwrap_or(event);
         match contract {
             StreamContract::V2 => {
@@ -1752,11 +1762,12 @@ pub(crate) fn complete_request_attempt(
     let mut logprobs_entries: Vec<serde_json::Value> = Vec::new();
 
     let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
-        let event_type = event.get("type").and_then(serde_json::Value::as_str);
+        let staged = normalize_staged_terminal_event(event)
+            .map_err(|detail| hipfire_client::ClientError::Protocol(detail.into()))?;
 
         // Staged terminal: commit_ready carries done fields with type != done.
         // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
-        if event_type == Some("commit_ready") {
+        if let Some(staged) = staged {
             latches.borrow_mut().commit_ready_seen = true;
             if terminal_delivered {
                 return Err(hipfire_client::ClientError::Protocol(
@@ -1767,15 +1778,6 @@ pub(crate) fn complete_request_attempt(
             let contract = contract_gate
                 .observe(event)
                 .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
-
-            let mut staged = event.clone();
-            if let Some(obj) = staged.as_object_mut() {
-                obj.insert("type".into(), serde_json::Value::String("done".into()));
-            } else {
-                return Err(hipfire_client::ClientError::Protocol(
-                    "commit_ready must be a JSON object".into(),
-                ));
-            }
 
             let preview = match contract {
                 StreamContract::V2 => {
@@ -1859,6 +1861,7 @@ pub(crate) fn complete_request_attempt(
             return Ok(());
         }
 
+        let event_type = event.get("type").and_then(serde_json::Value::as_str);
         let contract = contract_gate
             .observe(event)
             .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
