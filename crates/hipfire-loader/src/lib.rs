@@ -913,9 +913,13 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
 
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
+        let full_kv_bytes = gemma4::lowered::kv_owner_bytes(&b.kv_full);
+        let sliding_kv_bytes = gemma4::lowered::kv_owner_bytes(&b.kv_sliding);
         let owner_bytes = b.owner_bytes();
         b.kv_full.free_gpu(gpu).ok();
+        gemma4::lowered::unregister_live_owner_bytes(full_kv_bytes);
         b.kv_sliding.free_gpu(gpu).ok();
+        gemma4::lowered::unregister_live_owner_bytes(sliding_kv_bytes);
         b.scratch.free_gpu(gpu);
         b.weights.free_gpu(gpu);
         gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
@@ -5811,6 +5815,11 @@ mod gemma4_lowered_fault_tests {
         let baseline = free_vram(&gpu);
         let baseline_modules = gpu.loaded_module_count();
         assert_eq!(gpu.pool_cached_bytes(), 0);
+        assert_eq!(
+            gemma4::lowered::live_owner_bytes(),
+            0,
+            "warmup unload left live lowered owner bytes"
+        );
         eprintln!(
             "gemma4 fault baseline free={} pool={} modules={}",
             baseline,
@@ -5860,6 +5869,11 @@ mod gemma4_lowered_fault_tests {
                 modules_after_drain, baseline_modules,
                 "fault stage {stage} changed module residency"
             );
+            assert_eq!(
+                gemma4::lowered::live_owner_bytes(),
+                0,
+                "fault stage {stage} left live lowered owner bytes"
+            );
         }
 
         let model = load(&mut gpu).expect("unfaulted lowered model load");
@@ -5870,6 +5884,11 @@ mod gemma4_lowered_fault_tests {
         assert!(owner_bytes > 0, "published lowered bundle must own bytes");
         unload_model(model, &mut gpu).expect("unfaulted lowered model unload");
         assert_eq!(gpu.pool_cached_bytes(), 0);
+        assert_eq!(
+            gemma4::lowered::live_owner_bytes(),
+            0,
+            "normal lowered unload left live owner bytes"
+        );
         let after = free_vram(&gpu);
         assert!(
             baseline.abs_diff(after) < VRAM_TOLERANCE,

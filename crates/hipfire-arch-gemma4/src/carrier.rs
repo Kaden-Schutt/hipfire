@@ -125,21 +125,17 @@ impl<'a> Gemma4LoweredStaging<'a> {
 
     fn release(&mut self) {
         if let Some(kv_full) = self.kv_full.take() {
-            emit_rollback_boundary(
-                "rollback_full_kv_before",
-                lowered::kv_owner_bytes(&kv_full),
-                self.gpu,
-            );
+            let owner_bytes = lowered::kv_owner_bytes(&kv_full);
+            emit_rollback_boundary("rollback_full_kv_before", owner_bytes, self.gpu);
             let _ = kv_full.free_gpu(self.gpu);
+            lowered::unregister_live_owner_bytes(owner_bytes);
             emit_rollback_boundary("rollback_full_kv_after", 0, self.gpu);
         }
         if let Some(kv_sliding) = self.kv_sliding.take() {
-            emit_rollback_boundary(
-                "rollback_sliding_kv_before",
-                lowered::kv_owner_bytes(&kv_sliding),
-                self.gpu,
-            );
+            let owner_bytes = lowered::kv_owner_bytes(&kv_sliding);
+            emit_rollback_boundary("rollback_sliding_kv_before", owner_bytes, self.gpu);
             let _ = kv_sliding.free_gpu(self.gpu);
+            lowered::unregister_live_owner_bytes(owner_bytes);
             emit_rollback_boundary("rollback_sliding_kv_after", 0, self.gpu);
         }
         if let Some(scratch) = self.scratch.take() {
@@ -271,6 +267,9 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         )
         .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
         staging.kv_sliding = Some(kv_sliding);
+        lowered::register_live_owner_bytes(lowered::kv_owner_bytes(
+            staging.kv_sliding.as_ref().expect("sliding KV staged"),
+        ));
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::SlidingKv)
             .map_err(|e| format!("gemma4 (lowered) sliding KV stage: {e:?}"))?;
 
@@ -283,6 +282,9 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         )
         .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
         staging.kv_full = Some(kv_full);
+        lowered::register_live_owner_bytes(lowered::kv_owner_bytes(
+            staging.kv_full.as_ref().expect("full KV staged"),
+        ));
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::FullKv)
             .map_err(|e| format!("gemma4 (lowered) full KV stage: {e:?}"))?;
 

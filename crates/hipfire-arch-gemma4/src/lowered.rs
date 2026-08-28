@@ -32,6 +32,45 @@ use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+#[cfg(feature = "lowered-fault-inject")]
+static LIVE_OWNER_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Live bytes registered by lowered construction owners.
+///
+/// This counter is compiled as a no-op outside the fault-injection feature so
+/// production loads do not pay for test accounting. A nonzero value after a
+/// failed construction means a real owner escaped its transaction.
+pub fn live_owner_bytes() -> usize {
+    #[cfg(feature = "lowered-fault-inject")]
+    {
+        return LIVE_OWNER_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(feature = "lowered-fault-inject"))]
+    0
+}
+
+#[inline]
+pub fn register_live_owner_bytes(bytes: usize) {
+    #[cfg(feature = "lowered-fault-inject")]
+    LIVE_OWNER_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(feature = "lowered-fault-inject"))]
+    let _ = bytes;
+}
+
+#[inline]
+pub fn unregister_live_owner_bytes(bytes: usize) {
+    #[cfg(feature = "lowered-fault-inject")]
+    {
+        let previous = LIVE_OWNER_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(
+            previous >= bytes,
+            "lowered owner accounting underflow: previous={previous}, bytes={bytes}"
+        );
+    }
+    #[cfg(not(feature = "lowered-fault-inject"))]
+    let _ = bytes;
+}
+
 /// #397 Ship 5.2: route a single PLAIN-batched prefill GEMM through
 /// [`GemmFamily::run_key`] against an explicit dispatcher-entry key.
 ///
@@ -128,6 +167,7 @@ pub struct Gemma4AllocationTelemetry {
     pub phase: &'static str,
     pub cycle: u64,
     pub owner_bytes: usize,
+    pub live_owner_bytes: usize,
     pub pool_bytes: usize,
     pub free_device_bytes: Option<usize>,
     pub graph_resident: bool,
@@ -169,6 +209,7 @@ impl Gemma4AllocationTelemetry {
             phase,
             cycle,
             owner_bytes,
+            live_owner_bytes: live_owner_bytes(),
             pool_bytes: gpu.pool_cached_bytes(),
             free_device_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
             graph_resident: gpu.graphs.graph_exec.is_some()
@@ -188,10 +229,11 @@ impl Gemma4AllocationTelemetry {
             self.freed_owner_labels.join(",")
         };
         format!(
-            "[gemma4 alloc] phase={} cycle={} owner_bytes={} pool_bytes={} free_device_bytes={} graph_resident={} graph_blob_count={} module_count={} freed_owner_labels={}",
+            "[gemma4 alloc] phase={} cycle={} owner_bytes={} live_owner_bytes={} pool_bytes={} free_device_bytes={} graph_resident={} graph_blob_count={} module_count={} freed_owner_labels={}",
             self.phase,
             self.cycle,
             self.owner_bytes,
+            self.live_owner_bytes,
             self.pool_bytes,
             self.free_device_bytes
                 .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string()),
@@ -1141,9 +1183,21 @@ enum LoweredOwner {
     Layer(LayerWeights),
 }
 
+fn lowered_owner_bytes(owner: &LoweredOwner) -> usize {
+    match owner {
+        LoweredOwner::Empty => 0,
+        LoweredOwner::Tensor(tensor) => tensor_owner_bytes(tensor),
+        LoweredOwner::Weight(weight) => weight_owner_bytes(weight),
+        LoweredOwner::Buffer(buffer) => buffer.size(),
+        LoweredOwner::Moe(moe) => moe.owner_bytes(),
+        LoweredOwner::Layer(layer) => layer.owner_bytes(),
+    }
+}
+
 struct LoweredOwnerTransaction<'a> {
     gpu: &'a mut Gpu,
     owners: Vec<LoweredOwner>,
+    live_owner_bytes: usize,
 }
 
 impl<'a> LoweredOwnerTransaction<'a> {
@@ -1151,6 +1205,7 @@ impl<'a> LoweredOwnerTransaction<'a> {
         Self {
             gpu,
             owners: Vec::new(),
+            live_owner_bytes: 0,
         }
     }
 
@@ -1158,34 +1213,41 @@ impl<'a> LoweredOwnerTransaction<'a> {
         self.gpu
     }
 
-    fn push_tensor(&mut self, tensor: GpuTensor) -> LoweredOwnerId {
+    fn push_new(&mut self, owner: LoweredOwner) -> LoweredOwnerId {
+        let bytes = lowered_owner_bytes(&owner);
+        register_live_owner_bytes(bytes);
+        self.live_owner_bytes += bytes;
         let id = LoweredOwnerId(self.owners.len());
-        self.owners.push(LoweredOwner::Tensor(tensor));
+        self.owners.push(owner);
         id
+    }
+
+    fn push_transferred(&mut self, owner: LoweredOwner) -> LoweredOwnerId {
+        let bytes = lowered_owner_bytes(&owner);
+        self.live_owner_bytes += bytes;
+        let id = LoweredOwnerId(self.owners.len());
+        self.owners.push(owner);
+        id
+    }
+
+    fn push_tensor(&mut self, tensor: GpuTensor) -> LoweredOwnerId {
+        self.push_new(LoweredOwner::Tensor(tensor))
     }
 
     fn push_weight(&mut self, weight: WeightTensor) -> LoweredOwnerId {
-        let id = LoweredOwnerId(self.owners.len());
-        self.owners.push(LoweredOwner::Weight(weight));
-        id
+        self.push_new(LoweredOwner::Weight(weight))
     }
 
     fn push_buffer(&mut self, buffer: DeviceBuffer) -> LoweredOwnerId {
-        let id = LoweredOwnerId(self.owners.len());
-        self.owners.push(LoweredOwner::Buffer(buffer));
-        id
+        self.push_new(LoweredOwner::Buffer(buffer))
     }
 
     fn push_moe(&mut self, moe: MoeLayerExtras) -> LoweredOwnerId {
-        let id = LoweredOwnerId(self.owners.len());
-        self.owners.push(LoweredOwner::Moe(moe));
-        id
+        self.push_transferred(LoweredOwner::Moe(moe))
     }
 
     fn push_layer(&mut self, layer: LayerWeights) -> LoweredOwnerId {
-        let id = LoweredOwnerId(self.owners.len());
-        self.owners.push(LoweredOwner::Layer(layer));
-        id
+        self.push_transferred(LoweredOwner::Layer(layer))
     }
 
     fn tensor_ref(&self, id: LoweredOwnerId) -> &GpuTensor {
@@ -1195,42 +1257,57 @@ impl<'a> LoweredOwnerTransaction<'a> {
         }
     }
 
+    fn take_owner(&mut self, id: LoweredOwnerId) -> LoweredOwner {
+        let owner = std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty);
+        let bytes = lowered_owner_bytes(&owner);
+        debug_assert!(
+            self.live_owner_bytes >= bytes,
+            "lowered owner transaction accounting underflow on take"
+        );
+        self.live_owner_bytes -= bytes;
+        owner
+    }
+
     fn take_tensor(&mut self, id: LoweredOwnerId) -> GpuTensor {
-        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+        match self.take_owner(id) {
             LoweredOwner::Tensor(tensor) => tensor,
             _ => panic!("lowered owner is not a GPU tensor"),
         }
     }
 
     fn take_weight(&mut self, id: LoweredOwnerId) -> WeightTensor {
-        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+        match self.take_owner(id) {
             LoweredOwner::Weight(weight) => weight,
             _ => panic!("lowered owner is not a weight"),
         }
     }
 
     fn take_buffer(&mut self, id: LoweredOwnerId) -> DeviceBuffer {
-        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+        match self.take_owner(id) {
             LoweredOwner::Buffer(buffer) => buffer,
             _ => panic!("lowered owner is not a device buffer"),
         }
     }
 
     fn take_moe(&mut self, id: LoweredOwnerId) -> MoeLayerExtras {
-        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+        match self.take_owner(id) {
             LoweredOwner::Moe(moe) => moe,
             _ => panic!("lowered owner is not MoE extras"),
         }
     }
 
     fn take_layer(&mut self, id: LoweredOwnerId) -> LayerWeights {
-        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+        match self.take_owner(id) {
             LoweredOwner::Layer(layer) => layer,
             _ => panic!("lowered owner is not a layer"),
         }
     }
 
     fn commit(mut self) {
+        debug_assert_eq!(
+            self.live_owner_bytes, 0,
+            "lowered owner transaction committed with live local bytes"
+        );
         debug_assert!(self
             .owners
             .iter()
@@ -1257,8 +1334,19 @@ fn free_lowered_owner(gpu: &mut Gpu, owner: LoweredOwner) {
 impl Drop for LoweredOwnerTransaction<'_> {
     fn drop(&mut self) {
         while let Some(owner) = self.owners.pop() {
+            let bytes = lowered_owner_bytes(&owner);
+            debug_assert!(
+                self.live_owner_bytes >= bytes,
+                "lowered owner transaction accounting underflow on drop"
+            );
+            self.live_owner_bytes -= bytes;
             free_lowered_owner(self.gpu, owner);
+            unregister_live_owner_bytes(bytes);
         }
+        debug_assert_eq!(
+            self.live_owner_bytes, 0,
+            "lowered owner transaction dropped with live local bytes"
+        );
     }
 }
 
@@ -1280,6 +1368,7 @@ impl Gemma4Weights {
     /// Return all owning GPU buffers to the pool. The tied `lm_head` is a
     /// borrowed alias of `embed_tokens` and is intentionally not freed.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        let owner_bytes = self.owner_bytes();
         let Gemma4Weights {
             embed_tokens,
             embd_format: _,
@@ -1292,6 +1381,7 @@ impl Gemma4Weights {
         }
         let _ = gpu.free_tensor(final_norm);
         let _ = gpu.free_tensor(embed_tokens);
+        unregister_live_owner_bytes(owner_bytes);
     }
 
     /// Sum the actual capacities of all owning descriptors. Borrowed aliases
@@ -2630,6 +2720,7 @@ impl Gemma4Scratch {
     /// buffer is a raw HIP allocation and must be freed explicitly; it has no
     /// Drop implementation.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        let owner_bytes = self.owner_bytes();
         let Gemma4Scratch {
             x,
             residual,
@@ -2756,6 +2847,7 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(tmp);
         let _ = gpu.free_tensor(residual);
         let _ = gpu.free_tensor(x);
+        unregister_live_owner_bytes(owner_bytes);
     }
 }
 
@@ -6925,12 +7017,14 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn lowered_allocation_telemetry_formats_size_aware_fields() {
         let telemetry = Gemma4AllocationTelemetry {
             phase: "unload",
             cycle: 4,
             owner_bytes: 1280,
+            live_owner_bytes: 1280,
             pool_bytes: 2048,
             free_device_bytes: Some(4096),
             graph_resident: true,
@@ -6942,6 +7036,7 @@ mod tests {
         assert!(line.contains("phase=unload"));
         assert!(line.contains("cycle=4"));
         assert!(line.contains("owner_bytes=1280"));
+        assert!(line.contains("live_owner_bytes=1280"));
         assert!(line.contains("pool_bytes=2048"));
         assert!(line.contains("free_device_bytes=4096"));
         assert!(line.contains("graph_resident=true"));
@@ -7115,6 +7210,7 @@ mod tests {
             })],
         };
         assert!(weights.owner_bytes() > 0);
+        register_live_owner_bytes(weights.owner_bytes());
         weights.free_gpu(&mut gpu);
         gpu.drain_pool();
         assert!(

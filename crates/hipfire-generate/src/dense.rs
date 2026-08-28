@@ -2205,13 +2205,11 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
 /// This is the same request-level Step lifecycle used by the lowered product
 /// adapter, while delegating each token to eager `decode_step`. The wrapper
 /// cache remains the sole owner of overwrite bookkeeping.
-#[cfg(test)]
 struct Gemma4EagerAdapter<'a> {
     gpu: &'a mut rdna_compute::Gpu,
     bundle: &'a mut hipfire_loader::Gemma4Bundle,
 }
 
-#[cfg(test)]
 impl Gemma4EagerAdapter<'_> {
     fn forward_step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
         let physical_cap = self.bundle.state.kv_sliding.physical_cap;
@@ -2235,7 +2233,6 @@ impl Gemma4EagerAdapter<'_> {
     }
 }
 
-#[cfg(test)]
 impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
     fn vocab_size(&self) -> usize {
         self.bundle.config.vocab_size
@@ -2259,6 +2256,202 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
 
     fn cached_logits(&mut self) -> Result<Vec<f32>, String> {
         gemma_recompute_eager_cached_logits(self.bundle, self.gpu)
+    }
+}
+/// Run one eager Gemma request through the production framing boundary.
+///
+/// The caller owns request history and terminal publication; this helper owns
+/// the same parser/stop quarantine and shared token transaction used by the
+/// serving route. Keeping those boundaries here lets the ignored product
+/// oracle exercise the production adapter rather than a test-only duplicate.
+fn run_gemma4_eager_product_lifecycle<Commit>(
+    adapter: &mut Gemma4EagerAdapter<'_>,
+    prompt: &[u32],
+    max_tokens: usize,
+    capacity: usize,
+    stop_tokens: &[u32],
+    temp: f32,
+    top_p: f32,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    stop: &[String],
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    logprobs_top_k: Option<usize>,
+    rng_seed: u64,
+    mut commit: Commit,
+) -> Result<GemmaStepRun, String>
+where
+    Commit: FnMut(u32),
+{
+    let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
+    let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    let mut rng = deepseek4::sampling::Xorshift::new(rng_seed);
+    let lifecycle = run_gemma_step_lifecycle(
+        adapter,
+        prompt,
+        max_tokens,
+        capacity,
+        stop_tokens,
+        |logits| {
+            Ok(deepseek4::sampling::sample_token(
+                logits, temp, 0, top_p, &mut rng,
+            ))
+        },
+        |token| {
+            let raw_bytes = tokenizer.decode_bytes(&[token]);
+            gemma_prepare_token(&mut eos_filter, &mut router, &raw_bytes)
+        },
+        |token, prepared, sampled_logits, _next_logits| {
+            commit(token);
+            emit_gemma_prepared_events(
+                stdout,
+                id,
+                tokenizer,
+                token,
+                sampled_logits,
+                logprobs_top_k,
+                prepared.events,
+            );
+        },
+    )?;
+    let trailing_events = gemma_flush_prepared_events(&mut eos_filter, &mut router)?;
+    emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
+    Ok(lifecycle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4_eager_ar_lifecycle(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    prefill_tokens: &[u32],
+    prompt_tokens: usize,
+    cached_tokens: usize,
+    cache_cap: usize,
+    cache_identity: &str,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    stop: &[String],
+    logprobs_top_k: Option<usize>,
+) {
+    let (cfg_eos_tok, bundle_eos_tok) = match m.gemma4() {
+        Some(bundle) => (bundle.config.eos_token, bundle.eos_tok),
+        None => {
+            emit_error_with_id(stdout, id, "gemma4 eager bundle missing for lifecycle");
+            return;
+        }
+    };
+    let mut stop_tokens = vec![cfg_eos_tok, bundle_eos_tok];
+    if !stop_tokens.contains(&106) {
+        stop_tokens.push(106);
+    }
+    stop_tokens.dedup();
+    let tokenizer_ptr = match m.tokenizer.as_ref() {
+        Some(tokenizer) => tokenizer as *const hipfire_runtime::tokenizer::Tokenizer,
+        None => {
+            emit_error_with_id(stdout, id, "tokenizer not loaded");
+            return;
+        }
+    };
+    let bundle_ptr = match m.gemma4_mut() {
+        Some(bundle) => bundle as *mut hipfire_loader::Gemma4Bundle,
+        None => {
+            emit_error_with_id(stdout, id, "gemma4 eager bundle missing for lifecycle");
+            return;
+        }
+    };
+    let t0 = Instant::now();
+    // A failed prefill/decode rolls the working cache back to the committed
+    // prefix, so staging the suffix in host history before the lifecycle is
+    // safe and keeps the failure epilogue centralized.
+    m.conversation_tokens.extend_from_slice(prefill_tokens);
+    let mut generated = 0usize;
+    let rng_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let lifecycle = unsafe {
+        let mut adapter = Gemma4EagerAdapter {
+            gpu,
+            bundle: &mut *bundle_ptr,
+        };
+        run_gemma4_eager_product_lifecycle(
+            &mut adapter,
+            prefill_tokens,
+            max_tokens,
+            cache_cap,
+            &stop_tokens,
+            temp,
+            top_p,
+            max_think_tokens,
+            enable_thinking,
+            stop,
+            &*tokenizer_ptr,
+            stdout,
+            id,
+            logprobs_top_k,
+            rng_seed,
+            |token| {
+                m.conversation_tokens.push(token);
+                generated += 1;
+            },
+        )
+    };
+    let lifecycle = match lifecycle {
+        Ok(run) => run,
+        Err(error) => {
+            gemma_eager_fail_closed(
+                stdout,
+                id,
+                m,
+                gpu,
+                &format!("gemma4 eager lifecycle failed: {error}"),
+            );
+            return;
+        }
+    };
+    m.seq_pos = unsafe { (*bundle_ptr).state.materialized_cursor() };
+    let total_ms = t0.elapsed().as_millis().max(1) as f64;
+    let decode_ms = lifecycle.decode_ms.max(1.0);
+    let tok_s = generated as f64 * 1000.0 / decode_ms;
+    let metrics = GemmaDoneMetrics {
+        generated,
+        prompt_tokens,
+        cached_tokens,
+        tok_s,
+        prefill_ms: lifecycle.prefill_ms,
+        decode_tok_s: tok_s,
+        ttft_ms: lifecycle.ttft_ms.unwrap_or(total_ms),
+        total_ms,
+    };
+    let pending_done = gemma_pending_done(
+        id,
+        gemma_finish_reason(lifecycle.hit_eos, lifecycle.hit_length),
+        &metrics,
+    );
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            if let Err(error) = gemma_cache_publish_after_commit(m, cache_identity) {
+                gemma_eager_fail_closed(
+                    stdout,
+                    id,
+                    m,
+                    gpu,
+                    &format!("gemma4 cache publication failed: {error}"),
+                );
+                return;
+            }
+            emit_staged_terminal_done(stdout, &pending_done);
+        }
+        ClientTerminalDecision::Abort => {
+            gemma_eager_client_abort(stdout, id, m, generated, gpu);
+        }
     }
 }
 
@@ -4003,7 +4196,7 @@ mod gemma4_lowered_oracle_tests {
 
 #[cfg(test)]
 mod gemma4_eager_oracle_tests {
-    use super::{run_gemma_step_lifecycle, Gemma4EagerAdapter, GemmaPreparedToken};
+    use super::{run_gemma4_eager_product_lifecycle, Gemma4EagerAdapter};
     use hipfire_arch_gemma4::gemma4::{Gemma4State, Gemma4Weights};
     use hipfire_arch_gemma4::Gemma4Config;
     use hipfire_runtime::hfq::HfqFile;
@@ -4094,7 +4287,7 @@ mod gemma4_eager_oracle_tests {
         model_path: &Path,
         prompt_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<(Vec<u32>, u64), String> {
+    ) -> Result<(Vec<u32>, u64, Vec<u8>), String> {
         let mut gpu =
             rdna_compute::Gpu::init().map_err(|error| format!("product GPU init: {error:?}"))?;
         let cask = CaskConfig::default();
@@ -4112,42 +4305,45 @@ mod gemma4_eager_oracle_tests {
             SpecLoadCfg::default(),
             &mut gpu,
         )?;
-
-        let result = {
-            let bundle = model
-                .gemma4_mut()
-                .ok_or_else(|| "product oracle did not select eager Gemma4".to_string())?;
-            let eos = bundle.eos_tok;
+        let tokenizer_ptr = model
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "product oracle tokenizer missing".to_string())?
+            as *const hipfire_runtime::tokenizer::Tokenizer;
+        let bundle_ptr = model
+            .gemma4_mut()
+            .ok_or_else(|| "product oracle did not select eager Gemma4".to_string())?
+            as *mut hipfire_loader::Gemma4Bundle;
+        let mut output = Vec::new();
+        let mut ids = Vec::with_capacity(max_tokens);
+        let lifecycle = unsafe {
+            let eos = (*bundle_ptr).eos_tok;
             let mut adapter = Gemma4EagerAdapter {
                 gpu: &mut gpu,
-                bundle,
+                bundle: &mut *bundle_ptr,
             };
-            let mut ids = Vec::with_capacity(max_tokens);
-            let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(0x13579BDF);
-            let lifecycle = run_gemma_step_lifecycle(
+            run_gemma4_eager_product_lifecycle(
                 &mut adapter,
                 prompt_ids,
                 max_tokens,
                 prompt_ids.len() + max_tokens + 16,
                 &[eos, 106],
-                |logits| {
-                    Ok(hipfire_arch_deepseek4::sampling::sample_token(
-                        logits, 0.0, 0, 1.0, &mut rng,
-                    ))
-                },
-                |_token| {
-                    Ok(GemmaPreparedToken {
-                        events: Vec::new(),
-                        stop: false,
-                    })
-                },
-                |token, _prepared, _sampled_logits, _next_logits| ids.push(token),
-            )?;
-            Ok::<_, String>((ids, fnv1a64_f32(&lifecycle.final_logits)))
-        }?;
-
+                0.0,
+                1.0,
+                0,
+                false,
+                &[],
+                &*tokenizer_ptr,
+                &mut output,
+                "oracle",
+                None,
+                0x13579BDF,
+                |token| ids.push(token),
+            )?
+        };
+        let fnv = fnv1a64_f32(&lifecycle.final_logits);
         hipfire_loader::unload_model(model, &mut gpu)?;
-        Ok(result)
+        Ok((ids, fnv, output))
     }
 
     #[test]
@@ -4167,7 +4363,13 @@ mod gemma4_eager_oracle_tests {
         assert_eq!(direct.1, EAGER_DIRECT_FNV);
 
         let product = run_eager_product_oracle(&path, &PROMPT_IDS, 32).expect("product oracle run");
-        assert_eq!(product, direct);
+        assert_eq!(&product.0, &direct.0);
+        assert_eq!(product.1, direct.1);
+        let raw = String::from_utf8(product.2).expect("product wire output must be UTF-8");
+        assert!(
+            raw.contains("\"type\":\"token\""),
+            "product lifecycle must emit framed token events: {raw:?}"
+        );
     }
 }
 
@@ -4342,6 +4544,32 @@ pub fn generate_gemma4(
             .map(|bundle| bundle.state.max_seq)
             .unwrap_or(m.max_seq);
     }
+    let eagle_active = m.gemma4().is_some_and(|bundle| {
+        bundle.eagle.is_some()
+            && temp <= 1e-6
+            && std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1")
+    });
+    if !eagle_active {
+        generate_gemma4_eager_ar_lifecycle(
+            m,
+            gpu,
+            stdout,
+            id,
+            prefill_tokens,
+            prompt_ids.len(),
+            cached_tokens,
+            cache_cap,
+            &cache_identity,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            enable_thinking,
+            stop,
+            logprobs_top_k,
+        );
+        return;
+    }
     let Some(bundle) = m
         .state
         .as_mut()
@@ -4484,9 +4712,6 @@ pub fn generate_gemma4(
     // mode-3 `Promote6` on v_proj yields MQ6G256 and the verify fails loud with
     // "dtype MQ6G256 has no batched proj kernel". A uniform (--no-kmap) target
     // avoids that, which is how the numbers above were taken.
-    let eagle_active = bundle.eagle.is_some()
-        && temp <= 1e-6
-        && std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
     if eagle_active {
         let draft_len = bundle.eagle.as_ref().unwrap().draft_len;
         // Seed hidden = post-`model.norm` hidden of the last prompt position
@@ -4764,161 +4989,8 @@ pub fn generate_gemma4(
         }
         return;
     }
-
-    // ── Decode loop. Sample host-side from the running logits vector. ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    let mut generated_count: usize = 0;
-    let mut ttft_ms: Option<f64> = None;
-    let mut hit_eos = false;
-    let mut hit_length = false;
-    let decode_t0 = Instant::now();
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-
-    loop {
-        if generated_count >= max_tokens {
-            hit_length = true;
-            break;
-        }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        let sample =
-            match classify_gemma_sample_for_stops(next_tok, &stop_set, bundle.config.vocab_size) {
-                Ok(sample) => sample,
-                Err(error) => {
-                    gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-                    return;
-                }
-            };
-        trace_gemma4_logits(gpu, id, generated_count, next_tok, &last_logits);
-        if matches!(sample, GemmaSample::Eos) {
-            hit_eos = true;
-            break;
-        }
-
-        // A token can be sampled from the final valid logits row, but it cannot
-        // be materialized once the KV cursor is already at the physical cap.
-        if bundle.state.n_tokens >= cache_cap {
-            hit_length = true;
-            break;
-        }
-        let raw_bytes = tokenizer.decode_bytes(&[next_tok]);
-        let mut rollback_requested = false;
-        let transaction = gemma_token_transaction(
-            sample,
-            bundle.config.vocab_size,
-            |_| gemma_prepare_token(&mut eos_filter, &mut gemma_router, &raw_bytes),
-            |token| {
-                let position = bundle.state.n_tokens;
-                let physical_cap = bundle.state.kv_sliding.physical_cap;
-                let compact_offset = bundle.state.kv_sliding.compact_offset;
-                gemma_mark_overwrite_for_range(
-                    &mut bundle.prefix_cache,
-                    position,
-                    1,
-                    physical_cap,
-                    compact_offset,
-                );
-                gemma4::forward::decode_step_with_graph(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    position as u32,
-                )
-            },
-            |token, prepared, next_logits| {
-                if ttft_ms.is_none() {
-                    ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
-                }
-                m.conversation_tokens.push(token);
-                generated_count += 1;
-                emit_gemma_prepared_events(
-                    stdout,
-                    id,
-                    tokenizer,
-                    token,
-                    &last_logits,
-                    logprobs_top_k,
-                    prepared.events,
-                );
-                last_logits = next_logits;
-            },
-            || rollback_requested = true,
-        );
-        match transaction {
-            Ok(GemmaTokenTransactionResult::Eos) => {
-                hit_eos = true;
-                break;
-            }
-            Ok(GemmaTokenTransactionResult::Committed { stopped }) => {
-                if stopped {
-                    break;
-                }
-                if generated_count >= max_tokens || bundle.state.n_tokens >= cache_cap {
-                    hit_length = true;
-                    break;
-                }
-            }
-            Err(error) => {
-                debug_assert!(rollback_requested);
-                let message = format!("gemma4 decode failed: {error}");
-                gemma_eager_fail_closed(stdout, id, m, gpu, &message);
-                return;
-            }
-        }
-    }
-    let trailing_events = match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
-        Ok(events) => events,
-        Err(error) => {
-            gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-            return;
-        }
-    };
-    emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
-    gemma_sync_host_cursor(&mut m.seq_pos, bundle.state.n_tokens);
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-    let metrics = GemmaDoneMetrics {
-        generated: generated_count,
-        prompt_tokens: prompt_ids.len(),
-        cached_tokens,
-        tok_s,
-        prefill_ms: prefill_ms as f64,
-        decode_tok_s: tok_s,
-        ttft_ms,
-        total_ms: total_ms as f64,
-    };
-    let pending_done = gemma_pending_done(id, gemma_finish_reason(hit_eos, hit_length), &metrics);
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => {
-            if let Err(error) = gemma_cache_publish_after_commit(m, &cache_identity) {
-                gemma_eager_fail_closed(
-                    stdout,
-                    id,
-                    m,
-                    gpu,
-                    &format!("gemma4 cache publication failed: {error}"),
-                );
-                return;
-            }
-            emit_staged_terminal_done(stdout, &pending_done);
-        }
-        ClientTerminalDecision::Abort => {
-            gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
-        }
-    }
 }
+
 /// Run the lowered/MoE Gemma4 bundle through the same staged terminal and
 /// per-token transaction used by the eager route.
 ///
