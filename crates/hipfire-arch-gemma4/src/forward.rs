@@ -1352,13 +1352,20 @@ fn apply_per_layer_input_branch(
 // ADDITIVE: does not touch `decode_step` / `decode_step_with_graph`. The eager
 // path is unchanged.
 
+/// Gemma's dense Q8 batched projections use the scalar parity reference.
+///
+/// Keep this as an explicit GEMM-family key rather than relying on
+/// `gemm_q8_0_batched_chunked`'s process-wide WMMA preference. Other callers
+/// continue to select their existing chunked/WMMA route.
+#[inline]
+fn q8_batched_projection_key() -> hipfire_dispatch::types::KernelKey {
+    hipfire_dispatch::types::KernelKey::GemmQ8_0Batched
+}
+
 /// One projection GEMM, batched, dispatched by weight dtype. Mirrors the
 /// dtypes `weight_gemv` handles on the gemma4 weight set:
-///   - Q8_0      → `gemm_q8_0_batched_chunked` (no rotation; auto-routes to
-///                 the WMMA Q8 GEMM on gfx12/RDNA4 — the scalar
-///                 `gemm_q8_0_batched` was 334 us/call at b=4 proj widths =
-///                 ~61 ms/round = the gemma4 EAGLE slowdown on gfx1201;
-///                 elsewhere identical scalar kernel, b ≤ 64 = one sub-batch)
+///   - Q8_0      → the explicit scalar parity family entry
+///                 (`GemmQ8_0Batched`, no rotation)
 ///   - F32       → `gemm_f32_batched`; F16/BF16 projection tensors are widened
 ///                 to F32 by the loader.
 ///   - MQ4G256   → FWHT-rotate x (batched) then `gemm_hfq4g256_batched_lmhead`
@@ -1381,14 +1388,8 @@ fn proj_gemm_batched(
         DType::F32 => gpu
             .gemm_f32_batched(&w.buf, x, y, w.m, w.k, b)
             .map_err(|e| format!("gemma4 batch {label} (f32): {e:?}")),
-        DType::Q8_0 => {
-            let result = if eagle_strict_enabled() {
-                gpu.gemm_q8_0_batched(&w.buf, x, y, w.m, w.k, b)
-            } else {
-                gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
-            };
-            result.map_err(|e| format!("gemma4 batch {label} (q8): {e:?}"))
-        }
+        DType::Q8_0 => run_plain_gemm_key(gpu, q8_batched_projection_key(), w, x, y, b)
+            .map_err(|e| format!("gemma4 batch {label} (q8): {e}")),
         DType::MQ4G256 | DType::HFQ4G256 => {
             // FWHT-rotate the shared input once, then run the prerotated GEMM.
             // rotate_x_mq_batched_for handles the AWQ-aware branch (no-op AWQ
@@ -2009,39 +2010,24 @@ pub fn forward_batch_spec(
             out.reserve(b);
             let vocab = cfg.vocab_size;
             if weights.lm_head.gpu_dtype == DType::Q8_0 {
-                // FAST PATH (the spec-verify perf lever): a single batched Q8 WMMA
-                // lm_head reads the ~1 GB Q8 weight ONCE for all B rows, instead of
-                // the per-row weight_gemv that re-streamed the whole weight B times
-                // (~90% of the verify, ~4× off roofline). On gfx12 (RDNA4)
-                // `gemm_q8_0_batched_chunked` auto-routes to the WMMA Q8 GEMM (now
-                // correct after the stale-fp16-cache fix); elsewhere it sub-batches
-                // the scalar Q8 GEMM — either way Y[B, vocab] row-major.
+                // Keep the Q8 LM head on Gemma's explicit scalar parity
+                // family entry. This still computes all B rows in one
+                // batched launch; it only avoids the process-wide WMMA
+                // preference used by other callers.
                 //
                 // Softcap is SKIPPED: it's a strictly-monotonic per-element map
                 // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
                 // decision is an argmax, so this is bit-exact in the decision.
                 let logits_b = alloc(gpu, b * vocab, "spec_logits_b")?;
-                let lm_result = if eagle_strict_enabled() {
-                    gpu.gemm_q8_0_batched(
-                        &weights.lm_head.buf,
-                        normed_hidden,
-                        &logits_b,
-                        weights.lm_head.m,
-                        weights.lm_head.k,
-                        b,
-                    )
-                } else {
-                    gpu.gemm_q8_0_batched_chunked(
-                        &weights.lm_head.buf,
-                        normed_hidden,
-                        &logits_b,
-                        weights.lm_head.m,
-                        weights.lm_head.k,
-                        b,
-                    )
-                };
-                lm_result
-                    .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
+                proj_gemm_batched(
+                    gpu,
+                    &weights.lm_head,
+                    normed_hidden,
+                    &logits_b,
+                    &x_rot,
+                    b,
+                    "lm_head",
+                )?;
                 // A GPU argmax alone cannot attest mixed finite/non-finite
                 // rows. Download the verify matrix once, validate every row,
                 // then retain the existing low-bandwidth index download.
@@ -2665,7 +2651,7 @@ fn supports_exact_batched_q8_ple_projection(dtype: DType, k: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_batch_seq_len, supports_batched_projection_dtype,
+        checked_batch_seq_len, q8_batched_projection_key, supports_batched_projection_dtype,
         supports_exact_batched_q8_ple_projection, supports_gemma4_batched_prefill_arch,
         validate_batch_token_ids, validate_finite_logits_row,
     };
@@ -2734,5 +2720,12 @@ mod tests {
     fn verify_token_ids_are_validated_before_embedding() {
         assert!(validate_batch_token_ids(&[2, 7, 8], 8).is_err());
         assert!(validate_batch_token_ids(&[2, 7], 8).is_ok());
+    }
+    #[test]
+    fn q8_batch_uses_scalar_family_entry_without_global_override() {
+        assert_eq!(
+            q8_batched_projection_key(),
+            hipfire_dispatch::types::KernelKey::GemmQ8_0Batched
+        );
     }
 }

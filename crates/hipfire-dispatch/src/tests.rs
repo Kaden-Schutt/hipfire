@@ -343,6 +343,27 @@ fn registry_resolve_falls_through_to_second_variant() {
 }
 
 #[test]
+fn q8_explicit_scalar_entry_preserves_default_wmma_resolution() {
+    use crate::families::gemm::GemmFamily;
+
+    let family = GemmFamily::new();
+    let scalar = KernelKey::GemmQ8_0Batched;
+    assert_eq!(
+        family
+            .registry()
+            .resolve(scalar, &ctx_rdna3(), None)
+            .unwrap()
+            .key,
+        scalar
+    );
+    assert_eq!(
+        family.resolve(DType::Q8_0, &ctx_rdna3(), None).unwrap().key,
+        KernelKey::GemmQ8_0Wmma,
+        "dtype-keyed callers keep the WMMA default"
+    );
+}
+
+#[test]
 fn gemm_q8_0_batched_wide_exact_resolves_on_wmma_only() {
     use crate::families::gemm::GemmFamily;
     let fam = GemmFamily::new();
