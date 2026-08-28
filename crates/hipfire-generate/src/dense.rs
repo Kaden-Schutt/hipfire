@@ -1800,6 +1800,71 @@ fn gemma4_prefill_batch_for_arch(gpu_arch: &str, requested: Option<usize>) -> us
         .clamp(1, 64)
 }
 
+/// Terminal metrics shared by eager Gemma AR and EAGLE paths.
+#[derive(Debug, Clone, Copy)]
+pub struct GemmaDoneMetrics {
+    pub generated: usize,
+    pub prompt_tokens: usize,
+    pub cached_tokens: usize,
+    pub tok_s: f64,
+    pub prefill_ms: f64,
+    pub decode_tok_s: f64,
+    pub ttft_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Classify a completed Gemma stream without conflating EOS with the length cap.
+#[inline]
+pub fn gemma_finish_reason(hit_eos: bool, hit_length: bool) -> &'static str {
+    if hit_eos {
+        "stop"
+    } else if hit_length {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+/// Build the single pending `done` payload used by both Gemma eager routes.
+///
+/// `await_client_terminal_commit` changes only `type` while publishing
+/// `commit_ready`, so this value must contain every eventual terminal field.
+pub fn gemma_pending_done(
+    id: &str,
+    finish_reason: &str,
+    metrics: &GemmaDoneMetrics,
+) -> serde_json::Value {
+    let prefill_tok_s = metrics.prompt_tokens as f64 * 1000.0 / metrics.prefill_ms.max(1.0);
+    serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": metrics.generated,
+        "tok_s": metrics.tok_s,
+        "prefill_tokens": metrics.prompt_tokens,
+        "cached_tokens": metrics.cached_tokens,
+        "prefill_ms": metrics.prefill_ms,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": metrics.decode_tok_s,
+        "ttft_ms": metrics.ttft_ms,
+        "total_ms": metrics.total_ms,
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    })
+}
+
+/// Roll back an eager Gemma terminal and emit only an attested cancellation
+/// lifecycle (or one fail-closed error if the rollback cannot be attested).
+fn gemma_eager_client_abort(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    m: &mut LoadedModel,
+    completion_tokens: usize,
+    gpu: &mut rdna_compute::Gpu,
+) {
+    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
+}
+
 struct Gemma4LogitTraceConfig {
     dir: PathBuf,
     top_k: usize,
@@ -1973,7 +2038,9 @@ fn trace_gemma4_logits(
 
 #[cfg(test)]
 mod gemma4_prefill_batch_tests {
-    use super::gemma4_prefill_batch_for_arch;
+    use super::{
+        gemma4_prefill_batch_for_arch, gemma_finish_reason, gemma_pending_done, GemmaDoneMetrics,
+    };
 
     #[test]
     fn validated_arches_default_to_full_wmma_batch_tile_group() {
@@ -1994,6 +2061,33 @@ mod gemma4_prefill_batch_tests {
         assert_eq!(gemma4_prefill_batch_for_arch("gfx1201", Some(32)), 32);
         assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", Some(0)), 1);
         assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", Some(128)), 64);
+    }
+
+    #[test]
+    fn gemma_finish_reason_prefers_length_only_at_cap() {
+        assert_eq!(gemma_finish_reason(true, false), "stop");
+        assert_eq!(gemma_finish_reason(false, true), "length");
+        assert_eq!(gemma_finish_reason(false, false), "stop");
+    }
+
+    #[test]
+    fn gemma_pending_done_has_complete_usage_contract() {
+        let metrics = GemmaDoneMetrics {
+            generated: 7,
+            prompt_tokens: 11,
+            cached_tokens: 3,
+            tok_s: 1.0,
+            prefill_ms: 2.0,
+            decode_tok_s: 3.0,
+            ttft_ms: 4.0,
+            total_ms: 5.0,
+        };
+        let done = gemma_pending_done("r", "length", &metrics);
+        assert_eq!(done["finish_reason"], "length");
+        assert_eq!(done["tokens"], 7);
+        assert_eq!(done["prefill_tokens"], 11);
+        assert_eq!(done["cached_tokens"], 3);
+        assert!(done.get("attempt_id").is_some());
     }
 }
 
@@ -2284,12 +2378,15 @@ pub fn generate_gemma4(
         let mut rounds = 0usize;
         let mut total_accepted = 0usize;
         let mut stop = false;
+        let mut hit_eos = false;
+        let mut hit_length = false;
         let mut ttft_ms: Option<f64> = None;
         let decode_t0 = Instant::now();
         while !stop && generated_count < max_tokens {
             let committed_len = bundle.state.n_tokens;
             // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
             if committed_len + draft_len + 1 >= cache_cap {
+                hit_length = true;
                 break;
             }
             let spec = {
@@ -2330,6 +2427,7 @@ pub fn generate_gemma4(
             // EOS / max_tokens — identical to what the AR loop would commit.
             for &t in &spec.committed {
                 if stop_set.contains(&t) {
+                    hit_eos = true;
                     stop = true;
                     break;
                 }
@@ -2350,6 +2448,7 @@ pub fn generate_gemma4(
                 m.conversation_tokens.push(t);
                 generated_count += 1;
                 if generated_count >= max_tokens {
+                    hit_length = true;
                     stop = true;
                     break;
                 }
@@ -2363,6 +2462,9 @@ pub fn generate_gemma4(
             if stop {
                 break;
             }
+        }
+        if generated_count >= max_tokens {
+            hit_length = true;
         }
 
         // ── Cursor settle. `spec_step` leaves n_tokens = L+accept_len+1 with
@@ -2400,7 +2502,6 @@ pub fn generate_gemma4(
         } else {
             0.0
         };
-        let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
         let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
         // τ = mean tokens committed per round (accepted drafts + 1 bonus).
         let tau = if rounds > 0 {
@@ -2408,24 +2509,30 @@ pub fn generate_gemma4(
         } else {
             0.0
         };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
-            id,
-            generated_count,
+        let metrics = GemmaDoneMetrics {
+            generated: generated_count,
+            prompt_tokens: prompt_ids.len(),
+            cached_tokens: 0,
             tok_s,
-            prompt_ids.len(),
-            prefill_ms,
-            prefill_tok_s,
-            tok_s,
+            prefill_ms: prefill_ms as f64,
+            decode_tok_s: tok_s,
             ttft_ms,
-            total_ms,
-            rounds,
-            tau,
-            draft_len,
-            active_attempt_id(),
-        );
-        let _ = stdout.flush();
+            total_ms: total_ms as f64,
+        };
+        let mut pending_done =
+            gemma_pending_done(id, gemma_finish_reason(hit_eos, hit_length), &metrics);
+        if let Some(obj) = pending_done.as_object_mut() {
+            obj.insert("spec".to_string(), serde_json::json!("gemma4_eagle"));
+            obj.insert("rounds".to_string(), serde_json::json!(rounds));
+            obj.insert("tau".to_string(), serde_json::json!(tau));
+            obj.insert("draft_len".to_string(), serde_json::json!(draft_len));
+        }
+        match await_client_terminal_commit(stdout, id, &pending_done) {
+            ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Abort => {
+                gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
+            }
+        }
         return;
     }
 
@@ -2438,14 +2545,18 @@ pub fn generate_gemma4(
 
     let mut generated_count: usize = 0;
     let mut ttft_ms: Option<f64> = None;
+    let mut hit_eos = false;
+    let mut hit_length = false;
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
+            hit_length = true;
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         trace_gemma4_logits(gpu, id, generated_count, next_tok, &last_logits);
         if stop_set.contains(&next_tok) {
+            hit_eos = true;
             break;
         }
 
@@ -2489,6 +2600,7 @@ pub fn generate_gemma4(
         // forwarding at pos >= max_seq would write out of bounds. Stop
         // cleanly here — the just-emitted token is still valid.
         if bundle.state.n_tokens >= cache_cap {
+            hit_length = true;
             break;
         }
 
@@ -2534,23 +2646,24 @@ pub fn generate_gemma4(
     } else {
         0.0
     };
-    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
     let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
-        id,
-        generated_count,
+    let metrics = GemmaDoneMetrics {
+        generated: generated_count,
+        prompt_tokens: prompt_ids.len(),
+        cached_tokens: 0,
         tok_s,
-        prompt_ids.len(),
-        prefill_ms,
-        prefill_tok_s,
-        tok_s,
+        prefill_ms: prefill_ms as f64,
+        decode_tok_s: tok_s,
         ttft_ms,
-        total_ms,
-        active_attempt_id(),
-    );
-    let _ = stdout.flush();
+        total_ms: total_ms as f64,
+    };
+    let pending_done = gemma_pending_done(id, gemma_finish_reason(hit_eos, hit_length), &metrics);
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {
+            gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
+        }
+    }
 }
 /// Muse Glimmer dense text (arch_id=14) eager AR path.
 ///
