@@ -2091,6 +2091,32 @@ mod gemma4_prefill_batch_tests {
     }
 }
 
+#[cfg(test)]
+mod gemma4_overflow_reset_tests {
+    #[test]
+    fn gemma_overflow_cold_reset_invalidates_cache_and_cursor_kv_together() {
+        let mut cache =
+            hipfire_loader::GemmaPrefixCache::committed("model@config", vec![1, 2], 2);
+        let mut cursor = 7usize;
+        let mut sliding_offset = 4usize;
+        let mut full_offset = 6usize;
+
+        hipfire_loader::reset_gemma_cache_and_cursor(
+            &mut cache,
+            &mut cursor,
+            &mut sliding_offset,
+            &mut full_offset,
+        );
+
+        assert!(!cache.valid);
+        assert!(cache.materialized_tokens.is_empty());
+        assert_eq!(cache.committed_cursor, 0);
+        assert_eq!(cursor, 0);
+        assert_eq!(sliding_offset, 0);
+        assert_eq!(full_offset, 0);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
@@ -2232,8 +2258,11 @@ pub fn generate_gemma4(
     let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
-        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
-        bundle.state.reset();
+        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4Bundle");
+        if let Err(e) = bundle.cold_reset(gpu) {
+            emit_error_with_id(stdout, id, format!("gemma4 context reset failed: {e}"));
+            return;
+        }
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }

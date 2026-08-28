@@ -706,6 +706,22 @@ impl GemmaPrefixCache {
     }
 }
 
+/// Clear the eager Gemma cache metadata and all logical cursor/offset values
+/// as one cold-reset operation. The eager wrapper delegates to this helper so
+/// overflow/reset callers cannot leave a valid host prefix beside an empty KV.
+#[inline]
+pub fn reset_gemma_cache_and_cursor(
+    cache: &mut GemmaPrefixCache,
+    cursor: &mut usize,
+    sliding_offset: &mut usize,
+    full_offset: &mut usize,
+) {
+    cache.invalidate();
+    *cursor = 0;
+    *sliding_offset = 0;
+    *full_offset = 0;
+}
+
 // `ModelState` was the closed 12-variant enum that stored `LoadedModel.state`.
 // It has been replaced by `Option<Box<dyn ArchModel>>` (see `LoadedModel.state`
 // below). All per-architecture teardown now lives in each bundle's
@@ -763,8 +779,13 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
 impl Gemma4Bundle {
     /// Total cold reset for eager Gemma state and its wrapper-owned cache.
     pub fn cold_reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
-        self.state.reset_session_state();
-        self.prefix_cache.invalidate();
+        reset_gemma_cache_and_cursor(
+            &mut self.prefix_cache,
+            &mut self.state.n_tokens,
+            &mut self.state.kv_sliding.compact_offset,
+            &mut self.state.kv_full.compact_offset,
+        );
+        self.state.ar_warmed_up = false;
         gpu.invalidate_graph_state();
         gpu.replay.invalidate_replay_observation_window();
         Ok(())
