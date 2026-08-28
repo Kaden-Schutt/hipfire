@@ -5,7 +5,7 @@ Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 
 | Family | Mode | Production entry | SuperOp route | Default | Hand/state oracle | Replacement owner | Status |
 |---|---|---|---|---|---|---|---|
-| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — final rerun; Gate A terminal and lowered owner gates pass, dense eager owner/pool telemetry is unavailable, quality/reference/E-series and workspace validation blockers remain |
+| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | source remediation Gates A–C complete at `d4995096b` (review Spec APPROVED + Quality APPROVED); original Task 7 remains open for malformed MoE/attractor, the B=2 reference failure, absent HF/high-precision reference, absent E2B/E4B fixtures, and unrelated workspace baseline observations |
 | LFM2 | Single | `decode_step_layers_and_head` | `decode_step_layers_and_head_lowered` -> `run_layer_program` | on | direct layer loop with capture | LFM2 increment | open |
 | MiniMax | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct attention + sealed MoE loop | MiniMax increment | open |
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
@@ -493,9 +493,55 @@ All four commands used release binaries, `--sampling greedy --thinking off --max
 
 - `graphify update .` exited `0` after this inventory update and rebuilt the local graph with **40,771 nodes, 100,488 edges, and 2,038 communities**. HTML visualization was skipped because the graph exceeded the 5,000-node limit.
 - Graphify warned that **101 source files produced zero nodes** (retryable, not silently cached) and that **one SQL file contributed nothing because `tree_sitter_sql` is not installed**. Generated graph JSON/report/labels/manifest and caches remain local and untracked by policy; only the tracked `graphify-out/cache/stat-index.json` update may be staged.
-- Remediation-source blockers: **none proven**. Scoped formatter/build and Gemma-focused/actionable tests pass. The clippy result is an accepted unrelated shared `hipfire-config/src/rocm.rs` baseline classification; the one full-workspace `hipfire-quantize` failure is a non-reproducing transient/workspace validation blocker, not a proven Gemma source blocker.
-- Product Gate A terminal envelopes and Gate B parity/cache/injected paths pass, but Gate C remains **BLOCKED** for the dense eager route because it emitted no owner/pool telemetry; stable post-unload free-MB values alone are insufficient to close the ownership criterion. Lowered MoE lifecycle/owner telemetry and the five-stage owner matrix pass, while MoE semantic quality, the B=2 reference case, and E2B/E4B fixtures remain blocked.
-- Original Task 7 verdict: **BLOCKED**. Gemma4 row remains `open`; completion criteria are not reduced by passing source/actionable and lifecycle gates.
+- Remediation-source status: **COMPLETE** at source HEAD `d4995096b` (`fix(gemma4): complete eager owner teardown accounting`). Scoped formatter/build and Gemma-focused/actionable tests pass. The clippy result remains an accepted unrelated shared `hipfire-config/src/rocm.rs` baseline classification; the one full-workspace `hipfire-quantize` failure is a non-reproducing transient/workspace validation blocker, not a proven Gemma source blocker.
+- Product source Gates A–C: **COMPLETE** for their source contracts. Gate A terminal/usage envelopes and Gate B parity/cache/injected paths pass; Gate C now has reviewed dense eager owner/pool telemetry plus the lowered MoE owner matrix. The MoE chain `attractor=1` and malformed text remain quality/Task 7 blockers, not a source-gate pass.
+- Original Task 7 verdict: **BLOCKED**. The Gemma4 row remains `open`; semantic MoE/attractor evidence, the B=2 reference failure, absent exact HF/high-precision reference, absent E2B/E4B fixtures, and unrelated workspace baseline observations remain explicitly retained.
+
+## Remediation source-gates closure (reviewed through source HEAD `d4995096b`)
+
+This addendum supersedes only the prior dense-eager Gate C classification that owner/pool telemetry was unavailable. It does not promote malformed artifacts, absent external fixtures, or the quality/reference blockers retained above.
+
+### Reviewed commits and verdicts
+
+- Final source-blocker series: `b45dc3e6f..488917eba`; review ledger verdict: **Spec APPROVED + Quality APPROVED**.
+- Dense eager telemetry series: `8d128721c` (`feat(gemma4): expose eager ownership telemetry`) and `d4995096b` (`fix(gemma4): complete eager owner teardown accounting`); review verdict: **Spec APPROVED + Quality APPROVED**, with no remaining findings.
+- The dense telemetry changes add owner accounting and teardown observability only; the dense report states that generation, cache, and terminal code were not changed. Therefore the prior Gate A/B evidence remains the applicable source/actionable evidence at the final source HEAD.
+- Raw dense telemetry: `/home/bjoern/hipfire-step005/gemma4/remediation/dense-telemetry/dense-eager-lifecycle.json` and `dense-eager-daemon.stderr.log`; preceding A/B/C evidence is under `/home/bjoern/hipfire-step005/gemma4/remediation/rerun-488917eba/`.
+
+### Gate C dense eager four-cycle owner/pool telemetry
+
+The canonical dense route used isolated HOME/config, `HIP_VISIBLE_DEVICES=0`, graph/EAGLE disabled, `HIPFIRE_GEMMA4_ALLOC_TELEMETRY=1`, and `/home/bjoern/.hipfire/models/gemma4-12b.mq4`. Each cycle was load → generate (`temperature=0`, `max_tokens=1`) → reset → unload, with diagnostics at each boundary.
+
+| Cycle | Generate | Reset (`rolled_back`, `seq_pos`, `conversation_len`) | Publish owner / pool | Unload owner / pool | Post-unload free MB |
+|---:|---|---|---:|---:|---:|
+| 1 | `finish=length`, `tokens=1` | `true`, `0`, `0` | `9,696,395,268 / 0` | `9,696,395,268 / 9,696,395,264` | `99,523` |
+| 2 | `finish=length`, `tokens=1` | `true`, `0`, `0` | `9,696,395,268 / 0` | `9,696,395,268 / 9,696,395,264` | `99,523` |
+| 3 | `finish=length`, `tokens=1` | `true`, `0`, `0` | `9,696,395,268 / 0` | `9,696,395,268 / 9,696,395,264` | `99,523` |
+| 4 | `finish=length`, `tokens=1` | `true`, `0`, `0` | `9,696,395,268 / 0` | `9,696,395,268 / 9,696,395,264` | `99,523` |
+
+- All eight telemetry records reported `live_owner_bytes=0`, `graph_resident=false`, and `graph_blob_count=0`. After one-time warm-up, `module_count=17` was constant; publish emitted `freed_owner_labels=-`, and each eager unload emitted `freed_owner_labels=state,weights`.
+- The four-byte unload gap is accounted for exactly by `Gemma4State.pos_buf`: it is a raw HIP allocation counted in `owner_bytes` and freed directly outside the reusable tensor pool. Thus the pooled unload value is exactly `owner_bytes - 4`, with no unexplained pool gap.
+- Owner and unload-pool values were flat across all four cycles, and the telemetry helper emitted zero `[gemma4 alloc]` lines when the opt-in variable was unset. Free-device values are diagnostic only, not the ownership invariant.
+- The lowered MoE evidence remains: four lifecycle cycles completed; release telemetry was flat at `owner_bytes=16,509,459,208`, `pool_bytes=16,509,459,204`, `graph_resident=false`, `graph_blob_count=0`, `module_count=22`, and `freed_owner_labels=kv_full,kv_sliding,scratch,weights`; the feature-gated five-stage matrix returned `live_owner_bytes=0`, `pool_after_drain=0`, `modules_after_drain=0`, and `deficit=0` for `weights`, `scratch`, `sliding_kv`, `full_kv`, and `session`.
+
+### Final source-gate verdict
+
+| Source gate | Verdict | Evidence boundary |
+|---|---|---|
+| Gate A | **COMPLETE** | Dense and MoE production battery/chain requests reached terminal `finish=length`/DONE envelopes without premature EOF; the MoE chain's `attractor=1` and malformed decoded text remain original Task 7 quality blockers. |
+| Gate B | **COMPLETE** | Independent eager graph default/on/off IDs and FNV `0x981d38723fe270af`, batched-prefill cosine `0.9997148`, lowered-MoE canonical FNV `0x831756562b0ab110`, cache `0 → 4 → 0`, abort rollback, and 27/27 focused transaction tests passed. |
+| Gate C | **COMPLETE** | Dense eager reviewed owner/pool four-cycle table above; lowered-MoE lifecycle/owner telemetry and five-stage zero-owner fault matrix pass; teardown smoke passed. |
+
+**Remediation source verdict: COMPLETE / no Gemma source blocker proven.** This is deliberately narrower than original Task 7 acceptance.
+
+### Original Task 7 remains open
+
+- MoE production output remains visibly malformed; the MoE chain exits `1` after terminal completion because `attractor=1`. No malformed output is promoted as coherent.
+- The available dense eager reference matrix remains **FAIL** at `B=2`: B=1/4/8 pass, while `cosine=0.9999954`, `argmax_match=true`, `next_argmax_match=false` (`seq=2921`, `bat=236906`), and `next_cos=0.9975923`.
+- No exact local HF or higher-precision Gemma reference checkpoint was found; historical Task 7 decode logs remain non-promoted.
+- The exact E-series arm remains externally blocked: `/home/bjoern/.hipfire/models/gemma4-eseries/gemma4-e2b-it-pr439-q8.hfq` is missing, and the exact E2B/E4B fixture directory/files are absent.
+- Unrelated workspace observations remain recorded, not reclassified as Gemma defects: narrow clippy is blocked by the shared pre-existing `hipfire-config/src/rocm.rs` diagnostics, and the full `cargo test` run hit the non-reproducing `hipfire-quantize` `glimmer_self_attn_gate_proj_is_attention_not_mlp_or_router` failure (`155 passed; 1 failed; 4 ignored` in that binary; isolated rerun `1 passed; 159 filtered out`).
+
 
 ## Out of scope (later tasks)
 
