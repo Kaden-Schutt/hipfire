@@ -3585,6 +3585,23 @@ impl Gpu {
             Ok(())
         }
     }
+    /// Return the exact bytes currently cached in the reusable GPU pool.
+    ///
+    /// This read-only diagnostic accessor intentionally exposes no allocator
+    /// mutation. It reports actual free-list buffer capacities, allowing
+    /// lifecycle telemetry to distinguish model owners from retained pool
+    /// storage without duplicating pool accounting in callers.
+    pub fn pool_cached_bytes(&self) -> usize {
+        self.pool.cached_bytes()
+    }
+    /// Return the number of modules currently resident in this GPU context.
+    /// This is a read-only diagnostic count; module ownership remains with
+    /// `Gpu` and is unaffected by the accessor.
+    pub fn loaded_module_count(&self) -> usize {
+        self.modules.len()
+    }
+
+
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.

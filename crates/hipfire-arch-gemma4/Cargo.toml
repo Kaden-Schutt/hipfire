@@ -14,6 +14,9 @@ default = ["deltanet"]
 # Gemma 4 full-attention partial-rotate RoPE (rope_partial_halved_f32) lives
 # behind the same deltanet gate as the other rope_partial_* kernels.
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+# Test-only deterministic lowered-construction failures. Kept out of the
+# production/default feature set so synthetic allocation errors cannot ship.
+lowered-fault-inject = []
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }

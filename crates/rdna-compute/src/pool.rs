@@ -88,6 +88,20 @@ impl GpuPool {
         let bucket = Self::bucket_key(buf.size());
         self.free_lists.entry(bucket).or_default().push(buf);
     }
+    /// Return the exact bytes currently held in the reusable free lists.
+    ///
+    /// This is the cached portion of the pool, not cumulative allocation
+    /// traffic (`total_allocated`) and not a logical tensor-size estimate.
+    /// Callers use it for developer-only lifecycle accounting before/after
+    /// model teardown.
+    pub fn cached_bytes(&self) -> usize {
+        self.free_lists
+            .values()
+            .flat_map(|buffers| buffers.iter())
+            .map(DeviceBuffer::size)
+            .sum()
+    }
+
 
     /// Actually free all pooled buffers (call on cleanup).
     pub fn drain(&mut self, hip: &HipRuntime) {
@@ -140,5 +154,22 @@ impl GpuPool {
                 "{failures} pool buffer(s) failed to drain (first error: {first_err})"
             ))
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::GpuPool;
+
+    #[test]
+    fn cached_bytes_reports_actual_free_list_capacity() {
+        let mut pool = GpuPool::new();
+        pool.free(unsafe {
+            hip_bridge::DeviceBuffer::from_raw(0x1000 as *mut std::ffi::c_void, 512)
+        });
+        pool.free(unsafe {
+            hip_bridge::DeviceBuffer::from_raw(0x2000 as *mut std::ffi::c_void, 768)
+        });
+
+        assert_eq!(pool.cached_bytes(), 1280);
     }
 }

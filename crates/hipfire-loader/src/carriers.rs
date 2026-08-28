@@ -1903,6 +1903,14 @@ impl Carrier for Gemma4Carrier {
                     ctx.max_seq,
                     ctx.spec,
                 );
+                let owner_bytes = l.owner_bytes();
+                hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+                    "publish",
+                    hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
+                    owner_bytes,
+                    ctx.gpu,
+                    Vec::new(),
+                );
                 Ok(LoadedModel {
                     state: Some(Box::new(crate::Gemma4LoweredBundle {
                         config: l.config,

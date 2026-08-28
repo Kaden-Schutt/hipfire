@@ -20,6 +20,8 @@ arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []
+# Forward lowered Gemma construction faults for focused lifecycle tests.
+lowered-fault-inject = ["hipfire-arch-gemma4/lowered-fault-inject"]
 
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }

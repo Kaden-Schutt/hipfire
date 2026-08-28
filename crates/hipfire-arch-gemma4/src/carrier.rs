@@ -60,6 +60,82 @@ pub enum Gemma4Bundle {
     Eager(Gemma4EagerBundle),
     Lowered(Gemma4LoweredBundle),
 }
+impl Gemma4LoweredBundle {
+    /// Actual bytes owned by the lowered bundle, excluding borrowed aliases
+    /// (tied LM head and pool-backed expert views).
+    pub fn owner_bytes(&self) -> usize {
+        self.weights.owner_bytes()
+            + self.scratch.owner_bytes()
+            + lowered::kv_owner_bytes(&self.kv_sliding)
+            + lowered::kv_owner_bytes(&self.kv_full)
+    }
+}
+
+/// Lowered bundle construction owner. It borrows the destination GPU for the
+/// entire load and keeps every completed resource private until publication.
+/// Destruction is deliberately reverse-ordered: full KV, sliding KV, scratch,
+/// then weights.
+struct Gemma4LoweredStaging<'a> {
+    gpu: &'a mut rdna_compute::Gpu,
+    weights: Option<lowered::Gemma4Weights>,
+    scratch: Option<lowered::Gemma4Scratch>,
+    kv_sliding: Option<KvCache>,
+    kv_full: Option<KvCache>,
+}
+
+impl<'a> Gemma4LoweredStaging<'a> {
+    fn new(gpu: &'a mut rdna_compute::Gpu) -> Self {
+        Self {
+            gpu,
+            weights: None,
+            scratch: None,
+            kv_sliding: None,
+            kv_full: None,
+        }
+    }
+
+    fn gpu_mut(&mut self) -> &mut rdna_compute::Gpu {
+        self.gpu
+    }
+
+    fn publish(
+        mut self,
+        config: lowered::Gemma4Config,
+    ) -> Gemma4LoweredBundle {
+        Gemma4LoweredBundle {
+            config,
+            weights: self.weights.take().expect("lowered weights not staged"),
+            scratch: self.scratch.take().expect("lowered scratch not staged"),
+            kv_sliding: self
+                .kv_sliding
+                .take()
+                .expect("lowered sliding KV not staged"),
+            kv_full: self.kv_full.take().expect("lowered full KV not staged"),
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(kv_full) = self.kv_full.take() {
+            let _ = kv_full.free_gpu(self.gpu);
+        }
+        if let Some(kv_sliding) = self.kv_sliding.take() {
+            let _ = kv_sliding.free_gpu(self.gpu);
+        }
+        if let Some(scratch) = self.scratch.take() {
+            scratch.free_gpu(self.gpu);
+        }
+        if let Some(weights) = self.weights.take() {
+            weights.free_gpu(self.gpu);
+        }
+    }
+}
+
+impl Drop for Gemma4LoweredStaging<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 
 /// Gemma 4 source/option preconditions — the single authority shared by the
 /// bundle loader and the daemon-side preflight: HFQ-only source shape,
@@ -137,14 +213,28 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     if use_lowered {
         let lcfg = lowered_cfg.unwrap();
         let mut hfq2 = hfq;
-        let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
+        let mut staging = Gemma4LoweredStaging::new(ctx.gpu);
+
+        let weights = lowered::load_weights(&mut hfq2, &lcfg, staging.gpu_mut())
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-        let scratch = lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
+        staging.weights = Some(weights);
+        lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Weights)
+            .map_err(|e| format!("gemma4 (lowered) weights stage: {e:?}"))?;
+
+        let scratch = lowered::Gemma4Scratch::new(staging.gpu_mut(), &lcfg, 1)
             .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
-        lowered::init_scratch_constants(ctx.gpu, &scratch, lcfg.full_head_dim)
-            .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
+        staging.scratch = Some(scratch);
+        {
+            let gpu = &mut *staging.gpu;
+            let scratch = staging.scratch.as_ref().expect("lowered scratch staged");
+            lowered::init_scratch_constants(gpu, scratch, lcfg.full_head_dim)
+                .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
+        }
+        lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Scratch)
+            .map_err(|e| format!("gemma4 (lowered) scratch stage: {e:?}"))?;
+
         let kv_sliding = KvCache::new_gpu_q8_capped(
-            ctx.gpu,
+            staging.gpu_mut(),
             lcfg.n_layers,
             lcfg.sliding_n_kv_heads,
             lcfg.sliding_head_dim,
@@ -152,25 +242,32 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
             lcfg.sliding_window,
         )
         .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
+        staging.kv_sliding = Some(kv_sliding);
+        lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::SlidingKv)
+            .map_err(|e| format!("gemma4 (lowered) sliding KV stage: {e:?}"))?;
+
         let kv_full = KvCache::new_gpu_asym3_gemma4(
-            ctx.gpu,
+            staging.gpu_mut(),
             lcfg.n_layers,
             lcfg.full_n_kv_heads,
             lcfg.full_head_dim,
             ctx.max_seq,
         )
         .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
+        staging.kv_full = Some(kv_full);
+        lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::FullKv)
+            .map_err(|e| format!("gemma4 (lowered) full KV stage: {e:?}"))?;
+
+        // The final intermediate bundle has no GPU-side session object yet;
+        // this boundary protects publication and lets loader integration
+        // inject a deterministic session/cache failure before exposure.
+        lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Session)
+            .map_err(|e| format!("gemma4 (lowered) session stage: {e:?}"))?;
         eprintln!(
             "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
             lcfg.enable_moe_block, want_batched,
         );
-        return Ok(Gemma4Bundle::Lowered(Gemma4LoweredBundle {
-            config: lcfg,
-            weights,
-            scratch,
-            kv_sliding,
-            kv_full,
-        }));
+        return Ok(Gemma4Bundle::Lowered(staging.publish(lcfg)));
     }
     // ── Eager dense / E-series path ──
     let config = match eager_config {

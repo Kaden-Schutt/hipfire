@@ -827,6 +827,15 @@ impl Gemma4LoweredBundle {
         gpu.replay.invalidate_replay_observation_window();
         Ok(())
     }
+    /// Actual bytes owned by lowered weights, scratch, and both KV families.
+    /// Borrowed LM-head/expert views are excluded by the architecture helpers.
+    pub fn owner_bytes(&self) -> usize {
+        self.weights.owner_bytes()
+            + self.scratch.owner_bytes()
+            + gemma4::lowered::kv_owner_bytes(&self.kv_sliding)
+            + gemma4::lowered::kv_owner_bytes(&self.kv_full)
+    }
+
 
     /// Roll back a working request while preserving a safe committed prefix.
     /// If sliding rows were overwritten, or identity no longer matches, the
@@ -909,11 +918,25 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
 
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
+        let owner_bytes = b.owner_bytes();
+        b.kv_full.free_gpu(gpu).ok();
+        b.kv_sliding.free_gpu(gpu).ok();
         b.scratch.free_gpu(gpu);
-        let _ = b.kv_sliding.free_gpu(gpu);
-        let _ = b.kv_full.free_gpu(gpu);
         b.weights.free_gpu(gpu);
+        gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+            "unload",
+            gemma4::lowered::allocation_telemetry_cycle(),
+            owner_bytes,
+            gpu,
+            vec![
+                "kv_full".to_string(),
+                "kv_sliding".to_string(),
+                "scratch".to_string(),
+                "weights".to_string(),
+            ],
+        );
     }
+
 }
 
 impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {

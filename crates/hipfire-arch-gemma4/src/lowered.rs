@@ -64,6 +64,164 @@ pub enum GemmaRollback {
     RestoredCommitted,
     Invalidated,
 }
+/// Allocation boundaries in the lowered bundle constructor.
+///
+/// Keep this ordered list in construction order. The carrier stages each
+/// completed owner at one of these boundaries and rolls them back in reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gemma4ConstructionStage {
+    Weights,
+    Scratch,
+    SlidingKv,
+    FullKv,
+    Session,
+}
+
+/// Return the deterministic lowered-construction fault matrix in construction
+/// order. This is also the contract used by focused ownership tests.
+pub const fn construction_fault_stages() -> &'static [Gemma4ConstructionStage] {
+    &[
+        Gemma4ConstructionStage::Weights,
+        Gemma4ConstructionStage::Scratch,
+        Gemma4ConstructionStage::SlidingKv,
+        Gemma4ConstructionStage::FullKv,
+        Gemma4ConstructionStage::Session,
+    ]
+}
+
+impl Gemma4ConstructionStage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Weights => "weights",
+            Self::Scratch => "scratch",
+            Self::SlidingKv => "sliding_kv",
+            Self::FullKv => "full_kv",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// Test-only deterministic failure after a completed construction stage.
+///
+/// The hook is compiled out of production builds. Keeping the stage check at
+/// the carrier boundary means a fault exercises exactly the same rollback path
+/// as a real later-stage error.
+pub fn fail_after_construction_stage(stage: Gemma4ConstructionStage) -> HipResult<()> {
+    #[cfg(feature = "lowered-fault-inject")]
+    if std::env::var("HIPFIRE_GEMMA4_FAIL_STAGE").ok().as_deref() == Some(stage.label()) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("injected Gemma 4 lowered failure after {}", stage.label()),
+        ));
+    }
+    #[cfg(not(feature = "lowered-fault-inject"))]
+    let _ = stage;
+    Ok(())
+}
+/// One developer-only lifecycle allocation observation.
+///
+/// The values are deliberately actual owner/pool capacities rather than
+/// logical tensor estimates. No observation is emitted unless
+/// `HIPFIRE_GEMMA4_ALLOC_TELEMETRY=1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gemma4AllocationTelemetry {
+    pub phase: &'static str,
+    pub cycle: u64,
+    pub owner_bytes: usize,
+    pub pool_bytes: usize,
+    pub free_device_bytes: Option<usize>,
+    pub graph_resident: bool,
+    pub graph_blob_count: usize,
+    pub module_count: usize,
+    pub freed_owner_labels: Vec<String>,
+}
+
+fn allocation_telemetry_enabled_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Return whether developer-only Gemma lifecycle telemetry is enabled.
+pub fn allocation_telemetry_enabled() -> bool {
+    allocation_telemetry_enabled_value(
+        std::env::var("HIPFIRE_GEMMA4_ALLOC_TELEMETRY")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Optional operator-provided lifecycle cycle identifier.
+pub fn allocation_telemetry_cycle() -> u64 {
+    std::env::var("HIPFIRE_GEMMA4_ALLOC_CYCLE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+impl Gemma4AllocationTelemetry {
+    pub fn from_gpu(
+        phase: &'static str,
+        cycle: u64,
+        owner_bytes: usize,
+        gpu: &Gpu,
+        freed_owner_labels: Vec<String>,
+    ) -> Self {
+        Self {
+            phase,
+            cycle,
+            owner_bytes,
+            pool_bytes: gpu.pool_cached_bytes(),
+            free_device_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+            graph_resident: gpu.graphs.graph_exec.is_some()
+                || gpu.graphs.captured_graph.is_some()
+                || !gpu.graphs.verify.cache.is_empty()
+                || !gpu.graphs.replay.cache.is_empty(),
+            graph_blob_count: gpu.graph_blob_count(),
+            module_count: gpu.loaded_module_count(),
+            freed_owner_labels,
+        }
+    }
+
+    pub fn format_line(&self) -> String {
+        let freed = if self.freed_owner_labels.is_empty() {
+            "-".to_string()
+        } else {
+            self.freed_owner_labels.join(",")
+        };
+        format!(
+            "[gemma4 alloc] phase={} cycle={} owner_bytes={} pool_bytes={} free_device_bytes={} graph_resident={} graph_blob_count={} module_count={} freed_owner_labels={}",
+            self.phase,
+            self.cycle,
+            self.owner_bytes,
+            self.pool_bytes,
+            self.free_device_bytes
+                .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string()),
+            self.graph_resident,
+            self.graph_blob_count,
+            self.module_count,
+            freed,
+        )
+    }
+
+    pub fn emit_from_gpu(
+        phase: &'static str,
+        cycle: u64,
+        owner_bytes: usize,
+        gpu: &Gpu,
+        freed_owner_labels: Vec<String>,
+    ) {
+        if allocation_telemetry_enabled() {
+            Self::from_gpu(phase, cycle, owner_bytes, gpu, freed_owner_labels).emit();
+        }
+    }
+
+    pub fn emit(&self) {
+        if allocation_telemetry_enabled() {
+            eprintln!("{}", self.format_line());
+        }
+    }
+}
+
+
 
 /// Authoritative runtime cursor for the lowered Gemma bundle.
 ///
@@ -818,6 +976,291 @@ pub enum LayerWeights {
     Full(FullLayerWeights),
 }
 
+fn tensor_owner_bytes(tensor: &GpuTensor) -> usize {
+    if tensor.buf.is_borrowed() {
+        0
+    } else {
+        tensor.buf.size()
+    }
+}
+
+fn weight_owner_bytes(weight: &WeightTensor) -> usize {
+    let mut bytes = tensor_owner_bytes(&weight.buf);
+    if let Some(awq_scale) = weight.awq_scale.as_ref() {
+        bytes += tensor_owner_bytes(awq_scale);
+    }
+    if let Some(paro) = weight.paro.as_ref() {
+        if !paro.is_alias {
+            bytes += tensor_owner_bytes(&paro.pairs);
+            bytes += tensor_owner_bytes(&paro.theta);
+            bytes += tensor_owner_bytes(&paro.channel_scales);
+        }
+    }
+    bytes
+}
+
+impl LayerWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            LayerWeights::Sliding(s) => {
+                let SlidingLayerWeights {
+                    input_layernorm,
+                    post_attention_layernorm,
+                    pre_feedforward_layernorm,
+                    post_feedforward_layernorm,
+                    layer_scalar,
+                    layer_scalar_host: _,
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    q_norm,
+                    k_norm,
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                    moe,
+                } = s;
+                down_proj.free_all(gpu);
+                up_proj.free_all(gpu);
+                gate_proj.free_all(gpu);
+                let _ = gpu.free_tensor(k_norm);
+                let _ = gpu.free_tensor(q_norm);
+                o_proj.free_all(gpu);
+                v_proj.free_all(gpu);
+                k_proj.free_all(gpu);
+                q_proj.free_all(gpu);
+                let _ = gpu.free_tensor(post_feedforward_layernorm);
+                let _ = gpu.free_tensor(pre_feedforward_layernorm);
+                let _ = gpu.free_tensor(post_attention_layernorm);
+                let _ = gpu.free_tensor(input_layernorm);
+                if let Some(moe) = moe {
+                    Gemma4Weights::free_moe(gpu, moe);
+                }
+                let _ = gpu.free_tensor(layer_scalar);
+            }
+            LayerWeights::Full(f) => {
+                let FullLayerWeights {
+                    input_layernorm,
+                    post_attention_layernorm,
+                    pre_feedforward_layernorm,
+                    post_feedforward_layernorm,
+                    layer_scalar,
+                    layer_scalar_host: _,
+                    q_proj,
+                    k_proj,
+                    o_proj,
+                    q_norm,
+                    k_norm,
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                    moe,
+                } = f;
+                down_proj.free_all(gpu);
+                up_proj.free_all(gpu);
+                gate_proj.free_all(gpu);
+                let _ = gpu.free_tensor(k_norm);
+                let _ = gpu.free_tensor(q_norm);
+                o_proj.free_all(gpu);
+                k_proj.free_all(gpu);
+                q_proj.free_all(gpu);
+                let _ = gpu.free_tensor(post_feedforward_layernorm);
+                let _ = gpu.free_tensor(pre_feedforward_layernorm);
+                let _ = gpu.free_tensor(post_attention_layernorm);
+                let _ = gpu.free_tensor(input_layernorm);
+                if let Some(moe) = moe {
+                    Gemma4Weights::free_moe(gpu, moe);
+                }
+                let _ = gpu.free_tensor(layer_scalar);
+            }
+        }
+    }
+
+    fn owner_bytes(&self) -> usize {
+        match self {
+            LayerWeights::Sliding(s) => {
+                tensor_owner_bytes(&s.input_layernorm)
+                    + tensor_owner_bytes(&s.post_attention_layernorm)
+                    + tensor_owner_bytes(&s.pre_feedforward_layernorm)
+                    + tensor_owner_bytes(&s.post_feedforward_layernorm)
+                    + tensor_owner_bytes(&s.layer_scalar)
+                    + weight_owner_bytes(&s.q_proj)
+                    + weight_owner_bytes(&s.k_proj)
+                    + weight_owner_bytes(&s.v_proj)
+                    + weight_owner_bytes(&s.o_proj)
+                    + tensor_owner_bytes(&s.q_norm)
+                    + tensor_owner_bytes(&s.k_norm)
+                    + weight_owner_bytes(&s.gate_proj)
+                    + weight_owner_bytes(&s.up_proj)
+                    + weight_owner_bytes(&s.down_proj)
+                    + s.moe.as_ref().map_or(0, MoeLayerExtras::owner_bytes)
+            }
+            LayerWeights::Full(f) => {
+                tensor_owner_bytes(&f.input_layernorm)
+                    + tensor_owner_bytes(&f.post_attention_layernorm)
+                    + tensor_owner_bytes(&f.pre_feedforward_layernorm)
+                    + tensor_owner_bytes(&f.post_feedforward_layernorm)
+                    + tensor_owner_bytes(&f.layer_scalar)
+                    + weight_owner_bytes(&f.q_proj)
+                    + weight_owner_bytes(&f.k_proj)
+                    + weight_owner_bytes(&f.o_proj)
+                    + tensor_owner_bytes(&f.q_norm)
+                    + tensor_owner_bytes(&f.k_norm)
+                    + weight_owner_bytes(&f.gate_proj)
+                    + weight_owner_bytes(&f.up_proj)
+                    + weight_owner_bytes(&f.down_proj)
+                    + f.moe.as_ref().map_or(0, MoeLayerExtras::owner_bytes)
+            }
+        }
+    }
+}
+
+impl MoeLayerExtras {
+    fn owner_bytes(&self) -> usize {
+        weight_owner_bytes(&self.router_proj)
+            + tensor_owner_bytes(&self.router_scale)
+            + tensor_owner_bytes(&self.per_expert_scale)
+            + tensor_owner_bytes(&self.pre_feedforward_layernorm_2)
+            + tensor_owner_bytes(&self.post_feedforward_layernorm_1)
+            + tensor_owner_bytes(&self.post_feedforward_layernorm_2)
+            + tensor_owner_bytes(&self.experts_gate_up_pool)
+            + tensor_owner_bytes(&self.experts_down_pool)
+            + tensor_owner_bytes(&self.experts_gate_up_ptrs)
+            + tensor_owner_bytes(&self.experts_down_ptrs)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoweredOwnerId(usize);
+
+enum LoweredOwner {
+    Empty,
+    Tensor(GpuTensor),
+    Weight(WeightTensor),
+    Buffer(DeviceBuffer),
+    Moe(MoeLayerExtras),
+    Layer(LayerWeights),
+}
+
+struct LoweredOwnerTransaction<'a> {
+    gpu: &'a mut Gpu,
+    owners: Vec<LoweredOwner>,
+}
+
+impl<'a> LoweredOwnerTransaction<'a> {
+    fn new(gpu: &'a mut Gpu) -> Self {
+        Self {
+            gpu,
+            owners: Vec::new(),
+        }
+    }
+
+    fn gpu_mut(&mut self) -> &mut Gpu {
+        self.gpu
+    }
+
+    fn push_tensor(&mut self, tensor: GpuTensor) -> LoweredOwnerId {
+        let id = LoweredOwnerId(self.owners.len());
+        self.owners.push(LoweredOwner::Tensor(tensor));
+        id
+    }
+
+    fn push_weight(&mut self, weight: WeightTensor) -> LoweredOwnerId {
+        let id = LoweredOwnerId(self.owners.len());
+        self.owners.push(LoweredOwner::Weight(weight));
+        id
+    }
+
+    fn push_buffer(&mut self, buffer: DeviceBuffer) -> LoweredOwnerId {
+        let id = LoweredOwnerId(self.owners.len());
+        self.owners.push(LoweredOwner::Buffer(buffer));
+        id
+    }
+
+    fn push_moe(&mut self, moe: MoeLayerExtras) -> LoweredOwnerId {
+        let id = LoweredOwnerId(self.owners.len());
+        self.owners.push(LoweredOwner::Moe(moe));
+        id
+    }
+
+    fn push_layer(&mut self, layer: LayerWeights) -> LoweredOwnerId {
+        let id = LoweredOwnerId(self.owners.len());
+        self.owners.push(LoweredOwner::Layer(layer));
+        id
+    }
+
+    fn tensor_ref(&self, id: LoweredOwnerId) -> &GpuTensor {
+        match self.owners.get(id.0) {
+            Some(LoweredOwner::Tensor(tensor)) => tensor,
+            _ => panic!("lowered owner is not a GPU tensor"),
+        }
+    }
+
+    fn take_tensor(&mut self, id: LoweredOwnerId) -> GpuTensor {
+        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+            LoweredOwner::Tensor(tensor) => tensor,
+            _ => panic!("lowered owner is not a GPU tensor"),
+        }
+    }
+
+    fn take_weight(&mut self, id: LoweredOwnerId) -> WeightTensor {
+        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+            LoweredOwner::Weight(weight) => weight,
+            _ => panic!("lowered owner is not a weight"),
+        }
+    }
+
+    fn take_buffer(&mut self, id: LoweredOwnerId) -> DeviceBuffer {
+        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+            LoweredOwner::Buffer(buffer) => buffer,
+            _ => panic!("lowered owner is not a device buffer"),
+        }
+    }
+
+    fn take_moe(&mut self, id: LoweredOwnerId) -> MoeLayerExtras {
+        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+            LoweredOwner::Moe(moe) => moe,
+            _ => panic!("lowered owner is not MoE extras"),
+        }
+    }
+
+    fn take_layer(&mut self, id: LoweredOwnerId) -> LayerWeights {
+        match std::mem::replace(&mut self.owners[id.0], LoweredOwner::Empty) {
+            LoweredOwner::Layer(layer) => layer,
+            _ => panic!("lowered owner is not a layer"),
+        }
+    }
+
+    fn commit(mut self) {
+        debug_assert!(self.owners.iter().all(|owner| matches!(owner, LoweredOwner::Empty)));
+        self.owners.clear();
+    }
+}
+
+fn free_lowered_owner(gpu: &mut Gpu, owner: LoweredOwner) {
+    match owner {
+        LoweredOwner::Empty => {}
+        LoweredOwner::Tensor(tensor) => {
+            let _ = gpu.free_tensor(tensor);
+        }
+        LoweredOwner::Weight(weight) => weight.free_all(gpu),
+        LoweredOwner::Buffer(buffer) => {
+            let _ = gpu.hip.free(buffer);
+        }
+        LoweredOwner::Moe(moe) => Gemma4Weights::free_moe(gpu, moe),
+        LoweredOwner::Layer(layer) => layer.free_gpu(gpu),
+    }
+}
+
+impl Drop for LoweredOwnerTransaction<'_> {
+    fn drop(&mut self) {
+        while let Some(owner) = self.owners.pop() {
+            free_lowered_owner(self.gpu, owner);
+        }
+    }
+}
+
 pub struct Gemma4Weights {
     /// Token embedding [vocab_size, dim], Q8F16 to keep the 262144×5376 table manageable.
     /// Aliased as lm_head when tie_word_embeddings is true.
@@ -833,85 +1276,79 @@ pub struct Gemma4Weights {
 }
 
 impl Gemma4Weights {
+    /// Return all owning GPU buffers to the pool. The tied `lm_head` is a
+    /// borrowed alias of `embed_tokens` and is intentionally not freed.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.embed_tokens);
-        let _ = gpu.free_tensor(self.final_norm);
-        // lm_head may alias embed_tokens — skip if so (we rely on the loader
-        // to set `lm_head.buf` to an alias and not a separate allocation).
-        for l in self.layers {
-            match l {
-                LayerWeights::Sliding(s) => {
-                    for t in [
-                        s.input_layernorm,
-                        s.post_attention_layernorm,
-                        s.pre_feedforward_layernorm,
-                        s.post_feedforward_layernorm,
-                        s.layer_scalar,
-                        s.q_norm,
-                        s.k_norm,
-                    ] {
-                        let _ = gpu.free_tensor(t);
-                    }
-                    for wt in [
-                        s.q_proj.buf,
-                        s.k_proj.buf,
-                        s.v_proj.buf,
-                        s.o_proj.buf,
-                        s.gate_proj.buf,
-                        s.up_proj.buf,
-                        s.down_proj.buf,
-                    ] {
-                        let _ = gpu.free_tensor(wt);
-                    }
-                    if let Some(moe) = s.moe {
-                        Self::free_moe(gpu, moe);
-                    }
-                }
-                LayerWeights::Full(f) => {
-                    for t in [
-                        f.input_layernorm,
-                        f.post_attention_layernorm,
-                        f.pre_feedforward_layernorm,
-                        f.post_feedforward_layernorm,
-                        f.layer_scalar,
-                        f.q_norm,
-                        f.k_norm,
-                    ] {
-                        let _ = gpu.free_tensor(t);
-                    }
-                    for wt in [
-                        f.q_proj.buf,
-                        f.k_proj.buf,
-                        f.o_proj.buf,
-                        f.gate_proj.buf,
-                        f.up_proj.buf,
-                        f.down_proj.buf,
-                    ] {
-                        let _ = gpu.free_tensor(wt);
-                    }
-                    if let Some(moe) = f.moe {
-                        Self::free_moe(gpu, moe);
-                    }
-                }
-            }
+        let Gemma4Weights {
+            embed_tokens,
+            embd_format: _,
+            lm_head: _,
+            final_norm,
+            layers,
+        } = self;
+        for layer in layers.into_iter().rev() {
+            layer.free_gpu(gpu);
         }
+        let _ = gpu.free_tensor(final_norm);
+        let _ = gpu.free_tensor(embed_tokens);
+    }
+
+    /// Sum the actual capacities of all owning descriptors. Borrowed aliases
+    /// (the tied LM head and pool-backed expert views) contribute zero.
+    pub fn owner_bytes(&self) -> usize {
+        tensor_owner_bytes(&self.embed_tokens)
+            + tensor_owner_bytes(&self.final_norm)
+            + self
+                .layers
+                .iter()
+                .map(LayerWeights::owner_bytes)
+                .sum::<usize>()
     }
 
     fn free_moe(gpu: &mut Gpu, moe: MoeLayerExtras) {
-        let _ = gpu.free_tensor(moe.router_proj.buf);
-        let _ = gpu.free_tensor(moe.router_scale);
-        let _ = gpu.free_tensor(moe.per_expert_scale);
-        let _ = gpu.free_tensor(moe.pre_feedforward_layernorm_2);
-        let _ = gpu.free_tensor(moe.post_feedforward_layernorm_1);
-        let _ = gpu.free_tensor(moe.post_feedforward_layernorm_2);
-        // per-expert WeightTensors alias into the pools — skip freeing them.
-        // free the two pool allocations.
-        let _ = gpu.free_tensor(moe.experts_gate_up_pool);
-        let _ = gpu.free_tensor(moe.experts_down_pool);
-        let _ = gpu.free_tensor(moe.experts_gate_up_ptrs);
-        let _ = gpu.free_tensor(moe.experts_down_ptrs);
+        let MoeLayerExtras {
+            router_proj,
+            router_scale,
+            per_expert_scale,
+            per_expert_scale_host: _,
+            pre_feedforward_layernorm_2,
+            post_feedforward_layernorm_1,
+            post_feedforward_layernorm_2,
+            experts_gate_up_pool,
+            experts_down_pool,
+            gate_up_bytes: _,
+            down_bytes: _,
+            experts: _,
+            experts_gate_up_ptrs,
+            experts_down_ptrs,
+        } = moe;
+        // Reverse construction order: pointer tables, pools, norms, scales,
+        // and the router weight. Expert descriptors are borrowed pool views.
+        let _ = gpu.free_tensor(experts_down_ptrs);
+        let _ = gpu.free_tensor(experts_gate_up_ptrs);
+        let _ = gpu.free_tensor(experts_down_pool);
+        let _ = gpu.free_tensor(experts_gate_up_pool);
+        let _ = gpu.free_tensor(post_feedforward_layernorm_2);
+        let _ = gpu.free_tensor(post_feedforward_layernorm_1);
+        let _ = gpu.free_tensor(pre_feedforward_layernorm_2);
+        let _ = gpu.free_tensor(per_expert_scale);
+        let _ = gpu.free_tensor(router_scale);
+        router_proj.free_all(gpu);
     }
 }
+/// Sum actual bytes held by a lowered KV cache's owning tensors.
+pub fn kv_owner_bytes(kv: &llama::KvCache) -> usize {
+    kv.k_gpu
+        .iter()
+        .chain(kv.v_gpu.iter())
+        .chain(kv.k_scales.iter())
+        .chain(kv.v_scales.iter())
+        .map(tensor_owner_bytes)
+        .chain(kv.givens_cos.iter().map(tensor_owner_bytes))
+        .chain(kv.givens_sin.iter().map(tensor_owner_bytes))
+        .sum()
+}
+
 
 // ─── Loading helpers ───────────────────────────────────────────────────
 
@@ -1125,10 +1562,78 @@ fn load_gemma4_weight(
     Ok(wt)
 }
 
+/// Load all experts of one MoE projection into a single owning pool.
+fn load_moe_pool(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    n_exp: usize,
+    base: &str,
+) -> HipResult<(GpuTensor, DType, usize)> {
+    // First pass: read first expert to learn quant_type + bytes-per-expert.
+    let first_name = format!("{p}.experts.0.{base}.weight");
+    let (first_info, first_data) = hfq.tensor_data(&first_name).ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {first_name}"))
+    })?;
+    let bytes_per_expert = first_data.len();
+    let dtype = match first_info.quant_type {
+        3 => DType::Q8_0,
+        4 => DType::Q4K,
+        6 => DType::HFQ4G256,
+        7 => DType::HFQ4G128,
+        8 => DType::HFQ6G256,
+        9 => DType::HFQ2G256,
+        10 => DType::HFQ2G128,
+        11 => DType::HFQ3G256,
+        12 => DType::HFQ3G128,
+        // MQ4G256 (13) and MG4G256 (30) share dispatch.
+        13 | 30 => DType::MQ4G256,
+        14 => DType::MQ8G256,
+        15 => DType::MQ6G256,
+        17 => DType::MQ3G256,
+        18 => DType::MQ2G256,
+        qt => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("unsupported MoE expert quant_type {qt} for {first_name}"),
+            ))
+        }
+    };
+    // Concat all experts' bytes into one CPU buffer, upload once.
+    let mut concat = Vec::with_capacity(bytes_per_expert * n_exp);
+    concat.extend_from_slice(first_data);
+    for x in 1..n_exp {
+        let name = format!("{p}.experts.{x}.{base}.weight");
+        let (info, data) = hfq.tensor_data(&name).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {name}"))
+        })?;
+        if data.len() != bytes_per_expert {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MoE expert {name} byte size mismatch ({} vs {bytes_per_expert})",
+                    data.len()
+                ),
+            ));
+        }
+        if info.quant_type != first_info.quant_type {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MoE expert {name} quant_type mismatch ({} vs {})",
+                    info.quant_type, first_info.quant_type
+                ),
+            ));
+        }
+        concat.extend_from_slice(data);
+    }
+    let pool = gpu.upload_raw(&concat, &[concat.len()])?;
+    Ok((pool, dtype, bytes_per_expert))
+}
+
 /// Load the MoE branch weights for a single Gemma 4 MoE layer (26B-A4B).
-/// Builds 128 expert WeightTensors aliased into per-layer gate_up / down
-/// pool allocations. Pooling avoids the small-allocation HIP fragmentation
-/// that OOM'd at layer 25 on the pre-pool path (origin/gemma4 commit log).
+/// Builds expert `WeightTensor`s as non-owning views into two transaction-owned
+/// pools. The local owner transaction frees every partial stage on error.
 fn load_moe_layer_extras(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1138,13 +1643,21 @@ fn load_moe_layer_extras(
     let n_exp = config.num_experts;
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
+    let mut txn = LoweredOwnerTransaction::new(gpu);
 
-    let router_proj = load_gemma4_weight(hfq, gpu, &format!("{p}.router.proj.weight"), n_exp, dim)?;
-    // NOTE: `router.scale` and `router.per_expert_scale` ship WITHOUT the
-    // `.weight` suffix in HF's 26B-A4B safetensors (so `should_quantize`
-    // returns false → stored as F16). Loader uses bare paths.
-    let router_scale = load_gemma4_norm(hfq, gpu, &format!("{p}.router.scale"), dim)?;
-    let per_expert_scale_host = load_f32_vec(hfq, &format!("{p}.router.per_expert_scale"), n_exp)?;
+    let router_proj = {
+        let weight =
+            load_gemma4_weight(hfq, txn.gpu_mut(), &format!("{p}.router.proj.weight"), n_exp, dim)?;
+        txn.push_weight(weight)
+    };
+    // NOTE: `router.scale` and `per_expert_scale` ship WITHOUT the `.weight`
+    // suffix in HF's 26B-A4B safetensors, so the loader uses bare paths.
+    let router_scale = {
+        let tensor = load_gemma4_norm(hfq, txn.gpu_mut(), &format!("{p}.router.scale"), dim)?;
+        txn.push_tensor(tensor)
+    };
+    let per_expert_scale_host =
+        load_f32_vec(hfq, &format!("{p}.router.per_expert_scale"), n_exp)?;
     let per_expert_scale = {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -1152,100 +1665,55 @@ fn load_moe_layer_extras(
                 per_expert_scale_host.len() * 4,
             )
         };
-        gpu.upload_raw(bytes, &[n_exp])?
+        let tensor = txn.gpu_mut().upload_raw(bytes, &[n_exp])?;
+        txn.push_tensor(tensor)
     };
-    let pre_feedforward_layernorm_2 = load_gemma4_norm(
-        hfq,
-        gpu,
-        &format!("{p}.pre_feedforward_layernorm_2.weight"),
-        dim,
-    )?;
-    let post_feedforward_layernorm_1 = load_gemma4_norm(
-        hfq,
-        gpu,
-        &format!("{p}.post_feedforward_layernorm_1.weight"),
-        dim,
-    )?;
-    let post_feedforward_layernorm_2 = load_gemma4_norm(
-        hfq,
-        gpu,
-        &format!("{p}.post_feedforward_layernorm_2.weight"),
-        dim,
-    )?;
-
-    // Pool all `n_experts` weights of one kind into a single GPU allocation.
-    // 128 experts × 2 kinds × 30 layers = 7680 separate hipMalloc on the
-    // unpooled path fragmented the HIP heap and OOM'd at layer ~25 even
-    // when total memory fit. Pool collapses that to 60 allocs.
-    let load_pool = |gpu: &mut Gpu, base: &str| -> HipResult<(GpuTensor, DType, usize)> {
-        // First pass: read first expert to learn quant_type + bytes-per-expert.
-        let first_name = format!("{p}.experts.0.{base}.weight");
-        let (first_info, first_data) = hfq.tensor_data(&first_name).ok_or_else(|| {
-            hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {first_name}"))
-        })?;
-        let bytes_per_expert = first_data.len();
-        let dtype = match first_info.quant_type {
-            3 => DType::Q8_0,
-            4 => DType::Q4K,
-            6 => DType::HFQ4G256,
-            7 => DType::HFQ4G128,
-            8 => DType::HFQ6G256,
-            9 => DType::HFQ2G256,
-            10 => DType::HFQ2G128,
-            11 => DType::HFQ3G256,
-            12 => DType::HFQ3G128,
-            // MQ4G256 (13) and MG4G256 (30) share dispatch.
-            13 | 30 => DType::MQ4G256,
-            14 => DType::MQ8G256,
-            15 => DType::MQ6G256,
-            17 => DType::MQ3G256,
-            18 => DType::MQ2G256,
-            qt => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    &format!("unsupported MoE expert quant_type {qt} for {first_name}"),
-                ))
-            }
-        };
-        // Concat all experts' bytes into one CPU buffer, upload once.
-        let mut concat = Vec::with_capacity(bytes_per_expert * n_exp);
-        concat.extend_from_slice(first_data);
-        for x in 1..n_exp {
-            let name = format!("{p}.experts.{x}.{base}.weight");
-            let (info, data) = hfq.tensor_data(&name).ok_or_else(|| {
-                hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {name}"))
-            })?;
-            if data.len() != bytes_per_expert {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    &format!(
-                        "MoE expert {name} byte size mismatch ({} vs {bytes_per_expert})",
-                        data.len()
-                    ),
-                ));
-            }
-            if info.quant_type != first_info.quant_type {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    &format!(
-                        "MoE expert {name} quant_type mismatch ({} vs {})",
-                        info.quant_type, first_info.quant_type
-                    ),
-                ));
-            }
-            concat.extend_from_slice(data);
-        }
-        let pool = gpu.upload_raw(&concat, &[concat.len()])?;
-        Ok((pool, dtype, bytes_per_expert))
+    let pre_feedforward_layernorm_2 = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.pre_feedforward_layernorm_2.weight"),
+            dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
+    let post_feedforward_layernorm_1 = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.post_feedforward_layernorm_1.weight"),
+            dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
+    let post_feedforward_layernorm_2 = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.post_feedforward_layernorm_2.weight"),
+            dim,
+        )?;
+        txn.push_tensor(tensor)
     };
 
-    let (gate_up_pool, gate_up_dtype, gate_up_bytes) = load_pool(gpu, "gate_up_proj")?;
-    let (down_pool, down_dtype, down_bytes) = load_pool(gpu, "down_proj")?;
+    let (gate_up_pool, gate_up_dtype, gate_up_bytes) = {
+        let (pool, dtype, bytes) =
+            load_moe_pool(hfq, txn.gpu_mut(), p, n_exp, "gate_up_proj")?;
+        (txn.push_tensor(pool), dtype, bytes)
+    };
+    let (down_pool, down_dtype, down_bytes) = {
+        let (pool, dtype, bytes) = load_moe_pool(hfq, txn.gpu_mut(), p, n_exp, "down_proj")?;
+        (txn.push_tensor(pool), dtype, bytes)
+    };
 
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gu_view = gate_up_pool.sub_offset(x * gate_up_bytes, gate_up_bytes);
-        let dn_view = down_pool.sub_offset(x * down_bytes, down_bytes);
+        let gu_view = txn
+            .tensor_ref(gate_up_pool)
+            .sub_offset(x * gate_up_bytes, gate_up_bytes);
+        let dn_view = txn
+            .tensor_ref(down_pool)
+            .sub_offset(x * down_bytes, down_bytes);
         experts.push(MoeExpertWeights {
             gate_up_proj: WeightTensor {
                 buf: gu_view,
@@ -1268,63 +1736,335 @@ fn load_moe_layer_extras(
         });
     }
 
-    // Build [n_exp] device tensors of u64 weight-base pointers — one for
-    // each pool. The indexed MoE kernels read these as
-    // `expert_ptrs[topk_indices[krank]]`, eliminating the per-token D2H
-    // sync of the legacy CPU per-expert loop. Pointers are stable for the
-    // model's lifetime (pool allocations don't move).
-    let gate_up_ptr_u64: Vec<u64> = experts
+    // Build [n_exp] device tensors of u64 weight-base pointers. Each u64 is
+    // represented by two f32 slots, matching the indexed-MoE kernel ABI.
+    let gate_up_ptr_bytes: Vec<u8> = experts
         .iter()
-        .map(|e| e.gate_up_proj.buf.buf.as_ptr() as u64)
+        .flat_map(|e| (e.gate_up_proj.buf.buf.as_ptr() as u64).to_ne_bytes())
         .collect();
-    let down_ptr_u64: Vec<u64> = experts
+    let down_ptr_bytes: Vec<u8> = experts
         .iter()
-        .map(|e| e.down_proj.buf.buf.as_ptr() as u64)
+        .flat_map(|e| (e.down_proj.buf.buf.as_ptr() as u64).to_ne_bytes())
         .collect();
-    let gate_up_ptr_bytes: Vec<u8> = gate_up_ptr_u64
-        .iter()
-        .flat_map(|p| p.to_ne_bytes())
-        .collect();
-    let down_ptr_bytes: Vec<u8> = down_ptr_u64.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    // Each u64 = 8 bytes = 2 f32 slots. The tensor sees [n_exp * 2]
-    // f32 entries; the kernel casts the backing buffer to u64* itself.
-    let experts_gate_up_ptrs = gpu.upload_raw(&gate_up_ptr_bytes, &[n_exp * 2])?;
-    let experts_down_ptrs = gpu.upload_raw(&down_ptr_bytes, &[n_exp * 2])?;
+    let experts_gate_up_ptrs = {
+        let tensor = txn
+            .gpu_mut()
+            .upload_raw(&gate_up_ptr_bytes, &[n_exp * 2])?;
+        txn.push_tensor(tensor)
+    };
+    let experts_down_ptrs = {
+        let tensor = txn
+            .gpu_mut()
+            .upload_raw(&down_ptr_bytes, &[n_exp * 2])?;
+        txn.push_tensor(tensor)
+    };
 
-    Ok(MoeLayerExtras {
-        router_proj,
-        router_scale,
-        per_expert_scale,
+    let result = MoeLayerExtras {
+        router_proj: txn.take_weight(router_proj),
+        router_scale: txn.take_tensor(router_scale),
+        per_expert_scale: txn.take_tensor(per_expert_scale),
         per_expert_scale_host,
-        pre_feedforward_layernorm_2,
-        post_feedforward_layernorm_1,
-        post_feedforward_layernorm_2,
-        experts_gate_up_pool: gate_up_pool,
-        experts_down_pool: down_pool,
+        pre_feedforward_layernorm_2: txn.take_tensor(pre_feedforward_layernorm_2),
+        post_feedforward_layernorm_1: txn.take_tensor(post_feedforward_layernorm_1),
+        post_feedforward_layernorm_2: txn.take_tensor(post_feedforward_layernorm_2),
+        experts_gate_up_pool: txn.take_tensor(gate_up_pool),
+        experts_down_pool: txn.take_tensor(down_pool),
         gate_up_bytes,
         down_bytes,
         experts,
-        experts_gate_up_ptrs,
-        experts_down_ptrs,
-    })
+        experts_gate_up_ptrs: txn.take_tensor(experts_gate_up_ptrs),
+        experts_down_ptrs: txn.take_tensor(experts_down_ptrs),
+    };
+    txn.commit();
+    Ok(result)
+}
+
+fn load_layer_weights(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    layer_idx: usize,
+    config: &Gemma4Config,
+) -> HipResult<LayerWeights> {
+    let mut txn = LoweredOwnerTransaction::new(gpu);
+    let (layer_scalar, layer_scalar_host) =
+        load_layer_scalar(hfq, txn.gpu_mut(), &format!("{p}.layer_scalar"))?;
+
+    let layer_scalar = txn.push_tensor(layer_scalar);
+    let moe = if config.enable_moe_block {
+        let loaded = load_moe_layer_extras(hfq, txn.gpu_mut(), p, config)?;
+        Some(txn.push_moe(loaded))
+    } else {
+        None
+    };
+
+    let input_layernorm = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.input_layernorm.weight"),
+            config.dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
+    let post_attention_layernorm = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.post_attention_layernorm.weight"),
+            config.dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
+    let pre_feedforward_layernorm = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.pre_feedforward_layernorm.weight"),
+            config.dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
+    let post_feedforward_layernorm = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.post_feedforward_layernorm.weight"),
+            config.dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
+
+    let layer = match config.layer_types[layer_idx] {
+        LayerType::Sliding => {
+            let hd = config.sliding_head_dim;
+            let kv_dim = config.sliding_n_kv_heads * hd;
+            let q_dim = config.n_heads * hd;
+            let q_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    q_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let k_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    kv_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let v_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    kv_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let o_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    config.dim,
+                    q_dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let q_norm = {
+                let tensor = load_gemma4_head_norm(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.q_norm.weight"),
+                    hd,
+                )?;
+                txn.push_tensor(tensor)
+            };
+            let k_norm = {
+                let tensor = load_gemma4_head_norm(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.k_norm.weight"),
+                    hd,
+                )?;
+                txn.push_tensor(tensor)
+            };
+            let gate_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let up_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.mlp.up_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let down_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.mlp.down_proj.weight"),
+                    config.dim,
+                    config.hidden_dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            LayerWeights::Sliding(SlidingLayerWeights {
+                input_layernorm: txn.take_tensor(input_layernorm),
+                post_attention_layernorm: txn.take_tensor(post_attention_layernorm),
+                pre_feedforward_layernorm: txn.take_tensor(pre_feedforward_layernorm),
+                post_feedforward_layernorm: txn.take_tensor(post_feedforward_layernorm),
+                layer_scalar: txn.take_tensor(layer_scalar),
+                layer_scalar_host,
+                q_proj: txn.take_weight(q_proj),
+                k_proj: txn.take_weight(k_proj),
+                v_proj: txn.take_weight(v_proj),
+                o_proj: txn.take_weight(o_proj),
+                q_norm: txn.take_tensor(q_norm),
+                k_norm: txn.take_tensor(k_norm),
+                gate_proj: txn.take_weight(gate_proj),
+                up_proj: txn.take_weight(up_proj),
+                down_proj: txn.take_weight(down_proj),
+                moe: moe.map(|id| txn.take_moe(id)),
+            })
+        }
+        LayerType::Full => {
+            let hd = config.full_head_dim;
+            let kv_dim = config.full_n_kv_heads * hd;
+            let q_dim = config.n_heads * hd;
+            let q_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    q_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let k_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    kv_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let o_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    config.dim,
+                    q_dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let q_norm = {
+                let tensor = load_gemma4_head_norm(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.q_norm.weight"),
+                    hd,
+                )?;
+                txn.push_tensor(tensor)
+            };
+            let k_norm = {
+                let tensor = load_gemma4_head_norm(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.self_attn.k_norm.weight"),
+                    hd,
+                )?;
+                txn.push_tensor(tensor)
+            };
+            let gate_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let up_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.mlp.up_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            let down_proj = {
+                let weight = load_gemma4_weight(
+                    hfq,
+                    txn.gpu_mut(),
+                    &format!("{p}.mlp.down_proj.weight"),
+                    config.dim,
+                    config.hidden_dim,
+                )?;
+                txn.push_weight(weight)
+            };
+            // Full layers deliberately have no v_proj: V is the pre-k_norm
+            // output of k_proj, renormalized without a learned v weight.
+            LayerWeights::Full(FullLayerWeights {
+                input_layernorm: txn.take_tensor(input_layernorm),
+                post_attention_layernorm: txn.take_tensor(post_attention_layernorm),
+                pre_feedforward_layernorm: txn.take_tensor(pre_feedforward_layernorm),
+                post_feedforward_layernorm: txn.take_tensor(post_feedforward_layernorm),
+                layer_scalar: txn.take_tensor(layer_scalar),
+                layer_scalar_host,
+                q_proj: txn.take_weight(q_proj),
+                k_proj: txn.take_weight(k_proj),
+                o_proj: txn.take_weight(o_proj),
+                q_norm: txn.take_tensor(q_norm),
+                k_norm: txn.take_tensor(k_norm),
+                gate_proj: txn.take_weight(gate_proj),
+                up_proj: txn.take_weight(up_proj),
+                down_proj: txn.take_weight(down_proj),
+                moe: moe.map(|id| txn.take_moe(id)),
+            })
+        }
+    };
+    txn.commit();
+    Ok(layer)
 }
 
 /// Load Gemma 4 text model weights from an HFQ file.
 ///
-/// Design notes:
-///   - `lm_head` aliases the `embed_tokens` GPU bytes (tied weights). We upload
-///     the embed data once and create a second WeightTensor whose DeviceBuffer
-///     points at the same allocation via `buf.alias()`. `Gemma4Weights::free_gpu`
-///     skips freeing the LM head to avoid a double-free.
-///   - Vision tensors are skipped here — Phase 7 `gemma4_vision::load_weights`
-///     picks those up from the same HFQ file in a separate pass.
-///   - The `v_norm_ones_full` ones-filled scratch buffer is populated here so
-///     the forward pass never has to manage one-time init state.
+/// Every uploaded owner remains in a constructor-local transaction until the
+/// complete `Gemma4Weights` value is ready. Tied LM-head and MoE expert views
+/// are borrowed aliases and are never registered as independent owners.
 pub fn load_weights(
     hfq: &mut HfqFile,
     config: &Gemma4Config,
     gpu: &mut Gpu,
 ) -> HipResult<Gemma4Weights> {
+    let mut txn = LoweredOwnerTransaction::new(gpu);
     eprintln!("gemma4: loading embed_tokens...");
     let embed_name = "model.language_model.embed_tokens.weight";
     let (embed_info, embed_data) = hfq
@@ -1333,24 +2073,18 @@ pub fn load_weights(
     let (embed_tokens, embd_format) = match embed_info.quant_type {
         3 => {
             eprintln!("  (Q8_0 / Q8F16, {} MB)", embed_data.len() / 1_000_000);
-            (
-                gpu.upload_raw(embed_data, &[embed_data.len()])?,
-                EmbeddingFormat::Q8_0,
-            )
+            let tensor = txn.gpu_mut().upload_raw(embed_data, &[embed_data.len()])?;
+            (txn.push_tensor(tensor), EmbeddingFormat::Q8_0)
         }
         6 => {
             eprintln!("  (HFQ4-G256, {} MB)", embed_data.len() / 1_000_000);
-            (
-                gpu.upload_raw(embed_data, &[embed_data.len()])?,
-                EmbeddingFormat::HFQ4G256,
-            )
+            let tensor = txn.gpu_mut().upload_raw(embed_data, &[embed_data.len()])?;
+            (txn.push_tensor(tensor), EmbeddingFormat::HFQ4G256)
         }
         7 => {
             eprintln!("  (HFQ4-G128, {} MB)", embed_data.len() / 1_000_000);
-            (
-                gpu.upload_raw(embed_data, &[embed_data.len()])?,
-                EmbeddingFormat::HFQ4G128,
-            )
+            let tensor = txn.gpu_mut().upload_raw(embed_data, &[embed_data.len()])?;
+            (txn.push_tensor(tensor), EmbeddingFormat::HFQ4G128)
         }
         1 => {
             eprintln!("  (F16 → F32)");
@@ -1358,10 +2092,10 @@ pub fn load_weights(
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
-            (
-                gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
-                EmbeddingFormat::F32,
-            )
+            let tensor = txn
+                .gpu_mut()
+                .upload_f32(&f32_data, &[config.vocab_size, config.dim])?;
+            (txn.push_tensor(tensor), EmbeddingFormat::F32)
         }
         16 => {
             eprintln!("  (BF16 → F32)");
@@ -1369,10 +2103,10 @@ pub fn load_weights(
                 .chunks_exact(2)
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect();
-            (
-                gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
-                EmbeddingFormat::F32,
-            )
+            let tensor = txn
+                .gpu_mut()
+                .upload_f32(&f32_data, &[config.vocab_size, config.dim])?;
+            (txn.push_tensor(tensor), EmbeddingFormat::F32)
         }
         2 => {
             // F32 raw (oracle / --format f32 passthrough .hfq).
@@ -1381,10 +2115,10 @@ pub fn load_weights(
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            (
-                gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
-                EmbeddingFormat::F32,
-            )
+            let tensor = txn
+                .gpu_mut()
+                .upload_f32(&f32_data, &[config.vocab_size, config.dim])?;
+            (txn.push_tensor(tensor), EmbeddingFormat::F32)
         }
         qt => {
             return Err(hip_bridge::HipError::new(
@@ -1394,10 +2128,10 @@ pub fn load_weights(
         }
     };
 
-    // Tied LM head: WeightTensor whose buffer aliases the embed allocation.
-    // free_gpu skips freeing this — embed_tokens owns the bytes.
+    // Tied LM head: a non-owning alias of the transaction-owned embedding.
     let lm_head = {
-        let alias_buf = unsafe { embed_tokens.buf.alias() };
+        let embed = txn.tensor_ref(embed_tokens);
+        let alias_buf = unsafe { embed.buf.alias() };
         let dtype = match embd_format {
             EmbeddingFormat::Q8_0 => DType::Q8_0,
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
@@ -1407,7 +2141,7 @@ pub fn load_weights(
         };
         let alias_tensor = GpuTensor {
             buf: alias_buf,
-            shape: embed_tokens.shape.clone(),
+            shape: embed.shape.clone(),
             dtype,
         };
         WeightTensor {
@@ -1422,229 +2156,59 @@ pub fn load_weights(
     };
 
     eprintln!("gemma4: loading final norm...");
-    let final_norm = load_gemma4_norm(hfq, gpu, "model.language_model.norm.weight", config.dim)?;
+    let final_norm = {
+        let tensor = load_gemma4_norm(
+            hfq,
+            txn.gpu_mut(),
+            "model.language_model.norm.weight",
+            config.dim,
+        )?;
+        txn.push_tensor(tensor)
+    };
 
     eprintln!("gemma4: loading {} layers...", config.n_layers);
-    let mut layers = Vec::with_capacity(config.n_layers);
+    let mut layer_ids = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
         let p = format!("model.language_model.layers.{i}");
-        match config.layer_types[i] {
-            LayerType::Sliding => {
-                let hd = config.sliding_head_dim;
-                let kv_dim = config.sliding_n_kv_heads * hd;
-                let q_dim = config.n_heads * hd;
-                let (layer_scalar, layer_scalar_host) =
-                    load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
-                if i == 0 {
-                    eprintln!("[gemma4] L0 sliding layer_scalar = {layer_scalar_host}");
-                }
-                let moe = if config.enable_moe_block {
-                    Some(load_moe_layer_extras(hfq, gpu, &p, config)?)
-                } else {
-                    None
-                };
-                layers.push(LayerWeights::Sliding(SlidingLayerWeights {
-                    input_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.input_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    post_attention_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.post_attention_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    pre_feedforward_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.pre_feedforward_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    post_feedforward_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.post_feedforward_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    layer_scalar,
-                    layer_scalar_host,
-                    q_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.q_proj.weight"),
-                        q_dim,
-                        config.dim,
-                    )?,
-                    k_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.k_proj.weight"),
-                        kv_dim,
-                        config.dim,
-                    )?,
-                    v_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.v_proj.weight"),
-                        kv_dim,
-                        config.dim,
-                    )?,
-                    o_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.o_proj.weight"),
-                        config.dim,
-                        q_dim,
-                    )?,
-                    q_norm: load_gemma4_head_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.q_norm.weight"),
-                        hd,
-                    )?,
-                    k_norm: load_gemma4_head_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.k_norm.weight"),
-                        hd,
-                    )?,
-                    gate_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.gate_proj.weight"),
-                        config.hidden_dim,
-                        config.dim,
-                    )?,
-                    up_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.up_proj.weight"),
-                        config.hidden_dim,
-                        config.dim,
-                    )?,
-                    down_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.down_proj.weight"),
-                        config.dim,
-                        config.hidden_dim,
-                    )?,
-                    moe,
-                }));
-            }
-            LayerType::Full => {
-                let hd = config.full_head_dim;
-                let kv_dim = config.full_n_kv_heads * hd;
-                let q_dim = config.n_heads * hd;
-                let (layer_scalar, layer_scalar_host) =
-                    load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
-                if i <= 6 {
-                    eprintln!("[gemma4] L{i} full layer_scalar = {layer_scalar_host}");
-                }
-                let moe = if config.enable_moe_block {
-                    Some(load_moe_layer_extras(hfq, gpu, &p, config)?)
-                } else {
-                    None
-                };
-                layers.push(LayerWeights::Full(FullLayerWeights {
-                    input_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.input_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    post_attention_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.post_attention_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    pre_feedforward_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.pre_feedforward_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    post_feedforward_layernorm: load_gemma4_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.post_feedforward_layernorm.weight"),
-                        config.dim,
-                    )?,
-                    layer_scalar,
-                    layer_scalar_host,
-                    q_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.q_proj.weight"),
-                        q_dim,
-                        config.dim,
-                    )?,
-                    k_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.k_proj.weight"),
-                        kv_dim,
-                        config.dim,
-                    )?,
-                    // no v_proj on full layers — V reuses k_proj's pre-norm output.
-                    o_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.o_proj.weight"),
-                        config.dim,
-                        q_dim,
-                    )?,
-                    q_norm: load_gemma4_head_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.q_norm.weight"),
-                        hd,
-                    )?,
-                    k_norm: load_gemma4_head_norm(
-                        hfq,
-                        gpu,
-                        &format!("{p}.self_attn.k_norm.weight"),
-                        hd,
-                    )?,
-                    // no v_norm weight — v_norm is no-scale (ones buffer passed at decode time).
-                    gate_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.gate_proj.weight"),
-                        config.hidden_dim,
-                        config.dim,
-                    )?,
-                    up_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.up_proj.weight"),
-                        config.hidden_dim,
-                        config.dim,
-                    )?,
-                    down_proj: load_gemma4_weight(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.down_proj.weight"),
-                        config.dim,
-                        config.hidden_dim,
-                    )?,
-                    moe,
-                }));
-            }
+        let layer = load_layer_weights(hfq, txn.gpu_mut(), &p, i, config)?;
+        if i == 0 {
+            let scalar = match &layer {
+                LayerWeights::Sliding(s) => s.layer_scalar_host,
+                LayerWeights::Full(f) => f.layer_scalar_host,
+            };
+            eprintln!(
+                "[gemma4] L{} {} layer_scalar = {}",
+                i,
+                match &layer {
+                    LayerWeights::Sliding(_) => "sliding",
+                    LayerWeights::Full(_) => "full",
+                },
+                scalar
+            );
+        } else if i <= 6 && matches!(layer, LayerWeights::Full(_)) {
+            let scalar = match &layer {
+                LayerWeights::Full(f) => f.layer_scalar_host,
+                LayerWeights::Sliding(_) => unreachable!(),
+            };
+            eprintln!("[gemma4] L{i} full layer_scalar = {scalar}");
         }
+        layer_ids.push(txn.push_layer(layer));
     }
     eprintln!("gemma4: loaded all {} layers", config.n_layers);
 
-    Ok(Gemma4Weights {
-        embed_tokens,
+    let layers = layer_ids
+        .into_iter()
+        .map(|id| txn.take_layer(id))
+        .collect();
+    let weights = Gemma4Weights {
+        embed_tokens: txn.take_tensor(embed_tokens),
         embd_format,
         lm_head,
-        final_norm,
+        final_norm: txn.take_tensor(final_norm),
         layers,
-    })
+    };
+    txn.commit();
+    Ok(weights)
 }
 
 /// One-time init for the scratch buffers that must hold a constant value
@@ -1799,47 +2363,41 @@ pub struct Gemma4Scratch {
 
 impl Gemma4Scratch {
     pub fn new(gpu: &mut Gpu, config: &Gemma4Config, _max_prefill: usize) -> HipResult<Self> {
+        let mut txn = LoweredOwnerTransaction::new(gpu);
+        macro_rules! alloc {
+            ($name:ident, $shape:expr, $dtype:expr) => {
+                let tensor = txn.gpu_mut().zeros($shape, $dtype)?;
+                let $name = txn.push_tensor(tensor);
+            };
+        }
+
         let dim = config.dim;
         let q_dim =
             (config.n_heads * config.sliding_head_dim).max(config.n_heads * config.full_head_dim);
         let kv_dim = (config.sliding_n_kv_heads * config.sliding_head_dim)
             .max(config.full_n_kv_heads * config.full_head_dim);
 
-        let x = gpu.zeros(&[dim], DType::F32)?;
-        let residual = gpu.zeros(&[dim], DType::F32)?;
-        let tmp = gpu.zeros(&[dim], DType::F32)?;
+        alloc!(x, &[dim], DType::F32);
+        alloc!(residual, &[dim], DType::F32);
+        alloc!(tmp, &[dim], DType::F32);
+        let pos_buf = {
+            let buffer = txn.gpu_mut().hip.malloc(4)?;
+            txn.push_buffer(buffer)
+        };
+        alloc!(q, &[q_dim], DType::F32);
+        alloc!(k, &[kv_dim], DType::F32);
+        alloc!(v, &[kv_dim], DType::F32);
+        alloc!(attn_out, &[q_dim], DType::F32);
+        alloc!(gate_ffn, &[config.hidden_dim], DType::F32);
+        alloc!(up_ffn, &[config.hidden_dim], DType::F32);
+        alloc!(ffn_hidden, &[config.hidden_dim], DType::F32);
+        alloc!(ffn_out, &[dim], DType::F32);
+        alloc!(logits, &[config.vocab_size], DType::F32);
+        alloc!(sample_buf, &[2], DType::F32);
+        alloc!(repeat_buf, &[1024], DType::F32);
 
-        let pos_buf = gpu.hip.malloc(4)?;
-
-        let q = gpu.zeros(&[q_dim], DType::F32)?;
-        let k = gpu.zeros(&[kv_dim], DType::F32)?;
-        let v = gpu.zeros(&[kv_dim], DType::F32)?;
-        let attn_out = gpu.zeros(&[q_dim], DType::F32)?;
-
-        let gate_ffn = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        let up_ffn = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        let ffn_hidden = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        let ffn_out = gpu.zeros(&[dim], DType::F32)?;
-
-        let logits = gpu.zeros(&[config.vocab_size], DType::F32)?;
-        let sample_buf = gpu.zeros(&[2], DType::F32)?;
-        let repeat_buf = gpu.zeros(&[1024], DType::F32)?;
-
-        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
-        // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
-        // sliding-layer dispatches use part of the buffer, full-layer dispatches
-        // use all of it.
-        //
-        // Default 32k. The branch name "gemma4-128k-ring-buffer" describes the
-        // sliding-window code path (sliding KV is ring-buffered at sliding_window
-        // = 1024 slots regardless of context length). The FULL-attention layers
-        // (5 of 30 in 26B-A4B-it) still allocate `max_kv_seq` slots — those
-        // layers are NOT ring-buffered. At 26B-A4B-it asym3 sizes the full KV
-        // budget for 128k is ~970 MB (5 layers × 2 KV heads × 131072 tokens ×
-        // 740 B/head), which fits comfortably on a 17 GB card alongside the
-        // 14.8 GB model weights. Users who want the full 128k context set
-        // `HIPFIRE_KV_SEQ=131072` at daemon launch. Default stays at 32k to
-        // match the cross-arch baseline.
+        // Flash partials are sized for full attention, which is the larger of
+        // the two layer shapes. Keep the existing environment range.
         const FALLBACK_KV_SEQ: usize = 32768;
         const TILE_SIZE: usize = 128;
         let max_kv_seq: usize = std::env::var("HIPFIRE_KV_SEQ")
@@ -1849,89 +2407,246 @@ impl Gemma4Scratch {
             .unwrap_or(FALLBACK_KV_SEQ);
         let max_tiles_full = (max_kv_seq + TILE_SIZE - 1) / TILE_SIZE;
         let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
-        let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
+        alloc!(flash_partials, &[flash_partials_sz], DType::F32);
 
-        // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
-        // tables that were allocated here but never read by any kernel.
-        // `rope_f32` and `rope_partial_halved_f32` compute cos/sin inline
-        // from `pos_buf[0]` + `freq_base`; the lookup-table path was wired
-        // but never finished. The tables ate 4 * max_kv_seq * head_dim
-        // floats — 768 MB at max_kv_seq=131072 — which pushed the full KV
-        // cache (~970 MB at 128k) out of VRAM into GTT (PCIe-paged system
-        // RAM), causing attention reads to take a slow path.
-
-        // v_norm ones — populated on first use in the forward pass.
-        // Allocated up to the LARGER of sliding_head_dim and full_head_dim
-        // since both sliding and full apply no-scale v_norm (the post-rebase
-        // fix added v_norm to sliding_layer_decode; sliding head_dim=256,
-        // full head_dim=512 → max=512 covers both).
         let v_norm_max = config.sliding_head_dim.max(config.full_head_dim);
-        let v_norm_ones_full = gpu.zeros(&[v_norm_max], DType::F32)?;
+        alloc!(v_norm_ones_full, &[v_norm_max], DType::F32);
 
-        // MoE scratch. Allocated unconditionally because the buffers are tiny
-        // relative to the model; zero-sized on dense models would just complicate
-        // the dispatch path. Sized for 26B-A4B: n_experts=128, top_k=8, mi=704.
+        // MoE scratch is intentionally allocated for dense models too; the
+        // buffers are small and this keeps the forward path branch-free.
         let n_exp = config.num_experts.max(1);
         let mi = config.moe_intermediate_size.max(1);
         let k_top = config.top_k_experts.max(1);
-        let moe_cur_mlp = gpu.zeros(&[dim], DType::F32)?;
-        let moe_pre2 = gpu.zeros(&[dim], DType::F32)?;
-        let moe_router_in = gpu.zeros(&[dim], DType::F32)?;
-        let moe_router_logits = gpu.zeros(&[n_exp], DType::F32)?;
-        let moe_topk_indices = gpu.zeros(&[k_top], DType::F32)?;
-        let moe_topk_weights = gpu.zeros(&[k_top], DType::F32)?;
-        let moe_cur_moe = gpu.zeros(&[dim], DType::F32)?;
-        let moe_expert_gate_up = gpu.zeros(&[2 * mi], DType::F32)?;
-        let moe_expert_hidden = gpu.zeros(&[mi], DType::F32)?;
-        let moe_expert_out = gpu.zeros(&[dim], DType::F32)?;
+        alloc!(moe_cur_mlp, &[dim], DType::F32);
+        alloc!(moe_pre2, &[dim], DType::F32);
+        alloc!(moe_router_in, &[dim], DType::F32);
+        alloc!(moe_router_logits, &[n_exp], DType::F32);
+        alloc!(moe_topk_indices, &[k_top], DType::F32);
+        alloc!(moe_topk_weights, &[k_top], DType::F32);
+        alloc!(moe_cur_moe, &[dim], DType::F32);
+        alloc!(moe_expert_gate_up, &[2 * mi], DType::F32);
+        alloc!(moe_expert_hidden, &[mi], DType::F32);
+        alloc!(moe_expert_out, &[dim], DType::F32);
+        alloc!(moe_pre2_rot, &[dim], DType::F32);
+        alloc!(moe_expert_gate_batch, &[k_top * mi], DType::F32);
+        alloc!(moe_expert_up_batch, &[k_top * mi], DType::F32);
+        alloc!(moe_expert_hidden_batch, &[k_top * mi], DType::F32);
 
-        // Indexed-MoE scratch (k_top fixed at 8 by the kernel).
-        let moe_pre2_rot = gpu.zeros(&[dim], DType::F32)?;
-        let moe_expert_gate_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
-        let moe_expert_up_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
-        let moe_expert_hidden_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
-
-        // Prefill-batch scratch (N tokens at once). Larger batches expose
-        // more concurrent GPU work — total batch scratch ≈ N*0.16 MB.
         const MAX_PREFILL_BATCH: usize = 128;
-        let pb_attn_out = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_ffn_out = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_pre2 = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_pre2_rot = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_router_in = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_router_logits = gpu.zeros(&[MAX_PREFILL_BATCH, n_exp], DType::F32)?;
-        let pb_moe_topk_indices = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        let pb_moe_topk_weights = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        // Routing-bucket scratch (Phase B). expert_offsets has n_exp+1 entries.
-        // expert_token_list has one entry per (token, krank) pair = N × k_top.
-        let pb_moe_expert_offsets = gpu.zeros(&[n_exp + 1], DType::F32)?; // i32-typed slots
-        let pb_moe_expert_token_list = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        let pb_moe_gate_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_up_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_hidden_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_cur_moe = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_cur_mlp = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_residual = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_tmp = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        // Sized for max across sliding/full per-token vector dims.
-        // q_dim_max = n_heads * max(sliding_head_dim, full_head_dim)
+        alloc!(pb_attn_out, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_ffn_out, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_moe_pre2, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_moe_pre2_rot, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_moe_router_in, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(
+            pb_moe_router_logits,
+            &[MAX_PREFILL_BATCH, n_exp],
+            DType::F32
+        );
+        alloc!(
+            pb_moe_topk_indices,
+            &[MAX_PREFILL_BATCH, k_top],
+            DType::F32
+        );
+        alloc!(
+            pb_moe_topk_weights,
+            &[MAX_PREFILL_BATCH, k_top],
+            DType::F32
+        );
+        alloc!(pb_moe_expert_offsets, &[n_exp + 1], DType::F32);
+        alloc!(
+            pb_moe_expert_token_list,
+            &[MAX_PREFILL_BATCH, k_top],
+            DType::F32
+        );
+        alloc!(
+            pb_moe_gate_batch,
+            &[MAX_PREFILL_BATCH, k_top * mi],
+            DType::F32
+        );
+        alloc!(
+            pb_moe_up_batch,
+            &[MAX_PREFILL_BATCH, k_top * mi],
+            DType::F32
+        );
+        alloc!(
+            pb_moe_hidden_batch,
+            &[MAX_PREFILL_BATCH, k_top * mi],
+            DType::F32
+        );
+        alloc!(pb_moe_cur_moe, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_moe_cur_mlp, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_residual, &[MAX_PREFILL_BATCH, dim], DType::F32);
+        alloc!(pb_tmp, &[MAX_PREFILL_BATCH, dim], DType::F32);
         let q_dim_max = config.n_heads * config.sliding_head_dim.max(config.full_head_dim);
         let kv_dim_max = (config.sliding_n_kv_heads * config.sliding_head_dim)
             .max(config.full_n_kv_heads * config.full_head_dim);
-        let pb_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
-        let pb_attn_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
-        let pb_flash_partials = gpu.zeros(&[MAX_PREFILL_BATCH * flash_partials_sz], DType::F32)?;
-        let pb_k = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
-        let pb_v = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
-        let pb_gate = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_up = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_ffn_hidden = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_positions = gpu.zeros(&[MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
-                                                                         // BF16 staging for calibration MFMA: persistent, sized once.
+        alloc!(pb_q, &[MAX_PREFILL_BATCH, q_dim_max], DType::F32);
+        alloc!(pb_attn_q, &[MAX_PREFILL_BATCH, q_dim_max], DType::F32);
+        alloc!(
+            pb_flash_partials,
+            &[MAX_PREFILL_BATCH * flash_partials_sz],
+            DType::F32
+        );
+        alloc!(pb_k, &[MAX_PREFILL_BATCH, kv_dim_max], DType::F32);
+        alloc!(pb_v, &[MAX_PREFILL_BATCH, kv_dim_max], DType::F32);
+        alloc!(pb_gate, &[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32);
+        alloc!(pb_up, &[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32);
+        alloc!(
+            pb_ffn_hidden,
+            &[MAX_PREFILL_BATCH, config.hidden_dim],
+            DType::F32
+        );
+        alloc!(pb_positions, &[MAX_PREFILL_BATCH], DType::F32);
         let max_k_bf16 = config.dim.max(config.hidden_dim);
-        let pb_bf16 = gpu.zeros(&[MAX_PREFILL_BATCH * max_k_bf16], DType::BF16)?;
+        alloc!(
+            pb_bf16,
+            &[MAX_PREFILL_BATCH * max_k_bf16],
+            DType::BF16
+        );
 
-        Ok(Gemma4Scratch {
+        let scratch = Gemma4Scratch {
+            x: txn.take_tensor(x),
+            residual: txn.take_tensor(residual),
+            tmp: txn.take_tensor(tmp),
+            pos_buf: txn.take_buffer(pos_buf),
+            q: txn.take_tensor(q),
+            k: txn.take_tensor(k),
+            v: txn.take_tensor(v),
+            attn_out: txn.take_tensor(attn_out),
+            gate_ffn: txn.take_tensor(gate_ffn),
+            up_ffn: txn.take_tensor(up_ffn),
+            ffn_hidden: txn.take_tensor(ffn_hidden),
+            ffn_out: txn.take_tensor(ffn_out),
+            logits: txn.take_tensor(logits),
+            sample_buf: txn.take_tensor(sample_buf),
+            repeat_buf: txn.take_tensor(repeat_buf),
+            flash_partials: txn.take_tensor(flash_partials),
+            v_norm_ones_full: txn.take_tensor(v_norm_ones_full),
+            moe_cur_mlp: txn.take_tensor(moe_cur_mlp),
+            moe_pre2: txn.take_tensor(moe_pre2),
+            moe_router_in: txn.take_tensor(moe_router_in),
+            moe_router_logits: txn.take_tensor(moe_router_logits),
+            moe_topk_indices: txn.take_tensor(moe_topk_indices),
+            moe_topk_weights: txn.take_tensor(moe_topk_weights),
+            moe_cur_moe: txn.take_tensor(moe_cur_moe),
+            moe_expert_gate_up: txn.take_tensor(moe_expert_gate_up),
+            moe_expert_hidden: txn.take_tensor(moe_expert_hidden),
+            moe_expert_out: txn.take_tensor(moe_expert_out),
+            moe_pre2_rot: txn.take_tensor(moe_pre2_rot),
+            moe_expert_gate_batch: txn.take_tensor(moe_expert_gate_batch),
+            moe_expert_up_batch: txn.take_tensor(moe_expert_up_batch),
+            moe_expert_hidden_batch: txn.take_tensor(moe_expert_hidden_batch),
+            max_prefill_batch: MAX_PREFILL_BATCH,
+            pb_attn_out: txn.take_tensor(pb_attn_out),
+            pb_ffn_out: txn.take_tensor(pb_ffn_out),
+            pb_moe_pre2: txn.take_tensor(pb_moe_pre2),
+            pb_moe_pre2_rot: txn.take_tensor(pb_moe_pre2_rot),
+            pb_moe_router_in: txn.take_tensor(pb_moe_router_in),
+            pb_moe_router_logits: txn.take_tensor(pb_moe_router_logits),
+            pb_moe_topk_indices: txn.take_tensor(pb_moe_topk_indices),
+            pb_moe_topk_weights: txn.take_tensor(pb_moe_topk_weights),
+            pb_moe_expert_offsets: txn.take_tensor(pb_moe_expert_offsets),
+            pb_moe_expert_token_list: txn.take_tensor(pb_moe_expert_token_list),
+            pb_moe_gate_batch: txn.take_tensor(pb_moe_gate_batch),
+            pb_moe_up_batch: txn.take_tensor(pb_moe_up_batch),
+            pb_moe_hidden_batch: txn.take_tensor(pb_moe_hidden_batch),
+            pb_moe_cur_moe: txn.take_tensor(pb_moe_cur_moe),
+            pb_moe_cur_mlp: txn.take_tensor(pb_moe_cur_mlp),
+            pb_residual: txn.take_tensor(pb_residual),
+            pb_tmp: txn.take_tensor(pb_tmp),
+            pb_q: txn.take_tensor(pb_q),
+            pb_attn_q: txn.take_tensor(pb_attn_q),
+            pb_flash_partials: txn.take_tensor(pb_flash_partials),
+            pb_k: txn.take_tensor(pb_k),
+            pb_v: txn.take_tensor(pb_v),
+            pb_gate: txn.take_tensor(pb_gate),
+            pb_up: txn.take_tensor(pb_up),
+            pb_ffn_hidden: txn.take_tensor(pb_ffn_hidden),
+            pb_positions: txn.take_tensor(pb_positions),
+            pb_bf16: txn.take_tensor(pb_bf16),
+        };
+        txn.commit();
+        Ok(scratch)
+    }
+
+    /// Release every GPU allocation owned by this scratch. Mirrors the
+    /// Qwen35Scratch / LlamaScratch pattern so `unload_model` in the daemon
+    /// can reclaim VRAM on idle eviction.
+    /// Sum actual capacities of all scratch owners, including the raw device
+    /// position buffer. This excludes no scratch allocation and performs no
+    /// logical-shape estimation.
+    pub fn owner_bytes(&self) -> usize {
+        [
+            &self.x,
+            &self.residual,
+            &self.tmp,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.attn_out,
+            &self.gate_ffn,
+            &self.up_ffn,
+            &self.ffn_hidden,
+            &self.ffn_out,
+            &self.logits,
+            &self.sample_buf,
+            &self.repeat_buf,
+            &self.flash_partials,
+            &self.v_norm_ones_full,
+            &self.moe_cur_mlp,
+            &self.moe_pre2,
+            &self.moe_router_in,
+            &self.moe_router_logits,
+            &self.moe_topk_indices,
+            &self.moe_topk_weights,
+            &self.moe_cur_moe,
+            &self.moe_expert_gate_up,
+            &self.moe_expert_hidden,
+            &self.moe_expert_out,
+            &self.moe_pre2_rot,
+            &self.moe_expert_gate_batch,
+            &self.moe_expert_up_batch,
+            &self.moe_expert_hidden_batch,
+            &self.pb_attn_out,
+            &self.pb_ffn_out,
+            &self.pb_moe_pre2,
+            &self.pb_moe_pre2_rot,
+            &self.pb_moe_router_in,
+            &self.pb_moe_router_logits,
+            &self.pb_moe_topk_indices,
+            &self.pb_moe_topk_weights,
+            &self.pb_moe_expert_offsets,
+            &self.pb_moe_expert_token_list,
+            &self.pb_moe_gate_batch,
+            &self.pb_moe_up_batch,
+            &self.pb_moe_hidden_batch,
+            &self.pb_moe_cur_moe,
+            &self.pb_moe_cur_mlp,
+            &self.pb_residual,
+            &self.pb_tmp,
+            &self.pb_q,
+            &self.pb_attn_q,
+            &self.pb_flash_partials,
+            &self.pb_k,
+            &self.pb_v,
+            &self.pb_gate,
+            &self.pb_up,
+            &self.pb_ffn_hidden,
+            &self.pb_positions,
+            &self.pb_bf16,
+        ]
+        .into_iter()
+        .map(|tensor| tensor_owner_bytes(tensor))
+        .sum::<usize>()
+            + self.pos_buf.size()
+    }
+
+    /// Release every GPU allocation owned by this scratch. The position
+    /// buffer is a raw HIP allocation and must be freed explicitly; it has no
+    /// Drop implementation.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Gemma4Scratch {
             x,
             residual,
             tmp,
@@ -1963,7 +2678,7 @@ impl Gemma4Scratch {
             moe_expert_gate_batch,
             moe_expert_up_batch,
             moe_expert_hidden_batch,
-            max_prefill_batch: MAX_PREFILL_BATCH,
+            max_prefill_batch: _,
             pb_attn_out,
             pb_ffn_out,
             pb_moe_pre2,
@@ -1991,71 +2706,72 @@ impl Gemma4Scratch {
             pb_ffn_hidden,
             pb_positions,
             pb_bf16,
-        })
-    }
+        } = self;
 
-    /// Release every GPU allocation owned by this scratch. Mirrors the
-    /// Qwen35Scratch / LlamaScratch pattern so `unload_model` in the daemon
-    /// can reclaim VRAM on idle eviction.
-    pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.x);
-        let _ = gpu.free_tensor(self.residual);
-        let _ = gpu.free_tensor(self.tmp);
-        // pos_buf is a DeviceBuffer, not a GpuTensor; rely on Drop.
-        let _ = gpu.free_tensor(self.q);
-        let _ = gpu.free_tensor(self.k);
-        let _ = gpu.free_tensor(self.v);
-        let _ = gpu.free_tensor(self.attn_out);
-        let _ = gpu.free_tensor(self.gate_ffn);
-        let _ = gpu.free_tensor(self.up_ffn);
-        let _ = gpu.free_tensor(self.ffn_hidden);
-        let _ = gpu.free_tensor(self.ffn_out);
-        let _ = gpu.free_tensor(self.logits);
-        let _ = gpu.free_tensor(self.sample_buf);
-        let _ = gpu.free_tensor(self.repeat_buf);
-        let _ = gpu.free_tensor(self.flash_partials);
-        let _ = gpu.free_tensor(self.v_norm_ones_full);
-        let _ = gpu.free_tensor(self.moe_cur_mlp);
-        let _ = gpu.free_tensor(self.moe_pre2);
-        let _ = gpu.free_tensor(self.moe_router_in);
-        let _ = gpu.free_tensor(self.moe_router_logits);
-        let _ = gpu.free_tensor(self.moe_topk_indices);
-        let _ = gpu.free_tensor(self.moe_topk_weights);
-        let _ = gpu.free_tensor(self.moe_cur_moe);
-        let _ = gpu.free_tensor(self.moe_expert_gate_up);
-        let _ = gpu.free_tensor(self.moe_expert_hidden);
-        let _ = gpu.free_tensor(self.moe_expert_out);
-        let _ = gpu.free_tensor(self.moe_pre2_rot);
-        let _ = gpu.free_tensor(self.moe_expert_gate_batch);
-        let _ = gpu.free_tensor(self.moe_expert_up_batch);
-        let _ = gpu.free_tensor(self.moe_expert_hidden_batch);
-        let _ = gpu.free_tensor(self.pb_attn_out);
-        let _ = gpu.free_tensor(self.pb_ffn_out);
-        let _ = gpu.free_tensor(self.pb_moe_pre2);
-        let _ = gpu.free_tensor(self.pb_moe_pre2_rot);
-        let _ = gpu.free_tensor(self.pb_moe_router_in);
-        let _ = gpu.free_tensor(self.pb_moe_router_logits);
-        let _ = gpu.free_tensor(self.pb_moe_topk_indices);
-        let _ = gpu.free_tensor(self.pb_moe_topk_weights);
-        let _ = gpu.free_tensor(self.pb_moe_expert_offsets);
-        let _ = gpu.free_tensor(self.pb_moe_expert_token_list);
-        let _ = gpu.free_tensor(self.pb_moe_gate_batch);
-        let _ = gpu.free_tensor(self.pb_moe_up_batch);
-        let _ = gpu.free_tensor(self.pb_moe_hidden_batch);
-        let _ = gpu.free_tensor(self.pb_moe_cur_moe);
-        let _ = gpu.free_tensor(self.pb_moe_cur_mlp);
-        let _ = gpu.free_tensor(self.pb_residual);
-        let _ = gpu.free_tensor(self.pb_tmp);
-        let _ = gpu.free_tensor(self.pb_q);
-        let _ = gpu.free_tensor(self.pb_attn_q);
-        let _ = gpu.free_tensor(self.pb_flash_partials);
-        let _ = gpu.free_tensor(self.pb_k);
-        let _ = gpu.free_tensor(self.pb_v);
-        let _ = gpu.free_tensor(self.pb_gate);
-        let _ = gpu.free_tensor(self.pb_up);
-        let _ = gpu.free_tensor(self.pb_ffn_hidden);
-        let _ = gpu.free_tensor(self.pb_positions);
-        let _ = gpu.free_tensor(self.pb_bf16);
+        // Reverse construction order, with the raw position buffer released
+        // at its construction boundary between `tmp` and `q`.
+        for tensor in [
+            pb_bf16,
+            pb_positions,
+            pb_ffn_hidden,
+            pb_up,
+            pb_gate,
+            pb_v,
+            pb_k,
+            pb_flash_partials,
+            pb_attn_q,
+            pb_q,
+            pb_tmp,
+            pb_residual,
+            pb_moe_cur_mlp,
+            pb_moe_cur_moe,
+            pb_moe_hidden_batch,
+            pb_moe_up_batch,
+            pb_moe_gate_batch,
+            pb_moe_expert_token_list,
+            pb_moe_expert_offsets,
+            pb_moe_topk_weights,
+            pb_moe_topk_indices,
+            pb_moe_router_logits,
+            pb_moe_router_in,
+            pb_moe_pre2_rot,
+            pb_moe_pre2,
+            pb_ffn_out,
+            pb_attn_out,
+            moe_expert_hidden_batch,
+            moe_expert_up_batch,
+            moe_expert_gate_batch,
+            moe_pre2_rot,
+            moe_expert_out,
+            moe_expert_hidden,
+            moe_expert_gate_up,
+            moe_cur_moe,
+            moe_topk_weights,
+            moe_topk_indices,
+            moe_router_logits,
+            moe_router_in,
+            moe_pre2,
+            moe_cur_mlp,
+            v_norm_ones_full,
+            flash_partials,
+            repeat_buf,
+            sample_buf,
+            logits,
+            ffn_out,
+            ffn_hidden,
+            up_ffn,
+            gate_ffn,
+            attn_out,
+            v,
+            k,
+            q,
+        ] {
+            let _ = gpu.free_tensor(tensor);
+        }
+        let _ = gpu.hip.free(pos_buf);
+        let _ = gpu.free_tensor(tmp);
+        let _ = gpu.free_tensor(residual);
+        let _ = gpu.free_tensor(x);
     }
 }
 
@@ -6123,7 +6839,10 @@ fn forward_scratch_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{Gemma4Cursor, GemmaRollback};
+    use super::{
+        allocation_telemetry_enabled_value, construction_fault_stages,
+        Gemma4AllocationTelemetry, Gemma4ConstructionStage, Gemma4Cursor, GemmaRollback,
+    };
     #[test]
     fn gemma_cache_rollback_append_without_window_overwrite_restores_committed() {
         let mut cursor = Gemma4Cursor::new(3);
@@ -6238,5 +6957,66 @@ mod tests {
                 1
             );
         }
+    }
+    #[test]
+    fn lowered_constructor_fault_matrix_covers_every_publication_boundary() {
+        assert_eq!(
+            construction_fault_stages(),
+            &[
+                Gemma4ConstructionStage::Weights,
+                Gemma4ConstructionStage::Scratch,
+                Gemma4ConstructionStage::SlidingKv,
+                Gemma4ConstructionStage::FullKv,
+                Gemma4ConstructionStage::Session,
+            ]
+        );
+    }
+
+    #[test]
+    fn lowered_constructor_rollback_frees_completed_stages_in_reverse() {
+        assert_eq!(
+            construction_fault_stages()
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                Gemma4ConstructionStage::Session,
+                Gemma4ConstructionStage::FullKv,
+                Gemma4ConstructionStage::SlidingKv,
+                Gemma4ConstructionStage::Scratch,
+                Gemma4ConstructionStage::Weights,
+            ]
+        );
+    }
+    #[test]
+    fn lowered_allocation_telemetry_formats_size_aware_fields() {
+        let telemetry = Gemma4AllocationTelemetry {
+            phase: "unload",
+            cycle: 4,
+            owner_bytes: 1280,
+            pool_bytes: 2048,
+            free_device_bytes: Some(4096),
+            graph_resident: true,
+            graph_blob_count: 7,
+            module_count: 3,
+            freed_owner_labels: vec!["weights".into(), "scratch".into()],
+        };
+        let line = telemetry.format_line();
+        assert!(line.contains("phase=unload"));
+        assert!(line.contains("cycle=4"));
+        assert!(line.contains("owner_bytes=1280"));
+        assert!(line.contains("pool_bytes=2048"));
+        assert!(line.contains("free_device_bytes=4096"));
+        assert!(line.contains("graph_resident=true"));
+        assert!(line.contains("module_count=3"));
+        assert!(line.contains("freed_owner_labels=weights,scratch"));
+    }
+
+    #[test]
+    fn lowered_allocation_telemetry_is_disabled_without_opt_in() {
+        assert!(!allocation_telemetry_enabled_value(None));
+        assert!(!allocation_telemetry_enabled_value(Some("0")));
+        assert!(allocation_telemetry_enabled_value(Some("1")));
     }
 }
