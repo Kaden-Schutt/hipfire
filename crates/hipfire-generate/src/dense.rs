@@ -1942,6 +1942,23 @@ trait GemmaStepAdapter {
     fn cursor(&self) -> usize;
     fn set_cursor(&mut self, cursor: usize);
     fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
+    fn prefill_prompt(&mut self, prompt: &[u32], capacity: usize) -> Result<Vec<f32>, String> {
+        let mut position = self.cursor();
+        let mut last_logits = Vec::new();
+        for &token in prompt {
+            if position >= capacity {
+                return Err(format!(
+                    "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
+                ));
+            }
+            let logits = self.prefill(token, position)?;
+            validate_gemma_logits(&logits, self.vocab_size())?;
+            position += 1;
+            self.set_cursor(position);
+            last_logits = logits;
+        }
+        Ok(last_logits)
+    }
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
     /// Download the logits row left by the last committed materialized token.
     /// This is used only when an exact-prefix hit has no prompt suffix.
@@ -1996,18 +2013,9 @@ where
         last_logits = adapter.cached_logits()?;
         validate_gemma_logits(&last_logits, vocab_size)?;
     } else {
-        for &token in prompt {
-            if position >= capacity {
-                return Err(format!(
-                    "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
-                ));
-            }
-            let logits = adapter.prefill(token, position)?;
-            validate_gemma_logits(&logits, vocab_size)?;
-            position += 1;
-            adapter.set_cursor(position);
-            last_logits = logits;
-        }
+        last_logits = adapter.prefill_prompt(prompt, capacity)?;
+        position = adapter.cursor();
+        validate_gemma_logits(&last_logits, vocab_size)?;
     }
     let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
     let decode_t0 = Instant::now();
@@ -2208,6 +2216,7 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
 struct Gemma4EagerAdapter<'a> {
     gpu: &'a mut rdna_compute::Gpu,
     bundle: &'a mut hipfire_loader::Gemma4Bundle,
+    max_prefill_width: usize,
 }
 
 impl Gemma4EagerAdapter<'_> {
@@ -2248,6 +2257,71 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
 
     fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
         self.forward_step(token, position)
+    }
+
+    fn prefill_prompt(&mut self, prompt: &[u32], capacity: usize) -> Result<Vec<f32>, String> {
+        let requested_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let resolved_batch = gemma4_prefill_batch_for_arch(&self.gpu.arch, requested_batch);
+        let prefill_batch = if resolved_batch > 1
+            && !gemma4::forward::supports_batched_prefill(&self.bundle.weights)
+        {
+            eprintln!(
+                "[daemon] Gemma4 batched prefill is unavailable for this weight format; using eager prefill"
+            );
+            1
+        } else {
+            resolved_batch
+        };
+        let start_pos = self.cursor();
+        if start_pos.saturating_add(prompt.len()) > capacity {
+            return Err(format!(
+                "gemma4 prompt exceeds context capacity at position {start_pos} (capacity {capacity})"
+            ));
+        }
+        let mut offset = 0usize;
+        let mut last_logits = Vec::new();
+        while offset < prompt.len() {
+            let width = prefill_batch.min(prompt.len() - offset);
+            let position = self.cursor();
+            let physical_cap = self.bundle.state.kv_sliding.physical_cap;
+            let compact_offset = self.bundle.state.kv_sliding.compact_offset;
+            gemma_mark_overwrite_for_range(
+                &mut self.bundle.prefix_cache,
+                position,
+                width,
+                physical_cap,
+                compact_offset,
+            );
+            let result = if width == 1 {
+                gemma4::forward::decode_step(
+                    &self.bundle.config,
+                    &self.bundle.weights,
+                    &mut self.bundle.state,
+                    self.gpu,
+                    prompt[offset],
+                    position as u32,
+                )
+            } else {
+                gemma4::forward::forward_batch(
+                    &self.bundle.config,
+                    &self.bundle.weights,
+                    &mut self.bundle.state,
+                    self.gpu,
+                    &prompt[offset..offset + width],
+                    position,
+                )
+            };
+            let logits =
+                result.map_err(|error| format!("gemma4 eager prefill failed: {error:?}"))?;
+            validate_gemma_logits(&logits, self.vocab_size())?;
+            self.set_cursor(position + width);
+            self.max_prefill_width = self.max_prefill_width.max(width);
+            offset += width;
+            last_logits = logits;
+        }
+        Ok(last_logits)
     }
 
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
@@ -2380,6 +2454,7 @@ fn generate_gemma4_eager_ar_lifecycle(
         let mut adapter = Gemma4EagerAdapter {
             gpu,
             bundle: &mut *bundle_ptr,
+            max_prefill_width: 0,
         };
         run_gemma4_eager_product_lifecycle(
             &mut adapter,
@@ -4223,12 +4298,23 @@ mod gemma4_eager_oracle_tests {
                 })
         })
     }
+    fn cosine_similarity(lhs: &[f32], rhs: &[f32]) -> f32 {
+        assert_eq!(lhs.len(), rhs.len());
+        let (mut dot, mut lhs_norm, mut rhs_norm) = (0.0f64, 0.0f64, 0.0f64);
+        for (&left, &right) in lhs.iter().zip(rhs) {
+            let (left, right) = (f64::from(left), f64::from(right));
+            dot += left * right;
+            lhs_norm += left * left;
+            rhs_norm += right * right;
+        }
+        (dot / (lhs_norm.sqrt() * rhs_norm.sqrt())) as f32
+    }
 
     fn run_eager_direct_oracle(
         model_path: &Path,
         prompt_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<(Vec<u32>, u64), String> {
+    ) -> Result<(Vec<u32>, u64, Vec<f32>), String> {
         let mut gpu =
             rdna_compute::Gpu::init().map_err(|error| format!("oracle GPU init: {error:?}"))?;
         let hfq = HfqFile::open(model_path)
@@ -4278,17 +4364,18 @@ mod gemma4_eager_oracle_tests {
         }
 
         let fnv = fnv1a64_f32(&logits);
+        let final_logits = logits;
         state.free_gpu(&mut gpu);
         weights.free_gpu(&mut gpu);
         gpu.drain_pool();
-        Ok((ids, fnv))
+        Ok((ids, fnv, final_logits))
     }
 
     fn run_eager_product_oracle(
         model_path: &Path,
         prompt_ids: &[u32],
         max_tokens: usize,
-    ) -> Result<(Vec<u32>, u64, Vec<u8>), String> {
+    ) -> Result<(Vec<u32>, u64, Vec<u8>, usize, Vec<f32>), String> {
         let mut gpu =
             rdna_compute::Gpu::init().map_err(|error| format!("product GPU init: {error:?}"))?;
         let cask = CaskConfig::default();
@@ -4317,13 +4404,14 @@ mod gemma4_eager_oracle_tests {
             as *mut hipfire_loader::Gemma4Bundle;
         let mut output = Vec::new();
         let mut ids = Vec::with_capacity(max_tokens);
-        let lifecycle = unsafe {
+        let (lifecycle, max_prefill_width) = unsafe {
             let eos = (*bundle_ptr).eos_tok;
             let mut adapter = Gemma4EagerAdapter {
                 gpu: &mut gpu,
                 bundle: &mut *bundle_ptr,
+                max_prefill_width: 0,
             };
-            run_gemma4_eager_product_lifecycle(
+            let lifecycle = run_gemma4_eager_product_lifecycle(
                 &mut adapter,
                 prompt_ids,
                 max_tokens,
@@ -4340,16 +4428,18 @@ mod gemma4_eager_oracle_tests {
                 None,
                 0x13579BDF,
                 |token| ids.push(token),
-            )?
+            )?;
+            (lifecycle, adapter.max_prefill_width)
         };
-        let fnv = fnv1a64_f32(&lifecycle.final_logits);
+        let final_logits = lifecycle.final_logits;
+        let fnv = fnv1a64_f32(&final_logits);
         hipfire_loader::unload_model(model, &mut gpu)?;
-        Ok((ids, fnv, output))
+        Ok((ids, fnv, output, max_prefill_width, final_logits))
     }
     fn spawn_product_oracle(
         path: &Path,
         graph: Option<&str>,
-    ) -> Result<(Vec<u32>, u64, bool), String> {
+    ) -> Result<(Vec<u32>, u64, bool, usize), String> {
         let mut command = Command::new(
             std::env::current_exe().map_err(|error| format!("oracle test executable: {error}"))?,
         );
@@ -4406,7 +4496,13 @@ mod gemma4_eager_oracle_tests {
             .find_map(|line| line.strip_prefix("GEMMA_PRODUCT_RAW_TOKENS="))
             .ok_or_else(|| "eager graph oracle child omitted raw-output marker".to_string())?
             == "true";
-        Ok((ids, fnv, raw_tokens))
+        let max_prefill_width = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("GEMMA_PRODUCT_MAX_PREFILL_WIDTH="))
+            .ok_or_else(|| "eager graph oracle child omitted prefill width".to_string())?
+            .parse::<usize>()
+            .map_err(|error| format!("eager graph oracle child prefill width: {error}"))?;
+        Ok((ids, fnv, raw_tokens, max_prefill_width))
     }
 
     #[test]
@@ -4439,6 +4535,7 @@ mod gemma4_eager_oracle_tests {
                 "GEMMA_PRODUCT_RAW_TOKENS={}",
                 raw.contains("\"type\":\"token\"")
             );
+            println!("GEMMA_PRODUCT_MAX_PREFILL_WIDTH={}", product.3);
             return;
         }
 
@@ -4452,6 +4549,59 @@ mod gemma4_eager_oracle_tests {
             assert_eq!(product.1, EAGER_DIRECT_FNV, "{label} graph route FNV");
             assert!(product.2, "{label} graph route emitted raw token frames");
         }
+    }
+    #[test]
+    fn gemma4_eager_prefill_backend_selection_preserves_override() {
+        assert_eq!(super::gemma4_prefill_batch_for_arch("gfx1151", None), 1);
+        assert_eq!(super::gemma4_prefill_batch_for_arch("gfx1151", Some(8)), 8);
+        assert_eq!(super::gemma4_prefill_batch_for_arch("gfx1100", None), 64);
+    }
+
+    #[test]
+    #[ignore = "requires canonical Gemma4 dense artifact and AMD GPU"]
+    fn gemma4_eager_batched_prefill_matches_direct_oracle() {
+        let path = std::env::var_os("HIPFIRE_GEMMA4_DENSE_ORACLE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home/bjoern/.hipfire/models/gemma4-12b.mq4"));
+        assert!(
+            path.is_file(),
+            "canonical Gemma4 dense artifact is missing: {}",
+            path.display()
+        );
+        let prompt_ids: Vec<u32> = PROMPT_IDS.iter().copied().cycle().take(16).collect();
+        let direct =
+            run_eager_direct_oracle(&path, &prompt_ids, 4).expect("batched direct oracle run");
+
+        let previous_graph = std::env::var_os("HIPFIRE_GEMMA4_GRAPH");
+        let previous_batch = std::env::var_os("HIPFIRE_GEMMA4_PREFILL_BATCH");
+        std::env::set_var("HIPFIRE_GEMMA4_GRAPH", "0");
+        std::env::set_var("HIPFIRE_GEMMA4_PREFILL_BATCH", "8");
+        let product_result = run_eager_product_oracle(&path, &prompt_ids, 4);
+        match previous_graph {
+            Some(value) => std::env::set_var("HIPFIRE_GEMMA4_GRAPH", value),
+            None => std::env::remove_var("HIPFIRE_GEMMA4_GRAPH"),
+        }
+        match previous_batch {
+            Some(value) => std::env::set_var("HIPFIRE_GEMMA4_PREFILL_BATCH", value),
+            None => std::env::remove_var("HIPFIRE_GEMMA4_PREFILL_BATCH"),
+        }
+        let product = product_result.expect("batched product oracle run");
+        assert_eq!(product.0, direct.0, "batched prefill IDs");
+        let cosine = cosine_similarity(&direct.2, &product.4);
+        eprintln!(
+            "gemma4 batched prefill width={} final-logit cosine={cosine:.7}",
+            product.3
+        );
+        assert!(
+            cosine >= 0.999,
+            "batched prefill logits diverged: cosine={cosine:.7}"
+        );
+        assert_eq!(
+            product.3, 8,
+            "requested batched prefill width must be observed"
+        );
+        let raw = String::from_utf8(product.2).expect("batched product output must be UTF-8");
+        assert!(raw.contains("\"type\":\"token\""));
     }
 }
 
