@@ -17,7 +17,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use hipfire_loader::{AsstTurnCache, LoadedModel};
+use hipfire_loader::{AsstTurnCache, GemmaPrefixCache, LoadedModel};
 use hipfire_runtime::prompt_frame::ThinkMode;
 use std::io::Write;
 use std::time::Instant;
@@ -1781,10 +1781,10 @@ pub fn generate_deepseek4_heterogeneous(
 ///      the HF `eos_token_id` list is `[1, 106]`; parsing as a scalar drops
 ///      106 and decode loops `<turn|>` forever.
 ///
-/// Prompt-cache: arch 13 is intentionally ABSENT from the `cache_capable`
-/// allowlist (see load handler) — this path has no LCP prefix-cache block and
-/// always cold-prefills the full Jinja render. Enabling cache would corrupt
-/// KV slot offsets after turn 1.
+/// Prompt-cache: arch 13 uses the wrapper-owned exact-prefix materialization.
+/// A request reuses only an identity-matched committed prefix and pre-fills
+/// the suffix; mismatches take a total cold reset so KV slot offsets cannot
+/// bleed across turns.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`) is wired when
 /// `bundle.eagle.is_some()` and `temp <= 1e-6` — greedy-only accept rule,
@@ -1944,6 +1944,11 @@ trait GemmaStepAdapter {
     fn set_cursor(&mut self, cursor: usize);
     fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
+    /// Download the logits row left by the last committed materialized token.
+    /// This is used only when an exact-prefix hit has no prompt suffix.
+    fn cached_logits(&self) -> Result<Vec<f32>, String> {
+        Err("gemma4 cached logits unavailable".to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1980,25 +1985,30 @@ where
     Prepare: FnMut(u32) -> Result<GemmaPreparedToken, String>,
     Commit: FnMut(u32, GemmaPreparedToken, &[f32], &[f32]),
 {
-    if prompt.is_empty() {
-        return Err("gemma4 prompt is empty".to_string());
-    }
     let request_t0 = Instant::now();
     let prefill_t0 = Instant::now();
     let vocab_size = adapter.vocab_size();
     let mut position = adapter.cursor();
     let mut last_logits = Vec::new();
-    for &token in prompt {
-        if position >= capacity {
-            return Err(format!(
-                "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
-            ));
+    if prompt.is_empty() {
+        if position == 0 {
+            return Err("gemma4 prompt is empty".to_string());
         }
-        let logits = adapter.prefill(token, position)?;
-        validate_gemma_logits(&logits, vocab_size)?;
-        position += 1;
-        adapter.set_cursor(position);
-        last_logits = logits;
+        last_logits = adapter.cached_logits()?;
+        validate_gemma_logits(&last_logits, vocab_size)?;
+    } else {
+        for &token in prompt {
+            if position >= capacity {
+                return Err(format!(
+                    "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
+                ));
+            }
+            let logits = adapter.prefill(token, position)?;
+            validate_gemma_logits(&logits, vocab_size)?;
+            position += 1;
+            adapter.set_cursor(position);
+            last_logits = logits;
+        }
     }
     let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
     let decode_t0 = Instant::now();
@@ -2131,6 +2141,12 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
             .download_f32(&self.bundle.scratch.logits)
             .map_err(|error| format!("gemma4 lowered decode logits download failed: {error:?}"))
     }
+
+    fn cached_logits(&self) -> Result<Vec<f32>, String> {
+        self.gpu
+            .download_f32(&self.bundle.scratch.logits)
+            .map_err(|error| format!("gemma4 lowered cached logits download failed: {error:?}"))
+    }
 }
 /// Reset lowered state before a new request when cache reuse is disabled.
 ///
@@ -2150,6 +2166,297 @@ where
     }
     reset()?;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmaCachePrefixAction {
+    Cold { reset: bool },
+    Reuse { cached_tokens: usize },
+}
+
+/// Decide whether a Gemma request may extend the complete committed KV
+/// materialization. The only accepted reuse is an identity-matched
+/// `starts_with` check at the exact runtime cursor; any split-brain state takes
+/// the caller through a total cold reset.
+fn gemma_cache_prefix_action(
+    cache: &GemmaPrefixCache,
+    identity: &str,
+    prompt: &[u32],
+    resident_tokens: &[u32],
+    runtime_cursor: usize,
+    sliding_offset: usize,
+    full_offset: usize,
+) -> GemmaCachePrefixAction {
+    let cache_hit = sliding_offset == 0
+        && full_offset == 0
+        && !cache.overwrote_committed_rows()
+        && runtime_cursor == cache.committed_cursor
+        && resident_tokens == cache.materialized_tokens
+        && cache.match_prompt(identity, prompt) == Some(runtime_cursor);
+    if cache_hit {
+        return GemmaCachePrefixAction::Reuse {
+            cached_tokens: runtime_cursor,
+        };
+    }
+
+    GemmaCachePrefixAction::Cold {
+        reset: runtime_cursor != 0
+            || !resident_tokens.is_empty()
+            || cache.valid
+            || sliding_offset != 0
+            || full_offset != 0,
+    }
+}
+
+/// Publish exactly the materialized history after the terminal `Commit`
+/// decision. Working request history must never be passed to this helper
+/// before that decision.
+fn gemma_publish_prefix_on_commit(
+    cache: &mut GemmaPrefixCache,
+    identity: &str,
+    materialized_tokens: &[u32],
+    committed_cursor: usize,
+) -> Result<(), String> {
+    cache.publish_committed(
+        identity.to_string(),
+        materialized_tokens.to_vec(),
+        committed_cursor,
+    )
+}
+
+/// Build a stable identity for the loaded Gemma configuration. The model path
+/// alone is insufficient because callers may reload the same artifact with a
+/// different architecture config or capacity; including the typed config keeps
+/// a stale materialization from crossing that boundary.
+fn gemma_cache_identity(m: &LoadedModel) -> String {
+    if let Some(bundle) = m.gemma4() {
+        return format!(
+            "gemma4:eager:{}:max_seq={}:physical_cap={}:config={:?}",
+            m.model_path, m.max_seq, m.physical_cap, bundle.config
+        );
+    }
+    if let Some(bundle) = m.gemma4_lowered() {
+        return format!(
+            "gemma4:lowered:{}:max_seq={}:physical_cap={}:config={:?}:kv={}:{}",
+            m.model_path,
+            m.max_seq,
+            m.physical_cap,
+            bundle.config,
+            bundle.kv_sliding.physical_cap,
+            bundle.kv_full.physical_cap,
+        );
+    }
+    format!("gemma4:missing:{}", m.model_path)
+}
+
+/// Start one eager or lowered Gemma request at either the exact committed
+/// prefix or a clean cursor. A cold reset is performed before host history is
+/// discarded, so a failed reset cannot silently desynchronise the session.
+fn gemma_cache_begin_request(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    identity: &str,
+    prompt: &[u32],
+) -> Result<usize, String> {
+    let action = if let Some(bundle) = m.gemma4() {
+        gemma_cache_prefix_action(
+            &bundle.prefix_cache,
+            identity,
+            prompt,
+            &m.conversation_tokens,
+            bundle.state.materialized_cursor(),
+            bundle.state.kv_sliding.compact_offset,
+            bundle.state.kv_full.compact_offset,
+        )
+    } else if let Some(bundle) = m.gemma4_lowered() {
+        gemma_cache_prefix_action(
+            &bundle.prefix_cache,
+            identity,
+            prompt,
+            &m.conversation_tokens,
+            bundle.cursor.materialized_cursor(),
+            bundle.kv_sliding.compact_offset,
+            bundle.kv_full.compact_offset,
+        )
+    } else {
+        return Err("gemma4 bundle missing while starting cache request".to_string());
+    };
+
+    match action {
+        GemmaCachePrefixAction::Reuse { cached_tokens } => {
+            if let Some(bundle) = m.gemma4_mut() {
+                bundle
+                    .prefix_cache
+                    .begin_request_at(cached_tokens)
+                    .map_err(|error| format!("gemma4 cache begin: {error}"))?;
+            } else if let Some(bundle) = m.gemma4_lowered_mut() {
+                bundle
+                    .prefix_cache
+                    .begin_request_at(cached_tokens)
+                    .map_err(|error| format!("gemma4 lowered cache begin: {error}"))?;
+            }
+            m.seq_pos = cached_tokens;
+            Ok(cached_tokens)
+        }
+        GemmaCachePrefixAction::Cold { reset } => {
+            if reset {
+                let reset_result = if let Some(bundle) = m.gemma4_mut() {
+                    bundle.cold_reset(gpu)
+                } else if let Some(bundle) = m.gemma4_lowered_mut() {
+                    bundle.cold_reset(gpu)
+                } else {
+                    Err("gemma4 bundle disappeared while resetting cache".to_string())
+                };
+                if let Err(error) = reset_result {
+                    if let Some(bundle) = m.gemma4_mut() {
+                        bundle.prefix_cache.invalidate();
+                    }
+                    if let Some(bundle) = m.gemma4_lowered_mut() {
+                        bundle.prefix_cache.invalidate();
+                    }
+                    return Err(format!("gemma4 cache cold reset failed: {error}"));
+                }
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+            } else {
+                m.seq_pos = 0;
+            }
+            if let Some(bundle) = m.gemma4_mut() {
+                bundle
+                    .prefix_cache
+                    .begin_request_at(0)
+                    .map_err(|error| format!("gemma4 cache begin cold: {error}"))?;
+            } else if let Some(bundle) = m.gemma4_lowered_mut() {
+                bundle
+                    .prefix_cache
+                    .begin_request_at(0)
+                    .map_err(|error| format!("gemma4 lowered cache begin cold: {error}"))?;
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Publish the full resident history only after the client has sent terminal
+/// `Commit`. This keeps both Gemma KV families/cursor and host history as one
+/// exact materialization.
+fn gemma_cache_publish_after_commit(
+    m: &mut LoadedModel,
+    identity: &str,
+) -> Result<(), String> {
+    let materialized_tokens = m.conversation_tokens.clone();
+    if let Some(bundle) = m.gemma4_mut() {
+        return gemma_publish_prefix_on_commit(
+            &mut bundle.prefix_cache,
+            identity,
+            &materialized_tokens,
+            bundle.state.materialized_cursor(),
+        );
+    }
+    if let Some(bundle) = m.gemma4_lowered_mut() {
+        return gemma_publish_prefix_on_commit(
+            &mut bundle.prefix_cache,
+            identity,
+            &materialized_tokens,
+            bundle.cursor.materialized_cursor(),
+        );
+    }
+    Err("gemma4 bundle missing while publishing cache".to_string())
+}
+
+/// Roll back one Gemma request after an abort/error. Appended work restores
+/// the committed cursor/history; a sliding overwrite or identity mismatch
+/// takes the total cold-reset path owned by the architecture bundle.
+fn gemma_cache_rollback(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    identity: &str,
+) -> RollbackEpilogue {
+    let rollback = if let Some(bundle) = m.gemma4_mut() {
+        Some(bundle.rollback_working_request(identity, gpu))
+    } else if let Some(bundle) = m.gemma4_lowered_mut() {
+        Some(bundle.rollback_working_request(identity, gpu))
+    } else {
+        None
+    };
+    let Some(rollback) = rollback else {
+        return production_fail_closed_rollback(m, gpu, None, None);
+    };
+
+    match rollback {
+        gemma4::lowered::GemmaRollback::RestoredCommitted => {
+            let (cursor, tokens) = if let Some(bundle) = m.gemma4() {
+                (
+                    bundle.prefix_cache.committed_cursor,
+                    bundle.prefix_cache.materialized_tokens.clone(),
+                )
+            } else if let Some(bundle) = m.gemma4_lowered() {
+                (
+                    bundle.prefix_cache.committed_cursor,
+                    bundle.prefix_cache.materialized_tokens.clone(),
+                )
+            } else {
+                (0, Vec::new())
+            };
+            m.seq_pos = cursor;
+            m.conversation_tokens = tokens;
+        }
+        gemma4::lowered::GemmaRollback::Invalidated => {
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+        }
+    }
+
+    if let Err(error) = gpu.hip.device_synchronize() {
+        let cold_reset = if let Some(bundle) = m.gemma4_mut() {
+            bundle.cold_reset(gpu)
+        } else if let Some(bundle) = m.gemma4_lowered_mut() {
+            bundle.cold_reset(gpu)
+        } else {
+            Ok(())
+        };
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        let context = match cold_reset {
+            Ok(()) => format!("device_synchronize failed: {error}"),
+            Err(reset_error) => {
+                format!("device_synchronize failed: {error}; cold reset failed: {reset_error}")
+            }
+        };
+        return RollbackEpilogue {
+            rolled_back: false,
+            context: Some(context),
+        };
+    }
+
+    RollbackEpilogue {
+        rolled_back: true,
+        context: None,
+    }
+}
+
+fn gemma_cache_force_cold_reset(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    if let Some(bundle) = m.gemma4_mut() {
+        bundle.cold_reset(gpu)?;
+        bundle
+            .prefix_cache
+            .begin_request_at(0)
+            .map_err(|error| format!("gemma4 cache begin after reset: {error}"))?;
+    } else if let Some(bundle) = m.gemma4_lowered_mut() {
+        bundle.cold_reset(gpu)?;
+        bundle
+            .prefix_cache
+            .begin_request_at(0)
+            .map_err(|error| format!("gemma4 lowered cache begin after reset: {error}"))?;
+    } else {
+        return Err("gemma4 bundle missing while forcing cold reset".to_string());
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    Ok(())
 }
 
 
@@ -2367,7 +2674,8 @@ fn gemma_eager_client_abort(
     completion_tokens: usize,
     gpu: &mut rdna_compute::Gpu,
 ) {
-    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    let identity = gemma_cache_identity(m);
+    let epilogue = gemma_cache_rollback(m, gpu, &identity);
     emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 
@@ -2382,7 +2690,8 @@ fn gemma_eager_fail_closed(
     gpu: &mut rdna_compute::Gpu,
     message: &str,
 ) {
-    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    let identity = gemma_cache_identity(m);
+    let epilogue = gemma_cache_rollback(m, gpu, &identity);
     emit_fail_closed_error(stdout, Some(id), message, "gpu", true, &epilogue);
     let _ = stdout.flush();
 }
@@ -2636,6 +2945,233 @@ mod gemma4_overflow_reset_tests {
         assert_eq!(cursor, 0);
         assert_eq!(sliding_offset, 0);
         assert_eq!(full_offset, 0);
+    }
+}
+
+#[cfg(test)]
+mod gemma_exact_prefix_cache_tests {
+    use super::{
+        gemma_cache_prefix_action, gemma_publish_prefix_on_commit, GemmaCachePrefixAction,
+    };
+    use hipfire_loader::GemmaPrefixCache;
+
+    #[test]
+    fn eager_and_lowered_cache_reuse_only_the_exact_committed_prefix() {
+        let mut cache = GemmaPrefixCache::default();
+        let history = vec![1, 2, 3];
+
+        assert_eq!(
+            gemma_cache_prefix_action(&cache, "gemma@dense", &[1, 2], &[], 0, 0, 0),
+            GemmaCachePrefixAction::Cold { reset: false }
+        );
+        gemma_publish_prefix_on_commit(&mut cache, "gemma@dense", &history, 3)
+            .expect("publish committed first turn");
+
+        assert_eq!(
+            gemma_cache_prefix_action(
+                &cache,
+                "gemma@dense",
+                &[1, 2, 3, 4],
+                &history,
+                3,
+                0,
+                0,
+            ),
+            GemmaCachePrefixAction::Reuse { cached_tokens: 3 }
+        );
+        assert_eq!(
+            gemma_cache_prefix_action(&cache, "gemma@dense", &[9], &history, 3, 0, 0),
+            GemmaCachePrefixAction::Cold { reset: true }
+        );
+        assert_eq!(
+            gemma_cache_prefix_action(
+                &cache,
+                "different@config",
+                &[1, 2, 3, 4],
+                &history,
+                3,
+                0,
+                0,
+            ),
+            GemmaCachePrefixAction::Cold { reset: true }
+        );
+    }
+
+    #[test]
+    fn cache_is_published_only_after_terminal_commit_and_length_keeps_materialized_prefix() {
+        let mut cache = GemmaPrefixCache::default();
+        cache.begin_request_at(0).expect("start first request");
+        let working = vec![1, 2, 3];
+
+        assert!(!cache.valid, "working tokens must remain unpublished");
+        gemma_publish_prefix_on_commit(&mut cache, "gemma@config", &working, 3)
+            .expect("length terminal publication");
+        assert_eq!(cache.materialized_tokens, working);
+        assert_eq!(cache.committed_cursor, 3);
+    }
+
+    #[test]
+    fn sliding_overwrite_forces_cold_reset_instead_of_restoring_stale_prefix() {
+        let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3], 3);
+        cache.begin_request_at(3).expect("start append request");
+        cache.mark_overwrite(2);
+
+        assert_eq!(
+            gemma_cache_prefix_action(&cache, "gemma@config", &[1, 2, 3, 4], &[1, 2, 3], 3, 0, 0),
+            GemmaCachePrefixAction::Cold { reset: true }
+        );
+    }
+}
+
+#[cfg(test)]
+mod gemma_fake_two_turn_cache_tests {
+    use super::{
+        gemma_cache_prefix_action, gemma_publish_prefix_on_commit, run_gemma_step_lifecycle,
+        GemmaCachePrefixAction, GemmaPreparedToken, GemmaStepAdapter,
+    };
+    use hipfire_loader::GemmaPrefixCache;
+
+    struct FakeAdapter {
+        cursor: usize,
+        prefill: Vec<(u32, usize)>,
+        forward: Vec<(u32, usize)>,
+    }
+
+    impl FakeAdapter {
+        fn new() -> Self {
+            Self {
+                cursor: 0,
+                prefill: Vec::new(),
+                forward: Vec::new(),
+            }
+        }
+    }
+
+    impl GemmaStepAdapter for FakeAdapter {
+        fn vocab_size(&self) -> usize {
+            32
+        }
+
+        fn cursor(&self) -> usize {
+            self.cursor
+        }
+
+        fn set_cursor(&mut self, cursor: usize) {
+            self.cursor = cursor;
+        }
+
+        fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+            self.prefill.push((token, position));
+            Ok(vec![0.0; self.vocab_size()])
+        }
+
+        fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+            self.forward.push((token, position));
+            Ok(vec![0.0; self.vocab_size()])
+        }
+    }
+
+    fn run_request(
+        adapter: &mut FakeAdapter,
+        prompt: &[u32],
+        max_tokens: usize,
+        generated: &mut Vec<u32>,
+    ) -> super::GemmaStepRun {
+        let mut samples = [3_u32, 5_u32].into_iter();
+        run_gemma_step_lifecycle(
+            adapter,
+            prompt,
+            max_tokens,
+            64,
+            &[31],
+            move |_| Ok(samples.next().expect("sample fixture")),
+            |_token| {
+                Ok(GemmaPreparedToken {
+                    events: Vec::new(),
+                    stop: false,
+                })
+            },
+            |token, _prepared, _sampled_logits, _next_logits| generated.push(token),
+        )
+        .expect("fake Gemma request")
+    }
+
+    #[test]
+    fn eager_and_lowered_fakes_prefill_only_related_suffix_and_publish_on_commit() {
+        for route in ["eager", "lowered"] {
+            let mut adapter = FakeAdapter::new();
+            let mut cache = GemmaPrefixCache::default();
+            let mut history = Vec::new();
+
+            cache.begin_request_at(0).expect("first request start");
+            let mut generated = Vec::new();
+            let first = run_request(&mut adapter, &[1, 2], 1, &mut generated);
+            assert_eq!(first.generated, 1, "{route} first generation");
+            history.extend_from_slice(&[1, 2]);
+            history.extend_from_slice(&generated);
+            assert!(!cache.valid, "{route} must not publish before commit");
+            gemma_publish_prefix_on_commit(&mut cache, "gemma@config", &history, 3)
+                .expect("first terminal commit");
+
+            assert_eq!(
+                gemma_cache_prefix_action(
+                    &cache,
+                    "gemma@config",
+                    &[1, 2, 3, 4],
+                    &history,
+                    3,
+                    0,
+                    0,
+                ),
+                GemmaCachePrefixAction::Reuse { cached_tokens: 3 },
+                "{route} related request should reuse the committed prefix"
+            );
+            cache.begin_request_at(3).expect("related request start");
+            let mut second_generated = Vec::new();
+            let second = run_request(&mut adapter, &[4], 0, &mut second_generated);
+            assert_eq!(second.generated, 0, "{route} second request fixture");
+            history.extend_from_slice(&[4]);
+            gemma_publish_prefix_on_commit(&mut cache, "gemma@config", &history, 4)
+                .expect("second terminal commit");
+
+            assert_eq!(adapter.prefill, [(1, 0), (2, 1), (4, 3)], "{route} prefill");
+            assert_eq!(adapter.forward, [(3, 2)], "{route} decode");
+            assert_eq!(cache.materialized_tokens, vec![1, 2, 3, 4], "{route} cache history");
+            assert_eq!(cache.committed_cursor, 4, "{route} cache cursor");
+        }
+    }
+
+    #[test]
+    fn safe_abort_restores_previous_commit_without_publishing_working_suffix() {
+        let mut adapter = FakeAdapter::new();
+        let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3], 3);
+        let committed = cache.materialized_tokens.clone();
+        let mut history = committed.clone();
+
+        cache.begin_request_at(3).expect("append request start");
+        let mut generated = Vec::new();
+        run_request(&mut adapter, &[4], 1, &mut generated);
+        history.extend_from_slice(&[4]);
+        history.extend_from_slice(&generated);
+        assert_eq!(cache.materialized_tokens, committed, "abort must not publish");
+
+        adapter.set_cursor(cache.committed_cursor);
+        history = cache.materialized_tokens.clone();
+        cache.restore_committed();
+        assert_eq!(adapter.cursor(), 3);
+        assert_eq!(history, vec![1, 2, 3]);
+        assert_eq!(
+            gemma_cache_prefix_action(
+                &cache,
+                "gemma@config",
+                &[1, 2, 3, 6],
+                &history,
+                adapter.cursor(),
+                0,
+                0,
+            ),
+            GemmaCachePrefixAction::Reuse { cached_tokens: 3 }
+        );
     }
 }
 
@@ -3369,23 +3905,51 @@ pub fn generate_gemma4(
     let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
 
 
-    // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
-    // the requested run would overflow the physical cache.
-    let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
-    if overflow {
-        let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
-        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4Bundle");
-        if let Err(e) = bundle.cold_reset(gpu) {
-            emit_error_with_id(stdout, id, format!("gemma4 context reset failed: {e}"));
+    // Exact-prefix cache admission happens before capacity accounting. A hit
+    // starts at the committed cursor and only the suffix is materialized; any
+    // mismatch has already taken the total cold-reset path.
+    drop(bundle);
+    let cache_identity = gemma_cache_identity(m);
+    let mut cached_tokens =
+        match gemma_cache_begin_request(m, gpu, &cache_identity, &prompt_ids) {
+            Ok(cached_tokens) => cached_tokens,
+            Err(error) => {
+                emit_error_with_id(stdout, id, format!("gemma4 cache start failed: {error}"));
+                return;
+            }
+        };
+    let mut prefill_tokens = &prompt_ids[cached_tokens..];
+    let mut cache_cap = m
+        .gemma4()
+        .map(|bundle| bundle.state.max_seq)
+        .unwrap_or(m.max_seq);
+    let exceeds_capacity =
+        cached_tokens.saturating_add(prefill_tokens.len()).saturating_add(max_tokens) > cache_cap;
+    if exceeds_capacity && cached_tokens > 0 {
+        if let Err(error) = gemma_cache_force_cold_reset(m, gpu) {
+            emit_error_with_id(stdout, id, format!("gemma4 context reset failed: {error}"));
             return;
         }
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        cached_tokens = 0;
+        prefill_tokens = &prompt_ids[..];
+        cache_cap = m
+            .gemma4()
+            .map(|bundle| bundle.state.max_seq)
+            .unwrap_or(m.max_seq);
     }
-    // Hard refusal: even from a cold cache the prompt alone must fit (KV
-    // writes at pos >= max_seq would be out of bounds).
-    let cache_cap = bundle.state.max_seq;
-    if prompt_ids.len() >= cache_cap {
+    let Some(bundle) = m
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
+    else {
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma4 eager bundle missing after cache setup",
+        );
+        return;
+    };
+    if cached_tokens.saturating_add(prefill_tokens.len()) >= cache_cap {
         emit_error_with_id(
             stdout,
             id,
@@ -3420,8 +3984,8 @@ pub fn generate_gemma4(
             resolved_prefill_batch
         };
         let mut offset = 0usize;
-        while offset < prompt_ids.len() {
-            let width = prefill_batch.min(prompt_ids.len() - offset);
+        while offset < prefill_tokens.len() {
+            let width = prefill_batch.min(prefill_tokens.len() - offset);
             let start_pos = bundle.state.n_tokens;
             let result = if width == 1 {
                 gemma4::forward::decode_step(
@@ -3429,7 +3993,7 @@ pub fn generate_gemma4(
                     &bundle.weights,
                     &mut bundle.state,
                     gpu,
-                    prompt_ids[offset],
+                    prefill_tokens[offset],
                     start_pos as u32,
                 )
             } else {
@@ -3438,7 +4002,7 @@ pub fn generate_gemma4(
                     &bundle.weights,
                     &mut bundle.state,
                     gpu,
-                    &prompt_ids[offset..offset + width],
+                    &prefill_tokens[offset..offset + width],
                     start_pos,
                 )
             };
@@ -3452,12 +4016,22 @@ pub fn generate_gemma4(
             }
             offset += width;
         }
+        if prefill_tokens.is_empty() {
+            last_logits = match gpu.download_f32(&bundle.state.logits) {
+                Ok(logits) => logits,
+                Err(error) => {
+                    let message = format!("gemma4 cached logits download failed: {error:?}");
+                    gemma_eager_fail_closed(stdout, id, m, gpu, &message);
+                    return;
+                }
+            };
+        }
     }
     if let Err(error) = validate_gemma_logits(&last_logits, bundle.config.vocab_size) {
         gemma_eager_fail_closed(stdout, id, m, gpu, &error);
         return;
     }
-    for &tok in &prompt_ids {
+    for &tok in prefill_tokens {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
@@ -3726,7 +4300,7 @@ pub fn generate_gemma4(
         let metrics = GemmaDoneMetrics {
             generated: generated_count,
             prompt_tokens: prompt_ids.len(),
-            cached_tokens: 0,
+            cached_tokens,
             tok_s,
             prefill_ms: prefill_ms as f64,
             decode_tok_s: tok_s,
@@ -3742,7 +4316,19 @@ pub fn generate_gemma4(
             obj.insert("draft_len".to_string(), serde_json::json!(draft_len));
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => {
+                if let Err(error) = gemma_cache_publish_after_commit(m, &cache_identity) {
+                    gemma_eager_fail_closed(
+                        stdout,
+                        id,
+                        m,
+                        gpu,
+                        &format!("gemma4 cache publication failed: {error}"),
+                    );
+                    return;
+                }
+                emit_staged_terminal_done(stdout, &pending_done)
+            }
             ClientTerminalDecision::Abort => {
                 gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
             }
@@ -3871,7 +4457,7 @@ pub fn generate_gemma4(
     let metrics = GemmaDoneMetrics {
         generated: generated_count,
         prompt_tokens: prompt_ids.len(),
-        cached_tokens: 0,
+        cached_tokens,
         tok_s,
         prefill_ms: prefill_ms as f64,
         decode_tok_s: tok_s,
@@ -3880,7 +4466,19 @@ pub fn generate_gemma4(
     };
     let pending_done = gemma_pending_done(id, gemma_finish_reason(hit_eos, hit_length), &metrics);
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            if let Err(error) = gemma_cache_publish_after_commit(m, &cache_identity) {
+                gemma_eager_fail_closed(
+                    stdout,
+                    id,
+                    m,
+                    gpu,
+                    &format!("gemma4 cache publication failed: {error}"),
+                );
+                return;
+            }
+            emit_staged_terminal_done(stdout, &pending_done);
+        }
         ClientTerminalDecision::Abort => {
             gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
         }
@@ -3890,7 +4488,8 @@ pub fn generate_gemma4(
 /// per-token transaction used by the eager route.
 ///
 /// This is intentionally Step-only: no eager downcast, batched prefill,
-/// lowered speculative path, graph claim, or prefix-cache reuse/publication.
+/// lowered speculative path, or graph claim. Both KV families participate in
+/// the exact-prefix cache transaction below.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_gemma4_lowered(
     m: &mut LoadedModel,
@@ -3925,11 +4524,10 @@ pub(crate) fn generate_gemma4_lowered(
     let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
     emit_gen_start(stdout, id, false, gen_contract);
 
-    let (bos_tok, cfg_eos_tok, bundle_cursor, capacity) = match m.gemma4_lowered() {
+    let (bos_tok, cfg_eos_tok, initial_capacity) = match m.gemma4_lowered() {
         Some(bundle) => (
             bundle.config.bos_token,
             bundle.config.eos_token,
-            bundle.cursor.position(),
             bundle
                 .kv_sliding
                 .physical_cap
@@ -3986,31 +4584,29 @@ pub(crate) fn generate_gemma4_lowered(
         tokens
     };
 
-    // Lowered cache bytes are not reused by this task. Every non-cold request
-    // starts from a total architecture reset before its full prompt prefill;
-    // capacity overflow uses the same reset path.
-    let exceeds_capacity = bundle_cursor
-        .saturating_add(prompt_ids.len())
-        .saturating_add(max_tokens)
-        > capacity;
-    let reset_requested = bundle_cursor != 0 || exceeds_capacity;
-    let reset_result = gemma_lowered_reset_before_request(
-        bundle_cursor,
-        reset_requested,
-        || match m.gemma4_lowered_mut() {
-            Some(bundle) => bundle.cold_reset(gpu),
-            None => Err("gemma4 lowered bundle disappeared during reset".to_string()),
-        },
-    );
-    match reset_result {
-        Ok(true) => {
-            // Only clear host state after the architecture reset has
-            // succeeded and its cursor/KV metadata are known to be cold.
-            m.seq_pos = 0;
-            m.conversation_tokens.clear();
-        }
-        Ok(false) => {}
-        Err(error) => {
+    let cache_identity = gemma_cache_identity(m);
+    let mut cached_tokens =
+        match gemma_cache_begin_request(m, gpu, &cache_identity, &prompt_ids) {
+            Ok(cached_tokens) => cached_tokens,
+            Err(error) => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("gemma4 lowered cache start failed: {error}"),
+                    "gpu",
+                    true,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        };
+    let mut prefill_tokens = &prompt_ids[cached_tokens..];
+    let mut capacity = initial_capacity;
+    let exceeds_capacity =
+        cached_tokens.saturating_add(prefill_tokens.len()).saturating_add(max_tokens) > capacity;
+    if exceeds_capacity && cached_tokens > 0 {
+        if let Err(error) = gemma_cache_force_cold_reset(m, gpu) {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -4022,8 +4618,14 @@ pub(crate) fn generate_gemma4_lowered(
             let _ = stdout.flush();
             return;
         }
+        cached_tokens = 0;
+        prefill_tokens = &prompt_ids[..];
+        capacity = m
+            .gemma4_lowered()
+            .map(|bundle| bundle.kv_sliding.physical_cap.min(bundle.kv_full.physical_cap))
+            .unwrap_or(initial_capacity);
     }
-    if prompt_ids.len() >= capacity {
+    if cached_tokens.saturating_add(prefill_tokens.len()) >= capacity {
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -4038,7 +4640,6 @@ pub(crate) fn generate_gemma4_lowered(
         let _ = stdout.flush();
         return;
     }
-
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
     let mut gemma_router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
@@ -4058,7 +4659,7 @@ pub(crate) fn generate_gemma4_lowered(
             let mut adapter = Gemma4LoweredAdapter { gpu, bundle };
             run_gemma_step_lifecycle(
                 &mut adapter,
-                &prompt_ids,
+                prefill_tokens,
                 max_tokens,
                 capacity,
                 &stop_set,
@@ -4126,7 +4727,7 @@ pub(crate) fn generate_gemma4_lowered(
 
     // Host history is committed only after all per-token forwards and the
     // terminal parser flush succeed. EOS is absent from generated_tokens.
-    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.conversation_tokens.extend_from_slice(prefill_tokens);
     m.conversation_tokens.extend_from_slice(&generated_tokens);
     let materialized_cursor = m
         .gemma4_lowered()
@@ -4144,7 +4745,7 @@ pub(crate) fn generate_gemma4_lowered(
     let metrics = GemmaDoneMetrics {
         generated: run.generated,
         prompt_tokens: prompt_ids.len(),
-        cached_tokens: 0,
+        cached_tokens,
         tok_s,
         prefill_ms: run.prefill_ms,
         decode_tok_s: tok_s,
@@ -4157,7 +4758,19 @@ pub(crate) fn generate_gemma4_lowered(
         &metrics,
     );
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            if let Err(error) = gemma_cache_publish_after_commit(m, &cache_identity) {
+                gemma_eager_fail_closed(
+                    stdout,
+                    id,
+                    m,
+                    gpu,
+                    &format!("gemma4 lowered cache publication failed: {error}"),
+                );
+                return;
+            }
+            emit_staged_terminal_done(stdout, &pending_done);
+        }
         ClientTerminalDecision::Abort => {
             gemma_eager_client_abort(stdout, id, m, run.generated, gpu);
         }

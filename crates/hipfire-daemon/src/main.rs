@@ -1899,12 +1899,12 @@ fn main() {
                         };
                         batch_scheduler = staged_batch_scheduler;
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // arch_id 13 (gemma4) is intentionally ABSENT: hipfire_generate::dense::generate_gemma4 has
-                        // no LCP prefix-cache block and always cold-prefills the full
-                        // Jinja-rendered prompt. Enabling the cache would corrupt KV
-                        // slot offsets after turn 1 (stale prefix reuse). Wire when
-                        // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
+                        // Gemma4 (arch_id=13) owns an exact-prefix transaction in
+                        // both eager and lowered routes: only a committed,
+                        // identity-matched prefix is reused, while mismatches
+                        // take a total cold reset.
+                        let cache_capable =
+                            matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 13 | 14);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
                         let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)
