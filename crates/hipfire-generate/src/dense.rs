@@ -2221,7 +2221,7 @@ impl Gemma4EagerAdapter<'_> {
             physical_cap,
             compact_offset,
         );
-        gemma4::forward::decode_step(
+        gemma4::forward::decode_step_with_graph(
             &self.bundle.config,
             &self.bundle.weights,
             &mut self.bundle.state,
@@ -4202,6 +4202,7 @@ mod gemma4_eager_oracle_tests {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     const PROMPT_IDS: [u32; 5] = [2, 9259, 236888, 575, 106];
     const EXPECTED_IDS: [u32; 32] = [
@@ -4345,10 +4346,72 @@ mod gemma4_eager_oracle_tests {
         hipfire_loader::unload_model(model, &mut gpu)?;
         Ok((ids, fnv, output))
     }
+    fn spawn_product_oracle(
+        path: &Path,
+        graph: Option<&str>,
+    ) -> Result<(Vec<u32>, u64, bool), String> {
+        let mut command = Command::new(
+            std::env::current_exe().map_err(|error| format!("oracle test executable: {error}"))?,
+        );
+        command
+            .args([
+                "--exact",
+                "dense::gemma4_eager_oracle_tests::gemma4_eager_product_graph_routes_match_independent_dense_direct_oracle",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HIPFIRE_GEMMA4_ORACLE_CHILD", "1")
+            .env(
+                "HIPFIRE_GEMMA4_DENSE_ORACLE",
+                path.to_str()
+                    .ok_or_else(|| "oracle model path is not UTF-8".to_string())?,
+            );
+        match graph {
+            Some(value) => {
+                command.env("HIPFIRE_GEMMA4_GRAPH", value);
+            }
+            None => {
+                command.env_remove("HIPFIRE_GEMMA4_GRAPH");
+            }
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("spawn eager graph oracle: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "eager graph oracle child failed: status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|error| format!("eager graph oracle child stdout: {error}"))?;
+        let ids = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("GEMMA_PRODUCT_IDS="))
+            .ok_or_else(|| "eager graph oracle child omitted IDs".to_string())?
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<u32>().map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let fnv = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("GEMMA_PRODUCT_FNV="))
+            .ok_or_else(|| "eager graph oracle child omitted FNV".to_string())?;
+        let fnv = u64::from_str_radix(fnv.trim_start_matches("0x"), 16)
+            .map_err(|error| format!("eager graph oracle child FNV: {error}"))?;
+        let raw_tokens = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("GEMMA_PRODUCT_RAW_TOKENS="))
+            .ok_or_else(|| "eager graph oracle child omitted raw-output marker".to_string())?
+            == "true";
+        Ok((ids, fnv, raw_tokens))
+    }
 
     #[test]
     #[ignore = "requires canonical Gemma4 dense artifact and AMD GPU"]
-    fn gemma4_eager_product_matches_independent_dense_direct_oracle() {
+    fn gemma4_eager_product_graph_routes_match_independent_dense_direct_oracle() {
         let path = std::env::var_os("HIPFIRE_GEMMA4_DENSE_ORACLE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/home/bjoern/.hipfire/models/gemma4-12b.mq4"));
@@ -4358,18 +4421,37 @@ mod gemma4_eager_oracle_tests {
             path.display()
         );
 
+        if std::env::var_os("HIPFIRE_GEMMA4_ORACLE_CHILD").is_some() {
+            let product =
+                run_eager_product_oracle(&path, &PROMPT_IDS, 32).expect("product oracle run");
+            let raw = String::from_utf8(product.2).expect("product wire output must be UTF-8");
+            println!(
+                "GEMMA_PRODUCT_IDS={}",
+                product
+                    .0
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            println!("GEMMA_PRODUCT_FNV=0x{:016x}", product.1);
+            println!(
+                "GEMMA_PRODUCT_RAW_TOKENS={}",
+                raw.contains("\"type\":\"token\"")
+            );
+            return;
+        }
+
         let direct = run_eager_direct_oracle(&path, &PROMPT_IDS, 32).expect("direct oracle run");
         assert_eq!(direct.0, EXPECTED_IDS);
         assert_eq!(direct.1, EAGER_DIRECT_FNV);
-
-        let product = run_eager_product_oracle(&path, &PROMPT_IDS, 32).expect("product oracle run");
-        assert_eq!(&product.0, &direct.0);
-        assert_eq!(product.1, direct.1);
-        let raw = String::from_utf8(product.2).expect("product wire output must be UTF-8");
-        assert!(
-            raw.contains("\"type\":\"token\""),
-            "product lifecycle must emit framed token events: {raw:?}"
-        );
+        for (label, graph) in [("default", None), ("on", Some("1")), ("off", Some("0"))] {
+            let product = spawn_product_oracle(&path, graph)
+                .unwrap_or_else(|error| panic!("{label} graph oracle: {error}"));
+            assert_eq!(product.0, EXPECTED_IDS, "{label} graph route IDs");
+            assert_eq!(product.1, EAGER_DIRECT_FNV, "{label} graph route FNV");
+            assert!(product.2, "{label} graph route emitted raw token frames");
+        }
     }
 }
 
