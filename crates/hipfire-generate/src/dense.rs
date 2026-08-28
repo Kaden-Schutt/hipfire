@@ -1837,6 +1837,14 @@ fn validate_gemma_token(token: u32, vocab_size: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Mirror the architecture's materialized cursor into the host request state
+/// before a staged terminal is built.
+#[inline]
+fn gemma_sync_host_cursor(seq_pos: &mut usize, materialized_cursor: usize) {
+    *seq_pos = materialized_cursor;
+}
+
+
 /// Classify a validated sample before any parser, wire, or history mutation.
 fn classify_gemma_sample(
     token: u32,
@@ -1925,6 +1933,29 @@ where
     commit(token, prepared, next_logits);
     Ok(GemmaTokenTransactionResult::Committed { stopped })
 }
+/// Publish one staged EAGLE block only after its cursor-settle forward
+/// succeeds. The speculative verifier may leave its final bonus unwritten
+/// until that settle step, so host output/history/count must remain staged.
+fn gemma_eagle_publish_after_settle<Settle, Commit, Rollback>(
+    settle: Settle,
+    staged_tokens: Vec<u32>,
+    staged_events: Vec<GemmaEmit>,
+    commit: Commit,
+    rollback: Rollback,
+) -> Result<(), String>
+where
+    Settle: FnOnce() -> Result<(), String>,
+    Commit: FnOnce(Vec<u32>, Vec<GemmaEmit>),
+    Rollback: FnOnce(),
+{
+    if let Err(error) = settle() {
+        rollback();
+        return Err(error);
+    }
+    commit(staged_tokens, staged_events);
+    Ok(())
+}
+
 
 /// Build the shared output quarantine for Gemma's literal end markers and
 /// request-provided stop sequences.
@@ -2298,8 +2329,10 @@ mod gemma4_overflow_reset_tests {
 mod gemma4_token_transaction_tests {
     use super::{
         classify_gemma_sample, gemma_eos_filter_config, gemma_prepare_token,
-        gemma_token_transaction, validate_gemma_logits, validate_gemma_token, EosFilter, GemmaEmit,
-        GemmaPreparedToken, GemmaSample, GemmaThoughtRouter, GemmaTokenTransactionResult,
+        gemma_sync_host_cursor,
+        gemma_eagle_publish_after_settle, gemma_token_transaction, validate_gemma_logits,
+        validate_gemma_token, EosFilter, GemmaEmit, GemmaPreparedToken, GemmaSample,
+        GemmaThoughtRouter, GemmaTokenTransactionResult,
     };
 
     #[derive(Default)]
@@ -2449,6 +2482,45 @@ mod gemma4_token_transaction_tests {
         assert!(suffix.events.is_empty());
         assert!(suffix.stop);
     }
+
+    #[test]
+    fn gemma_eagle_settle_failure_rolls_back_before_publish() {
+        use std::cell::RefCell;
+
+        let adapter = RefCell::new(FakeGemmaAdapter::default());
+        let result = gemma_eagle_publish_after_settle(
+            || Err("forced cursor settle failure".to_string()),
+            vec![3],
+            vec![GemmaEmit::Token("must stay staged".to_string())],
+            |tokens, events| {
+                let mut adapter = adapter.borrow_mut();
+                adapter.history.extend(tokens);
+                adapter.visible.extend(events.into_iter().map(|event| match event {
+                    GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
+                }));
+                adapter.count += 1;
+                adapter.done_count += 1;
+            },
+            || adapter.borrow_mut().rollback_count += 1,
+        );
+
+        assert_eq!(result, Err("forced cursor settle failure".to_string()));
+        let adapter = adapter.into_inner();
+        assert!(adapter.visible.is_empty());
+        assert!(adapter.history.is_empty());
+        assert_eq!(adapter.count, 0);
+        assert!(adapter.cache.is_empty());
+        assert_eq!(adapter.rollback_count, 1);
+        assert_eq!(adapter.done_count, 0);
+    }
+
+    #[test]
+    fn gemma_terminal_sync_restores_host_cursor_from_materialized_state() {
+        let mut host_seq_pos = 7usize;
+        gemma_sync_host_cursor(&mut host_seq_pos, 42);
+        assert_eq!(host_seq_pos, 42);
+    }
+
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2754,6 +2826,9 @@ pub fn generate_gemma4(
         let mut hit_length = false;
         let mut ttft_ms: Option<f64> = None;
         let decode_t0 = Instant::now();
+        let mut staged_tokens: Vec<u32> = Vec::new();
+        let mut staged_events: Vec<GemmaEmit> = Vec::new();
+
         while !stop && generated_count < max_tokens {
             let committed_len = bundle.state.n_tokens;
             // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
@@ -2833,15 +2908,11 @@ pub fn generate_gemma4(
                         return;
                     }
                 };
-                m.conversation_tokens.push(t);
+                staged_tokens.push(t);
                 generated_count += 1;
-                for event in prepared.events {
-                    match event {
-                        GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
-                    }
-                }
-                if prepared.stop {
+                let stopped = prepared.stop;
+                staged_events.extend(prepared.events);
+                if stopped {
                     stop = true;
                     break;
                 }
@@ -2874,8 +2945,8 @@ pub fn generate_gemma4(
         // position keyed and deterministic, so the re-write is identical to
         // a fresh forward — the same property the verify itself relies on
         // when it re-writes the seed's KV each round.) ──
-        if generated_count > 0 {
-            let last_tok = *m.conversation_tokens.last().unwrap();
+        let settle_res = if generated_count > 0 {
+            let last_tok = *staged_tokens.last().unwrap();
             let last_pos = (prefill_end + generated_count - 1) as u32;
             let bundle_ptr = bundle as *mut hipfire_loader::Gemma4Bundle;
             let settle_res = unsafe {
@@ -2884,14 +2955,11 @@ pub fn generate_gemma4(
                 let state = &mut (*bundle_ptr).state;
                 gemma4::forward::decode_step(cfg, weights, state, gpu, last_tok, last_pos)
             };
-            if let Err(e) = settle_res {
-                let message = format!("gemma4 eagle cursor settle failed: {e:?}");
-                gemma_eager_fail_closed(stdout, id, m, gpu, &message);
-                return;
-            }
+            settle_res.map(|_| ())
         } else {
             bundle.state.n_tokens = prefill_end;
-        }
+            Ok(())
+        };
         let trailing_events =
             match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
                 Ok(events) => events,
@@ -2900,10 +2968,30 @@ pub fn generate_gemma4(
                     return;
                 }
             };
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
-
-        m.seq_pos = bundle.state.n_tokens;
+        staged_events.extend(trailing_events);
+        let mut rollback_requested = false;
+        let publish_result = gemma_eagle_publish_after_settle(
+            || settle_res,
+            staged_tokens,
+            staged_events,
+            |tokens, events| {
+                m.conversation_tokens.extend(tokens);
+                for event in events {
+                    match event {
+                        GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                        GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    }
+                }
+            },
+            || rollback_requested = true,
+        );
+        if let Err(error) = publish_result {
+            debug_assert!(rollback_requested);
+            let message = format!("gemma4 eagle cursor settle failed: {error}");
+            gemma_eager_fail_closed(stdout, id, m, gpu, &message);
+            return;
+        }
+        gemma_sync_host_cursor(&mut m.seq_pos, bundle.state.n_tokens);
 
         let decode_ms = decode_t0.elapsed().as_millis().max(1);
         let total_ms = t0.elapsed().as_millis().max(1);
@@ -3055,6 +3143,7 @@ pub fn generate_gemma4(
         }
     };
     emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
+    gemma_sync_host_cursor(&mut m.seq_pos, bundle.state.n_tokens);
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 {
