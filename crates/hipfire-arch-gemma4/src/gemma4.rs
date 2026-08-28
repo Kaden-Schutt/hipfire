@@ -342,7 +342,6 @@ impl LayerWeights {
     }
 }
 
-
 pub struct Gemma4Weights {
     /// Token embedding [vocab, dim]; aliased as lm_head when tied.
     pub embed_tokens: GpuTensor,
@@ -1351,10 +1350,7 @@ mod owner_tests {
         expected_tensor(&weights.embed_tokens)
             + expected_weight(&weights.lm_head)
             + expected_tensor(&weights.final_norm)
-            + weights
-                .per_layer_input
-                .as_ref()
-                .map_or(0, expected_ple)
+            + weights.per_layer_input.as_ref().map_or(0, expected_ple)
             + weights
                 .layers
                 .iter()
@@ -1613,8 +1609,7 @@ mod owner_tests {
             return;
         };
         let cfg = state_config();
-        let state =
-            Gemma4State::new_with_max_seq(&mut gpu, &cfg, 128).expect("tiny eager state");
+        let state = Gemma4State::new_with_max_seq(&mut gpu, &cfg, 128).expect("tiny eager state");
         assert_eq!(state.owner_bytes(), expected_state(&state));
         assert_eq!(expected_buffer(&state.pos_buf), state.pos_buf.size());
         state.free_gpu(&mut gpu);
