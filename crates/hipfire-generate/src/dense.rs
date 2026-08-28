@@ -3155,6 +3155,33 @@ mod gemma_exact_prefix_cache_tests {
         gemma_mark_overwrite_for_range(&mut compacted, 3, 1, 6, 4);
         assert_eq!(compacted.overwrite_boundary, Some(1));
     }
+    #[test]
+    fn terminal_commit_replaces_cache_after_sliding_wrap() {
+        let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3, 4, 5], 5);
+        cache.begin_request_at(5).expect("working request start");
+        gemma_mark_overwrite_for_range(&mut cache, 5, 4, 6, 0);
+
+        let next = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        gemma_publish_prefix_on_commit(&mut cache, "gemma@config", &next, next.len())
+            .expect("terminal commit can publish new materialization");
+        assert_eq!(cache.materialized_tokens, next);
+        assert_eq!(cache.committed_cursor, 9);
+        assert_eq!(cache.request_start_cursor, 9);
+        assert_eq!(cache.overwrite_boundary, None);
+    }
+
+    #[test]
+    fn abort_after_sliding_wrap_invalidates_instead_of_restoring_old_commit() {
+        let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3, 4, 5], 5);
+        cache.begin_request_at(5).expect("working request start");
+        gemma_mark_overwrite_for_range(&mut cache, 5, 4, 6, 0);
+
+        assert!(!cache.can_restore_working_request("gemma@config", 9));
+        cache.invalidate();
+        assert!(!cache.valid);
+        assert_eq!(cache.materialized_tokens, Vec::<u32>::new());
+        assert_eq!(cache.committed_cursor, 0);
+    }
 }
 
 #[cfg(test)]

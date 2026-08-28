@@ -688,18 +688,17 @@ impl GemmaPrefixCache {
 
     /// Publish a complete materialization after the client has committed the
     /// request terminal. This is the sole history mutation operation.
+    ///
+    /// A successful terminal commit replaces the old materialization even when
+    /// the working request wrapped the sliding cache. Abort/error callers use
+    /// [`Self::can_restore_working_request`] before restoring; an unsafe
+    /// overwrite therefore never reaches this method.
     pub fn publish_committed(
         &mut self,
         identity: impl Into<String>,
         materialized_tokens: Vec<u32>,
         committed_cursor: usize,
     ) -> Result<(), String> {
-        if self.overwrote_committed_rows() {
-            return Err(
-                "gemma prefix cache: cannot publish after committed sliding rows were overwritten"
-                    .into(),
-            );
-        }
         let next = Self::try_committed(identity, materialized_tokens, committed_cursor)?;
         *self = next;
         Ok(())
