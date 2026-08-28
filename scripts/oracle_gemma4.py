@@ -44,7 +44,7 @@ def main():
     ap.add_argument("--ids-out")
     ap.add_argument("--max-ids", type=int, default=1200)
     args = ap.parse_args()
-    model_path = args.model or os.environ.get("GEMMA4_MODEL") or MODEL
+    model_path = args.model if args.model is not None else os.environ.get("GEMMA4_MODEL", MODEL)
 
     if args.make_ids:
         from transformers import AutoTokenizer
