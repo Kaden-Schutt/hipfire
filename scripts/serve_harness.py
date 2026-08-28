@@ -2286,7 +2286,7 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
             tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
             # For rich shape we WOULD include name, but this frozen gate explicitly requires no name
             messages.append(tool_msg)
-            r = send(cfg, messages, tools=tools)
+            r = _require_terminal(send(cfg, messages, tools=tools))
             r["prompt_md5"] = hashlib.md5(content.encode("utf-8")).hexdigest()
             r["prompt_file"] = turn.get("prompt_file", "")
             r["step"] = turn.get("step", "tool_followup")
@@ -2308,7 +2308,7 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
         else:
             prompt = turn.get("content") or ""
             messages.append({"role": "user", "content": prompt})
-            r = send(cfg, messages, tools=tools)
+            r = _require_terminal(send(cfg, messages, tools=tools))
             r["prompt_md5"] = turn.get("prompt_md5") or hashlib.md5(prompt.encode("utf-8")).hexdigest()
             r["prompt_file"] = turn.get("prompt_file", "")
             r["step"] = turn.get("step") or ("normal" if idx == 0 else "tool_call")
@@ -2366,6 +2366,13 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
 
 
 
+def _require_terminal(row):
+    """Abort validation immediately when an SSE request lacks its terminal."""
+    if row.get("error"):
+        raise SystemExit(f"serve_harness: {row['error']}")
+    return row
+
+
 def send(cfg, messages, tools=None):
     body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
             "stream": True, "stream_options": {"include_usage": True}}
@@ -2380,6 +2387,8 @@ def send(cfg, messages, tools=None):
     t0 = time.time(); ttft = None; think = []; ans = []
     tool_acc = {}
     usage = {}; timings = {}; finish = None; completion_id = None
+    terminal_finish_seen = False
+    done_marker_seen = False
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
                                  data=body_bytes,
                                  headers={"Content-Type": "application/json"}, method="POST")
@@ -2387,7 +2396,9 @@ def send(cfg, messages, tools=None):
         line = raw.decode("utf-8", "ignore").strip()
         if not line.startswith("data:"): continue
         p = line[5:].strip()
-        if p == "[DONE]": break
+        if p == "[DONE]":
+            done_marker_seen = True
+            break
         try: ck = json.loads(p)
         except Exception: continue
         if isinstance(ck.get("id"), str):
@@ -2395,7 +2406,9 @@ def send(cfg, messages, tools=None):
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
-        if ch.get("finish_reason"): finish = ch["finish_reason"]
+        if ch.get("finish_reason"):
+            finish = ch["finish_reason"]
+            terminal_finish_seen = True
         d = ch.get("delta") or {}
         if isinstance(d.get("reasoning_content"), str):
             if ttft is None and d["reasoning_content"]: ttft = time.time() - t0
@@ -2431,7 +2444,7 @@ def send(cfg, messages, tools=None):
           (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50)) or (gram3(half) > 0.50)
     # ATEM leak detection (visible content deltas must not contain raw ATEM markup)
     atem_leak = ("<atem:" in ans_s) or ("<atem:" in think_s) or any("<atem:" in (tc.get("function", {}).get("arguments") or "") for tc in tool_calls)
-    return {
+    result = {
         "request_id": completion_id,
         "ctx": usage.get("prompt_tokens", 0),
         "cached": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
@@ -2452,6 +2465,9 @@ def send(cfg, messages, tools=None):
         "request_md5": request_md5,
         "atem_leak": atem_leak,
     }
+    if not terminal_finish_seen or not done_marker_seen:
+        result["error"] = "premature EOF before terminal event"
+    return result
 
 
 def turn_line(i, r, recall=""):
@@ -2493,7 +2509,7 @@ def run(cfg, args):
     )
     if cfg["mode"] == "battery":
         for genre, prompt, expected in battery:
-            r = send(cfg, [{"role": "user", "content": prompt}])
+            r = _require_terminal(send(cfg, [{"role": "user", "content": prompt}]))
             r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
             missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
             r["expected_substrings"] = expected
@@ -2504,7 +2520,7 @@ def run(cfg, args):
         messages = []
         for genre, prompt, expected in battery:
             messages.append({"role": "user", "content": prompt})
-            r = send(cfg, messages)
+            r = _require_terminal(send(cfg, messages))
             r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
             # Chain feedback respects shape (rich vs plain)
             messages.append(_assistant_feedback(r, feedback_shape))
@@ -2530,7 +2546,7 @@ def run(cfg, args):
             messages = []
             for i, t in enumerate(turns):
                 messages.append({"role": "user", "content": t["content"]})
-                r = send(cfg, messages)
+                r = _require_terminal(send(cfg, messages))
                 r["prompt_md5"] = hashlib.md5(t["content"].encode("utf-8")).hexdigest()
                 messages.append(_assistant_feedback(r, feedback_shape))
                 recall = ""

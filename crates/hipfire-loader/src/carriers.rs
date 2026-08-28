@@ -1847,7 +1847,7 @@ impl Carrier for Gemma4Carrier {
             dflash: None,
             supports_mtp: false,
             spec_excludes_adaptive: false,
-            semantic_contract_version: None,
+            semantic_contract_version: Some(2),
             has_deltanet: false,
             supports_images: false,
             reasoning_contract: saddle_core::caps::ReasoningContract::GemmaBoolean,
@@ -2527,7 +2527,13 @@ impl Carrier for MuseGlimmerCarrier {
 
 #[cfg(test)]
 mod gemma4_route_tests {
-    use super::{gemma4_use_lowered, gemma4_validate_drafter_route};
+    use super::{gemma4_use_lowered, gemma4_validate_drafter_route, Carrier, Gemma4Carrier};
+
+    #[test]
+    fn gemma4_advertises_staged_semantic_contract() {
+        let caps = Gemma4Carrier.caps();
+        assert_eq!(caps.semantic_contract_version, Some(2));
+    }
 
     #[test]
     fn e_series_never_enters_dense_lowered_prefill() {

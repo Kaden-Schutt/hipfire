@@ -1330,6 +1330,21 @@ pub(crate) fn fold_complete_request_stream(
 
     for event in events {
         let contract = gate.observe(event)?;
+        let staged = if event.get("type").and_then(serde_json::Value::as_str)
+            == Some("commit_ready")
+        {
+            let mut staged = event.clone();
+            let Some(obj) = staged.as_object_mut() else {
+                return Err(StreamContractError::MalformedToolCall {
+                    detail: "commit_ready must be a JSON object".into(),
+                });
+            };
+            obj.insert("type".into(), serde_json::Value::String("done".into()));
+            Some(staged)
+        } else {
+            None
+        };
+        let event = staged.as_ref().unwrap_or(event);
         match contract {
             StreamContract::V2 => {
                 // Map fold correlation errors onto stream framing errors for the
@@ -5122,6 +5137,71 @@ mod tests {
         .expect("contract_version 1 is legacy");
         assert_eq!(legacy_v1.contract, StreamContract::Legacy);
         assert_eq!(legacy_v1.content, "plain");
+    }
+
+    #[test]
+    fn gemma4_staged_terminal() {
+        let folded = fold_complete_request_stream(
+            "req-gemma4",
+            7,
+            &[
+                serde_json::json!({
+                    "type": "gen_start",
+                    "contract_version": 2,
+                    "id": "req-gemma4",
+                    "attempt_id": 7
+                }),
+                serde_json::json!({
+                    "type": "token",
+                    "text": "answer",
+                    "id": "req-gemma4",
+                    "attempt_id": 7
+                }),
+                serde_json::json!({
+                    "type": "commit_ready",
+                    "finish_reason": "stop",
+                    "prefill_tokens": 8,
+                    "tokens": 7,
+                    "cached_tokens": 3,
+                    "prefill_ms": 12.5,
+                    "decode_tok_s": 40.0,
+                    "id": "req-gemma4",
+                    "attempt_id": 7
+                }),
+            ],
+        )
+        .expect("valid staged v2 stream");
+        let done = folded
+            .done
+            .expect("commit_ready must become the generic v2 terminal");
+        let completion = Completion {
+            id: "req-gemma4".into(),
+            created: 42,
+            model: "gemma4:test".into(),
+            content: folded.content,
+            reasoning_content: folded.reasoning_content,
+            preserve_thinking: false,
+            tool_calls: folded.tool_calls,
+            done,
+            logprobs: None,
+            reasoning: None,
+        };
+
+        let json = completion_json(&completion);
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["prompt_tokens"], 11);
+        assert_eq!(json["usage"]["completion_tokens"], 7);
+        assert_eq!(
+            json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(json["timings"]["prefill_ms"], 12.5);
+        assert_eq!(json["timings"]["decode_tok_s"], 40.0);
+
+        let chunks = openai_stream_terminal_chunks(&completion, true);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chunks[1]["usage"]["prompt_tokens"], 11);
+        assert_eq!(chunks[1]["usage"]["completion_tokens"], 7);
     }
 
     #[test]
