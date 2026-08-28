@@ -1354,11 +1354,14 @@ fn apply_per_layer_input_branch(
 
 /// Gemma's dense Q8 batched projections use the scalar parity reference.
 ///
-/// Keep this as an explicit GEMM-family key rather than relying on
-/// `gemm_q8_0_batched_chunked`'s process-wide WMMA preference. Other callers
-/// continue to select their existing chunked/WMMA route.
+/// The architecture and historical fused-prefill request are accepted only
+/// to make the no-WMMA policy explicit at every call site. They intentionally
+/// do not alter the selected family key.
 #[inline]
-fn q8_batched_projection_key() -> hipfire_dispatch::types::KernelKey {
+fn q8_batched_projection_key(
+    _arch: &str,
+    _fused_prefill_requested: bool,
+) -> hipfire_dispatch::types::KernelKey {
     hipfire_dispatch::types::KernelKey::GemmQ8_0Batched
 }
 
@@ -1388,8 +1391,11 @@ fn proj_gemm_batched(
         DType::F32 => gpu
             .gemm_f32_batched(&w.buf, x, y, w.m, w.k, b)
             .map_err(|e| format!("gemma4 batch {label} (f32): {e:?}")),
-        DType::Q8_0 => run_plain_gemm_key(gpu, q8_batched_projection_key(), w, x, y, b)
-            .map_err(|e| format!("gemma4 batch {label} (q8): {e}")),
+        DType::Q8_0 => {
+            let key = q8_batched_projection_key(&gpu.arch, gpu.flags.gemma4_q8_fused_prefill);
+            run_plain_gemm_key(gpu, key, w, x, y, b)
+                .map_err(|e| format!("gemma4 batch {label} (q8): {e}"))
+        }
         DType::MQ4G256 | DType::HFQ4G256 => {
             // FWHT-rotate the shared input once, then run the prerotated GEMM.
             // rotate_x_mq_batched_for handles the AWQ-aware branch (no-op AWQ
@@ -1438,70 +1444,6 @@ fn run_plain_gemm_key(
     };
     hipfire_runtime::llama::gemm_family()
         .run_key(key, &ctx, gpu, &params)
-        .map_err(|e| format!("{e:?}"))
-}
-
-/// Route a 2-way fused gate+up (or Q/K) GEMM through `FusedQkvFamily`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn run_fused_gate_up_key(
-    gpu: &mut Gpu,
-    key: hipfire_dispatch::types::KernelKey,
-    w_gate: &WeightTensor,
-    w_up: &WeightTensor,
-    x: &GpuTensor,
-    y_gate: &GpuTensor,
-    y_up: &GpuTensor,
-    batch_size: usize,
-) -> Result<(), String> {
-    use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
-    let ctx = DispatchCtx::new(gpu);
-    let params = FusedQkvParams {
-        kind: key,
-        weights: &[&w_gate.buf, &w_up.buf],
-        x,
-        outputs: &[y_gate, y_up],
-        m: &[w_gate.m, w_up.m],
-        k: w_gate.k,
-        rot_scratch: &[],
-        batch_size: Some(batch_size),
-    };
-    hipfire_runtime::llama::fused_qkv_family()
-        .run(&ctx, gpu, &params)
-        .map_err(|e| format!("{e:?}"))
-}
-
-/// Route a 3-way fused QKV GEMM through `FusedQkvFamily`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn run_fused_qkv_key(
-    gpu: &mut Gpu,
-    key: hipfire_dispatch::types::KernelKey,
-    wq: &WeightTensor,
-    wk: &WeightTensor,
-    wv: &WeightTensor,
-    x: &GpuTensor,
-    y_q: &GpuTensor,
-    y_k: &GpuTensor,
-    y_v: &GpuTensor,
-    batch_size: usize,
-) -> Result<(), String> {
-    use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
-    let ctx = DispatchCtx::new(gpu);
-    let params = FusedQkvParams {
-        kind: key,
-        weights: &[&wq.buf, &wk.buf, &wv.buf],
-        x,
-        outputs: &[y_q, y_k, y_v],
-        m: &[wq.m, wk.m, wv.m],
-        k: wq.k,
-        rot_scratch: &[],
-        batch_size: Some(batch_size),
-    };
-    hipfire_runtime::llama::fused_qkv_family()
-        .run(&ctx, gpu, &params)
         .map_err(|e| format!("{e:?}"))
 }
 
@@ -2231,62 +2173,20 @@ fn batch_attn_block(
         .map_err(|e| format!("gemma4 batch attn input rmsnorm: {e:?}"))?;
 
     // Shared-KV layers only project Q. K/V are read from the latest preceding
-    // layer with the same attention type. On exact gfx1100, opt in to the
-    // existing fused Q8 WMMA projections so the common activation is staged
-    // once instead of once per matrix.
-    let fuse_q8 = gpu.arch == "gfx1100"
-        && gpu.flags.gemma4_q8_fused_prefill
-        && a.write_slot.is_some()
-        && a.q_proj.gpu_dtype == DType::Q8_0
-        && a.k_proj.gpu_dtype == DType::Q8_0
-        && a.q_proj.k == a.k_proj.k
-        && a.q_proj.k % 32 == 0;
-    match (fuse_q8, a.v_proj) {
-        (true, Some(vw)) if vw.gpu_dtype == DType::Q8_0 && vw.k == a.q_proj.k => {
-            run_fused_qkv_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::FusedQkvQ8_0,
-                a.q_proj,
-                a.k_proj,
-                vw,
-                nrm,
-                q,
-                k,
-                v,
-                b,
-            )
-            .map_err(|e| format!("gemma4 batch fused qkv (q8): {e}"))?;
-        }
-        (true, None) => {
-            run_fused_gate_up_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
-                a.q_proj,
-                a.k_proj,
-                nrm,
-                q,
-                k,
-                b,
-            )
-            .map_err(|e| format!("gemma4 batch fused qk (q8): {e}"))?;
-            gpu.hip
-                .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
-                .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
-        }
-        _ => {
-            proj_gemm_batched(gpu, a.q_proj, nrm, q, x_rot, b, "q_proj")?;
-            if a.write_slot.is_some() {
-                proj_gemm_batched(gpu, a.k_proj, nrm, k, x_rot, b, "k_proj")?;
-                match a.v_proj {
-                    Some(vw) => {
-                        proj_gemm_batched(gpu, vw, nrm, v, x_rot, b, "v_proj")?;
-                    }
-                    None => {
-                        gpu.hip
-                            .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
-                            .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
-                    }
-                }
+    // layer with the same attention type. Every dense Q8 projection flows
+    // through `proj_gemm_batched`, which selects Gemma's explicit scalar
+    // parity family entry regardless of architecture or feature flags.
+    proj_gemm_batched(gpu, a.q_proj, nrm, q, x_rot, b, "q_proj")?;
+    if a.write_slot.is_some() {
+        proj_gemm_batched(gpu, a.k_proj, nrm, k, x_rot, b, "k_proj")?;
+        match a.v_proj {
+            Some(vw) => {
+                proj_gemm_batched(gpu, vw, nrm, v, x_rot, b, "v_proj")?;
+            }
+            None => {
+                gpu.hip
+                    .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
+                    .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
             }
         }
     }
@@ -2455,29 +2355,12 @@ fn batch_ffn_block(
         .memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4)
         .map_err(|e| format!("gemma4 batch ffn save residual: {e:?}"))?;
 
-    // 2) gate / up projections (shared nrm input).
-    if gpu.arch == "gfx1100"
-        && gpu.flags.gemma4_q8_fused_prefill
-        && tail.gate_proj.gpu_dtype == DType::Q8_0
-        && tail.up_proj.gpu_dtype == DType::Q8_0
-        && tail.gate_proj.k == tail.up_proj.k
-        && tail.gate_proj.k % 32 == 0
-    {
-        run_fused_gate_up_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
-            tail.gate_proj,
-            tail.up_proj,
-            nrm,
-            gate_ffn,
-            up_ffn,
-            b,
-        )
-        .map_err(|e| format!("gemma4 batch fused gate+up (q8): {e}"))?;
-    } else {
-        proj_gemm_batched(gpu, tail.gate_proj, nrm, gate_ffn, ffn_rot, b, "gate_proj")?;
-        proj_gemm_batched(gpu, tail.up_proj, nrm, up_ffn, ffn_rot, b, "up_proj")?;
-    }
+    // 2) gate / up projections (shared nrm input). Both Q8 projections use
+    // the same explicit scalar parity family entry as attention and LM-head
+    // projections; the historical gfx1100 fused-WMMA opt-in is intentionally
+    // not used by the eager batch path.
+    proj_gemm_batched(gpu, tail.gate_proj, nrm, gate_ffn, ffn_rot, b, "gate_proj")?;
+    proj_gemm_batched(gpu, tail.up_proj, nrm, up_ffn, ffn_rot, b, "up_proj")?;
 
     // 3) hidden = gelu_tanh(gate) * up  (elementwise over B*ffn_hd).
     gpu.gelu_tanh_f32(gate_ffn, ffn_hidden, b * ffn_hd)
@@ -2722,10 +2605,11 @@ mod tests {
         assert!(validate_batch_token_ids(&[2, 7], 8).is_ok());
     }
     #[test]
-    fn q8_batch_uses_scalar_family_entry_without_global_override() {
-        assert_eq!(
-            q8_batched_projection_key(),
-            hipfire_dispatch::types::KernelKey::GemmQ8_0Batched
-        );
+    fn q8_batch_uses_scalar_family_entry_even_with_gfx1100_fusion_opt_in() {
+        let scalar = hipfire_dispatch::types::KernelKey::GemmQ8_0Batched;
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(q8_batched_projection_key(arch, false), scalar);
+            assert_eq!(q8_batched_projection_key(arch, true), scalar);
+        }
     }
 }
