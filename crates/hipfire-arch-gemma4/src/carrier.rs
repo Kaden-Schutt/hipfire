@@ -48,10 +48,19 @@ pub struct Gemma4EagerBundle {
     pub state: Gemma4State,
 }
 
+impl Gemma4EagerBundle {
+    /// Actual bytes owned by eager target weights and state. Tied aliases are
+    /// excluded by the underlying owner accounting helpers.
+    pub fn owner_bytes(&self) -> usize {
+        self.weights.owner_bytes() + self.state.owner_bytes()
+    }
+}
+
 pub struct Gemma4LoweredBundle {
     pub config: lowered::Gemma4Config,
     pub weights: lowered::Gemma4Weights,
     pub scratch: lowered::Gemma4Scratch,
+
     pub kv_sliding: KvCache,
     pub kv_full: KvCache,
 }
@@ -59,6 +68,15 @@ pub struct Gemma4LoweredBundle {
 pub enum Gemma4Bundle {
     Eager(Gemma4EagerBundle),
     Lowered(Gemma4LoweredBundle),
+}
+impl Gemma4Bundle {
+    /// Actual bytes owned by whichever Gemma execution route was selected.
+    pub fn owner_bytes(&self) -> usize {
+        match self {
+            Self::Eager(eager) => eager.owner_bytes(),
+            Self::Lowered(lowered) => lowered.owner_bytes(),
+        }
+    }
 }
 impl Gemma4LoweredBundle {
     /// Actual bytes owned by the lowered bundle, excluding borrowed aliases

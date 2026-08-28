@@ -35,6 +35,7 @@ use crate::config::Gemma4Config;
 use crate::drafter::{drafter_step, Gemma4DrafterConfig, Gemma4DrafterScratch, Gemma4DrafterWeights};
 use crate::forward::forward_batch_spec;
 use crate::gemma4::{Gemma4State, Gemma4Weights};
+use crate::lowered::tensor_owner_bytes;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Result of one EAGLE spec step.
@@ -91,6 +92,13 @@ impl Gemma4SpecScratch {
             .memcpy_dtod_at(&self.seed_hidden.buf, 0, &src.buf, 0, self.dim * 4)
             .map_err(|e| format!("gemma4-spec: seed_hidden copy: {e:?}"))
     }
+    /// Sum actual capacities of the reusable EAGLE scratch buffers.
+    pub fn owner_bytes(&self) -> usize {
+        tensor_owner_bytes(&self.seed_hidden)
+            + tensor_owner_bytes(&self.draft_hidden)
+            + tensor_owner_bytes(&self.verify_hidden)
+    }
+
 
     pub fn free(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.seed_hidden);
@@ -249,4 +257,56 @@ pub fn spec_step_gemma4_eagle(
         next_seed_token: bonus,
         drafts,
     })
+}
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use crate::config::{LayerType, RopeType};
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_spec_scratch_owner_bytes_includes_all_verify_buffers() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = Gemma4Config {
+            dim: 4,
+            n_layers: 1,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            bos_token: 2,
+            eos_token: 1,
+            pad_token: 0,
+            n_heads: 1,
+            sliding_head_dim: 4,
+            sliding_n_kv_heads: 1,
+            sliding_rope_theta: 10_000.0,
+            sliding_rope_type: RopeType::Default,
+            sliding_window: 128,
+            full_head_dim: 4,
+            full_n_kv_heads: 1,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            hidden_dim: 8,
+            use_double_wide_mlp: false,
+            hidden_size_per_layer_input: 0,
+            vocab_size_per_layer_input: 0,
+            num_kv_shared_layers: 0,
+            final_logit_softcapping: 30.0,
+            tie_word_embeddings: true,
+            embed_scale: 2.0,
+            max_position_embeddings: 128,
+            layer_types: vec![LayerType::Sliding],
+            norm_plus_one: false,
+        };
+        let scratch = Gemma4SpecScratch::new(&mut gpu, &cfg, 3).expect("tiny spec scratch");
+        assert!(scratch.owner_bytes() > 3 * cfg.dim * std::mem::size_of::<f32>());
+        scratch.free(&mut gpu);
+        gpu.drain_pool();
+    }
 }

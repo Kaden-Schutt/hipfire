@@ -1989,7 +1989,7 @@ impl Carrier for Gemma4Carrier {
                     ctx.max_seq,
                     ctx.spec,
                 );
-                Ok(LoadedModel {
+                let model = LoadedModel {
                     state: Some(Box::new(crate::Gemma4Bundle {
                         config: e.config,
                         weights: e.weights,
@@ -2007,7 +2007,18 @@ impl Carrier for Gemma4Carrier {
                         ctx.path.to_string(),
                         meta.chat_template,
                     )
-                })
+                };
+                let owner_bytes = model
+                    .gemma4()
+                    .map_or(0, crate::Gemma4Bundle::owner_bytes);
+                hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+                    "publish",
+                    hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
+                    owner_bytes,
+                    ctx.gpu,
+                    Vec::new(),
+                );
+                Ok(model)
             }
         }
     }

@@ -772,6 +772,17 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
 /// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
 /// freeing less leaks, freeing more double-frees.
 impl Gemma4Bundle {
+    /// Actual bytes owned by eager weights, state, and optional EAGLE state.
+    /// Aliased LM-head and sidecar views are excluded by the arch helpers.
+    pub fn owner_bytes(&self) -> usize {
+        self.weights.owner_bytes()
+            + self.state.owner_bytes()
+            + self
+                .eagle
+                .as_ref()
+                .map_or(0, Gemma4EagleState::owner_bytes)
+    }
+
     /// Total cold reset for eager Gemma state and its wrapper-owned cache.
     pub fn cold_reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         reset_gemma_cache_and_cursor(
@@ -879,6 +890,8 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
+        let owner_bytes = b.owner_bytes();
+        let has_eagle = b.eagle.is_some();
         if let Some(eagle) = b.eagle {
             eagle.spec_scratch.free(gpu);
             eagle.drafter_scratch.free_gpu(gpu);
@@ -886,6 +899,13 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
         }
         b.state.free_gpu(gpu);
         b.weights.free_gpu(gpu);
+        gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+            "unload",
+            gemma4::lowered::allocation_telemetry_cycle(),
+            owner_bytes,
+            gpu,
+            gemma4_eager_freed_owner_labels(has_eagle),
+        );
     }
 }
 
@@ -1003,6 +1023,28 @@ pub struct Gemma4EagleState {
     /// Drafts per round (verify block = draft_len + 1).
     pub draft_len: usize,
 }
+impl Gemma4EagleState {
+    /// Actual bytes owned by the optional drafter and per-round scratch.
+    pub fn owner_bytes(&self) -> usize {
+        self.drafter_weights.owner_bytes()
+            + self.drafter_scratch.owner_bytes()
+            + self.spec_scratch.owner_bytes()
+    }
+}
+
+fn gemma4_eager_freed_owner_labels(has_eagle: bool) -> Vec<String> {
+    let mut labels = Vec::with_capacity(if has_eagle { 5 } else { 2 });
+    if has_eagle {
+        labels.extend([
+            "eagle_spec_scratch",
+            "eagle_drafter_scratch",
+            "eagle_drafter_weights",
+        ]);
+    }
+    labels.extend(["state", "weights"]);
+    labels.into_iter().map(str::to_string).collect()
+}
+
 
 /// Gemma 4 dense text (arch_id=13) GPU bundle — eager dense path. Re-exported
 /// from the arch crate, which owns config/weights/state so `impl SpecTarget`
@@ -5973,6 +6015,34 @@ mod ep_policy_mesh_tests {
             policy.mesh().epoch(),
             load_mesh.epoch(),
             "a policy from a fresh mesh must NOT match the load mesh epoch"
+        );
+    }
+}
+#[cfg(test)]
+mod gemma4_telemetry_tests {
+    use super::{Gemma4Bundle, Gemma4EagleState};
+
+    #[test]
+    fn eager_owner_methods_cover_wrapper_and_optional_eagle() {
+        let _: fn(&Gemma4Bundle) -> usize = Gemma4Bundle::owner_bytes;
+        let _: fn(&Gemma4EagleState) -> usize = Gemma4EagleState::owner_bytes;
+    }
+
+    #[test]
+    fn eager_unload_labels_name_each_owner_once() {
+        assert_eq!(
+            super::gemma4_eager_freed_owner_labels(false),
+            ["state", "weights"]
+        );
+        assert_eq!(
+            super::gemma4_eager_freed_owner_labels(true),
+            [
+                "eagle_spec_scratch",
+                "eagle_drafter_scratch",
+                "eagle_drafter_weights",
+                "state",
+                "weights"
+            ]
         );
     }
 }

@@ -1016,7 +1016,7 @@ pub enum LayerWeights {
     Full(FullLayerWeights),
 }
 
-fn tensor_owner_bytes(tensor: &GpuTensor) -> usize {
+pub(crate) fn tensor_owner_bytes(tensor: &GpuTensor) -> usize {
     if tensor.buf.is_borrowed() {
         0
     } else {
@@ -1024,7 +1024,15 @@ fn tensor_owner_bytes(tensor: &GpuTensor) -> usize {
     }
 }
 
-fn weight_owner_bytes(weight: &WeightTensor) -> usize {
+pub(crate) fn device_buffer_owner_bytes(buffer: &hip_bridge::DeviceBuffer) -> usize {
+    if buffer.is_borrowed() {
+        0
+    } else {
+        buffer.size()
+    }
+}
+
+pub(crate) fn weight_owner_bytes(weight: &WeightTensor) -> usize {
     let mut bytes = tensor_owner_bytes(&weight.buf);
     if let Some(awq_scale) = weight.awq_scale.as_ref() {
         bytes += tensor_owner_bytes(awq_scale);
@@ -2713,7 +2721,7 @@ impl Gemma4Scratch {
         .into_iter()
         .map(|tensor| tensor_owner_bytes(tensor))
         .sum::<usize>()
-            + self.pos_buf.size()
+            + device_buffer_owner_bytes(&self.pos_buf)
     }
 
     /// Release every GPU allocation owned by this scratch. The position

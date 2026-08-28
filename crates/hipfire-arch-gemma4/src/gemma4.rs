@@ -9,6 +9,9 @@
 //! contract in [`Gemma4Config`]. MoE and multimodal towers remain out of scope.
 
 use crate::config::{Gemma4Config, LayerType};
+use crate::lowered::{
+    device_buffer_owner_bytes, kv_owner_bytes, tensor_owner_bytes, weight_owner_bytes,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hipfire_runtime::weight_backend::load_embedding;
@@ -278,6 +281,68 @@ fn load_per_layer_branch(
     }))
 }
 
+impl PerLayerBranchWeights {
+    fn owner_bytes(&self) -> usize {
+        weight_owner_bytes(&self.input_gate)
+            + weight_owner_bytes(&self.projection)
+            + tensor_owner_bytes(&self.post_input_norm)
+    }
+}
+
+impl PerLayerInputWeights {
+    fn owner_bytes(&self) -> usize {
+        tensor_owner_bytes(&self.embed_tokens)
+            + weight_owner_bytes(&self.model_projection)
+            + tensor_owner_bytes(&self.projection_norm)
+    }
+}
+
+impl LayerWeights {
+    fn owner_bytes(&self) -> usize {
+        match self {
+            LayerWeights::Sliding(layer) => {
+                tensor_owner_bytes(&layer.input_layernorm)
+                    + tensor_owner_bytes(&layer.post_attention_layernorm)
+                    + tensor_owner_bytes(&layer.pre_feedforward_layernorm)
+                    + tensor_owner_bytes(&layer.post_feedforward_layernorm)
+                    + weight_owner_bytes(&layer.q_proj)
+                    + weight_owner_bytes(&layer.k_proj)
+                    + weight_owner_bytes(&layer.v_proj)
+                    + weight_owner_bytes(&layer.o_proj)
+                    + tensor_owner_bytes(&layer.q_norm)
+                    + tensor_owner_bytes(&layer.k_norm)
+                    + weight_owner_bytes(&layer.gate_proj)
+                    + weight_owner_bytes(&layer.up_proj)
+                    + weight_owner_bytes(&layer.down_proj)
+                    + layer
+                        .per_layer
+                        .as_ref()
+                        .map_or(0, PerLayerBranchWeights::owner_bytes)
+            }
+            LayerWeights::Full(layer) => {
+                tensor_owner_bytes(&layer.input_layernorm)
+                    + tensor_owner_bytes(&layer.post_attention_layernorm)
+                    + tensor_owner_bytes(&layer.pre_feedforward_layernorm)
+                    + tensor_owner_bytes(&layer.post_feedforward_layernorm)
+                    + weight_owner_bytes(&layer.q_proj)
+                    + weight_owner_bytes(&layer.k_proj)
+                    + layer.v_proj.as_ref().map_or(0, weight_owner_bytes)
+                    + weight_owner_bytes(&layer.o_proj)
+                    + tensor_owner_bytes(&layer.q_norm)
+                    + tensor_owner_bytes(&layer.k_norm)
+                    + weight_owner_bytes(&layer.gate_proj)
+                    + weight_owner_bytes(&layer.up_proj)
+                    + weight_owner_bytes(&layer.down_proj)
+                    + layer
+                        .per_layer
+                        .as_ref()
+                        .map_or(0, PerLayerBranchWeights::owner_bytes)
+            }
+        }
+    }
+}
+
+
 pub struct Gemma4Weights {
     /// Token embedding [vocab, dim]; aliased as lm_head when tied.
     pub embed_tokens: GpuTensor,
@@ -290,6 +355,25 @@ pub struct Gemma4Weights {
 }
 
 impl Gemma4Weights {
+    /// Sum the actual capacities of every owning eager weight descriptor.
+    ///
+    /// Tied `lm_head` and any aliased Paro/pool views contribute zero through
+    /// the shared ownership helpers, while their owning source is counted once.
+    pub fn owner_bytes(&self) -> usize {
+        tensor_owner_bytes(&self.embed_tokens)
+            + weight_owner_bytes(&self.lm_head)
+            + tensor_owner_bytes(&self.final_norm)
+            + self
+                .per_layer_input
+                .as_ref()
+                .map_or(0, PerLayerInputWeights::owner_bytes)
+            + self
+                .layers
+                .iter()
+                .map(LayerWeights::owner_bytes)
+                .sum::<usize>()
+    }
+
     pub fn load(hfq: &HfqFile, cfg: &Gemma4Config, gpu: &mut Gpu) -> Result<Self, String> {
         if cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0 {
             cfg.e_series_variant()?;
@@ -634,13 +718,15 @@ impl Gemma4Weights {
     /// Return all GPU weight buffers to the pool (drained on unload by the
     /// daemon's `unload_model`). Consumes self.
     ///
-    /// `lm_head` is NOT freed here: it is always an alias of `embed_tokens`'
-    /// allocation (tied embeddings — see the alias construction in `load`).
-    /// `embed_tokens` owns the bytes and is freed exactly once below; dropping
-    /// the alias is a no-op (`DeviceBuffer` has no `Drop`).
+    /// The tied `lm_head` buffer is a borrowed alias of `embed_tokens`, so its
+    /// buffer is skipped. Any independently owning LM-head sidecars/buffer are
+    /// still released exactly once.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        let lm_head = self.lm_head;
+        if weight_owner_bytes(&lm_head) != 0 {
+            lm_head.free_all(gpu);
+        }
         let _ = gpu.free_tensor(self.embed_tokens);
-        let _ = gpu.free_tensor(self.final_norm);
         if let Some(ple) = self.per_layer_input {
             let _ = gpu.free_tensor(ple.embed_tokens);
             ple.model_projection.free_all(gpu);
@@ -1099,6 +1185,45 @@ impl Gemma4State {
         outcome
     }
 
+    /// Sum the actual capacities of all eager state owners, including both KV
+    /// families, the raw position scalar, and every scratch tensor.
+    pub fn owner_bytes(&self) -> usize {
+        kv_owner_bytes(&self.kv_sliding)
+            + kv_owner_bytes(&self.kv_full)
+            + device_buffer_owner_bytes(&self.pos_buf)
+            + [
+                &self.x,
+                &self.residual,
+                &self.tmp,
+                &self.tmp_rot,
+                &self.q,
+                &self.k,
+                &self.v,
+                &self.attn_out,
+                &self.q8_flash_partials,
+                &self.v_norm_ones,
+                &self.gate_ffn,
+                &self.up_ffn,
+                &self.ffn_hidden,
+                &self.ffn_out,
+                &self.logits,
+            ]
+            .into_iter()
+            .map(tensor_owner_bytes)
+            .sum::<usize>()
+            + [
+                &self.ple_token_inputs,
+                &self.ple_projection_all,
+                &self.ple_gate,
+                &self.ple_hidden,
+                &self.ple_out,
+            ]
+            .into_iter()
+            .flatten()
+            .map(tensor_owner_bytes)
+            .sum::<usize>()
+    }
+
     /// Return all GPU state buffers (both KV caches, the device position
     /// scalar, and the per-decode scratch tensors) to the pool. Consumes
     /// self. Caller follows with `gpu.drain_pool()` (the daemon's
@@ -1137,5 +1262,153 @@ impl Gemma4State {
                 let _ = gpu.free_tensor(t);
             }
         }
+    }
+}
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use hipfire_runtime::llama::ParoRotation;
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_weights_owner_bytes_counts_sidecars_once_and_excludes_tied_alias() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let tensor = |gpu: &mut Gpu| gpu.zeros(&[1], DType::F32).expect("tiny tensor");
+        let weight = |gpu: &mut Gpu| WeightTensor {
+            buf: tensor(gpu),
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+
+        let embed_tokens = tensor(&mut gpu);
+        let lm_head = WeightTensor {
+            buf: GpuTensor {
+                buf: unsafe { embed_tokens.buf.alias() },
+                shape: embed_tokens.shape.clone(),
+                dtype: DType::F32,
+            },
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+        let final_norm = tensor(&mut gpu);
+        let mut q_proj = weight(&mut gpu);
+        let q_buf_bytes = q_proj.buf.buf.size();
+        let awq_scale = tensor(&mut gpu);
+        let awq_bytes = awq_scale.buf.size();
+        let paro_pairs = tensor(&mut gpu);
+        let paro_theta = tensor(&mut gpu);
+        let paro_channel_scales = tensor(&mut gpu);
+        let paro_bytes =
+            paro_pairs.buf.size() + paro_theta.buf.size() + paro_channel_scales.buf.size();
+        q_proj.awq_scale = Some(awq_scale);
+        q_proj.paro = Some(ParoRotation {
+            pairs: paro_pairs,
+            theta: paro_theta,
+            channel_scales: paro_channel_scales,
+            krot: 1,
+            group_size: 1,
+            is_alias: false,
+        });
+
+        let layer = LayerWeights::Sliding(SlidingLayerWeights {
+            input_layernorm: tensor(&mut gpu),
+            post_attention_layernorm: tensor(&mut gpu),
+            pre_feedforward_layernorm: tensor(&mut gpu),
+            post_feedforward_layernorm: tensor(&mut gpu),
+            layer_scalar_host: 1.0,
+            q_proj,
+            k_proj: weight(&mut gpu),
+            v_proj: weight(&mut gpu),
+            o_proj: weight(&mut gpu),
+            q_norm: tensor(&mut gpu),
+            k_norm: tensor(&mut gpu),
+            gate_proj: weight(&mut gpu),
+            up_proj: weight(&mut gpu),
+            down_proj: weight(&mut gpu),
+            ffn_hidden_dim: 1,
+            per_layer: None,
+        });
+        let weights = Gemma4Weights {
+            embed_tokens,
+            embd_format: EmbeddingFormat::F32,
+            lm_head,
+            final_norm,
+            per_layer_input: None,
+            layers: vec![layer],
+        };
+
+        let expected = weights.embed_tokens.buf.size()
+            + weights.final_norm.buf.size()
+            + weights.layers[0].owner_bytes();
+        assert_eq!(weights.owner_bytes(), expected);
+        assert!(
+            weights.layers[0].owner_bytes() >= q_buf_bytes + awq_bytes + paro_bytes,
+            "layer owner total must include weight and both sidecar families"
+        );
+        assert_eq!(weights.lm_head.buf.buf.size(), weights.embed_tokens.buf.size());
+        assert!(weights.lm_head.buf.buf.is_borrowed());
+
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+    }
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_state_owner_bytes_includes_kv_position_and_scratch_owners() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = Gemma4Config {
+            dim: 4,
+            n_layers: 1,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            bos_token: 2,
+            eos_token: 1,
+            pad_token: 0,
+            n_heads: 1,
+            sliding_head_dim: 32,
+            sliding_n_kv_heads: 1,
+            sliding_rope_theta: 10_000.0,
+            sliding_rope_type: crate::config::RopeType::Default,
+            sliding_window: 128,
+            full_head_dim: 32,
+            full_n_kv_heads: 1,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: crate::config::RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            hidden_dim: 8,
+            use_double_wide_mlp: false,
+            hidden_size_per_layer_input: 0,
+            vocab_size_per_layer_input: 0,
+            num_kv_shared_layers: 0,
+            final_logit_softcapping: 30.0,
+            tie_word_embeddings: true,
+            embed_scale: 2.0,
+            max_position_embeddings: 128,
+            layer_types: vec![LayerType::Sliding],
+            norm_plus_one: false,
+        };
+        let state =
+            Gemma4State::new_with_max_seq(&mut gpu, &cfg, 128).expect("tiny eager state");
+        assert!(state.owner_bytes() > state.pos_buf.size());
+        state.free_gpu(&mut gpu);
+        gpu.drain_pool();
     }
 }

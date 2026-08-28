@@ -48,6 +48,7 @@
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{Gemma4State, Gemma4Weights};
+use crate::lowered::{device_buffer_owner_bytes, tensor_owner_bytes, weight_owner_bytes};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{f16_to_f32, weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -422,6 +423,38 @@ pub struct DrafterLayerWeights {
     pub down_proj: WeightTensor,
 }
 
+impl DrafterLayerWeights {
+    fn owner_bytes(&self) -> usize {
+        tensor_owner_bytes(&self.input_layernorm)
+            + tensor_owner_bytes(&self.post_attention_layernorm)
+            + tensor_owner_bytes(&self.pre_feedforward_layernorm)
+            + tensor_owner_bytes(&self.post_feedforward_layernorm)
+            + weight_owner_bytes(&self.q_proj)
+            + weight_owner_bytes(&self.o_proj)
+            + tensor_owner_bytes(&self.q_norm)
+            + weight_owner_bytes(&self.gate_proj)
+            + weight_owner_bytes(&self.up_proj)
+            + weight_owner_bytes(&self.down_proj)
+    }
+}
+
+impl Gemma4DrafterWeights {
+    /// Sum actual capacities of all drafter weight owners. The tied LM-head
+    /// alias contributes zero, while its `embed_tokens` owner is counted once.
+    pub fn owner_bytes(&self) -> usize {
+        tensor_owner_bytes(&self.embed_tokens)
+            + weight_owner_bytes(&self.lm_head)
+            + tensor_owner_bytes(&self.final_norm)
+            + weight_owner_bytes(&self.pre_projection)
+            + weight_owner_bytes(&self.post_projection)
+            + self
+                .layers
+                .iter()
+                .map(DrafterLayerWeights::owner_bytes)
+                .sum::<usize>()
+    }
+}
+
 pub struct Gemma4DrafterWeights {
     /// Own token embedding [vocab, hidden=1024]; aliased as the drafter lm_head.
     pub lm_head: WeightTensor, // tied to embed_tokens, dim = hidden
@@ -607,14 +640,15 @@ impl Gemma4DrafterWeights {
     /// Return all GPU weight buffers to the pool (drained by the daemon's
     /// `unload_model`). Consumes self.
     ///
-    /// `lm_head` is NOT freed here: it is always an alias of `embed_tokens`'
-    /// allocation (tied embedding — see the alias construction in `load`).
-    /// `embed_tokens` owns the bytes and is freed exactly once below; dropping
-    /// the alias is a no-op (`DeviceBuffer` has no `Drop`). Same rule as
-    /// `Gemma4Weights::free_gpu` on the target.
+    /// The tied `lm_head` buffer is a borrowed alias of `embed_tokens`, so its
+    /// buffer is skipped. Any independently owning LM-head sidecars/buffer are
+    /// still released exactly once.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        let lm_head = self.lm_head;
+        if weight_owner_bytes(&lm_head) != 0 {
+            lm_head.free_all(gpu);
+        }
         let _ = gpu.free_tensor(self.embed_tokens);
-        let _ = gpu.free_tensor(self.final_norm);
         self.pre_projection.free_all(gpu);
         self.post_projection.free_all(gpu);
         for l in self.layers {
@@ -681,6 +715,31 @@ impl Gemma4DrafterScratch {
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
             pos_buf,
         })
+    }
+
+    /// Sum actual capacities of every drafter scratch owner, including the
+    /// raw device position scalar.
+    pub fn owner_bytes(&self) -> usize {
+        [
+            &self.concat,
+            &self.embed_half,
+            &self.x,
+            &self.residual,
+            &self.tmp,
+            &self.q,
+            &self.attn_out,
+            &self.gate_ffn,
+            &self.up_ffn,
+            &self.ffn_hidden,
+            &self.ffn_out,
+            &self.normed,
+            &self.post_proj,
+            &self.logits,
+        ]
+        .into_iter()
+        .map(tensor_owner_bytes)
+        .sum::<usize>()
+            + device_buffer_owner_bytes(&self.pos_buf)
     }
 
     /// Return all scratch buffers to the pool. Consumes self. The raw
@@ -1079,4 +1138,47 @@ fn argmax_f32(v: &[f32]) -> u32 {
         }
     }
     bi
+}
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_drafter_scratch_owner_bytes_includes_all_scratch_and_position() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = Gemma4DrafterConfig {
+            hidden: 4,
+            n_layers: 1,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            n_heads: 1,
+            sliding_head_dim: 4,
+            sliding_n_kv_heads: 1,
+            sliding_rope_theta: 10_000.0,
+            sliding_window: 128,
+            full_head_dim: 4,
+            full_n_kv_heads: 1,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: crate::config::RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            hidden_dim: 8,
+            backbone_hidden: 4,
+            final_logit_softcapping: 0.0,
+            num_centroids: 0,
+            centroid_top_k: 0,
+            use_ordered_embeddings: false,
+            layer_types: vec![crate::config::LayerType::Sliding],
+            norm_plus_one: false,
+        };
+        let scratch = Gemma4DrafterScratch::new(&mut gpu, &cfg).expect("tiny drafter scratch");
+        assert!(scratch.owner_bytes() > scratch.pos_buf.size());
+        scratch.free_gpu(&mut gpu);
+        gpu.drain_pool();
+    }
 }
