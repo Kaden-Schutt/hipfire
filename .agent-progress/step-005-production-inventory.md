@@ -5,7 +5,7 @@ Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 
 | Family | Mode | Production entry | SuperOp route | Default | Hand/state oracle | Replacement owner | Status |
 |---|---|---|---|---|---|---|---|
-| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — final source gates rerun; A/C/lifecycle/owner gates pass, quality/reference/E-series and workspace baseline blockers remain |
+| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — final rerun; Gate A terminal and lowered owner gates pass, dense eager owner/pool telemetry is unavailable, quality/reference/E-series and workspace validation blockers remain |
 | LFM2 | Single | `decode_step_layers_and_head` | `decode_step_layers_and_head_lowered` -> `run_layer_program` | on | direct layer loop with capture | LFM2 increment | open |
 | MiniMax | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct attention + sealed MoE loop | MiniMax increment | open |
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
@@ -493,7 +493,8 @@ All four commands used release binaries, `--sampling greedy --thinking off --max
 
 - `graphify update .` exited `0` after this inventory update and rebuilt the local graph with **40,771 nodes, 100,488 edges, and 2,038 communities**. HTML visualization was skipped because the graph exceeded the 5,000-node limit.
 - Graphify warned that **101 source files produced zero nodes** (retryable, not silently cached) and that **one SQL file contributed nothing because `tree_sitter_sql` is not installed**. Generated graph JSON/report/labels/manifest and caches remain local and untracked by policy; only the tracked `graphify-out/cache/stat-index.json` update may be staged.
-- Source gate verdict: **BLOCKED** by the observed workspace quantize test failure and accepted shared clippy baseline classification; scoped formatter/build and Gemma-focused/actionable tests pass. Product Gate A terminal envelopes and Gate B/C lifecycle/owner gates pass, but MoE semantic quality, the available B=2 reference case, and E2B/E4B fixtures remain blocked.
+- Remediation-source blockers: **none proven**. Scoped formatter/build and Gemma-focused/actionable tests pass. The clippy result is an accepted unrelated shared `hipfire-config/src/rocm.rs` baseline classification; the one full-workspace `hipfire-quantize` failure is a non-reproducing transient/workspace validation blocker, not a proven Gemma source blocker.
+- Product Gate A terminal envelopes and Gate B parity/cache/injected paths pass, but Gate C remains **BLOCKED** for the dense eager route because it emitted no owner/pool telemetry; stable post-unload free-MB values alone are insufficient to close the ownership criterion. Lowered MoE lifecycle/owner telemetry and the five-stage owner matrix pass, while MoE semantic quality, the B=2 reference case, and E2B/E4B fixtures remain blocked.
 - Original Task 7 verdict: **BLOCKED**. Gemma4 row remains `open`; completion criteria are not reduced by passing source/actionable and lifecycle gates.
 
 ## Out of scope (later tasks)
