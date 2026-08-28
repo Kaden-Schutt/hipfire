@@ -1,11 +1,11 @@
 # STEP-005 production SuperOp inventory
 
-Date: 2026-08-27
+Date: 2026-08-28
 Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 
 | Family | Mode | Production entry | SuperOp route | Default | Hand/state oracle | Replacement owner | Status |
 |---|---|---|---|---|---|---|---|
-| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — fixture-ready; Task 7 serve/lifecycle blocked |
+| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | open — final source gates rerun; A/C/lifecycle/owner gates pass, quality/reference/E-series and workspace baseline blockers remain |
 | LFM2 | Single | `decode_step_layers_and_head` | `decode_step_layers_and_head_lowered` -> `run_layer_program` | on | direct layer loop with capture | LFM2 increment | open |
 | MiniMax | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct attention + sealed MoE loop | MiniMax increment | open |
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
@@ -438,6 +438,63 @@ Gate A raw files are under `/home/bjoern/hipfire-step005/gemma4/remediation/gate
 - Graphify warned that **101 source files produced zero nodes** (they remain retryable and are not silently treated as extracted) and that **one SQL file contributed nothing because `tree_sitter_sql` is not installed**. Local graph outputs remain outside the evidence commit; only the pre-existing tracked `graphify-out/cache/stat-index.json` update is committed.
 
 Because source formatting/clippy/test gates, MoE quality/chain, the constructor fault matrix, the available batched-reference case, and E2B/E4B fixtures remain unresolved, the Gemma4 inventory row stays `open`; the original Task 7 verdict stays **BLOCKED**.
+
+## Task 8 final rerun (2026-08-28, corrected source HEAD `488917ebafa687e2ca3cac60792e93d21581292d`)
+
+Validation-only rerun. No source implementation files were changed. Raw logs and JSON are local under `/home/bjoern/hipfire-step005/gemma4/remediation/rerun-488917eba/`; no prior raw result is substituted.
+
+### Identity and source/actionable gates
+
+- Canonical dense model `/home/bjoern/.hipfire/models/gemma4-12b.mq4`: SHA-256 `4ceb57b558275776680b9acd78fa4e058abefa994a901eb5253654c51e9981c3`, MD5 `a1419f8a5ddbbe70ad5fa7e6a3c2b73a`.
+- Canonical MoE model `/home/bjoern/.hipfire/models/gemma4-26b-a4b.mq4`: SHA-256 `6f83d448d4bc089aa18debd6601d34c6fd3ce0bab96ee8519d08f6d65121df63`, MD5 `182eafae7b25386ac9f9b73ce77b1a88`.
+- Committed prompt `benchmarks/prompts/merge_sort_thinking_off.txt`: SHA-256 `d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0`, current MD5 `253c7ac50857fe6d0e10fb0d2c5e35c0`.
+- Current release binaries from the corrected HEAD: `target/release/hipfire` MD5 `957e10a9a0c5834227ff8b5229b1db69`; `target/release/daemon` MD5 `222d00ee61f592cd2c28c92a41817b14`. The isolated rerun daemon copy has the same MD5 and was used for product probes.
+- Existing user daemon was observed as PID `819407` (CLI parent `819389`) before the rerun and was not signaled or stopped. Product runs used `HIP_VISIBLE_DEVICES=0`, isolated homes, unique ports for HTTP, and supervised process groups.
+- Exact scoped `rustfmt --edition 2021 --check --config skip_children=true` over the 11 brief-listed files: exit `0`.
+- `cargo build`: exit `0` (compiler warnings only). `cargo build --release --locked -p hipfire-cli -p hipfire-daemon`: exit `0` (compiler warnings only).
+- All three exact narrow clippy commands exit `101` before modified targets because the shared pre-existing `hipfire-config/src/rocm.rs` diagnostics remain: `doc_overindented_list_items`, `redundant_guards`, and `obfuscated_if_else`. No clippy baseline source was changed.
+- Exact workspace `cargo test`: exit `101` on `hipfire-quantize` test `diagnostics::tests::glimmer_self_attn_gate_proj_is_attention_not_mlp_or_router` (155 passed, 1 failed, 4 ignored in that bin). The exact test rerun in isolation exited `0` (`1 passed`, `159 filtered`), so the full-run failure is not deterministic in isolation and remains an unrelated order/interference or transient baseline observation; no source patch was made. Raw files: `source/cargo-test.log`, `source/quantize-single-failure.log`.
+
+### Gate A — isolated production HTTP battery and chain
+
+All four commands used release binaries, `--sampling greedy --thinking off --max-tokens 64`, `HIP_VISIBLE_DEVICES=0`, isolated homes, unique ports `11531`–`11534`, and per-run daemon logs/JSON.
+
+- Dense battery (`gate-a/dense-battery.log/.json`) exit `0`: `ctx=[48,56,26,33,32]`, `cached=[0,0,0,0,0]`, `gen=[64,64,64,64,64]`; every row reached `finish=length`, `[gemma4-12b.mq4|off|battery DONE]`, `empty=0`, `attractor=0`, `retrieval_miss=0`, with no premature EOF. All five rows hit the cap (`runaway=5`); visible prefixes were coherent, so this is terminal/usage evidence, not a semantic-quality pass.
+- Dense chain (`gate-a/dense-chain.log/.json`) exit `0`: `ctx=[48,163,250,344,437]`, `cached=[0,0,0,0,0]`, `gen=[64,64,64,64,64]`; every row reached `finish=length` and `[gemma4-12b.mq4|off|chain DONE]`, `empty=0`, `attractor=0`, `retrieval_miss=0`, with no premature EOF. All five hit the cap (`runaway=5`); no positive cache observation is claimed from this harness chain.
+- MoE battery (`gate-a/moe-battery.log/.json`) exit `0`: `ctx=[48,56,26,33,32]`, `cached=[0,0,0,0,0]`, `gen=[64,64,64,64,64]`; every row reached `finish=length` and `[gemma4-26b-a4b.mq4|off|battery DONE]`, `empty=0`, `attractor=0`, with no premature EOF. Decoded text is visibly malformed multilingual/repeated-token output.
+- MoE chain (`gate-a/moe-chain.log/.json`) exit `1`: `ctx=[48,154,236,327,418]`, `cached=[0,0,0,0,0]`, `gen=[64,64,64,64,64]`; all rows reached `finish=length` and `[gemma4-26b-a4b.mq4|off|chain DONE]`, then the harness failed on `attractor=1`. Decoded text is visibly malformed; semantic quality and chain remain blocked.
+
+### Gate B — canonical parity, cache, and injected paths
+
+- Fresh eager production graph child logs (`gate-b/eager-graph-{default,on,off}-child.log`) each reported the exact canonical continuation IDs `[45518,107,101,1509,5724,1133,611,2473,735,3265,496,11409,3618,653,496,116896,167043,236775,575,236775,1018,769,108,3910,740,564,1601,611,3124,236881,1637,611]`, `GEMMA_PRODUCT_FNV=0x981d38723fe270af`, `GEMMA_PRODUCT_RAW_TOKENS=true`, and test result `1 passed`. Default had the graph capture marker; explicit `on` and `off` also matched. The parent fresh-process oracle (`gate-b/eager-product-graph-oracle.log`) passed all three routes against the independent eager direct control.
+- Fresh eager batched-prefill oracle (`gate-b/eager-batched-prefill-oracle.log`) passed: requested width `8` was observed on the 16-token exact-input artifact prompt, IDs matched, and final-logit cosine was `0.9997148`.
+- Fresh lowered MoE canonical oracle (`gate-b/lowered-moe-oracle.log`) passed (`1 passed`); the test asserted the accepted fixed-token IDs and final-logit FNV `0x831756562b0ab110` for `[2,9259,236888,575,106]`, greedy, `--max 32`, repetition penalty `1.0`.
+- Dense and lowered MoE cache probes (`gate-b/dense-cache.json`, `moe-cache.json`) both observed seed `cached_tokens=0`, related suffix `cached_tokens=4` with suffix-only prefill (`prefill_tokens=8`), unrelated request `cached_tokens=0`, correlated `commit_ready`/`done`, and `unloaded`; both process exits were `0`.
+- Dense and lowered MoE abort probes (`gate-b/dense-abort.json`, `moe-abort.json`) both sent a correlated abort, observed `aborted` plus terminal `done` with `finish_reason=aborted`, then a related follow-up with `cached_tokens=4`; both process exits were `0`.
+- Fresh injected transaction tests (`gate-b/gemma-focused-tests.log`) passed `27/27`, covering EOS-before-prepare/forward/commit, invalid shape/non-finite/out-of-range token, forward failure rollback, stop quarantine, and abort/cache fakes. Registry pin (`gate-b/registry-pin.log`), telemetry formatting (`gate-b/lowered-telemetry-format.log`), eager prefill selection (`gate-b/eager-prefill-selection.log`), and ignored-oracle compile selection (`gate-b/eager-oracle-selection.log`) each passed.
+
+### Gate C — lifecycle and ownership
+
+- Fresh direct daemon lifecycle probes completed four dense eager cycles and four lowered MoE cycles (`gate-c/dense-eager-lifecycle.json`, `gate-c/moe-lifecycle.json`). Every cycle observed load → generate (`finish=length`, `tokens=1`) → reset (`rolled_back=true`, `seq_pos=0`, `conversation_len=0`) → unload → post-unload diag. Dense eager post-unload `vram_free_mb=99649` on cycles 1–4; lowered MoE post-unload `vram_free_mb=99511` on cycles 1–4. The dense eager production binary emitted no `[gemma4 alloc]` records; MoE production telemetry held constant `owner_bytes=16509459208`, `pool_bytes=16509459204`, `graph_resident=false`, `graph_blob_count=0`, `module_count=22`, and complete freed labels `kv_full,kv_sliding,scratch,weights` (the release binary has no fault-inject live-owner feature, so its `live_owner_bytes=0` field is not used as the fault-matrix claim).
+- Fresh feature-gated five-stage constructor matrix (`gate-c/constructor-fault-matrix.log`) passed all `weights`, `scratch`, `sliding_kv`, `full_kv`, and `session` injections plus normal load/unload. Every fault row reported `live_owner_bytes=0`, `pool_after_drain=0`, `modules_after_drain=0`, `deficit=0`, and checked drain `Ok(())`; the unfaulted publish/unload also returned live owners to zero. The former 70,545,408-byte free-device RED observation is retained as historical evidence only and is not substituted or silently relabeled.
+- Fresh ignored teardown smoke (`gate-c/lowered-teardown-smoke.log`) passed (`1 passed`), exercising sidecars, aliases, and MoE pools.
+
+### Quality/reference and artifact disposition
+
+- Fresh eager sequential-vs-batched reference matrix (`quality/dense-eager-reference-matrix.log`) used exact token input `[2,9259,236888,575,106]`; B=1,4,8 passed, but B=2 failed post-batch KV next-token argmax (`seq=2921`, `bat=236906`, next cosine `0.9975923`). Available reference matrix remains **FAIL**.
+- Fresh Gate A dense output is coherent only at visible prefixes and cap-terminated; fresh MoE output is visibly malformed. No malformed output is called coherent, and no semantic-quality pass is inferred from counters or FNV.
+- Fresh reference availability (`quality/reference-availability.log`) found no exact local HF/higher-precision Gemma checkpoint; exact E2B/E4B fixtures are absent. Historical Task 7 logs remain non-promoted.
+
+### E-series arm
+
+- `scripts/reproduce-gemma4-eseries-parity.sh` was run only with exact expected E2B/E4B fixture paths and exited `2` at missing `/home/bjoern/.hipfire/models/gemma4-eseries/gemma4-e2b-it-pr439-q8.hfq`; `eseries/fixture-state.log` confirms the directory and both exact fixtures are absent. This remains an external fixture blocker.
+
+### Graph refresh and current verdict
+
+- `graphify update .` exited `0` after this inventory update and rebuilt the local graph with **40,771 nodes, 100,488 edges, and 2,038 communities**. HTML visualization was skipped because the graph exceeded the 5,000-node limit.
+- Graphify warned that **101 source files produced zero nodes** (retryable, not silently cached) and that **one SQL file contributed nothing because `tree_sitter_sql` is not installed**. Generated graph JSON/report/labels/manifest and caches remain local and untracked by policy; only the tracked `graphify-out/cache/stat-index.json` update may be staged.
+- Source gate verdict: **BLOCKED** by the observed workspace quantize test failure and accepted shared clippy baseline classification; scoped formatter/build and Gemma-focused/actionable tests pass. Product Gate A terminal envelopes and Gate B/C lifecycle/owner gates pass, but MoE semantic quality, the available B=2 reference case, and E2B/E4B fixtures remain blocked.
+- Original Task 7 verdict: **BLOCKED**. Gemma4 row remains `open`; completion criteria are not reduced by passing source/actionable and lifecycle gates.
 
 ## Out of scope (later tasks)
 
