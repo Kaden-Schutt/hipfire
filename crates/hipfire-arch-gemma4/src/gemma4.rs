@@ -1050,8 +1050,53 @@ impl Gemma4State {
         })
     }
 
-    pub fn reset(&mut self) {
+    /// Current number of tokens materialized in the eager KV caches.
+    #[inline]
+    pub const fn materialized_cursor(&self) -> usize {
+        self.n_tokens
+    }
+
+    /// Set the eager runtime cursor after a committed forward.
+    #[inline]
+    pub fn set_materialized_cursor(&mut self, cursor: usize) {
+        self.n_tokens = cursor;
+    }
+
+    /// Total architecture-local cold reset. KV bytes remain allocated, but
+    /// the shared cursor and both KV-family offsets/warmup markers return to
+    /// their load state.
+    pub fn reset_session_state(&mut self) {
         self.n_tokens = 0;
+        self.kv_sliding.compact_offset = 0;
+        self.kv_full.compact_offset = 0;
+        self.ar_warmed_up = false;
+    }
+
+    /// Backwards-compatible state reset used by existing forward callers.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.reset_session_state();
+    }
+
+    /// Apply the shared exact-prefix rollback policy to the eager cursor.
+    pub fn rollback_working_request(
+        &mut self,
+        committed_cursor: usize,
+        identity_matches: bool,
+        overwrite_boundary: Option<usize>,
+    ) -> crate::lowered::GemmaRollback {
+        let outcome = crate::lowered::rollback_gemma_cursor(
+            &mut self.n_tokens,
+            committed_cursor,
+            identity_matches,
+            overwrite_boundary,
+        );
+        if matches!(outcome, crate::lowered::GemmaRollback::Invalidated) {
+            self.kv_sliding.compact_offset = 0;
+            self.kv_full.compact_offset = 0;
+            self.ar_warmed_up = false;
+        }
+        outcome
     }
 
     /// Return all GPU state buffers (both KV caches, the device position

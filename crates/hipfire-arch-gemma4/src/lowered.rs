@@ -54,6 +54,116 @@ pub fn batched_prefill_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("HIPFIRE_BATCHED_PREFILL").map_or(false, |v| v == "1"))
 }
 
+/// Result of rolling back a working Gemma request.
+///
+/// `RestoredCommitted` is valid only for append-only work that did not damage
+/// any row belonging to the committed sliding window. `Invalidated` means the
+/// caller must perform the total cold reset before the next request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmaRollback {
+    RestoredCommitted,
+    Invalidated,
+}
+
+/// Authoritative runtime cursor for the lowered Gemma bundle.
+///
+/// Both the sliding and full KV families advance against this one logical
+/// position. The host prefix cache owns committed/request transaction metadata;
+/// this type owns only the live runtime cursor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gemma4Cursor {
+    position: usize,
+}
+
+/// Apply the exact-prefix rollback policy to an architecture-owned cursor.
+///
+/// This free helper lets the eager `Gemma4State` adapter and the lowered
+/// cursor share one overwrite/identity decision without sharing host history.
+pub fn rollback_gemma_cursor(
+    position: &mut usize,
+    committed_cursor: usize,
+    identity_matches: bool,
+    overwrite_boundary: Option<usize>,
+) -> GemmaRollback {
+    let overwrote_committed = overwrite_boundary
+        .is_some_and(|boundary| boundary < committed_cursor);
+    if identity_matches && *position >= committed_cursor && !overwrote_committed {
+        *position = committed_cursor;
+        GemmaRollback::RestoredCommitted
+    } else {
+        *position = 0;
+        GemmaRollback::Invalidated
+    }
+}
+
+impl Gemma4Cursor {
+    #[inline]
+    pub const fn new(position: usize) -> Self {
+        Self { position }
+    }
+
+    #[inline]
+    pub const fn position(self) -> usize {
+        self.position
+    }
+
+    /// Current number of tokens materialized in both lowered KV families.
+    #[inline]
+    pub const fn materialized_cursor(self) -> usize {
+        self.position
+    }
+
+    /// Set the shared lowered runtime cursor after a committed forward.
+    #[inline]
+    pub fn set_materialized_cursor(&mut self, cursor: usize) {
+        self.position = cursor;
+    }
+
+    #[inline]
+    pub fn set_position(&mut self, position: usize) {
+        self.position = position;
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.position = 0;
+    }
+
+    /// Roll back the live cursor after a working request.
+    ///
+    /// `overwrite_boundary` is the earliest absolute row overwritten by that
+    /// request. A boundary at or after `committed_cursor` touches only working
+    /// rows and is therefore safe; a boundary below it destroys committed
+    /// sliding-window data. Identity mismatches and cursor regressions fail
+    /// closed to the cold state.
+    pub fn rollback_working_request(
+        &mut self,
+        committed_cursor: usize,
+        identity_matches: bool,
+        overwrite_boundary: Option<usize>,
+    ) -> GemmaRollback {
+        rollback_gemma_cursor(
+            &mut self.position,
+            committed_cursor,
+            identity_matches,
+            overwrite_boundary,
+        )
+    }
+}
+
+/// Reset the two lowered KV families' logical offset state together.
+///
+/// KV bytes are reusable after a cursor reset; the offsets are the metadata
+/// that must not survive a cold session reset.
+#[inline]
+pub fn reset_kv_offsets(
+    kv_sliding: &mut hipfire_runtime::llama::KvCache,
+    kv_full: &mut hipfire_runtime::llama::KvCache,
+) {
+    kv_sliding.compact_offset = 0;
+    kv_full.compact_offset = 0;
+}
+
 /// Batched GEMM for prefill projections.
 ///
 /// Scalar path: routes through `GemmFamily::run_key` with the appropriate
@@ -6013,6 +6123,55 @@ fn forward_scratch_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::{Gemma4Cursor, GemmaRollback};
+    #[test]
+    fn gemma_cache_rollback_append_without_window_overwrite_restores_committed() {
+        let mut cursor = Gemma4Cursor::new(3);
+        cursor.set_position(7);
+
+        assert_eq!(
+            cursor.rollback_working_request(3, true, None),
+            GemmaRollback::RestoredCommitted
+        );
+        assert_eq!(cursor.position(), 3);
+    }
+
+    #[test]
+    fn gemma_cache_rollback_overwrite_of_committed_sliding_rows_invalidates() {
+        let mut cursor = Gemma4Cursor::new(3);
+        cursor.set_position(9);
+
+        assert_eq!(
+            cursor.rollback_working_request(3, true, Some(2)),
+            GemmaRollback::Invalidated
+        );
+        assert_eq!(cursor.position(), 0);
+    }
+
+    #[test]
+    fn gemma_cache_rollback_identity_mismatch_invalidates() {
+        let mut cursor = Gemma4Cursor::new(3);
+        cursor.set_position(7);
+
+        assert_eq!(
+            cursor.rollback_working_request(3, false, None),
+            GemmaRollback::Invalidated
+        );
+        assert_eq!(cursor.position(), 0);
+    }
+
+    #[test]
+    fn gemma_cache_rollback_overwrite_after_request_start_is_safe() {
+        let mut cursor = Gemma4Cursor::new(3);
+        cursor.set_position(7);
+
+        assert_eq!(
+            cursor.rollback_working_request(3, true, Some(3)),
+            GemmaRollback::RestoredCommitted
+        );
+        assert_eq!(cursor.position(), 3);
+    }
+
     use super::{gemma4_op_sequence, Gemma4Op, Gemma4Variant};
 
     #[test]

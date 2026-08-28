@@ -1911,6 +1911,8 @@ impl Carrier for Gemma4Carrier {
                         kv_sliding: l.kv_sliding,
                         kv_full: l.kv_full,
                         eos_tok,
+                        cursor: hipfire_arch_gemma4::lowered::Gemma4Cursor::default(),
+                        prefix_cache: crate::GemmaPrefixCache::default(),
                     })),
                     speculator,
                     ..LoadedModel::skeleton(
@@ -1971,6 +1973,7 @@ impl Carrier for Gemma4Carrier {
                         state: e.state,
                         eos_tok,
                         eagle,
+                        prefix_cache: crate::GemmaPrefixCache::default(),
                     })),
                     speculator,
                     ..LoadedModel::skeleton(

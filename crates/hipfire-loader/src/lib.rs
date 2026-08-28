@@ -528,6 +528,184 @@ impl AsstTurnCache {
     }
 }
 
+/// Host-side exact-prefix cache metadata for one Gemma model/session owner.
+///
+/// The cache deliberately stores only a complete, committed materialization.
+/// Working-request tokens are never appended here: callers publish a new
+/// materialization only after the client terminal commit succeeds. Runtime KV
+/// bytes and their cursor stay in the Gemma architecture bundle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GemmaPrefixCache {
+    /// Tokens represented by the committed runtime KV state.
+    pub materialized_tokens: Vec<u32>,
+    /// Number of committed/materialized tokens. Always equals
+    /// `materialized_tokens.len()` while `valid`.
+    pub committed_cursor: usize,
+    /// Exact model/config identity. Equal identities are required for reuse.
+    pub identity: String,
+    /// Whether the materialization is usable for an exact-prefix match.
+    pub valid: bool,
+    /// Runtime cursor at the beginning of the current working request.
+    pub request_start_cursor: usize,
+    /// First absolute row known to have been overwritten during the working
+    /// request, if any. A boundary below `request_start_cursor` destroys the
+    /// committed prefix in a sliding cache.
+    pub overwrite_boundary: Option<usize>,
+}
+
+impl GemmaPrefixCache {
+    /// Construct an empty, invalid cache for a newly loaded model.
+    #[inline]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Construct a valid committed cache, panicking on the structural
+    /// invariant violation. Use [`Self::try_committed`] at fallible boundaries.
+    pub fn committed(
+        identity: impl Into<String>,
+        materialized_tokens: Vec<u32>,
+        committed_cursor: usize,
+    ) -> Self {
+        Self::try_committed(identity, materialized_tokens, committed_cursor)
+            .expect("GemmaPrefixCache committed cursor must equal materialized token length")
+    }
+
+    /// Construct a valid committed cache after checking that its history and
+    /// cursor describe exactly the same prefix.
+    pub fn try_committed(
+        identity: impl Into<String>,
+        materialized_tokens: Vec<u32>,
+        committed_cursor: usize,
+    ) -> Result<Self, String> {
+        if materialized_tokens.len() != committed_cursor {
+            return Err(format!(
+                "gemma prefix cache: materialized_tokens.len()={} != committed_cursor={committed_cursor}",
+                materialized_tokens.len()
+            ));
+        }
+        Ok(Self {
+            materialized_tokens,
+            committed_cursor,
+            identity: identity.into(),
+            valid: true,
+            request_start_cursor: committed_cursor,
+            overwrite_boundary: None,
+        })
+    }
+
+    /// Return the complete committed prefix when identity and token prefix
+    /// match exactly. No partial LCP or arbitrary rewind is attempted.
+    #[inline]
+    pub fn match_prompt(&self, identity: &str, prompt: &[u32]) -> Option<usize> {
+        if !self.valid
+            || self.materialized_tokens.len() != self.committed_cursor
+            || self.identity != identity
+            || prompt.len() < self.committed_cursor
+        {
+            return None;
+        }
+        prompt
+            .get(..self.committed_cursor)
+            .filter(|prefix| prefix == &&self.materialized_tokens[..])
+            .map(|_| self.committed_cursor)
+    }
+
+    /// Begin a working request without changing the committed materialization.
+    #[inline]
+    pub fn begin_request(&mut self) {
+        self.request_start_cursor = self.committed_cursor;
+        self.overwrite_boundary = None;
+    }
+
+    /// Begin a working request at an explicitly supplied runtime cursor.
+    ///
+    /// The cursor must agree with the currently committed cache (or be zero
+    /// for an invalid cache), preventing a split-brain cache transaction.
+    pub fn begin_request_at(&mut self, cursor: usize) -> Result<(), String> {
+        let expected = if self.valid {
+            self.committed_cursor
+        } else {
+            0
+        };
+        if cursor != expected {
+            return Err(format!(
+                "gemma prefix cache: request start cursor {cursor} != committed cursor {expected}"
+            ));
+        }
+        self.request_start_cursor = cursor;
+        self.overwrite_boundary = None;
+        Ok(())
+    }
+
+    /// Record the earliest absolute row overwritten by the working request.
+    /// Keeping the minimum preserves the first damaged committed row.
+    #[inline]
+    pub fn mark_overwrite(&mut self, boundary: usize) {
+        self.overwrite_boundary = Some(
+            self.overwrite_boundary
+                .map_or(boundary, |previous| previous.min(boundary)),
+        );
+    }
+
+    /// Whether a working request has overwritten a row belonging to the
+    /// committed prefix.
+    #[inline]
+    pub fn overwrote_committed_rows(&self) -> bool {
+        self.overwrite_boundary
+            .is_some_and(|boundary| boundary < self.request_start_cursor)
+    }
+
+    /// Whether an append-only working request can restore this committed
+    /// materialization.
+    #[inline]
+    pub fn can_restore_working_request(&self, identity: &str, working_cursor: usize) -> bool {
+        self.valid
+            && self.materialized_tokens.len() == self.committed_cursor
+            && self.identity == identity
+            && working_cursor >= self.request_start_cursor
+            && !self.overwrote_committed_rows()
+    }
+
+    /// Finish a safe working request while retaining the committed prefix.
+    /// This does not alter history or publish any working tokens.
+    #[inline]
+    pub fn restore_committed(&mut self) {
+        self.request_start_cursor = self.committed_cursor;
+        self.overwrite_boundary = None;
+    }
+
+    /// Invalidate all host metadata after an unsafe rollback or cold reset.
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.materialized_tokens.clear();
+        self.committed_cursor = 0;
+        self.identity.clear();
+        self.valid = false;
+        self.request_start_cursor = 0;
+        self.overwrite_boundary = None;
+    }
+
+    /// Publish a complete materialization after the client has committed the
+    /// request terminal. This is the sole history mutation operation.
+    pub fn publish_committed(
+        &mut self,
+        identity: impl Into<String>,
+        materialized_tokens: Vec<u32>,
+        committed_cursor: usize,
+    ) -> Result<(), String> {
+        if self.overwrote_committed_rows() {
+            return Err(
+                "gemma prefix cache: cannot publish after committed sliding rows were overwritten"
+                    .into(),
+            );
+        }
+        let next = Self::try_committed(identity, materialized_tokens, committed_cursor)?;
+        *self = next;
+        Ok(())
+    }
+}
+
 // `ModelState` was the closed 12-variant enum that stored `LoadedModel.state`.
 // It has been replaced by `Option<Box<dyn ArchModel>>` (see `LoadedModel.state`
 // below). All per-architecture teardown now lives in each bundle's
@@ -582,6 +760,80 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
 /// declared here rather than in their arch crates, so — orphan rule — the impls
 /// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
 /// freeing less leaks, freeing more double-frees.
+impl Gemma4Bundle {
+    /// Total cold reset for eager Gemma state and its wrapper-owned cache.
+    pub fn cold_reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.state.reset_session_state();
+        self.prefix_cache.invalidate();
+        gpu.invalidate_graph_state();
+        gpu.replay.invalidate_replay_observation_window();
+        Ok(())
+    }
+
+    /// Roll back one working request without invoking cold reset when the
+    /// committed prefix remains intact. Unsafe or identity-mismatched work
+    /// invalidates the cache and takes the total cold-reset path.
+    pub fn rollback_working_request(
+        &mut self,
+        identity: &str,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> gemma4::lowered::GemmaRollback {
+        let committed = self.prefix_cache.committed_cursor;
+        let overwrite_boundary = self.prefix_cache.overwrite_boundary;
+        let identity_matches = self.prefix_cache.valid && self.prefix_cache.identity == identity;
+        let outcome = self
+            .state
+            .rollback_working_request(committed, identity_matches, overwrite_boundary);
+        match outcome {
+            gemma4::lowered::GemmaRollback::RestoredCommitted => {
+                self.prefix_cache.restore_committed();
+            }
+            gemma4::lowered::GemmaRollback::Invalidated => {
+                let _ = self.cold_reset(gpu);
+            }
+        }
+        outcome
+    }
+}
+
+impl Gemma4LoweredBundle {
+    /// Total cold reset for lowered Gemma state, both KV families, and the
+    /// wrapper-owned cache.
+    pub fn cold_reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.cursor.reset();
+        gemma4::lowered::reset_kv_offsets(&mut self.kv_sliding, &mut self.kv_full);
+        self.prefix_cache.invalidate();
+        gpu.invalidate_graph_state();
+        gpu.replay.invalidate_replay_observation_window();
+        Ok(())
+    }
+
+    /// Roll back a working request while preserving a safe committed prefix.
+    /// If sliding rows were overwritten, or identity no longer matches, the
+    /// complete lowered state is invalidated through [`Self::cold_reset`].
+    pub fn rollback_working_request(
+        &mut self,
+        identity: &str,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> gemma4::lowered::GemmaRollback {
+        let committed = self.prefix_cache.committed_cursor;
+        let overwrite_boundary = self.prefix_cache.overwrite_boundary;
+        let identity_matches = self.prefix_cache.valid && self.prefix_cache.identity == identity;
+        let outcome = self
+            .cursor
+            .rollback_working_request(committed, identity_matches, overwrite_boundary);
+        match outcome {
+            gemma4::lowered::GemmaRollback::RestoredCommitted => {
+                self.prefix_cache.restore_committed();
+            }
+            gemma4::lowered::GemmaRollback::Invalidated => {
+                let _ = self.cold_reset(gpu);
+            }
+        }
+        outcome
+    }
+}
+
 impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     fn dim(&self) -> usize {
         self.config.dim
@@ -598,10 +850,8 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
         None
     }
-    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
-        // Mirrors daemon reset arms (main.rs:3336 / 3387): `bundle.state.reset()`.
-        self.state.reset();
-        Ok(())
+    fn reset_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.cold_reset(gpu)
     }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
@@ -633,6 +883,10 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
         // one, so expose neither rather than silently picking.
         None
     }
+    fn reset_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.cold_reset(gpu)
+    }
+
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
         b.scratch.free_gpu(gpu);
@@ -721,17 +975,16 @@ pub struct Gemma4Bundle {
     pub state: gemma4::gemma4::Gemma4State,
     pub eos_tok: u32,
     pub eagle: Option<Gemma4EagleState>,
+    /// The sole host-side exact-prefix history for this eager model.
+    pub prefix_cache: GemmaPrefixCache,
 }
 
 /// Lowered / MoE Gemma 4 execution bundle (arch_id=13 26B-A4B + opt-in
 /// batched/WMMA dense prefill). Uses `lowered::{Gemma4Config, Gemma4Weights,
 /// Gemma4Scratch}` plus TWO `hipfire_runtime::llama::KvCache`s (q8
 /// ring-buffered sliding + asym3 full) and `eos_tok`. Mutually exclusive
-/// with `Gemma4Bundle` (eager) via the `ModelState` enum — a given
-/// `LoadedModel` populates exactly one of the two variants.
-/// Chose second `ModelState` variant over enum-inside-bundle to keep
-/// `Gemma4Bundle`'s struct shape stable for the existing eager AR path that
-/// `Gemma4Generate` already matches as `Some(ModelState::Gemma4(bundle))`.
+/// with `Gemma4Bundle` (eager); a given `LoadedModel` populates exactly one
+/// wrapper/cache.
 pub struct Gemma4LoweredBundle {
     pub config: gemma4::lowered::Gemma4Config,
     pub weights: gemma4::lowered::Gemma4Weights,
@@ -739,6 +992,10 @@ pub struct Gemma4LoweredBundle {
     pub kv_sliding: llama::KvCache,
     pub kv_full: llama::KvCache,
     pub eos_tok: u32,
+    /// One cursor shared by both sliding and full KV families.
+    pub cursor: gemma4::lowered::Gemma4Cursor,
+    /// The sole host-side exact-prefix history for this lowered model.
+    pub prefix_cache: GemmaPrefixCache,
 }
 
 /// Muse Glimmer 30B dense text (arch_id=14) GPU bundle — eager dense path.
@@ -1112,6 +1369,12 @@ impl LoadedModel {
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4Bundle>())
     }
 
+    pub fn gemma4_lowered(&self) -> Option<&Gemma4LoweredBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Gemma4LoweredBundle>())
+    }
+
     pub fn gemma4_lowered_mut(&mut self) -> Option<&mut Gemma4LoweredBundle> {
         self.state
             .as_deref_mut()
@@ -1295,6 +1558,15 @@ impl LoadedModel {
         self.seq_pos = 0;
         self.conversation_tokens.clear();
         self.asst_turn_cache.clear();
+        // Gemma's exact-prefix history belongs to its mutually-exclusive
+        // wrapper, but host metadata must be invalidated even when a live
+        // SpecTarget owns the architecture reset below.
+        if let Some(bundle) = self.gemma4_mut() {
+            bundle.prefix_cache.invalidate();
+        }
+        if let Some(bundle) = self.gemma4_lowered_mut() {
+            bundle.prefix_cache.invalidate();
+        }
         let mut first_err: Option<String> = None;
         if let Some(slot) = slot {
             // Live SpecTarget path: arch hook owns KV/recurrent/compact (and
@@ -1343,11 +1615,14 @@ impl LoadedModel {
                 b.state.reset();
             }
             if let Some(bundle) = self.gemma4_mut() {
-                // Gemma4State::reset is cursor-only (n_tokens = 0); the
-                // captured decode hipGraph stays valid across resets (position
-                // is re-staged via pos_host on every replay and attention
-                // geometry is sized for max_seq).
-                bundle.state.reset();
+                if let Err(e) = bundle.cold_reset(gpu) {
+                    push_reset_err(&mut first_err, "gemma4.reset", e);
+                }
+            }
+            if let Some(bundle) = self.gemma4_lowered_mut() {
+                if let Err(e) = bundle.cold_reset(gpu) {
+                    push_reset_err(&mut first_err, "gemma4_lowered.reset", e);
+                }
             }
             if let Some(bundle) = self.muse_glimmer_mut() {
                 bundle.reset_session_state();
@@ -5452,6 +5727,44 @@ mod registry_tests {
         );
     }
 }
+#[cfg(test)]
+mod gemma_prefix_cache_tests {
+    use super::GemmaPrefixCache;
+
+    #[test]
+    fn gemma_prefix_cache_exact_prefix_reuses_only_complete_materialized_prefix() {
+        let cache = GemmaPrefixCache::committed("model@config", vec![1, 2, 3], 3);
+        assert_eq!(
+            cache.match_prompt("model@config", &[1, 2, 3, 4, 5]),
+            Some(3)
+        );
+        assert_eq!(cache.match_prompt("model@config", &[1, 2, 9]), None);
+        assert_eq!(cache.match_prompt("other", &[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn gemma_prefix_cache_materialized_history_and_cursor_must_match() {
+        assert!(GemmaPrefixCache::try_committed("id", vec![1, 2], 1).is_err());
+    }
+
+    #[test]
+    fn gemma_prefix_cache_does_not_publish_working_tokens_before_client_commit() {
+        let mut cache = GemmaPrefixCache::committed("model@config", vec![1, 2, 3], 3);
+        cache.begin_request();
+        cache.mark_overwrite(3);
+
+        // Working request bookkeeping must not mutate the committed prefix.
+        assert_eq!(cache.materialized_tokens, vec![1, 2, 3]);
+        assert_eq!(cache.committed_cursor, 3);
+
+        // An explicit restore keeps the prior committed prefix. Publication is
+        // a separate operation, called only after the client commits.
+        cache.restore_committed();
+        assert_eq!(cache.materialized_tokens, vec![1, 2, 3]);
+        assert_eq!(cache.committed_cursor, 3);
+    }
+}
+
 #[cfg(test)]
 mod ep_policy_mesh_tests {
     use super::*;
