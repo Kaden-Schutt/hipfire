@@ -99,7 +99,6 @@ pub trait ArchModel: Send + std::any::Any {
     /// experiment converted 15 sites of 154 and this hatch is expected to do
     /// better.
 
-
     /// Return every GPU buffer this model owns.
     ///
     /// Consumes the box: unload is terminal, and taking `self` by value makes

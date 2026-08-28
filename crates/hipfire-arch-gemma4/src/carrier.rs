@@ -83,6 +83,18 @@ struct Gemma4LoweredStaging<'a> {
     kv_full: Option<KvCache>,
 }
 
+fn emit_rollback_boundary(phase: &'static str, owner_bytes: usize, gpu: &rdna_compute::Gpu) {
+    if lowered::allocation_telemetry_enabled() {
+        lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+            phase,
+            lowered::allocation_telemetry_cycle(),
+            owner_bytes,
+            gpu,
+            Vec::new(),
+        );
+    }
+}
+
 impl<'a> Gemma4LoweredStaging<'a> {
     fn new(gpu: &'a mut rdna_compute::Gpu) -> Self {
         Self {
@@ -98,10 +110,7 @@ impl<'a> Gemma4LoweredStaging<'a> {
         self.gpu
     }
 
-    fn publish(
-        mut self,
-        config: lowered::Gemma4Config,
-    ) -> Gemma4LoweredBundle {
+    fn publish(mut self, config: lowered::Gemma4Config) -> Gemma4LoweredBundle {
         Gemma4LoweredBundle {
             config,
             weights: self.weights.take().expect("lowered weights not staged"),
@@ -116,16 +125,32 @@ impl<'a> Gemma4LoweredStaging<'a> {
 
     fn release(&mut self) {
         if let Some(kv_full) = self.kv_full.take() {
+            emit_rollback_boundary(
+                "rollback_full_kv_before",
+                lowered::kv_owner_bytes(&kv_full),
+                self.gpu,
+            );
             let _ = kv_full.free_gpu(self.gpu);
+            emit_rollback_boundary("rollback_full_kv_after", 0, self.gpu);
         }
         if let Some(kv_sliding) = self.kv_sliding.take() {
+            emit_rollback_boundary(
+                "rollback_sliding_kv_before",
+                lowered::kv_owner_bytes(&kv_sliding),
+                self.gpu,
+            );
             let _ = kv_sliding.free_gpu(self.gpu);
+            emit_rollback_boundary("rollback_sliding_kv_after", 0, self.gpu);
         }
         if let Some(scratch) = self.scratch.take() {
+            emit_rollback_boundary("rollback_scratch_before", scratch.owner_bytes(), self.gpu);
             scratch.free_gpu(self.gpu);
+            emit_rollback_boundary("rollback_scratch_after", 0, self.gpu);
         }
         if let Some(weights) = self.weights.take() {
+            emit_rollback_boundary("rollback_weights_before", weights.owner_bytes(), self.gpu);
             weights.free_gpu(self.gpu);
+            emit_rollback_boundary("rollback_weights_after", 0, self.gpu);
         }
     }
 }
@@ -135,7 +160,6 @@ impl Drop for Gemma4LoweredStaging<'_> {
         self.release();
     }
 }
-
 
 /// Gemma 4 source/option preconditions — the single authority shared by the
 /// bundle loader and the daemon-side preflight: HFQ-only source shape,
@@ -218,6 +242,10 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         let weights = lowered::load_weights(&mut hfq2, &lcfg, staging.gpu_mut())
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
         staging.weights = Some(weights);
+        // All model tensor reads are complete. Release the HFQ mapping before
+        // rollback can return the weights to the pool; on UMA this mapping's
+        // resident pages share the same physical budget as hipMalloc owners.
+        hfq2.drop_mmap();
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Weights)
             .map_err(|e| format!("gemma4 (lowered) weights stage: {e:?}"))?;
 

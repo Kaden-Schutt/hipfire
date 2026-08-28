@@ -1844,7 +1844,6 @@ fn gemma_sync_host_cursor(seq_pos: &mut usize, materialized_cursor: usize) {
     *seq_pos = materialized_cursor;
 }
 
-
 /// Classify a validated sample before any parser, wire, or history mutation.
 fn classify_gemma_sample(
     token: u32,
@@ -2197,12 +2196,72 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
             .gpu
             .download_f32(&self.bundle.scratch.logits)
             .map_err(|error| format!("gemma4 lowered cached logits download failed: {error:?}"))?;
-        self.bundle
-            .cursor
-            .set_materialized_cursor(committed_cursor);
+        self.bundle.cursor.set_materialized_cursor(committed_cursor);
         Ok(logits)
     }
 }
+/// Production adapter for the eager Gemma4 bundle.
+///
+/// This is the same request-level Step lifecycle used by the lowered product
+/// adapter, while delegating each token to eager `decode_step`. The wrapper
+/// cache remains the sole owner of overwrite bookkeeping.
+#[cfg(test)]
+struct Gemma4EagerAdapter<'a> {
+    gpu: &'a mut rdna_compute::Gpu,
+    bundle: &'a mut hipfire_loader::Gemma4Bundle,
+}
+
+#[cfg(test)]
+impl Gemma4EagerAdapter<'_> {
+    fn forward_step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        let physical_cap = self.bundle.state.kv_sliding.physical_cap;
+        let compact_offset = self.bundle.state.kv_sliding.compact_offset;
+        gemma_mark_overwrite_for_range(
+            &mut self.bundle.prefix_cache,
+            position,
+            1,
+            physical_cap,
+            compact_offset,
+        );
+        gemma4::forward::decode_step(
+            &self.bundle.config,
+            &self.bundle.weights,
+            &mut self.bundle.state,
+            self.gpu,
+            token,
+            position as u32,
+        )
+        .map_err(|error| format!("gemma4 eager Step forward failed: {error:?}"))
+    }
+}
+
+#[cfg(test)]
+impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
+    fn vocab_size(&self) -> usize {
+        self.bundle.config.vocab_size
+    }
+
+    fn cursor(&self) -> usize {
+        self.bundle.state.materialized_cursor()
+    }
+
+    fn set_cursor(&mut self, cursor: usize) {
+        self.bundle.state.set_materialized_cursor(cursor);
+    }
+
+    fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        self.forward_step(token, position)
+    }
+
+    fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        self.forward_step(token, position)
+    }
+
+    fn cached_logits(&mut self) -> Result<Vec<f32>, String> {
+        gemma_recompute_eager_cached_logits(self.bundle, self.gpu)
+    }
+}
+
 /// Reset lowered state before a new request when cache reuse is disabled.
 ///
 /// The reset closure is the attested architecture reset. The caller must clear
@@ -2268,9 +2327,9 @@ fn gemma_recompute_eager_cached_logits(
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<Vec<f32>, String> {
     let committed_cursor = bundle.prefix_cache.committed_cursor;
-    let tail_position = committed_cursor.checked_sub(1).ok_or_else(|| {
-        "gemma4 cached logits require a non-empty committed prefix".to_string()
-    })?;
+    let tail_position = committed_cursor
+        .checked_sub(1)
+        .ok_or_else(|| "gemma4 cached logits require a non-empty committed prefix".to_string())?;
     let token = bundle
         .prefix_cache
         .materialized_tokens
@@ -2304,7 +2363,6 @@ fn gemma_recompute_eager_cached_logits(
     bundle.state.set_materialized_cursor(committed_cursor);
     Ok(logits)
 }
-
 
 /// Record the first absolute sliding-KV row overwritten by a forward range.
 /// Capped Gemma sliding caches address rows modulo `physical_cap`; compaction
@@ -2460,10 +2518,7 @@ fn gemma_cache_begin_request(
 /// Publish the full resident history only after the client has sent terminal
 /// `Commit`. This keeps both Gemma KV families/cursor and host history as one
 /// exact materialization.
-fn gemma_cache_publish_after_commit(
-    m: &mut LoadedModel,
-    identity: &str,
-) -> Result<(), String> {
+fn gemma_cache_publish_after_commit(m: &mut LoadedModel, identity: &str) -> Result<(), String> {
     let materialized_tokens = m.conversation_tokens.clone();
     if let Some(bundle) = m.gemma4_mut() {
         return gemma_publish_prefix_on_commit(
@@ -2579,8 +2634,6 @@ fn gemma_cache_force_cold_reset(
     Ok(())
 }
 
-
-
 /// Render one Gemma4 chat turn with the same Jinja/BOS behavior used by the
 /// eager route. Keeping prompt construction shared prevents dense and MoE
 /// bundles from drifting onto different token prefixes.
@@ -2613,26 +2666,14 @@ fn gemma4_prompt_ids(
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                match messages_history {
-                    Some(history) => history,
-                    None => {
-                        let mut messages = Vec::new();
-                        if let Some(system) = system_prompt {
-                            messages.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: system.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                        }
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(history) => history,
+                None => {
+                    let mut messages = Vec::new();
+                    if let Some(system) = system_prompt {
                         messages.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: system.to_string(),
                             reasoning_content: None,
                             name: None,
                             rendered_name: None,
@@ -2640,10 +2681,21 @@ fn gemma4_prompt_ids(
                             tool_call_id: None,
                             tool_plan: String::new(),
                         });
-                        synthesized = messages;
-                        &synthesized
                     }
-                };
+                    messages.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = messages;
+                    &synthesized
+                }
+            };
             frame.render_messages(messages_slice, tools, None)
         } else {
             frame.render()
@@ -2696,7 +2748,6 @@ where
     commit(staged_tokens, staged_events);
     Ok(())
 }
-
 
 /// Build the shared output quarantine for Gemma's literal end markers and
 /// request-provided stop sequences.
@@ -3046,8 +3097,7 @@ mod gemma4_prefill_batch_tests {
 mod gemma4_overflow_reset_tests {
     #[test]
     fn gemma_overflow_cold_reset_invalidates_cache_and_cursor_kv_together() {
-        let mut cache =
-            hipfire_loader::GemmaPrefixCache::committed("model@config", vec![1, 2], 2);
+        let mut cache = hipfire_loader::GemmaPrefixCache::committed("model@config", vec![1, 2], 2);
         let mut cursor = 7usize;
         let mut sliding_offset = 4usize;
         let mut full_offset = 6usize;
@@ -3071,8 +3121,8 @@ mod gemma4_overflow_reset_tests {
 #[cfg(test)]
 mod gemma_exact_prefix_cache_tests {
     use super::{
-        gemma_cache_prefix_action, gemma_mark_overwrite_for_range,
-        gemma_publish_prefix_on_commit, GemmaCachePrefixAction,
+        gemma_cache_prefix_action, gemma_mark_overwrite_for_range, gemma_publish_prefix_on_commit,
+        GemmaCachePrefixAction,
     };
     use hipfire_loader::GemmaPrefixCache;
 
@@ -3089,15 +3139,7 @@ mod gemma_exact_prefix_cache_tests {
             .expect("publish committed first turn");
 
         assert_eq!(
-            gemma_cache_prefix_action(
-                &cache,
-                "gemma@dense",
-                &[1, 2, 3, 4],
-                &history,
-                3,
-                0,
-                0,
-            ),
+            gemma_cache_prefix_action(&cache, "gemma@dense", &[1, 2, 3, 4], &history, 3, 0, 0,),
             GemmaCachePrefixAction::Reuse { cached_tokens: 3 }
         );
         assert_eq!(
@@ -3105,15 +3147,7 @@ mod gemma_exact_prefix_cache_tests {
             GemmaCachePrefixAction::Cold { reset: true }
         );
         assert_eq!(
-            gemma_cache_prefix_action(
-                &cache,
-                "different@config",
-                &[1, 2, 3, 4],
-                &history,
-                3,
-                0,
-                0,
-            ),
+            gemma_cache_prefix_action(&cache, "different@config", &[1, 2, 3, 4], &history, 3, 0, 0,),
             GemmaCachePrefixAction::Cold { reset: true }
         );
     }
@@ -3149,9 +3183,10 @@ mod gemma_exact_prefix_cache_tests {
         gemma_mark_overwrite_for_range(&mut cache, 5, 4, 6, 0);
         assert_eq!(cache.overwrite_boundary, Some(0));
 
-        let mut compacted =
-            GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3, 4, 5], 5);
-        compacted.begin_request_at(5).expect("compacted request start");
+        let mut compacted = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3, 4, 5], 5);
+        compacted
+            .begin_request_at(5)
+            .expect("compacted request start");
         gemma_mark_overwrite_for_range(&mut compacted, 3, 1, 6, 4);
         assert_eq!(compacted.overwrite_boundary, Some(1));
     }
@@ -3234,7 +3269,9 @@ mod gemma_fake_two_turn_cache_tests {
         }
         fn cached_logits(&mut self) -> Result<Vec<f32>, String> {
             let committed = self.cursor;
-            let tail_position = committed.checked_sub(1).ok_or_else(|| "empty".to_string())?;
+            let tail_position = committed
+                .checked_sub(1)
+                .ok_or_else(|| "empty".to_string())?;
             self.cursor = tail_position;
             self.cached_tail.push((3, tail_position));
             self.cursor = committed;
@@ -3285,15 +3322,7 @@ mod gemma_fake_two_turn_cache_tests {
                 .expect("first terminal commit");
 
             assert_eq!(
-                gemma_cache_prefix_action(
-                    &cache,
-                    "gemma@config",
-                    &[1, 2, 3, 4],
-                    &history,
-                    3,
-                    0,
-                    0,
-                ),
+                gemma_cache_prefix_action(&cache, "gemma@config", &[1, 2, 3, 4], &history, 3, 0, 0,),
                 GemmaCachePrefixAction::Reuse { cached_tokens: 3 },
                 "{route} related request should reuse the committed prefix"
             );
@@ -3307,7 +3336,11 @@ mod gemma_fake_two_turn_cache_tests {
 
             assert_eq!(adapter.prefill, [(1, 0), (2, 1), (4, 3)], "{route} prefill");
             assert_eq!(adapter.forward, [(3, 2)], "{route} decode");
-            assert_eq!(cache.materialized_tokens, vec![1, 2, 3, 4], "{route} cache history");
+            assert_eq!(
+                cache.materialized_tokens,
+                vec![1, 2, 3, 4],
+                "{route} cache history"
+            );
             assert_eq!(cache.committed_cursor, 4, "{route} cache cursor");
         }
     }
@@ -3324,7 +3357,10 @@ mod gemma_fake_two_turn_cache_tests {
         run_request(&mut adapter, &[4], 1, &mut generated);
         history.extend_from_slice(&[4]);
         history.extend_from_slice(&generated);
-        assert_eq!(cache.materialized_tokens, committed, "abort must not publish");
+        assert_eq!(
+            cache.materialized_tokens, committed,
+            "abort must not publish"
+        );
 
         adapter.set_cursor(cache.committed_cursor);
         history = cache.materialized_tokens.clone();
@@ -3349,7 +3385,9 @@ mod gemma_fake_two_turn_cache_tests {
         let mut adapter = FakeAdapter::new();
         adapter.set_cursor(3);
         let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3], 3);
-        cache.begin_request_at(3).expect("equal-prefix request start");
+        cache
+            .begin_request_at(3)
+            .expect("equal-prefix request start");
 
         let mut generated = Vec::new();
         let run = run_request(&mut adapter, &[], 1, &mut generated);
@@ -3392,11 +3430,10 @@ mod gemma_fake_two_turn_cache_tests {
 #[cfg(test)]
 mod gemma4_token_transaction_tests {
     use super::{
-        classify_gemma_sample, gemma_eos_filter_config, gemma_prepare_token,
-        gemma_sync_host_cursor,
-        gemma_eagle_publish_after_settle, gemma_token_transaction, validate_gemma_logits,
-        validate_gemma_token, EosFilter, GemmaEmit, GemmaPreparedToken, GemmaSample,
-        GemmaThoughtRouter, GemmaTokenTransactionResult,
+        classify_gemma_sample, gemma_eagle_publish_after_settle, gemma_eos_filter_config,
+        gemma_prepare_token, gemma_sync_host_cursor, gemma_token_transaction,
+        validate_gemma_logits, validate_gemma_token, EosFilter, GemmaEmit, GemmaPreparedToken,
+        GemmaSample, GemmaThoughtRouter, GemmaTokenTransactionResult,
     };
 
     #[derive(Default)]
@@ -3411,9 +3448,10 @@ mod gemma4_token_transaction_tests {
 
     impl FakeGemmaAdapter {
         fn commit(&mut self, token: u32, prepared: GemmaPreparedToken, _logits: Vec<f32>) {
-            self.visible.extend(prepared.events.into_iter().map(|event| match event {
-                GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
-            }));
+            self.visible
+                .extend(prepared.events.into_iter().map(|event| match event {
+                    GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
+                }));
             self.history.push(token);
             self.cache.push(token);
             self.count += 1;
@@ -3446,10 +3484,7 @@ mod gemma4_token_transaction_tests {
     #[test]
     fn gemma_custom_stop_sequences_enter_shared_quarantine() {
         let config = gemma_eos_filter_config(&["<user-stop>".to_string(), String::new()]);
-        assert!(config
-            .stop_at
-            .iter()
-            .any(|marker| marker == b"<user-stop>"));
+        assert!(config.stop_at.iter().any(|marker| marker == b"<user-stop>"));
         assert!(!config.stop_at.iter().any(Vec::is_empty));
     }
 
@@ -3536,10 +3571,7 @@ mod gemma4_token_transaction_tests {
         let mut router = GemmaThoughtRouter::new(false, 0);
 
         let prefix = gemma_prepare_token(&mut filter, &mut router, b"answer <user-").unwrap();
-        assert_eq!(
-            prefix.events,
-            vec![GemmaEmit::Token("answer ".to_string())]
-        );
+        assert_eq!(prefix.events, vec![GemmaEmit::Token("answer ".to_string())]);
         assert!(!prefix.stop);
 
         let suffix = gemma_prepare_token(&mut filter, &mut router, b"stop>").unwrap();
@@ -3560,9 +3592,11 @@ mod gemma4_token_transaction_tests {
             |tokens, events| {
                 let mut adapter = adapter.borrow_mut();
                 adapter.history.extend(tokens);
-                adapter.visible.extend(events.into_iter().map(|event| match event {
-                    GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
-                }));
+                adapter
+                    .visible
+                    .extend(events.into_iter().map(|event| match event {
+                        GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
+                    }));
                 adapter.count += 1;
                 adapter.done_count += 1;
             },
@@ -3592,9 +3626,11 @@ mod gemma4_token_transaction_tests {
             |tokens, events| {
                 let mut adapter = adapter.borrow_mut();
                 adapter.history.extend(tokens);
-                adapter.visible.extend(events.into_iter().map(|event| match event {
-                    GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
-                }));
+                adapter
+                    .visible
+                    .extend(events.into_iter().map(|event| match event {
+                        GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
+                    }));
                 adapter.count += 1;
                 adapter.done_count += 1;
             },
@@ -3650,7 +3686,6 @@ mod gemma4_token_transaction_tests {
         gemma_sync_host_cursor(&mut host_seq_pos, 42);
         assert_eq!(host_seq_pos, 42);
     }
-
 }
 
 #[cfg(test)]
@@ -3680,8 +3715,7 @@ mod gemma4_lowered_lifecycle_tests {
         }
 
         fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
-            self.calls
-                .push(format!("prefill({token}@{position})"));
+            self.calls.push(format!("prefill({token}@{position})"));
             Ok(vec![0.0; self.vocab_size()])
         }
 
@@ -3715,9 +3749,7 @@ mod gemma4_lowered_lifecycle_tests {
             &[99],
             move |_| {
                 let token = samples.next().expect("sample fixture");
-                sample_calls
-                    .borrow_mut()
-                    .push(format!("sample({token})"));
+                sample_calls.borrow_mut().push(format!("sample({token})"));
                 Ok(token)
             },
             |_token| {
@@ -3727,9 +3759,7 @@ mod gemma4_lowered_lifecycle_tests {
                 })
             },
             move |token, _prepared, _sampled_logits, _next_logits| {
-                commit_calls
-                    .borrow_mut()
-                    .push(format!("commit({token})"));
+                commit_calls.borrow_mut().push(format!("commit({token})"));
                 committed_history.borrow_mut().push(token);
                 committed_generated.borrow_mut().push(token);
             },
@@ -3744,10 +3774,7 @@ mod gemma4_lowered_lifecycle_tests {
             adapter.calls,
             ["prefill(1@0)", "prefill(2@1)", "forward(3@2)"]
         );
-        assert_eq!(
-            calls,
-            ["sample(3)", "commit(3)", "sample(99)", "terminal"]
-        );
+        assert_eq!(calls, ["sample(3)", "commit(3)", "sample(99)", "terminal"]);
         assert_eq!(history, vec![1, 2, 3]);
         assert_eq!(generated, vec![3]);
         assert_eq!(result.generated, 1);
@@ -3782,15 +3809,11 @@ mod gemma4_lowered_lifecycle_tests {
         assert_eq!(adapter.cursor(), 1);
 
         let mut reset_order = Vec::new();
-        let did_reset = super::gemma_lowered_reset_before_request(
-            adapter.cursor(),
-            false,
-            || {
-                reset_order.push("reset");
-                adapter.set_cursor(0);
-                Ok(())
-            },
-        )
+        let did_reset = super::gemma_lowered_reset_before_request(adapter.cursor(), false, || {
+            reset_order.push("reset");
+            adapter.set_cursor(0);
+            Ok(())
+        })
         .expect("lowered request reset");
         assert!(did_reset);
         if did_reset {
@@ -3837,14 +3860,11 @@ mod gemma4_lowered_lifecycle_tests {
         };
         assert_eq!(metrics.cached_tokens, 0);
     }
-
 }
 
 #[cfg(test)]
 mod gemma4_lowered_oracle_tests {
-    use super::{
-        run_gemma_step_lifecycle, Gemma4LoweredAdapter, GemmaEmit, GemmaPreparedToken,
-    };
+    use super::{run_gemma_step_lifecycle, Gemma4LoweredAdapter, GemmaEmit, GemmaPreparedToken};
     use hipfire_runtime::arch_model::ArchModel;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
@@ -3852,9 +3872,13 @@ mod gemma4_lowered_oracle_tests {
 
     fn fnv1a64_f32(values: &[f32]) -> u64 {
         values.iter().fold(0xcbf29ce484222325_u64, |hash, value| {
-            value.to_bits().to_le_bytes().iter().fold(hash, |hash, byte| {
-                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-            })
+            value
+                .to_bits()
+                .to_le_bytes()
+                .iter()
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                })
         })
     }
 
@@ -3946,10 +3970,7 @@ mod gemma4_lowered_oracle_tests {
             (ids, result.final_logits)
         };
 
-        <hipfire_loader::Gemma4LoweredBundle as ArchModel>::free_gpu(
-            Box::new(bundle),
-            &mut gpu,
-        );
+        <hipfire_loader::Gemma4LoweredBundle as ArchModel>::free_gpu(Box::new(bundle), &mut gpu);
         Ok((ids, fnv1a64_f32(&final_logits)))
     }
 
@@ -3971,12 +3992,182 @@ mod gemma4_lowered_oracle_tests {
         assert_eq!(
             ids,
             [
-                1852, 236772, 236770, 1852, 237597, 236770, 29802, 237089, 1852, 1852,
-                237610, 1852, 1852, 1852, 237610, 237610, 237610, 2165, 236775, 569, 1852,
-                5596, 236779, 237610, 236771, 1852, 870, 237372, 1852, 237610, 236770, 5596
+                1852, 236772, 236770, 1852, 237597, 236770, 29802, 237089, 1852, 1852, 237610,
+                1852, 1852, 1852, 237610, 237610, 237610, 2165, 236775, 569, 1852, 5596, 236779,
+                237610, 236771, 1852, 870, 237372, 1852, 237610, 236770, 5596
             ]
         );
         assert_eq!(fnv, 0x831756562b0ab110);
+    }
+}
+
+#[cfg(test)]
+mod gemma4_eager_oracle_tests {
+    use super::{run_gemma_step_lifecycle, Gemma4EagerAdapter, GemmaPreparedToken};
+    use hipfire_arch_gemma4::gemma4::{Gemma4State, Gemma4Weights};
+    use hipfire_arch_gemma4::Gemma4Config;
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+    use std::path::{Path, PathBuf};
+
+    const PROMPT_IDS: [u32; 5] = [2, 9259, 236888, 575, 106];
+    const EXPECTED_IDS: [u32; 32] = [
+        45518, 107, 101, 1509, 5724, 1133, 611, 2473, 735, 3265, 496, 11409, 3618, 653, 496,
+        116896, 167043, 236775, 575, 236775, 1018, 769, 108, 3910, 740, 564, 1601, 611, 3124,
+        236881, 1637, 611,
+    ];
+    const EAGER_DIRECT_FNV: u64 = 0x981d38723fe270af;
+
+    fn fnv1a64_f32(values: &[f32]) -> u64 {
+        values.iter().fold(0xcbf29ce484222325_u64, |hash, value| {
+            value
+                .to_bits()
+                .to_le_bytes()
+                .iter()
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                })
+        })
+    }
+
+    fn run_eager_direct_oracle(
+        model_path: &Path,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+    ) -> Result<(Vec<u32>, u64), String> {
+        let mut gpu =
+            rdna_compute::Gpu::init().map_err(|error| format!("oracle GPU init: {error:?}"))?;
+        let hfq = HfqFile::open(model_path)
+            .map_err(|error| format!("oracle eager HFQ open: {error:?}"))?;
+        let config = Gemma4Config::from_hfq(&hfq)
+            .map_err(|error| format!("oracle eager config: {error:?}"))?;
+        let weights = Gemma4Weights::load(&hfq, &config, &mut gpu)
+            .map_err(|error| format!("oracle eager weights: {error:?}"))?;
+        let mut state =
+            Gemma4State::new_with_max_seq(&mut gpu, &config, prompt_ids.len() + max_tokens + 16)
+                .map_err(|error| format!("oracle eager state: {error:?}"))?;
+
+        let mut logits = Vec::new();
+        for (position, &token) in prompt_ids.iter().enumerate() {
+            logits = hipfire_arch_gemma4::forward::decode_step(
+                &config,
+                &weights,
+                &mut state,
+                &mut gpu,
+                token,
+                position as u32,
+            )
+            .map_err(|error| format!("oracle eager prefill: {error:?}"))?;
+        }
+
+        let mut ids = Vec::with_capacity(max_tokens);
+        let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(0x13579BDF);
+        let stop_tokens = [config.eos_token, 106];
+        let mut position = prompt_ids.len();
+        for _ in 0..max_tokens {
+            let token =
+                hipfire_arch_deepseek4::sampling::sample_token(&logits, 0.0, 0, 1.0, &mut rng);
+            if stop_tokens.contains(&token) {
+                break;
+            }
+            ids.push(token);
+            logits = hipfire_arch_gemma4::forward::decode_step(
+                &config,
+                &weights,
+                &mut state,
+                &mut gpu,
+                token,
+                position as u32,
+            )
+            .map_err(|error| format!("oracle eager decode: {error:?}"))?;
+            position += 1;
+        }
+
+        let fnv = fnv1a64_f32(&logits);
+        state.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        Ok((ids, fnv))
+    }
+
+    fn run_eager_product_oracle(
+        model_path: &Path,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+    ) -> Result<(Vec<u32>, u64), String> {
+        let mut gpu =
+            rdna_compute::Gpu::init().map_err(|error| format!("product GPU init: {error:?}"))?;
+        let cask = CaskConfig::default();
+        let mut model = hipfire_loader::load_model(
+            model_path
+                .to_str()
+                .ok_or_else(|| "product model path is not UTF-8".to_string())?,
+            prompt_ids.len() + max_tokens + 16,
+            None,
+            None,
+            None,
+            None,
+            &cask,
+            1,
+            SpecLoadCfg::default(),
+            &mut gpu,
+        )?;
+
+        let result = {
+            let bundle = model
+                .gemma4_mut()
+                .ok_or_else(|| "product oracle did not select eager Gemma4".to_string())?;
+            let eos = bundle.eos_tok;
+            let mut adapter = Gemma4EagerAdapter {
+                gpu: &mut gpu,
+                bundle,
+            };
+            let mut ids = Vec::with_capacity(max_tokens);
+            let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(0x13579BDF);
+            let lifecycle = run_gemma_step_lifecycle(
+                &mut adapter,
+                prompt_ids,
+                max_tokens,
+                prompt_ids.len() + max_tokens + 16,
+                &[eos, 106],
+                |logits| {
+                    Ok(hipfire_arch_deepseek4::sampling::sample_token(
+                        logits, 0.0, 0, 1.0, &mut rng,
+                    ))
+                },
+                |_token| {
+                    Ok(GemmaPreparedToken {
+                        events: Vec::new(),
+                        stop: false,
+                    })
+                },
+                |token, _prepared, _sampled_logits, _next_logits| ids.push(token),
+            )?;
+            Ok::<_, String>((ids, fnv1a64_f32(&lifecycle.final_logits)))
+        }?;
+
+        hipfire_loader::unload_model(model, &mut gpu)?;
+        Ok(result)
+    }
+
+    #[test]
+    #[ignore = "requires canonical Gemma4 dense artifact and AMD GPU"]
+    fn gemma4_eager_product_matches_independent_dense_direct_oracle() {
+        let path = std::env::var_os("HIPFIRE_GEMMA4_DENSE_ORACLE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home/bjoern/.hipfire/models/gemma4-12b.mq4"));
+        assert!(
+            path.is_file(),
+            "canonical Gemma4 dense artifact is missing: {}",
+            path.display()
+        );
+
+        let direct = run_eager_direct_oracle(&path, &PROMPT_IDS, 32).expect("direct oracle run");
+        assert_eq!(direct.0, EXPECTED_IDS);
+        assert_eq!(direct.1, EAGER_DIRECT_FNV);
+
+        let product = run_eager_product_oracle(&path, &PROMPT_IDS, 32).expect("product oracle run");
+        assert_eq!(product, direct);
     }
 }
 
@@ -4118,27 +4309,27 @@ pub fn generate_gemma4(
     };
     let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
 
-
     // Exact-prefix cache admission happens before capacity accounting. A hit
     // starts at the committed cursor and only the suffix is materialized; any
     // mismatch has already taken the total cold-reset path.
     drop(bundle);
     let cache_identity = gemma_cache_identity(m);
-    let mut cached_tokens =
-        match gemma_cache_begin_request(m, gpu, &cache_identity, &prompt_ids) {
-            Ok(cached_tokens) => cached_tokens,
-            Err(error) => {
-                emit_error_with_id(stdout, id, format!("gemma4 cache start failed: {error}"));
-                return;
-            }
-        };
+    let mut cached_tokens = match gemma_cache_begin_request(m, gpu, &cache_identity, &prompt_ids) {
+        Ok(cached_tokens) => cached_tokens,
+        Err(error) => {
+            emit_error_with_id(stdout, id, format!("gemma4 cache start failed: {error}"));
+            return;
+        }
+    };
     let mut prefill_tokens = &prompt_ids[cached_tokens..];
     let mut cache_cap = m
         .gemma4()
         .map(|bundle| bundle.state.max_seq)
         .unwrap_or(m.max_seq);
-    let exceeds_capacity =
-        cached_tokens.saturating_add(prefill_tokens.len()).saturating_add(max_tokens) > cache_cap;
+    let exceeds_capacity = cached_tokens
+        .saturating_add(prefill_tokens.len())
+        .saturating_add(max_tokens)
+        > cache_cap;
     if exceeds_capacity && cached_tokens > 0 {
         if let Err(error) = gemma_cache_force_cold_reset(m, gpu) {
             emit_error_with_id(stdout, id, format!("gemma4 context reset failed: {error}"));
@@ -4156,11 +4347,7 @@ pub fn generate_gemma4(
         .as_mut()
         .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
     else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "gemma4 eager bundle missing after cache setup",
-        );
+        emit_error_with_id(stdout, id, "gemma4 eager bundle missing after cache setup");
         return;
     };
     if cached_tokens.saturating_add(prefill_tokens.len()) >= cache_cap {
@@ -4386,17 +4573,14 @@ pub fn generate_gemma4(
             let mut block_events: Vec<GemmaEmit> = Vec::new();
             // Stage the verified block; publish only after cursor settle succeeds.
             for &t in &spec.committed {
-                let sample = match classify_gemma_sample_for_stops(
-                    t,
-                    &stop_set,
-                    bundle.config.vocab_size,
-                ) {
-                    Ok(sample) => sample,
-                    Err(error) => {
-                        gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-                        return;
-                    }
-                };
+                let sample =
+                    match classify_gemma_sample_for_stops(t, &stop_set, bundle.config.vocab_size) {
+                        Ok(sample) => sample,
+                        Err(error) => {
+                            gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                            return;
+                        }
+                    };
                 if matches!(sample, GemmaSample::Eos) {
                     hit_eos = true;
                     stop = true;
@@ -4409,17 +4593,14 @@ pub fn generate_gemma4(
                     let tokenizer = m.tokenizer.as_ref().unwrap();
                     tokenizer.decode_bytes(&[t])
                 };
-                let prepared = match gemma_prepare_token(
-                    &mut eos_filter,
-                    &mut gemma_router,
-                    &raw_bytes,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-                        return;
-                    }
-                };
+                let prepared =
+                    match gemma_prepare_token(&mut eos_filter, &mut gemma_router, &raw_bytes) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                            return;
+                        }
+                    };
                 block_tokens.push(t);
                 let stopped = prepared.stop;
                 block_events.extend(prepared.events);
@@ -4441,8 +4622,7 @@ pub fn generate_gemma4(
             // this block now, validate its logits, then publish only this
             // block so EAGLE keeps streaming/TTFT behavior round by round.
             let settle_res = if let Some(&last_tok) = block_tokens.last() {
-                let last_pos =
-                    (prefill_end + generated_count + block_tokens.len() - 1) as u32;
+                let last_pos = (prefill_end + generated_count + block_tokens.len() - 1) as u32;
                 let physical_cap = bundle.state.kv_sliding.physical_cap;
                 let compact_offset = bundle.state.kv_sliding.compact_offset;
                 gemma_mark_overwrite_for_range(
@@ -4520,14 +4700,14 @@ pub fn generate_gemma4(
                 break;
             }
         }
-        let trailing_events =
-            match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
-                Ok(events) => events,
-                Err(error) => {
-                    gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-                    return;
-                }
-            };
+        let trailing_events = match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router)
+        {
+            Ok(events) => events,
+            Err(error) => {
+                gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                return;
+            }
+        };
         let tokenizer = m.tokenizer.as_ref().unwrap();
         emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
         gemma_sync_host_cursor(&mut m.seq_pos, bundle.state.n_tokens);
@@ -4605,17 +4785,14 @@ pub fn generate_gemma4(
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        let sample = match classify_gemma_sample_for_stops(
-            next_tok,
-            &stop_set,
-            bundle.config.vocab_size,
-        ) {
-            Ok(sample) => sample,
-            Err(error) => {
-                gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-                return;
-            }
-        };
+        let sample =
+            match classify_gemma_sample_for_stops(next_tok, &stop_set, bundle.config.vocab_size) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                    return;
+                }
+            };
         trace_gemma4_logits(gpu, id, generated_count, next_tok, &last_logits);
         if matches!(sample, GemmaSample::Eos) {
             hit_eos = true;
@@ -4843,26 +5020,27 @@ pub(crate) fn generate_gemma4_lowered(
     };
 
     let cache_identity = gemma_cache_identity(m);
-    let mut cached_tokens =
-        match gemma_cache_begin_request(m, gpu, &cache_identity, &prompt_ids) {
-            Ok(cached_tokens) => cached_tokens,
-            Err(error) => {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("gemma4 lowered cache start failed: {error}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        };
+    let mut cached_tokens = match gemma_cache_begin_request(m, gpu, &cache_identity, &prompt_ids) {
+        Ok(cached_tokens) => cached_tokens,
+        Err(error) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("gemma4 lowered cache start failed: {error}"),
+                "gpu",
+                true,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
     let mut prefill_tokens = &prompt_ids[cached_tokens..];
     let mut capacity = initial_capacity;
-    let exceeds_capacity =
-        cached_tokens.saturating_add(prefill_tokens.len()).saturating_add(max_tokens) > capacity;
+    let exceeds_capacity = cached_tokens
+        .saturating_add(prefill_tokens.len())
+        .saturating_add(max_tokens)
+        > capacity;
     if exceeds_capacity && cached_tokens > 0 {
         if let Err(error) = gemma_cache_force_cold_reset(m, gpu) {
             emit_active_attempt_error(
@@ -4880,7 +5058,12 @@ pub(crate) fn generate_gemma4_lowered(
         prefill_tokens = &prompt_ids[..];
         capacity = m
             .gemma4_lowered()
-            .map(|bundle| bundle.kv_sliding.physical_cap.min(bundle.kv_full.physical_cap))
+            .map(|bundle| {
+                bundle
+                    .kv_sliding
+                    .physical_cap
+                    .min(bundle.kv_full.physical_cap)
+            })
             .unwrap_or(initial_capacity);
     }
     if cached_tokens.saturating_add(prefill_tokens.len()) >= capacity {
@@ -4910,8 +5093,7 @@ pub(crate) fn generate_gemma4_lowered(
     let total_t0 = Instant::now();
 
     let run_result = match m.state.as_mut().and_then(|state| {
-        (state.as_mut() as &mut dyn Any)
-            .downcast_mut::<hipfire_loader::Gemma4LoweredBundle>()
+        (state.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4LoweredBundle>()
     }) {
         Some(bundle) => {
             let mut adapter = Gemma4LoweredAdapter { gpu, bundle };
@@ -4973,14 +5155,13 @@ pub(crate) fn generate_gemma4_lowered(
         return;
     }
 
-    let trailing_events =
-        match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
-            Ok(events) => events,
-            Err(error) => {
-                gemma_eager_fail_closed(stdout, id, m, gpu, &error);
-                return;
-            }
-        };
+    let trailing_events = match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
+        Ok(events) => events,
+        Err(error) => {
+            gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+            return;
+        }
+    };
     emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
 
     // Host history is committed only after all per-token forwards and the

@@ -5194,10 +5194,7 @@ mod tests {
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
         assert_eq!(json["usage"]["prompt_tokens"], 11);
         assert_eq!(json["usage"]["completion_tokens"], 7);
-        assert_eq!(
-            json["usage"]["prompt_tokens_details"]["cached_tokens"],
-            3
-        );
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
         assert_eq!(json["timings"]["prefill_ms"], 12.5);
         assert_eq!(json["timings"]["decode_tok_s"], 40.0);
 

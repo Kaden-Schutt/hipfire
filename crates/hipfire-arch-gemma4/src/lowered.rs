@@ -23,10 +23,10 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemm::GemmParams;
 use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::families::moe::{
     launch_moe_gelu_experts, MoeGeluExpertsRef, MoeRouterBackend,
 };
-use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
@@ -221,8 +221,6 @@ impl Gemma4AllocationTelemetry {
     }
 }
 
-
-
 /// Authoritative runtime cursor for the lowered Gemma bundle.
 ///
 /// Both the sliding and full KV families advance against this one logical
@@ -243,8 +241,8 @@ pub fn rollback_gemma_cursor(
     identity_matches: bool,
     overwrite_boundary: Option<usize>,
 ) -> GemmaRollback {
-    let overwrote_committed = overwrite_boundary
-        .is_some_and(|boundary| boundary < committed_cursor);
+    let overwrote_committed =
+        overwrite_boundary.is_some_and(|boundary| boundary < committed_cursor);
     if identity_matches && *position >= committed_cursor && !overwrote_committed {
         *position = committed_cursor;
         GemmaRollback::RestoredCommitted
@@ -1233,7 +1231,10 @@ impl<'a> LoweredOwnerTransaction<'a> {
     }
 
     fn commit(mut self) {
-        debug_assert!(self.owners.iter().all(|owner| matches!(owner, LoweredOwner::Empty)));
+        debug_assert!(self
+            .owners
+            .iter()
+            .all(|owner| matches!(owner, LoweredOwner::Empty)));
         self.owners.clear();
     }
 }
@@ -1348,7 +1349,6 @@ pub fn kv_owner_bytes(kv: &llama::KvCache) -> usize {
         .chain(kv.givens_sin.iter().map(tensor_owner_bytes))
         .sum()
 }
-
 
 // ─── Loading helpers ───────────────────────────────────────────────────
 
@@ -1646,8 +1646,13 @@ fn load_moe_layer_extras(
     let mut txn = LoweredOwnerTransaction::new(gpu);
 
     let router_proj = {
-        let weight =
-            load_gemma4_weight(hfq, txn.gpu_mut(), &format!("{p}.router.proj.weight"), n_exp, dim)?;
+        let weight = load_gemma4_weight(
+            hfq,
+            txn.gpu_mut(),
+            &format!("{p}.router.proj.weight"),
+            n_exp,
+            dim,
+        )?;
         txn.push_weight(weight)
     };
     // NOTE: `router.scale` and `per_expert_scale` ship WITHOUT the `.weight`
@@ -1656,8 +1661,7 @@ fn load_moe_layer_extras(
         let tensor = load_gemma4_norm(hfq, txn.gpu_mut(), &format!("{p}.router.scale"), dim)?;
         txn.push_tensor(tensor)
     };
-    let per_expert_scale_host =
-        load_f32_vec(hfq, &format!("{p}.router.per_expert_scale"), n_exp)?;
+    let per_expert_scale_host = load_f32_vec(hfq, &format!("{p}.router.per_expert_scale"), n_exp)?;
     let per_expert_scale = {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -1697,8 +1701,7 @@ fn load_moe_layer_extras(
     };
 
     let (gate_up_pool, gate_up_dtype, gate_up_bytes) = {
-        let (pool, dtype, bytes) =
-            load_moe_pool(hfq, txn.gpu_mut(), p, n_exp, "gate_up_proj")?;
+        let (pool, dtype, bytes) = load_moe_pool(hfq, txn.gpu_mut(), p, n_exp, "gate_up_proj")?;
         (txn.push_tensor(pool), dtype, bytes)
     };
     let (down_pool, down_dtype, down_bytes) = {
@@ -1747,15 +1750,11 @@ fn load_moe_layer_extras(
         .flat_map(|e| (e.down_proj.buf.buf.as_ptr() as u64).to_ne_bytes())
         .collect();
     let experts_gate_up_ptrs = {
-        let tensor = txn
-            .gpu_mut()
-            .upload_raw(&gate_up_ptr_bytes, &[n_exp * 2])?;
+        let tensor = txn.gpu_mut().upload_raw(&gate_up_ptr_bytes, &[n_exp * 2])?;
         txn.push_tensor(tensor)
     };
     let experts_down_ptrs = {
-        let tensor = txn
-            .gpu_mut()
-            .upload_raw(&down_ptr_bytes, &[n_exp * 2])?;
+        let tensor = txn.gpu_mut().upload_raw(&down_ptr_bytes, &[n_exp * 2])?;
         txn.push_tensor(tensor)
     };
 
@@ -2196,10 +2195,7 @@ pub fn load_weights(
     }
     eprintln!("gemma4: loaded all {} layers", config.n_layers);
 
-    let layers = layer_ids
-        .into_iter()
-        .map(|id| txn.take_layer(id))
-        .collect();
+    let layers = layer_ids.into_iter().map(|id| txn.take_layer(id)).collect();
     let weights = Gemma4Weights {
         embed_tokens: txn.take_tensor(embed_tokens),
         embd_format,
@@ -2443,16 +2439,8 @@ impl Gemma4Scratch {
             &[MAX_PREFILL_BATCH, n_exp],
             DType::F32
         );
-        alloc!(
-            pb_moe_topk_indices,
-            &[MAX_PREFILL_BATCH, k_top],
-            DType::F32
-        );
-        alloc!(
-            pb_moe_topk_weights,
-            &[MAX_PREFILL_BATCH, k_top],
-            DType::F32
-        );
+        alloc!(pb_moe_topk_indices, &[MAX_PREFILL_BATCH, k_top], DType::F32);
+        alloc!(pb_moe_topk_weights, &[MAX_PREFILL_BATCH, k_top], DType::F32);
         alloc!(pb_moe_expert_offsets, &[n_exp + 1], DType::F32);
         alloc!(
             pb_moe_expert_token_list,
@@ -2499,11 +2487,7 @@ impl Gemma4Scratch {
         );
         alloc!(pb_positions, &[MAX_PREFILL_BATCH], DType::F32);
         let max_k_bf16 = config.dim.max(config.hidden_dim);
-        alloc!(
-            pb_bf16,
-            &[MAX_PREFILL_BATCH * max_k_bf16],
-            DType::BF16
-        );
+        alloc!(pb_bf16, &[MAX_PREFILL_BATCH * max_k_bf16], DType::BF16);
 
         let scratch = Gemma4Scratch {
             x: txn.take_tensor(x),
@@ -3291,12 +3275,13 @@ pub fn forward_scratch(
     //   - Compact offset != 0 (TriAttention eviction) still breaks capture
     //     for the same reason as Qwen35 — bail to direct in that case.
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    let graph_override =
-        *GRAPH_OVERRIDE_ENV.get_or_init(|| match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
+    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
+        match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
             Some("0") => Some(false),
             Some("1") => Some(true),
             _ => None,
-        });
+        }
+    });
     let use_graph = graph_override.unwrap_or(false)
         && kv_sliding.compact_offset == 0
         && kv_full.compact_offset == 0;
@@ -3364,7 +3349,6 @@ pub fn forward_scratch(
     }
     Ok(())
 }
-
 
 /// Single sliding-window attention layer.
 ///
@@ -5589,7 +5573,6 @@ fn forward_prefill_batch_v2(
     Ok(())
 }
 
-
 // ── Variant enum ──────────────────────────────────────────────────────────
 
 /// The four Gemma 4 decoder-layer shapes. Derived from the layer type
@@ -5795,7 +5778,6 @@ fn gemma4_op_sequence(variant: Gemma4Variant) -> &'static [Gemma4Op] {
     }
 }
 
-
 // ── Borrowed Step lowering ───────────────────────────────────────────────
 
 fn execute_bound_gemma4_steps(
@@ -5935,45 +5917,39 @@ fn execute_gemma4_layer(
                 sliding_kv_idx,
             )
         }
-        (Gemma4Variant::SlidingMoe, LayerWeights::Sliding(weights)) => {
-            execute_sliding_moe_steps(
-                gpu,
-                &ctx,
-                layer_idx,
-                weights,
-                config,
-                scratch,
-                pos,
-                kv_sliding,
-                sliding_kv_idx,
-            )
-        }
-        (Gemma4Variant::FullDense, LayerWeights::Full(weights)) => {
-            execute_full_dense_steps(
-                gpu,
-                &ctx,
-                layer_idx,
-                weights,
-                config,
-                scratch,
-                pos,
-                kv_full,
-                full_kv_idx,
-            )
-        }
-        (Gemma4Variant::FullMoe, LayerWeights::Full(weights)) => {
-            execute_full_moe_steps(
-                gpu,
-                &ctx,
-                layer_idx,
-                weights,
-                config,
-                scratch,
-                pos,
-                kv_full,
-                full_kv_idx,
-            )
-        }
+        (Gemma4Variant::SlidingMoe, LayerWeights::Sliding(weights)) => execute_sliding_moe_steps(
+            gpu,
+            &ctx,
+            layer_idx,
+            weights,
+            config,
+            scratch,
+            pos,
+            kv_sliding,
+            sliding_kv_idx,
+        ),
+        (Gemma4Variant::FullDense, LayerWeights::Full(weights)) => execute_full_dense_steps(
+            gpu,
+            &ctx,
+            layer_idx,
+            weights,
+            config,
+            scratch,
+            pos,
+            kv_full,
+            full_kv_idx,
+        ),
+        (Gemma4Variant::FullMoe, LayerWeights::Full(weights)) => execute_full_moe_steps(
+            gpu,
+            &ctx,
+            layer_idx,
+            weights,
+            config,
+            scratch,
+            pos,
+            kv_full,
+            full_kv_idx,
+        ),
         _ => unreachable!("validate_gemma4_layer rejected the mismatch"),
     }
 }
@@ -6772,7 +6748,6 @@ fn execute_full_moe_steps(
     execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
 }
 
-
 /// Typed-Step decode body used by `forward_scratch`.
 fn forward_scratch_inner(
     gpu: &mut Gpu,
@@ -6925,10 +6900,7 @@ mod tests {
     #[test]
     fn full_attention_copies_k_before_normalization_and_uses_partial_rope() {
         let ops = gemma4_op_sequence(Gemma4Variant::FullDense);
-        let copy = ops
-            .iter()
-            .position(|op| *op == Gemma4Op::CopyKToV)
-            .unwrap();
+        let copy = ops.iter().position(|op| *op == Gemma4Op::CopyKToV).unwrap();
         let norm_k = ops.iter().position(|op| *op == Gemma4Op::NormK).unwrap();
         let norm_v = ops.iter().position(|op| *op == Gemma4Op::NormV).unwrap();
         assert!(copy < norm_k && copy < norm_v);
@@ -6941,9 +6913,7 @@ mod tests {
         for variant in [Gemma4Variant::SlidingMoe, Gemma4Variant::FullMoe] {
             let ops = gemma4_op_sequence(variant);
             assert_eq!(
-                ops.iter()
-                    .filter(|op| **op == Gemma4Op::MoeExperts)
-                    .count(),
+                ops.iter().filter(|op| **op == Gemma4Op::MoeExperts).count(),
                 1
             );
             assert!(!ops.contains(&Gemma4Op::NormPostFfn));
@@ -7047,7 +7017,6 @@ mod tests {
         warmup.free_gpu(&mut gpu);
         gpu.drain_pool();
         let baseline = vram_free(&gpu);
-
 
         let scratch = Gemma4Scratch::new(&mut gpu, &config, 1).expect("tiny scratch");
         assert_eq!(scratch.pos_buf.size(), 4);

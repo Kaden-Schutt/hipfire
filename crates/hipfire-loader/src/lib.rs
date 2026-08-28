@@ -623,11 +623,7 @@ impl GemmaPrefixCache {
     /// The cursor must agree with the currently committed cache (or be zero
     /// for an invalid cache), preventing a split-brain cache transaction.
     pub fn begin_request_at(&mut self, cursor: usize) -> Result<(), String> {
-        let expected = if self.valid {
-            self.committed_cursor
-        } else {
-            0
-        };
+        let expected = if self.valid { self.committed_cursor } else { 0 };
         if cursor != expected {
             return Err(format!(
                 "gemma prefix cache: request start cursor {cursor} != committed cursor {expected}"
@@ -801,9 +797,9 @@ impl Gemma4Bundle {
         let committed = self.prefix_cache.committed_cursor;
         let overwrite_boundary = self.prefix_cache.overwrite_boundary;
         let identity_matches = self.prefix_cache.valid && self.prefix_cache.identity == identity;
-        let outcome = self
-            .state
-            .rollback_working_request(committed, identity_matches, overwrite_boundary);
+        let outcome =
+            self.state
+                .rollback_working_request(committed, identity_matches, overwrite_boundary);
         match outcome {
             gemma4::lowered::GemmaRollback::RestoredCommitted => {
                 self.prefix_cache.restore_committed();
@@ -836,7 +832,6 @@ impl Gemma4LoweredBundle {
             + gemma4::lowered::kv_owner_bytes(&self.kv_full)
     }
 
-
     /// Roll back a working request while preserving a safe committed prefix.
     /// If sliding rows were overwritten, or identity no longer matches, the
     /// complete lowered state is invalidated through [`Self::cold_reset`].
@@ -848,9 +843,9 @@ impl Gemma4LoweredBundle {
         let committed = self.prefix_cache.committed_cursor;
         let overwrite_boundary = self.prefix_cache.overwrite_boundary;
         let identity_matches = self.prefix_cache.valid && self.prefix_cache.identity == identity;
-        let outcome = self
-            .cursor
-            .rollback_working_request(committed, identity_matches, overwrite_boundary);
+        let outcome =
+            self.cursor
+                .rollback_working_request(committed, identity_matches, overwrite_boundary);
         match outcome {
             gemma4::lowered::GemmaRollback::RestoredCommitted => {
                 self.prefix_cache.restore_committed();
@@ -936,7 +931,6 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
             ],
         );
     }
-
 }
 
 impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
@@ -5491,6 +5485,7 @@ mod registry_tests {
             caps_of("gemma4"),
             ArchCaps {
                 reasoning_contract: ReasoningContract::GemmaBoolean,
+                semantic_contract_version: Some(2),
                 ..text_only
             }
         );
@@ -5809,35 +5804,61 @@ mod gemma4_lowered_fault_tests {
         std::env::remove_var("HIPFIRE_GEMMA4_FAIL_STAGE");
         let warmup = load(&mut gpu).expect("warmup lowered model load");
         assert!(
-            warmup
-                .gemma4_lowered()
-                .is_some(),
+            warmup.gemma4_lowered().is_some(),
             "canonical fixture must select lowered route"
         );
         unload_model(warmup, &mut gpu).expect("warmup lowered model unload");
         let baseline = free_vram(&gpu);
+        let baseline_modules = gpu.loaded_module_count();
         assert_eq!(gpu.pool_cached_bytes(), 0);
+        eprintln!(
+            "gemma4 fault baseline free={} pool={} modules={}",
+            baseline,
+            gpu.pool_cached_bytes(),
+            baseline_modules
+        );
 
         for stage in ["weights", "scratch", "sliding_kv", "full_kv", "session"] {
             std::env::set_var("HIPFIRE_GEMMA4_FAIL_STAGE", stage);
             let failed = load(&mut gpu);
             assert!(failed.is_err(), "fault stage {stage} must return an error");
+            let pool_before_drain = gpu.pool_cached_bytes();
+            let modules_before_drain = gpu.loaded_module_count();
+            let free_before_drain = free_vram(&gpu);
             eprintln!(
-                "gemma4 fault stage={stage} owner_error=true pool_before_drain={}",
-                gpu.pool_cached_bytes()
+                "gemma4 fault stage={stage} owner_error=true free_before_drain={} \
+                 pool_before_drain={} modules_before_drain={}",
+                free_before_drain, pool_before_drain, modules_before_drain
             );
             std::env::remove_var("HIPFIRE_GEMMA4_FAIL_STAGE");
-            let pool_before_drain = gpu.pool_cached_bytes();
-            gpu.drain_pool();
+            let drain_result = gpu.drain_pool_checked();
+            assert!(
+                drain_result.is_ok(),
+                "fault stage {stage} pool drain failed: {drain_result:?}"
+            );
             let after = free_vram(&gpu);
+            let modules_after_drain = gpu.loaded_module_count();
+            eprintln!(
+                "gemma4 fault stage={stage} free_after_drain={} deficit={} \
+                 pool_after_drain={} modules_after_drain={}",
+                after,
+                baseline.abs_diff(after),
+                gpu.pool_cached_bytes(),
+                modules_after_drain
+            );
             assert!(
                 baseline.abs_diff(after) < VRAM_TOLERANCE,
-                "fault stage {stage} leaked device memory: baseline={baseline}, after={after}, pool_before_drain={pool_before_drain}"
+                "fault stage {stage} leaked device memory: baseline={baseline}, after={after}, \
+                 pool_before_drain={pool_before_drain}"
             );
             assert_eq!(
                 gpu.pool_cached_bytes(),
                 0,
                 "fault stage {stage} left cached pool owners"
+            );
+            assert_eq!(
+                modules_after_drain, baseline_modules,
+                "fault stage {stage} changed module residency"
             );
         }
 

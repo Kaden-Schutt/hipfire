@@ -1927,11 +1927,9 @@ impl Carrier for Gemma4Carrier {
                 let owner_bytes = model
                     .gemma4_lowered()
                     .map_or(0, crate::Gemma4LoweredBundle::owner_bytes);
-                if let Err(error) =
-                    hipfire_arch_gemma4::lowered::fail_after_construction_stage(
-                        hipfire_arch_gemma4::lowered::Gemma4ConstructionStage::Session,
-                    )
-                {
+                if let Err(error) = hipfire_arch_gemma4::lowered::fail_after_construction_stage(
+                    hipfire_arch_gemma4::lowered::Gemma4ConstructionStage::Session,
+                ) {
                     let cleanup = crate::unload_model(model, ctx.gpu);
                     let cleanup_note = cleanup
                         .err()
