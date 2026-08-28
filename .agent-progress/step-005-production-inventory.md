@@ -383,6 +383,53 @@ Because E-series artifacts are absent, dense serving terminals are invalid despi
 coherent visible text, MoE serving is empty/unwired, dense lifecycle terminals omit
 `finish_reason`, and MoE lifecycle free memory decreases by 2 MB each cycle, the row
 remains open.
+## Task 8 remediation validation (2026-08-28, validation-only)
+
+**Status: BLOCKED.** Current source revision is `2039883a5a394f60c6cd8c6f1a5587483ff66f0d`. No source implementation files were changed by this validation. Raw evidence is under `/home/bjoern/hipfire-step005/gemma4/remediation/`; the existing user-owned daemon PID `819407` was observed before validation and was not stopped, signaled, or reused.
+
+### Source gates
+
+- The exact scoped `rustfmt --edition 2021 --check --config skip_children=true` command from the Task 8 brief exited `1`; it reported formatting diffs in listed changed files including `hipfire-generate/src/dense.rs`, `hipfire-loader/src/lib.rs`, `hipfire-arch-gemma4/src/lowered.rs`, and `hipfire-cli/src/serve/complete.rs`. Raw output: `remediation/source/rustfmt-check.log`.
+- The exact `cargo clippy -p hipfire-generate --lib -- -D warnings`, `cargo clippy -p hipfire-loader --lib -- -D warnings`, and `cargo clippy -p hipfire-arch-gemma4 --lib -- -D warnings` commands each exited `101` before target checking on the shared `hipfire-config/src/rocm.rs` baseline (`doc_overindented_list_items`, `redundant_guards`, and `obfuscated_if_else` under `-D warnings`). Raw output: `remediation/source/clippy-{generate,loader,gemma4}.log`.
+- `cargo build` exited `0` (compiler warnings only). Raw output: `remediation/source/cargo-build.log`.
+- `cargo test` exited `101`: 59 loader tests passed and one failed, `registry_tests::caps_and_route_tables_are_pinned`, because observed `semantic_contract_version` was `Some(2)` while the pinned expected value was `None`. Raw output: `remediation/source/cargo-test.log`.
+- `cargo build --release --locked -p hipfire-cli -p hipfire-daemon` exited `0`. Release binary MD5s: `target/release/hipfire` = `fdab7ca9a2436ea795edcd6d9a09970b`; `target/release/daemon` = `0feb34a6fa99a0a42a1ba4f3c5b70e42`. Raw output: `remediation/source/release-build.log` and `binary-md5s.log`.
+
+### Gate A — isolated HTTP terminal battery/chain
+
+All runs used the release CLI/daemon, `HIP_VISIBLE_DEVICES=0`, `HIPFIRE_GEMMA4_GRAPH=0`, `HIPFIRE_GEMMA4_EAGLE=0`, isolated homes, and unique ports. Built-in prompt MD5s were code `43ca0d15712d3dfb777b51ae76d8fd5f`, reason `640e0fd4f55996cb175a422f0a12cef5`, factual `8f66b4c97988825bd8e7840aaf44357e`, prose `8fe0ad36f61bcf4992cc9df81cdf3817`, instruct `8bed8e2d056dc1d47dccae9d32dbecf4`.
+
+- Dense battery (`gate-a/dense-battery.log/.json`) and dense chain (`dense-chain.log/.json`) exited `0`. Each row had a terminal `finish=length`, nonzero `ctx`/`gen` (battery `gen=64` on all five rows), `[gemma4-12b.mq4|off|{battery,chain} DONE]`, no premature-EOF error, `empty=0`, `attractor=0`, and `retrieval_miss=0`. Every row hit the explicit `max_tokens=64` cap (`runaway=5`), so these are terminal-contract observations, not a semantic-quality pass.
+- MoE battery (`gate-a/moe-battery.log/.json`) exited `0`; all five rows had terminal `finish=length`, nonzero `ctx`/`gen=64`, `[DONE]`, no premature EOF, `empty=0`, and `attractor=0`, but decoded text is visibly malformed multilingual/repeated-token output.
+- MoE chain (`gate-a/moe-chain.log/.json`) exited `1` after `[DONE]` summary because `attractor=1`; all five rows were `finish=length`, `gen=64`, and visibly malformed. This is a hard quality/serving blocker, not hidden by the outer summary.
+
+### Gate B — direct/product parity, cache, and injected paths
+
+- Current direct canonical fixed-token controls used `2,9259,236888,575,106`, greedy `--rep-pen 1.0`, `HIPFIRE_GEMMA4_GRAPH=0`, and `--max 32`. Dense direct IDs are the recorded canonical hand sequence and final-logit FNV `0x981d38723fe270af` from the temporary eager direct harness (`quality/dense-eager-direct-fixed.log`); MoE direct IDs/FNV are the accepted sequence and `0x831756562b0ab110` (`gate-b/direct-moe.log`).
+- The committed ignored `gemma4_lowered_product_matches_accepted_direct_oracle` test passed (`gate-b/gemma4-lowered-product-oracle.log`), proving current lowered MoE product IDs/FNV equal the accepted canonical direct values.
+- A raw-text dense eager direct/product comparison used identical tokenizer input `[2,818,5279,529,7001,563]` for `The capital of France is`. Direct generated 13 IDs and FNV `0xf2bc42133d8166dc` (`quality/dense-eager-direct-raw.log`); current daemon product trace sampled the same 13 IDs before EOS and its full step-13 logits FNV was `0xf2bc42133d8166dc` (`gate-b/dense-jsonl-product.json`, `dense-jsonl-trace/`). The trace self-compare was exact (`quality/dense-trace-self-compare.json`); the self-compare is diagnostic and is not substituted for an external HF reference.
+- Eager dense and lowered MoE cache probes (`gate-b/{dense,moe}-cache-product.json`) both observed seed `cached_tokens=0`, related suffix `cached_tokens=4` with suffix-only prefill, unrelated request `cached_tokens=0`, and valid correlated `commit_ready`/`done`/`unloaded` envelopes.
+- Eager dense and lowered MoE abort probes (`gate-b/{dense,moe}-abort-product.json`) both observed a correlated `abort`, terminal `finish_reason=aborted`, and a following related request with `cached_tokens=4`, demonstrating committed-prefix restoration after abort.
+- Focused Gemma transaction tests passed: `gemma_` = 27/27; EOS tests = 2/2; invalid-shape/non-finite/out-of-range tests = 3/3; forward-failure rollback = 1/1; EAGLE settle-failure and invalid-settle-logits rollback = 1/1 each. Raw output: `gate-b/gemma-focused-tests.log`, `gemma-eos-tests.log`, `gemma-invalid-tests.log`, `gemma-forward-failure-test.log`, `gemma-eagle-settle-failure-test.log`, and `gemma-eagle-invalid-test.log`.
+
+### Gate C — four-cycle lifecycle/ownership telemetry
+
+- The direct daemon lifecycle driver completed four dense eager cycles (`gate-c/dense-eager-lifecycle.json`) and four dense lowered cycles (`dense-lowered-lifecycle.json`), each with load → generate (`finish=length`, `tokens=1`) → reset (`rolled_back=true`, `seq_pos=0`, `conversation_len=0`) → unload → post-unload diag. Dense eager post-unload free MB was `99428, 99427, 99427, 99428`; dense lowered was `99454, 99455, 99455, 99454`.
+- Dense lowered telemetry emitted eight `[gemma4 alloc]` records. `owner_bytes` stayed exactly `10309160452`; unload `pool_bytes` stayed exactly `10309160448`; `graph_resident=false`, `graph_blob_count=0`, `module_count=19`, and freed labels were `kv_full,kv_sliding,scratch,weights`. The telemetry `cycle=0` field reflects no operator cycle env override; driver cycle labels are 1–4.
+- The MoE lifecycle driver completed four cycles (`gate-c/moe-lifecycle.json`) with the same reset/unload envelope. Post-unload free MB was `99289` on all four cycles. Eight telemetry records held `owner_bytes=16554924808`, unload `pool_bytes=16554924804`, `graph_resident=false`, `graph_blob_count=0`, `module_count=22`, and the same complete freed-owner labels; `cycle=0` for the same reason.
+- The canonical ignored lowered constructor fault matrix did **not** pass on this revision (`gate-c/gemma4-constructor-fault-matrix.log`): at injected `weights` stage it observed `baseline=104515829760`, `after=104445284352`, and `pool_before_drain=15206432256`, a `70,545,408`-byte free-device deficit. This is recorded as a source ownership blocker, not free-device variance.
+- The ignored complete teardown ownership smoke passed (`gate-c/gemma4-teardown-ignored.log`); focused lowered telemetry tests passed 2/2 with one expected ignored GPU teardown test.
+
+### Quality/reference and artifact disposition
+
+- `quality/dense-eager-reference-matrix.log` ran the exact canonical dense input through eager sequential versus batched reference paths: B=1,4,8 passed, but B=2 failed the post-batch KV next-token argmax (`seq=2921`, `bat=236906`; next cosine `0.9975923`), so the available batched-reference matrix is **FAIL**.
+- Current dense battery/chain decoded text is coherent at the visible prefix but all rows are cap-terminated; current MoE battery/chain text is visibly malformed. The old Task 5 malformed text remains historical evidence only; no semantic quality is inferred from counters/FNV. No local HF or higher-precision Gemma reference checkpoint was available (`quality/reference-availability.log`); historical Task 7 logs are not promoted to current evidence.
+
+### E-series arm
+
+- `scripts/reproduce-gemma4-eseries-parity.sh` was run only with the exact expected E2B/E4B paths and exited `2` on missing `/home/bjoern/.hipfire/models/gemma4-eseries/gemma4-e2b-it-pr439-q8.hfq`. The E-series directory and both exact files are absent (`eseries/eseries-command.log`, `eseries/fixture-state.log`); this remains an external fixture blocker.
+
+Because source formatting/clippy/test gates, MoE quality/chain, the constructor fault matrix, the available batched-reference case, and E2B/E4B fixtures remain unresolved, the Gemma4 inventory row stays `open`; the original Task 7 verdict stays **BLOCKED**.
 
 ## Out of scope (later tasks)
 
