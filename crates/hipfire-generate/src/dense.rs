@@ -1946,7 +1946,7 @@ trait GemmaStepAdapter {
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
     /// Download the logits row left by the last committed materialized token.
     /// This is used only when an exact-prefix hit has no prompt suffix.
-    fn cached_logits(&self) -> Result<Vec<f32>, String> {
+    fn cached_logits(&mut self) -> Result<Vec<f32>, String> {
         Err("gemma4 cached logits unavailable".to_string())
     }
 }
@@ -2109,6 +2109,15 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
     }
 
     fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        let physical_cap = self.bundle.kv_sliding.physical_cap;
+        let compact_offset = self.bundle.kv_sliding.compact_offset;
+        gemma_mark_overwrite_for_range(
+            &mut self.bundle.prefix_cache,
+            position,
+            1,
+            physical_cap,
+            compact_offset,
+        );
         gemma4::lowered::forward_scratch(
             self.gpu,
             &self.bundle.weights,
@@ -2126,6 +2135,15 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
     }
 
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        let physical_cap = self.bundle.kv_sliding.physical_cap;
+        let compact_offset = self.bundle.kv_sliding.compact_offset;
+        gemma_mark_overwrite_for_range(
+            &mut self.bundle.prefix_cache,
+            position,
+            1,
+            physical_cap,
+            compact_offset,
+        );
         gemma4::lowered::forward_scratch(
             self.gpu,
             &self.bundle.weights,
@@ -2142,10 +2160,47 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
             .map_err(|error| format!("gemma4 lowered decode logits download failed: {error:?}"))
     }
 
-    fn cached_logits(&self) -> Result<Vec<f32>, String> {
-        self.gpu
+    fn cached_logits(&mut self) -> Result<Vec<f32>, String> {
+        let committed_cursor = self.bundle.prefix_cache.committed_cursor;
+        let tail_position = committed_cursor.checked_sub(1).ok_or_else(|| {
+            "gemma4 lowered cached logits require a non-empty committed prefix".to_string()
+        })?;
+        let token = self
+            .bundle
+            .prefix_cache
+            .materialized_tokens
+            .get(tail_position)
+            .copied()
+            .ok_or_else(|| "gemma4 lowered cached tail token is missing".to_string())?;
+        let physical_cap = self.bundle.kv_sliding.physical_cap;
+        let compact_offset = self.bundle.kv_sliding.compact_offset;
+        gemma_mark_overwrite_for_range(
+            &mut self.bundle.prefix_cache,
+            tail_position,
+            1,
+            physical_cap,
+            compact_offset,
+        );
+        self.bundle.cursor.set_materialized_cursor(tail_position);
+        gemma4::lowered::forward_scratch(
+            self.gpu,
+            &self.bundle.weights,
+            &self.bundle.config,
+            token,
+            tail_position,
+            &mut self.bundle.kv_sliding,
+            &mut self.bundle.kv_full,
+            &self.bundle.scratch,
+        )
+        .map_err(|error| format!("gemma4 lowered cached tail forward failed: {error:?}"))?;
+        let logits = self
+            .gpu
             .download_f32(&self.bundle.scratch.logits)
-            .map_err(|error| format!("gemma4 lowered cached logits download failed: {error:?}"))
+            .map_err(|error| format!("gemma4 lowered cached logits download failed: {error:?}"))?;
+        self.bundle
+            .cursor
+            .set_materialized_cursor(committed_cursor);
+        Ok(logits)
     }
 }
 /// Reset lowered state before a new request when cache reuse is disabled.
@@ -2208,6 +2263,71 @@ fn gemma_cache_prefix_action(
     }
 }
 
+fn gemma_recompute_eager_cached_logits(
+    bundle: &mut hipfire_loader::Gemma4Bundle,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<Vec<f32>, String> {
+    let committed_cursor = bundle.prefix_cache.committed_cursor;
+    let tail_position = committed_cursor.checked_sub(1).ok_or_else(|| {
+        "gemma4 cached logits require a non-empty committed prefix".to_string()
+    })?;
+    let token = bundle
+        .prefix_cache
+        .materialized_tokens
+        .get(tail_position)
+        .copied()
+        .ok_or_else(|| "gemma4 cached tail token is missing".to_string())?;
+    let physical_cap = bundle.state.kv_sliding.physical_cap;
+    let compact_offset = bundle.state.kv_sliding.compact_offset;
+    gemma_mark_overwrite_for_range(
+        &mut bundle.prefix_cache,
+        tail_position,
+        1,
+        physical_cap,
+        compact_offset,
+    );
+    bundle.state.set_materialized_cursor(tail_position);
+    let logits = match gemma4::forward::decode_step(
+        &bundle.config,
+        &bundle.weights,
+        &mut bundle.state,
+        gpu,
+        token,
+        tail_position as u32,
+    ) {
+        Ok(logits) => logits,
+        Err(error) => {
+            bundle.state.set_materialized_cursor(tail_position);
+            return Err(format!("gemma4 cached tail forward failed: {error:?}"));
+        }
+    };
+    bundle.state.set_materialized_cursor(committed_cursor);
+    Ok(logits)
+}
+
+
+/// Record the first absolute sliding-KV row overwritten by a forward range.
+/// Capped Gemma sliding caches address rows modulo `physical_cap`; compaction
+/// contributes `compact_offset` to the absolute row. The cache keeps the
+/// minimum boundary so rollback can distinguish append-only work from damage to
+/// the committed live window.
+fn gemma_mark_overwrite_for_range(
+    cache: &mut GemmaPrefixCache,
+    start_pos: usize,
+    count: usize,
+    physical_cap: usize,
+    compact_offset: usize,
+) {
+    if count == 0 || physical_cap == 0 {
+        return;
+    }
+    let first_absolute = start_pos.saturating_add(compact_offset);
+    let end_absolute = first_absolute.saturating_add(count);
+    let first_wrapped = first_absolute.max(physical_cap);
+    if first_wrapped < end_absolute {
+        cache.mark_overwrite(first_wrapped.saturating_sub(physical_cap));
+    }
+}
 /// Publish exactly the materialized history after the terminal `Commit`
 /// decision. Working request history must never be passed to this helper
 /// before that decision.
@@ -2951,7 +3071,8 @@ mod gemma4_overflow_reset_tests {
 #[cfg(test)]
 mod gemma_exact_prefix_cache_tests {
     use super::{
-        gemma_cache_prefix_action, gemma_publish_prefix_on_commit, GemmaCachePrefixAction,
+        gemma_cache_prefix_action, gemma_mark_overwrite_for_range,
+        gemma_publish_prefix_on_commit, GemmaCachePrefixAction,
     };
     use hipfire_loader::GemmaPrefixCache;
 
@@ -3021,6 +3142,19 @@ mod gemma_exact_prefix_cache_tests {
             GemmaCachePrefixAction::Cold { reset: true }
         );
     }
+    #[test]
+    fn sliding_range_marks_the_earliest_absolute_overwritten_row() {
+        let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3, 4, 5], 5);
+        cache.begin_request_at(5).expect("working request start");
+        gemma_mark_overwrite_for_range(&mut cache, 5, 4, 6, 0);
+        assert_eq!(cache.overwrite_boundary, Some(0));
+
+        let mut compacted =
+            GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3, 4, 5], 5);
+        compacted.begin_request_at(5).expect("compacted request start");
+        gemma_mark_overwrite_for_range(&mut compacted, 3, 1, 6, 4);
+        assert_eq!(compacted.overwrite_boundary, Some(1));
+    }
 }
 
 #[cfg(test)]
@@ -3035,6 +3169,7 @@ mod gemma_fake_two_turn_cache_tests {
         cursor: usize,
         prefill: Vec<(u32, usize)>,
         forward: Vec<(u32, usize)>,
+        cached_tail: Vec<(u32, usize)>,
     }
 
     impl FakeAdapter {
@@ -3043,6 +3178,7 @@ mod gemma_fake_two_turn_cache_tests {
                 cursor: 0,
                 prefill: Vec::new(),
                 forward: Vec::new(),
+                cached_tail: Vec::new(),
             }
         }
     }
@@ -3067,6 +3203,14 @@ mod gemma_fake_two_turn_cache_tests {
 
         fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
             self.forward.push((token, position));
+            Ok(vec![0.0; self.vocab_size()])
+        }
+        fn cached_logits(&mut self) -> Result<Vec<f32>, String> {
+            let committed = self.cursor;
+            let tail_position = committed.checked_sub(1).ok_or_else(|| "empty".to_string())?;
+            self.cursor = tail_position;
+            self.cached_tail.push((3, tail_position));
+            self.cursor = committed;
             Ok(vec![0.0; self.vocab_size()])
         }
     }
@@ -3171,6 +3315,49 @@ mod gemma_fake_two_turn_cache_tests {
                 0,
             ),
             GemmaCachePrefixAction::Reuse { cached_tokens: 3 }
+        );
+    }
+    #[test]
+    fn equal_prefix_hit_recomputes_tail_before_generation_and_abort_restores_it() {
+        let mut adapter = FakeAdapter::new();
+        adapter.set_cursor(3);
+        let mut cache = GemmaPrefixCache::committed("gemma@config", vec![1, 2, 3], 3);
+        cache.begin_request_at(3).expect("equal-prefix request start");
+
+        let mut generated = Vec::new();
+        let run = run_request(&mut adapter, &[], 1, &mut generated);
+        assert_eq!(run.generated, 1);
+        assert_eq!(generated, vec![3]);
+        assert_eq!(adapter.cached_tail, [(3, 2)]);
+        assert_eq!(adapter.forward, [(3, 3)]);
+        assert_eq!(adapter.cursor(), 4);
+        assert_eq!(cache.materialized_tokens, vec![1, 2, 3]);
+
+        adapter.set_cursor(cache.committed_cursor);
+        cache.restore_committed();
+        assert_eq!(
+            gemma_cache_prefix_action(
+                &cache,
+                "gemma@config",
+                &[1, 2, 3],
+                &cache.materialized_tokens,
+                adapter.cursor(),
+                0,
+                0,
+            ),
+            GemmaCachePrefixAction::Reuse { cached_tokens: 3 }
+        );
+        assert_eq!(
+            gemma_cache_prefix_action(
+                &cache,
+                "gemma@config",
+                &[1, 2, 3, 4],
+                &cache.materialized_tokens,
+                2,
+                0,
+                0,
+            ),
+            GemmaCachePrefixAction::Cold { reset: true }
         );
     }
 }
@@ -3987,6 +4174,15 @@ pub fn generate_gemma4(
         while offset < prefill_tokens.len() {
             let width = prefill_batch.min(prefill_tokens.len() - offset);
             let start_pos = bundle.state.n_tokens;
+            let physical_cap = bundle.state.kv_sliding.physical_cap;
+            let compact_offset = bundle.state.kv_sliding.compact_offset;
+            gemma_mark_overwrite_for_range(
+                &mut bundle.prefix_cache,
+                start_pos,
+                width,
+                physical_cap,
+                compact_offset,
+            );
             let result = if width == 1 {
                 gemma4::forward::decode_step(
                     &bundle.config,
@@ -4017,11 +4213,10 @@ pub fn generate_gemma4(
             offset += width;
         }
         if prefill_tokens.is_empty() {
-            last_logits = match gpu.download_f32(&bundle.state.logits) {
+            last_logits = match gemma_recompute_eager_cached_logits(bundle, gpu) {
                 Ok(logits) => logits,
                 Err(error) => {
-                    let message = format!("gemma4 cached logits download failed: {error:?}");
-                    gemma_eager_fail_closed(stdout, id, m, gpu, &message);
+                    gemma_eager_fail_closed(stdout, id, m, gpu, &error);
                     return;
                 }
             };
@@ -4116,6 +4311,15 @@ pub fn generate_gemma4(
                 hit_length = true;
                 break;
             }
+            let physical_cap = bundle.state.kv_sliding.physical_cap;
+            let compact_offset = bundle.state.kv_sliding.compact_offset;
+            gemma_mark_overwrite_for_range(
+                &mut bundle.prefix_cache,
+                committed_len.saturating_sub(1),
+                draft_len.saturating_add(1),
+                physical_cap,
+                compact_offset,
+            );
             let spec = {
                 // Split borrows: config/weights immutably, state+eagle mutably.
                 // Use raw pointers to avoid borrow-checker overlap on `bundle`.
@@ -4212,6 +4416,15 @@ pub fn generate_gemma4(
             let settle_res = if let Some(&last_tok) = block_tokens.last() {
                 let last_pos =
                     (prefill_end + generated_count + block_tokens.len() - 1) as u32;
+                let physical_cap = bundle.state.kv_sliding.physical_cap;
+                let compact_offset = bundle.state.kv_sliding.compact_offset;
+                gemma_mark_overwrite_for_range(
+                    &mut bundle.prefix_cache,
+                    last_pos as usize,
+                    1,
+                    physical_cap,
+                    compact_offset,
+                );
                 let bundle_ptr = bundle as *mut hipfire_loader::Gemma4Bundle;
                 unsafe {
                     let cfg = &(*bundle_ptr).config;
@@ -4222,6 +4435,15 @@ pub fn generate_gemma4(
             } else if generated_count > 0 {
                 let last_tok = *m.conversation_tokens.last().unwrap();
                 let last_pos = (prefill_end + generated_count - 1) as u32;
+                let physical_cap = bundle.state.kv_sliding.physical_cap;
+                let compact_offset = bundle.state.kv_sliding.compact_offset;
+                gemma_mark_overwrite_for_range(
+                    &mut bundle.prefix_cache,
+                    last_pos as usize,
+                    1,
+                    physical_cap,
+                    compact_offset,
+                );
                 let bundle_ptr = bundle as *mut hipfire_loader::Gemma4Bundle;
                 unsafe {
                     let cfg = &(*bundle_ptr).config;
@@ -4386,14 +4608,23 @@ pub fn generate_gemma4(
             bundle.config.vocab_size,
             |_| gemma_prepare_token(&mut eos_filter, &mut gemma_router, &raw_bytes),
             |token| {
-                let position = bundle.state.n_tokens as u32;
+                let position = bundle.state.n_tokens;
+                let physical_cap = bundle.state.kv_sliding.physical_cap;
+                let compact_offset = bundle.state.kv_sliding.compact_offset;
+                gemma_mark_overwrite_for_range(
+                    &mut bundle.prefix_cache,
+                    position,
+                    1,
+                    physical_cap,
+                    compact_offset,
+                );
                 gemma4::forward::decode_step_with_graph(
                     &bundle.config,
                     &bundle.weights,
                     &mut bundle.state,
                     gpu,
                     token,
-                    position,
+                    position as u32,
                 )
             },
             |token, prepared, next_logits| {
