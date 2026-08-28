@@ -1164,7 +1164,6 @@ pub fn generate(
                 presence_penalty,
                 frequency_penalty,
             );
-            let _ = stop;
             crate::dense::generate_gemma4(
                 m,
                 gpu,
@@ -1179,6 +1178,7 @@ pub fn generate(
                 enable_thinking,
                 tools,
                 messages_history,
+                stop,
                 logprobs_top_k,
             );
             return;

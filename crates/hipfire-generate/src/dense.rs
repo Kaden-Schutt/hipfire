@@ -34,7 +34,7 @@ use hipfire_arch_qwen35::speculative;
 use hipfire_runtime::emit_text::{
     ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteError, ToolRouteEvent,
 };
-use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
+use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::spec::{
     accept_greedy_prefix, ClientEvent, EvictRetain, FinishSummary, SpecRequestConfig, SpecTarget,
     Speculator, StopReason,
@@ -1800,6 +1800,167 @@ fn gemma4_prefill_batch_for_arch(gpu_arch: &str, requested: Option<usize>) -> us
         .clamp(1, 64)
 }
 
+/// Validated sample from the eager Gemma token transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmaSample {
+    Eos,
+    Token(u32),
+}
+
+/// Validate one eager Gemma logits result before sampling.
+///
+/// The eager forward contract is one full vocabulary row. Sampling may
+/// tolerate a few non-finite entries, but it must have at least one finite
+/// candidate; an all-nonfinite row is not a token decision and must fail
+/// closed instead of silently becoming token zero.
+fn validate_gemma_logits(logits: &[f32], vocab_size: usize) -> Result<(), String> {
+    if logits.len() != vocab_size {
+        return Err(format!(
+            "gemma4 logits shape mismatch: got {}, expected {}",
+            logits.len(),
+            vocab_size
+        ));
+    }
+    if !logits.iter().any(|value| value.is_finite()) {
+        return Err("gemma4 logits contain no finite candidate".to_string());
+    }
+    Ok(())
+}
+
+/// Validate a sampled Gemma token against the exact model vocabulary.
+fn validate_gemma_token(token: u32, vocab_size: usize) -> Result<(), String> {
+    if (token as usize) >= vocab_size {
+        return Err(format!(
+            "gemma4 sampled token {token} is outside vocabulary size {vocab_size}"
+        ));
+    }
+    Ok(())
+}
+
+/// Classify a validated sample before any parser, wire, or history mutation.
+fn classify_gemma_sample(
+    token: u32,
+    eos_token: u32,
+    vocab_size: usize,
+) -> Result<GemmaSample, String> {
+    validate_gemma_token(token, vocab_size)?;
+    if token == eos_token {
+        Ok(GemmaSample::Eos)
+    } else {
+        Ok(GemmaSample::Token(token))
+    }
+}
+
+/// Classify a sampled token against every model EOS/EOT ID.
+fn classify_gemma_sample_for_stops(
+    token: u32,
+    stop_tokens: &[u32],
+    vocab_size: usize,
+) -> Result<GemmaSample, String> {
+    validate_gemma_token(token, vocab_size)?;
+    if stop_tokens.contains(&token) {
+        Ok(GemmaSample::Eos)
+    } else {
+        Ok(GemmaSample::Token(token))
+    }
+}
+
+/// Prepared parser output that remains quarantined until the matching forward
+/// has succeeded.
+struct GemmaPreparedToken {
+    events: Vec<GemmaEmit>,
+    stop: bool,
+}
+
+/// Result of one sampled-token transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmaTokenTransactionResult {
+    Eos,
+    Committed { stopped: bool },
+}
+
+/// Run one sampled Gemma token as a two-phase transaction.
+///
+/// EOS is terminal before parser preparation, forward, or any host mutation.
+/// Every other sample prepares output first, then forwards and validates the
+/// next full-vocabulary logits row. Only after both succeed is the commit
+/// callback allowed to publish events/history/count/cache state. Any failure
+/// invokes exactly one rollback callback.
+fn gemma_token_transaction<Prepare, Forward, Commit, Rollback>(
+    sample: GemmaSample,
+    vocab_size: usize,
+    prepare: Prepare,
+    forward: Forward,
+    commit: Commit,
+    rollback: Rollback,
+) -> Result<GemmaTokenTransactionResult, String>
+where
+    Prepare: FnOnce(u32) -> Result<GemmaPreparedToken, String>,
+    Forward: FnOnce(u32) -> Result<Vec<f32>, String>,
+    Commit: FnOnce(u32, GemmaPreparedToken, Vec<f32>),
+    Rollback: FnOnce(),
+{
+    let GemmaSample::Token(token) = sample else {
+        return Ok(GemmaTokenTransactionResult::Eos);
+    };
+    let prepared = match prepare(token) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            rollback();
+            return Err(error);
+        }
+    };
+    let next_logits = match forward(token) {
+        Ok(logits) => logits,
+        Err(error) => {
+            rollback();
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate_gemma_logits(&next_logits, vocab_size) {
+        rollback();
+        return Err(error);
+    }
+    let stopped = prepared.stop;
+    commit(token, prepared, next_logits);
+    Ok(GemmaTokenTransactionResult::Committed { stopped })
+}
+
+/// Build the shared output quarantine for Gemma's literal end markers and
+/// request-provided stop sequences.
+///
+/// Token-level EOS IDs are classified before this parser runs. These byte
+/// markers cover exports that decode an end token as ordinary text and keep a
+/// user stop sequence from leaking a prefix across token boundaries.
+fn gemma_eos_filter_config(stop: &[String]) -> EosFilterConfig {
+    let mut stop_at: Vec<Vec<u8>> = [
+        "<turn|>",
+        "<end_of_turn>",
+        "<eos>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "</s>",
+    ]
+    .into_iter()
+    .map(str::as_bytes)
+    .map(ToOwned::to_owned)
+    .collect();
+    for marker in stop {
+        if !marker.is_empty() {
+            let bytes = marker.as_bytes().to_vec();
+            if !stop_at.contains(&bytes) {
+                stop_at.push(bytes);
+            }
+        }
+    }
+    EosFilterConfig {
+        strip_think: false,
+        started_in_think: false,
+        stop_at,
+        holdback_prefixes: Vec::new(),
+    }
+}
+
 /// Terminal metrics shared by eager Gemma AR and EAGLE paths.
 #[derive(Debug, Clone, Copy)]
 pub struct GemmaDoneMetrics {
@@ -1863,6 +2024,22 @@ fn gemma_eager_client_abort(
 ) {
     let epilogue = production_fail_closed_rollback(m, gpu, None, None);
     emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
+}
+
+/// Roll back one eager Gemma forward/sampling failure and emit one error.
+///
+/// The rollback epilogue is the sole failure teardown for this route; in
+/// particular, a failed forward never falls through to a successful `done`.
+fn gemma_eager_fail_closed(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    message: &str,
+) {
+    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    emit_fail_closed_error(stdout, Some(id), message, "gpu", true, &epilogue);
+    let _ = stdout.flush();
 }
 
 struct Gemma4LogitTraceConfig {
@@ -2117,6 +2294,163 @@ mod gemma4_overflow_reset_tests {
     }
 }
 
+#[cfg(test)]
+mod gemma4_token_transaction_tests {
+    use super::{
+        classify_gemma_sample, gemma_eos_filter_config, gemma_prepare_token,
+        gemma_token_transaction, validate_gemma_logits, validate_gemma_token, EosFilter, GemmaEmit,
+        GemmaPreparedToken, GemmaSample, GemmaThoughtRouter, GemmaTokenTransactionResult,
+    };
+
+    #[derive(Default)]
+    struct FakeGemmaAdapter {
+        visible: Vec<String>,
+        history: Vec<u32>,
+        count: usize,
+        cache: Vec<u32>,
+        rollback_count: usize,
+        done_count: usize,
+    }
+
+    impl FakeGemmaAdapter {
+        fn commit(&mut self, token: u32, prepared: GemmaPreparedToken, _logits: Vec<f32>) {
+            self.visible.extend(prepared.events.into_iter().map(|event| match event {
+                GemmaEmit::Reasoning(text) | GemmaEmit::Token(text) => text,
+            }));
+            self.history.push(token);
+            self.cache.push(token);
+            self.count += 1;
+            if prepared.stop {
+                self.done_count += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn gemma_rejects_wrong_logit_shape() {
+        assert!(validate_gemma_logits(&[0.0; 7], 8).is_err());
+    }
+
+    #[test]
+    fn gemma_rejects_all_nonfinite_logits() {
+        assert!(validate_gemma_logits(&[f32::NAN, f32::INFINITY], 2).is_err());
+    }
+
+    #[test]
+    fn gemma_rejects_out_of_range_sample() {
+        assert!(validate_gemma_token(8, 8).is_err());
+    }
+
+    #[test]
+    fn gemma_eos_is_not_materialized() {
+        assert_eq!(classify_gemma_sample(2, 2, 8).unwrap(), GemmaSample::Eos);
+    }
+
+    #[test]
+    fn gemma_custom_stop_sequences_enter_shared_quarantine() {
+        let config = gemma_eos_filter_config(&["<user-stop>".to_string(), String::new()]);
+        assert!(config
+            .stop_at
+            .iter()
+            .any(|marker| marker == b"<user-stop>"));
+        assert!(!config.stop_at.iter().any(Vec::is_empty));
+    }
+
+    #[test]
+    fn gemma_eos_transaction_does_not_prepare_forward_or_commit() {
+        let result = gemma_token_transaction(
+            GemmaSample::Eos,
+            8,
+            |_| panic!("EOS must not enter parser preparation"),
+            |_| panic!("EOS must not enter forward"),
+            |_, _, _| panic!("EOS must not commit"),
+            || panic!("EOS must not roll back"),
+        );
+        assert_eq!(result, Ok(GemmaTokenTransactionResult::Eos));
+    }
+
+    #[test]
+    fn gemma_transaction_forwards_before_visible_commit() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let prepare_order = Rc::clone(&order);
+        let forward_order = Rc::clone(&order);
+        let commit_order = Rc::clone(&order);
+        let rollback_order = Rc::clone(&order);
+        let result = gemma_token_transaction(
+            GemmaSample::Token(3),
+            8,
+            move |_| {
+                prepare_order.borrow_mut().push("prepare");
+                Ok(GemmaPreparedToken {
+                    events: vec![GemmaEmit::Token("visible".to_string())],
+                    stop: false,
+                })
+            },
+            move |_| {
+                forward_order.borrow_mut().push("forward");
+                Ok(vec![0.0; 8])
+            },
+            move |_, _, _| commit_order.borrow_mut().push("commit"),
+            move || rollback_order.borrow_mut().push("rollback"),
+        );
+
+        assert_eq!(
+            result,
+            Ok(GemmaTokenTransactionResult::Committed { stopped: false })
+        );
+        assert_eq!(&*order.borrow(), &["prepare", "forward", "commit"]);
+    }
+
+    #[test]
+    fn gemma_forward_failure_rolls_back_once_without_visible_commit() {
+        use std::cell::RefCell;
+
+        let adapter = RefCell::new(FakeGemmaAdapter::default());
+        let result = gemma_token_transaction(
+            GemmaSample::Token(3),
+            8,
+            |_| {
+                Ok(GemmaPreparedToken {
+                    events: vec![GemmaEmit::Token("must stay staged".to_string())],
+                    stop: true,
+                })
+            },
+            |_| Err("forced forward failure".to_string()),
+            |token, prepared, logits| adapter.borrow_mut().commit(token, prepared, logits),
+            || adapter.borrow_mut().rollback_count += 1,
+        );
+
+        assert_eq!(result, Err("forced forward failure".to_string()));
+        let adapter = adapter.into_inner();
+        assert!(adapter.visible.is_empty());
+        assert!(adapter.history.is_empty());
+        assert_eq!(adapter.count, 0);
+        assert!(adapter.cache.is_empty());
+        assert_eq!(adapter.rollback_count, 1);
+        assert_eq!(adapter.done_count, 0);
+    }
+
+    #[test]
+    fn gemma_stop_quarantine_holds_split_marker_without_leaking_it() {
+        let mut filter = EosFilter::new(gemma_eos_filter_config(&["<user-stop>".to_string()]));
+        let mut router = GemmaThoughtRouter::new(false, 0);
+
+        let prefix = gemma_prepare_token(&mut filter, &mut router, b"answer <user-").unwrap();
+        assert_eq!(
+            prefix.events,
+            vec![GemmaEmit::Token("answer ".to_string())]
+        );
+        assert!(!prefix.stop);
+
+        let suffix = gemma_prepare_token(&mut filter, &mut router, b"stop>").unwrap();
+        assert!(suffix.events.is_empty());
+        assert!(suffix.stop);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
@@ -2132,6 +2466,7 @@ pub fn generate_gemma4(
     enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
     // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
     // default and produces exactly the envelope this path emitted before.
     logprobs_top_k: Option<usize>,
@@ -2252,6 +2587,8 @@ pub fn generate_gemma4(
         s.dedup();
         s
     };
+    let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
+
 
     // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
     // the requested run would overflow the physical cache.
@@ -2329,12 +2666,17 @@ pub fn generate_gemma4(
             match result {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
+                    let message = format!("gemma4 prefill failed: {e:?}");
+                    gemma_eager_fail_closed(stdout, id, m, gpu, &message);
                     return;
                 }
             }
             offset += width;
         }
+    }
+    if let Err(error) = validate_gemma_logits(&last_logits, bundle.config.vocab_size) {
+        gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+        return;
     }
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
@@ -2397,7 +2739,8 @@ pub fn generate_gemma4(
                 .spec_scratch
                 .set_seed_hidden_from(gpu, &bundle.state.tmp)
             {
-                emit_error_with_id(stdout, id, format!("gemma4 eagle seed hidden: {e}"));
+                let message = format!("gemma4 eagle seed hidden: {e}");
+                gemma_eager_fail_closed(stdout, id, m, gpu, &message);
                 return;
             }
         }
@@ -2446,7 +2789,8 @@ pub fn generate_gemma4(
             let spec = match spec {
                 Ok(s) => s,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("gemma4 eagle spec step failed: {e}"));
+                    let message = format!("gemma4 eagle spec step failed: {e}");
+                    gemma_eager_fail_closed(stdout, id, m, gpu, &message);
                     return;
                 }
             };
@@ -2455,7 +2799,18 @@ pub fn generate_gemma4(
             // Emit the committed tokens (accepted drafts ++ bonus); stop at
             // EOS / max_tokens — identical to what the AR loop would commit.
             for &t in &spec.committed {
-                if stop_set.contains(&t) {
+                let sample = match classify_gemma_sample_for_stops(
+                    t,
+                    &stop_set,
+                    bundle.config.vocab_size,
+                ) {
+                    Ok(sample) => sample,
+                    Err(error) => {
+                        gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                        return;
+                    }
+                };
+                if matches!(sample, GemmaSample::Eos) {
                     hit_eos = true;
                     stop = true;
                     break;
@@ -2463,19 +2818,33 @@ pub fn generate_gemma4(
                 if ttft_ms.is_none() {
                     ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
                 }
-                let frag = {
+                let raw_bytes = {
                     let tokenizer = m.tokenizer.as_ref().unwrap();
-                    tokenizer.decode(&[t])
+                    tokenizer.decode_bytes(&[t])
                 };
-                let (emits, _) = gemma_router.push(&frag);
-                for ev in emits {
-                    match ev {
+                let prepared = match gemma_prepare_token(
+                    &mut eos_filter,
+                    &mut gemma_router,
+                    &raw_bytes,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                        return;
+                    }
+                };
+                m.conversation_tokens.push(t);
+                generated_count += 1;
+                for event in prepared.events {
+                    match event {
                         GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                         GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
                     }
                 }
-                m.conversation_tokens.push(t);
-                generated_count += 1;
+                if prepared.stop {
+                    stop = true;
+                    break;
+                }
                 if generated_count >= max_tokens {
                     hit_length = true;
                     stop = true;
@@ -2516,12 +2885,24 @@ pub fn generate_gemma4(
                 gemma4::forward::decode_step(cfg, weights, state, gpu, last_tok, last_pos)
             };
             if let Err(e) = settle_res {
-                eprintln!("[daemon] gemma4 eagle cursor settle failed: {e:?}");
-                bundle.state.n_tokens = prefill_end + generated_count;
+                let message = format!("gemma4 eagle cursor settle failed: {e:?}");
+                gemma_eager_fail_closed(stdout, id, m, gpu, &message);
+                return;
             }
         } else {
             bundle.state.n_tokens = prefill_end;
         }
+        let trailing_events =
+            match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
+                Ok(events) => events,
+                Err(error) => {
+                    gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                    return;
+                }
+            };
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
+
         m.seq_pos = bundle.state.n_tokens;
 
         let decode_ms = decode_t0.elapsed().as_millis().max(1);
@@ -2577,97 +2958,103 @@ pub fn generate_gemma4(
     let mut hit_eos = false;
     let mut hit_length = false;
     let decode_t0 = Instant::now();
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+
     loop {
         if generated_count >= max_tokens {
             hit_length = true;
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        let sample = match classify_gemma_sample_for_stops(
+            next_tok,
+            &stop_set,
+            bundle.config.vocab_size,
+        ) {
+            Ok(sample) => sample,
+            Err(error) => {
+                gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                return;
+            }
+        };
         trace_gemma4_logits(gpu, id, generated_count, next_tok, &last_logits);
-        if stop_set.contains(&next_tok) {
+        if matches!(sample, GemmaSample::Eos) {
             hit_eos = true;
             break;
         }
 
-        if ttft_ms.is_none() {
-            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        let (emits, _) = gemma_router.push(&frag);
-        for ev in emits {
-            match ev {
-                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                GemmaEmit::Token(text) => {
-                    let mut envelope = serde_json::json!({
-                        "type": "token",
-                        "id": id,
-                        "text": text,
-                        "attempt_id": active_attempt_id(),
-                    });
-                    if let Some((lp, top)) = crate::common::token_logprob_fields(
-                        &last_logits,
-                        next_tok,
-                        logprobs_top_k,
-                        m.tokenizer.as_ref().unwrap(),
-                    ) {
-                        envelope["logprob"] = serde_json::json!(lp);
-                        envelope["top_logprobs"] = top;
-                    }
-                    let _ = writeln!(stdout, "{}", envelope);
-                    let _ = stdout.flush();
-                }
-            }
-        }
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // KV-capacity guard: the next forward writes KV at slot n_tokens;
-        // forwarding at pos >= max_seq would write out of bounds. Stop
-        // cleanly here — the just-emitted token is still valid.
+        // A token can be sampled from the final valid logits row, but it cannot
+        // be materialized once the KV cursor is already at the physical cap.
         if bundle.state.n_tokens >= cache_cap {
             hit_length = true;
             break;
         }
-
-        let position = bundle.state.n_tokens as u32;
-        let step = gemma4::forward::decode_step_with_graph(
-            &bundle.config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            next_tok,
-            position,
+        let raw_bytes = tokenizer.decode_bytes(&[next_tok]);
+        let mut rollback_requested = false;
+        let transaction = gemma_token_transaction(
+            sample,
+            bundle.config.vocab_size,
+            |_| gemma_prepare_token(&mut eos_filter, &mut gemma_router, &raw_bytes),
+            |token| {
+                let position = bundle.state.n_tokens as u32;
+                gemma4::forward::decode_step_with_graph(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    token,
+                    position,
+                )
+            },
+            |token, prepared, next_logits| {
+                if ttft_ms.is_none() {
+                    ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                m.conversation_tokens.push(token);
+                generated_count += 1;
+                emit_gemma_prepared_events(
+                    stdout,
+                    id,
+                    tokenizer,
+                    token,
+                    &last_logits,
+                    logprobs_top_k,
+                    prepared.events,
+                );
+                last_logits = next_logits;
+            },
+            || rollback_requested = true,
         );
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+        match transaction {
+            Ok(GemmaTokenTransactionResult::Eos) => {
+                hit_eos = true;
+                break;
+            }
+            Ok(GemmaTokenTransactionResult::Committed { stopped }) => {
+                if stopped {
+                    break;
+                }
+                if generated_count >= max_tokens || bundle.state.n_tokens >= cache_cap {
+                    hit_length = true;
+                    break;
+                }
+            }
+            Err(error) => {
+                debug_assert!(rollback_requested);
+                let message = format!("gemma4 decode failed: {error}");
+                gemma_eager_fail_closed(stdout, id, m, gpu, &message);
                 return;
             }
         }
     }
-    for ev in gemma_router.flush() {
-        match ev {
-            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-            GemmaEmit::Token(text) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap(),
-                    active_attempt_id()
-                );
-                let _ = stdout.flush();
-            }
+    let trailing_events = match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
+        Ok(events) => events,
+        Err(error) => {
+            gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+            return;
         }
-    }
-
-    m.seq_pos = bundle.state.n_tokens;
-
+    };
+    emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 {
@@ -3168,6 +3555,81 @@ impl GemmaThoughtRouter {
             GemmaEmit::Token(text)
         }]
     }
+}
+
+/// Route one decoded token through the shared stop quarantine and Gemma's
+/// channel parser without releasing the resulting events.
+fn gemma_prepare_token(
+    filter: &mut EosFilter,
+    router: &mut GemmaThoughtRouter,
+    raw_bytes: &[u8],
+) -> Result<GemmaPreparedToken, String> {
+    let (safe_bytes, mut stop) = match filter.observe(raw_bytes) {
+        FilterAction::Emit(bytes) => (bytes, false),
+        FilterAction::EmitAndStop(bytes) => (bytes, true),
+        FilterAction::Hold => (Vec::new(), false),
+        FilterAction::Stop => (Vec::new(), true),
+    };
+    let mut events = Vec::new();
+    if !safe_bytes.is_empty() {
+        let text = std::str::from_utf8(&safe_bytes)
+            .map_err(|error| format!("gemma4 output is not valid UTF-8: {error}"))?;
+        let (routed, parser_stop) = router.push(text);
+        events = routed;
+        stop |= parser_stop;
+    }
+    Ok(GemmaPreparedToken { events, stop })
+}
+
+/// Release parser output only after the corresponding forward has committed.
+fn emit_gemma_prepared_events(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    token: u32,
+    logits: &[f32],
+    logprobs_top_k: Option<usize>,
+    events: Vec<GemmaEmit>,
+) {
+    for event in events {
+        match event {
+            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GemmaEmit::Token(text) => {
+                let mut envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": text,
+                    "attempt_id": active_attempt_id(),
+                });
+                if let Some((lp, top)) =
+                    crate::common::token_logprob_fields(logits, token, logprobs_top_k, tokenizer)
+                {
+                    envelope["logprob"] = serde_json::json!(lp);
+                    envelope["top_logprobs"] = top;
+                }
+                let _ = writeln!(stdout, "{}", envelope);
+                let _ = stdout.flush();
+            }
+        }
+    }
+}
+
+/// Finish the shared quarantine at a terminal boundary and flush any channel
+/// parser tail that is safe to expose.
+fn gemma_flush_prepared_events(
+    filter: &mut EosFilter,
+    router: &mut GemmaThoughtRouter,
+) -> Result<Vec<GemmaEmit>, String> {
+    let pending = filter.flush_pending();
+    let mut events = Vec::new();
+    if !pending.is_empty() {
+        let text = std::str::from_utf8(&pending)
+            .map_err(|error| format!("gemma4 output is not valid UTF-8: {error}"))?;
+        let (routed, _) = router.push(text);
+        events.extend(routed);
+    }
+    events.extend(router.flush());
+    Ok(events)
 }
 
 pub fn gemma_is_marker_prefix(s: &str) -> bool {
