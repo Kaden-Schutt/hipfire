@@ -59,6 +59,124 @@ pub const KV_BACKEND_NAMES: &[&str] = &["contiguous", "vmm"];
 
 pub const DEFAULT_KV_CHUNK_TOKENS: usize = 64;
 pub const DEFAULT_VMM_PHYSICAL_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+enum Asym3Owner {
+    K(GpuTensor),
+    V(GpuTensor),
+    GivensCos(GpuTensor),
+    GivensSin(GpuTensor),
+}
+
+/// Constructor-local owner for contiguous asym3 KV. `GpuTensor` has no Drop,
+/// so every successful allocation is registered immediately and released in
+/// exact reverse allocation order if a later allocation or host-to-device copy
+/// fails.
+struct Asym3KvStaging<'a> {
+    gpu: &'a mut Gpu,
+    owners: Vec<Asym3Owner>,
+    committed: bool,
+}
+
+impl<'a> Asym3KvStaging<'a> {
+    fn new(gpu: &'a mut Gpu) -> Self {
+        Self {
+            gpu,
+            owners: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn alloc_k(&mut self, elems: usize) -> HipResult<()> {
+        let tensor = self.gpu.zeros(&[elems], DType::F32)?;
+        self.owners.push(Asym3Owner::K(tensor));
+        #[cfg(test)]
+        if fault_seam::consume_asym3() {
+            return Err(HipError::new(
+                0,
+                "kv asym3 fault seam: forced failure after K allocation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn alloc_v(&mut self, elems: usize) -> HipResult<()> {
+        let tensor = self.gpu.zeros(&[elems], DType::F32)?;
+        self.owners.push(Asym3Owner::V(tensor));
+        #[cfg(test)]
+        if fault_seam::consume_asym3() {
+            return Err(HipError::new(
+                0,
+                "kv asym3 fault seam: forced failure after V allocation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn alloc_givens(&mut self, elems: usize, bytes: &[u8], cos: bool) -> HipResult<()> {
+        let tensor = self.gpu.alloc_tensor(&[elems], DType::F32)?;
+        self.owners.push(if cos {
+            Asym3Owner::GivensCos(tensor)
+        } else {
+            Asym3Owner::GivensSin(tensor)
+        });
+        let index = self.owners.len() - 1;
+        let buffer = match &self.owners[index] {
+            Asym3Owner::GivensCos(tensor) | Asym3Owner::GivensSin(tensor) => &tensor.buf,
+            Asym3Owner::K(_) | Asym3Owner::V(_) => unreachable!(),
+        };
+        self.gpu.hip.memcpy_htod(buffer, bytes)?;
+        #[cfg(test)]
+        if fault_seam::consume_asym3() {
+            return Err(HipError::new(
+                0,
+                "kv asym3 fault seam: forced failure after Givens copy",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> (Vec<GpuTensor>, Vec<GpuTensor>, GpuTensor, GpuTensor) {
+        let owners = std::mem::take(&mut self.owners);
+        self.committed = true;
+        let mut k_gpu = Vec::new();
+        let mut v_gpu = Vec::new();
+        let mut givens_cos = None;
+        let mut givens_sin = None;
+        for owner in owners {
+            match owner {
+                Asym3Owner::K(tensor) => k_gpu.push(tensor),
+                Asym3Owner::V(tensor) => v_gpu.push(tensor),
+                Asym3Owner::GivensCos(tensor) => givens_cos = Some(tensor),
+                Asym3Owner::GivensSin(tensor) => givens_sin = Some(tensor),
+            }
+        }
+        (
+            k_gpu,
+            v_gpu,
+            givens_cos.expect("asym3 givens cosine owner missing"),
+            givens_sin.expect("asym3 givens sine owner missing"),
+        )
+    }
+}
+
+impl Drop for Asym3KvStaging<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        while let Some(owner) = self.owners.pop() {
+            let tensor = match owner {
+                Asym3Owner::K(tensor)
+                | Asym3Owner::V(tensor)
+                | Asym3Owner::GivensCos(tensor)
+                | Asym3Owner::GivensSin(tensor) => tensor,
+            };
+            if let Err(error) = self.gpu.release_tensor_immediate(tensor) {
+                eprintln!("KV cache: asym3 rollback free failed: {error}");
+            }
+        }
+    }
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvMapGrowth {
@@ -3589,6 +3707,7 @@ impl KvCache {
         )
     }
 
+
     fn new_gpu_asym3_capped_inner(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -3609,20 +3728,18 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
 
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
+        let mut staging = Asym3KvStaging::new(gpu);
         for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+            staging.alloc_k(k_elems)?;
+            staging.alloc_v(v_elems)?;
         }
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
         let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        staging.alloc_givens(n_blocks, &cb, true)?;
+        staging.alloc_givens(n_blocks, &sb, false)?;
+        let (k_gpu, v_gpu, ct, st) = staging.finish();
         let v_bph = v_bpp / n_kv_heads;
         eprintln!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
             k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
@@ -4402,26 +4519,39 @@ mod fault_seam {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static FAIL_NEXT_Q8_ALLOC: AtomicBool = AtomicBool::new(false);
+    static FAIL_NEXT_ASYM3_ALLOC: AtomicBool = AtomicBool::new(false);
 
-    /// Arm the next single-device Q8 KV construction to fail at the
-    /// mid-allocation seam.
+    /// Arm the next single-device Q8 KV construction to fail.
     pub fn arm_fail_next_q8_alloc() {
         FAIL_NEXT_Q8_ALLOC.store(true, Ordering::SeqCst);
     }
 
-    /// One-shot consume: returns true exactly once per arm.
+    /// Arm the next contiguous asym3 KV construction to fail after a staged
+    /// allocation or copy. The owner must be released by its constructor.
+    pub fn arm_fail_next_asym3_alloc() {
+        FAIL_NEXT_ASYM3_ALLOC.store(true, Ordering::SeqCst);
+    }
+
+    /// One-shot Q8 consume.
     pub fn consume() -> bool {
         FAIL_NEXT_Q8_ALLOC.swap(false, Ordering::SeqCst)
+    }
+
+    /// One-shot asym3 consume.
+    pub fn consume_asym3() -> bool {
+        FAIL_NEXT_ASYM3_ALLOC.swap(false, Ordering::SeqCst)
     }
 
     /// True while an arm is pending (tests assert the arm is consumed).
     pub fn is_armed() -> bool {
         FAIL_NEXT_Q8_ALLOC.load(Ordering::SeqCst)
+            || FAIL_NEXT_ASYM3_ALLOC.load(Ordering::SeqCst)
     }
 
     /// Clear any pending arm (suite-isolation backstop).
     pub fn reset() {
         FAIL_NEXT_Q8_ALLOC.store(false, Ordering::SeqCst);
+        FAIL_NEXT_ASYM3_ALLOC.store(false, Ordering::SeqCst);
     }
 }
 
@@ -4633,6 +4763,77 @@ mod allocation_fault_tests {
         assert!(
             success,
             "F32 KV hook sweep did not reach the constructor-success sentinel"
+        );
+    }
+    #[test]
+    fn failed_asym3_gemma4_construction_reclaims_owned_allocations() {
+        if Gpu::init().is_err() {
+            eprintln!("skip: no GPU");
+            return;
+        }
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gpu = Gpu::init().expect("GPU required for asym3 rollback contract");
+        const N_LAYERS: usize = 4;
+        const N_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 512;
+        const MAX_SEQ: usize = 1024;
+
+        {
+            let kv = KvCache::new_gpu_asym3_gemma4(
+                &mut gpu,
+                N_LAYERS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ,
+            )
+            .expect("warm-up Gemma asym3 KV must succeed");
+            kv.free_gpu(&mut gpu).expect("warm-up asym3 free must succeed");
+        }
+        gpu.drain_pool();
+        let baseline = vram_free(&gpu);
+
+        fault_seam::reset();
+        fault_seam::arm_fail_next_asym3_alloc();
+        assert!(fault_seam::is_armed(), "asym3 fault arm must be set");
+        let err = match KvCache::new_gpu_asym3_gemma4(
+            &mut gpu,
+            N_LAYERS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            MAX_SEQ,
+        ) {
+            Ok(_) => panic!("armed asym3 KV fault must fail construction"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("asym3 fault seam"),
+            "expected asym3 fault seam, got: {err}"
+        );
+        assert!(
+            !fault_seam::is_armed(),
+            "asym3 fault arm must be one-shot"
+        );
+        gpu.drain_pool();
+        let after = vram_free(&gpu);
+        assert!(
+            baseline.abs_diff(after) < VRAM_TOLERANCE,
+            "asym3 rollback did not reclaim staged owners: baseline={baseline} after={after}"
+        );
+
+        let kv = KvCache::new_gpu_asym3_gemma4(
+            &mut gpu,
+            N_LAYERS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            MAX_SEQ,
+        )
+        .expect("asym3 construction must recover after injected failure");
+        kv.free_gpu(&mut gpu).expect("post-fault asym3 free must succeed");
+        gpu.drain_pool();
+        let recovered = vram_free(&gpu);
+        assert!(
+            baseline.abs_diff(recovered) < VRAM_TOLERANCE,
+            "asym3 post-fault cycle drifted: baseline={baseline} recovered={recovered}"
         );
     }
 }

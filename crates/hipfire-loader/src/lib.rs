@@ -5770,6 +5770,93 @@ mod registry_tests {
         );
     }
 }
+#[cfg(all(test, feature = "lowered-fault-inject"))]
+mod gemma4_lowered_fault_tests {
+    use super::*;
+    use std::path::Path;
+
+    const VRAM_TOLERANCE: usize = 64 * 1024 * 1024;
+
+    fn free_vram(gpu: &rdna_compute::Gpu) -> usize {
+        gpu.hip.get_vram_info().expect("hipMemGetInfo").0
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and the canonical Gemma4 MoE fixture"]
+    fn gemma4_lowered_constructor_fault_matrix_reclaims_all_owners() {
+        let home = std::env::var("HOME").expect("HOME is required");
+        let path = std::env::var("HIPFIRE_GEMMA4_HFQ")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/gemma4-26b-a4b.mq4"));
+        assert!(Path::new(&path).is_file(), "fixture not found: {path}");
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let cask = CaskConfig::default();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            load_model(
+                &path,
+                1024,
+                None,
+                None,
+                None,
+                None,
+                &cask,
+                1,
+                SpecLoadCfg::default(),
+                gpu,
+            )
+        };
+
+        std::env::remove_var("HIPFIRE_GEMMA4_FAIL_STAGE");
+        let warmup = load(&mut gpu).expect("warmup lowered model load");
+        assert!(
+            warmup
+                .gemma4_lowered()
+                .is_some(),
+            "canonical fixture must select lowered route"
+        );
+        unload_model(warmup, &mut gpu).expect("warmup lowered model unload");
+        let baseline = free_vram(&gpu);
+        assert_eq!(gpu.pool_cached_bytes(), 0);
+
+        for stage in ["weights", "scratch", "sliding_kv", "full_kv", "session"] {
+            std::env::set_var("HIPFIRE_GEMMA4_FAIL_STAGE", stage);
+            let failed = load(&mut gpu);
+            assert!(failed.is_err(), "fault stage {stage} must return an error");
+            eprintln!(
+                "gemma4 fault stage={stage} owner_error=true pool_before_drain={}",
+                gpu.pool_cached_bytes()
+            );
+            std::env::remove_var("HIPFIRE_GEMMA4_FAIL_STAGE");
+            let pool_before_drain = gpu.pool_cached_bytes();
+            gpu.drain_pool();
+            let after = free_vram(&gpu);
+            assert!(
+                baseline.abs_diff(after) < VRAM_TOLERANCE,
+                "fault stage {stage} leaked device memory: baseline={baseline}, after={after}, pool_before_drain={pool_before_drain}"
+            );
+            assert_eq!(
+                gpu.pool_cached_bytes(),
+                0,
+                "fault stage {stage} left cached pool owners"
+            );
+        }
+
+        let model = load(&mut gpu).expect("unfaulted lowered model load");
+        let owner_bytes = model
+            .gemma4_lowered()
+            .expect("canonical fixture must select lowered route")
+            .owner_bytes();
+        assert!(owner_bytes > 0, "published lowered bundle must own bytes");
+        unload_model(model, &mut gpu).expect("unfaulted lowered model unload");
+        assert_eq!(gpu.pool_cached_bytes(), 0);
+        let after = free_vram(&gpu);
+        assert!(
+            baseline.abs_diff(after) < VRAM_TOLERANCE,
+            "normal lowered unload drifted: baseline={baseline}, after={after}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod gemma_prefix_cache_tests {
     use super::GemmaPrefixCache;

@@ -6839,10 +6839,7 @@ fn forward_scratch_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        allocation_telemetry_enabled_value, construction_fault_stages,
-        Gemma4AllocationTelemetry, Gemma4ConstructionStage, Gemma4Cursor, GemmaRollback,
-    };
+    use super::*;
     #[test]
     fn gemma_cache_rollback_append_without_window_overwrite_restores_committed() {
         let mut cursor = Gemma4Cursor::new(3);
@@ -6959,37 +6956,6 @@ mod tests {
         }
     }
     #[test]
-    fn lowered_constructor_fault_matrix_covers_every_publication_boundary() {
-        assert_eq!(
-            construction_fault_stages(),
-            &[
-                Gemma4ConstructionStage::Weights,
-                Gemma4ConstructionStage::Scratch,
-                Gemma4ConstructionStage::SlidingKv,
-                Gemma4ConstructionStage::FullKv,
-                Gemma4ConstructionStage::Session,
-            ]
-        );
-    }
-
-    #[test]
-    fn lowered_constructor_rollback_frees_completed_stages_in_reverse() {
-        assert_eq!(
-            construction_fault_stages()
-                .iter()
-                .rev()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![
-                Gemma4ConstructionStage::Session,
-                Gemma4ConstructionStage::FullKv,
-                Gemma4ConstructionStage::SlidingKv,
-                Gemma4ConstructionStage::Scratch,
-                Gemma4ConstructionStage::Weights,
-            ]
-        );
-    }
-    #[test]
     fn lowered_allocation_telemetry_formats_size_aware_fields() {
         let telemetry = Gemma4AllocationTelemetry {
             phase: "unload",
@@ -7018,5 +6984,173 @@ mod tests {
         assert!(!allocation_telemetry_enabled_value(None));
         assert!(!allocation_telemetry_enabled_value(Some("0")));
         assert!(allocation_telemetry_enabled_value(Some("1")));
+    }
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn lowered_teardown_frees_pos_sidecars_aliases_and_moe_pools() {
+        use rdna_compute::{DType, Gpu, GpuTensor};
+
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let vram_free = |gpu: &Gpu| gpu.hip.get_vram_info().expect("hipMemGetInfo").0;
+        let tensor = |gpu: &mut Gpu| gpu.zeros(&[1], DType::F32).expect("tiny tensor");
+        let weight = |gpu: &mut Gpu| WeightTensor {
+            buf: tensor(gpu),
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+
+        let config = Gemma4Config {
+            dim: 4,
+            n_layers: 1,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            bos_token: 2,
+            eos_token: 1,
+            pad_token: 0,
+            n_heads: 1,
+            sliding_head_dim: 32,
+            sliding_n_kv_heads: 1,
+            sliding_rope_theta: 10_000.0,
+            sliding_window: 128,
+            full_head_dim: 32,
+            full_n_kv_heads: 1,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            hidden_dim: 8,
+            enable_moe_block: false,
+            moe_intermediate_size: 4,
+            num_experts: 0,
+            top_k_experts: 0,
+            final_logit_softcapping: 30.0,
+            tie_word_embeddings: true,
+            embed_scale: 2.0,
+            layer_types: vec![LayerType::Sliding],
+            has_vision: false,
+            image_token_id: 0,
+            boi_token_id: 0,
+            eoi_token_id: 0,
+            audio_token_id: 0,
+            video_token_id: 0,
+        };
+        let warmup = Gemma4Scratch::new(&mut gpu, &config, 1).expect("scratch warmup");
+        warmup.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        let baseline = vram_free(&gpu);
+
+
+        let scratch = Gemma4Scratch::new(&mut gpu, &config, 1).expect("tiny scratch");
+        assert_eq!(scratch.pos_buf.size(), 4);
+        assert!(scratch.owner_bytes() > scratch.pos_buf.size());
+        scratch.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        assert!(
+            baseline.abs_diff(vram_free(&gpu)) < 64 * 1024 * 1024,
+            "scratch teardown did not reclaim VRAM"
+        );
+
+        let embed_tokens = tensor(&mut gpu);
+        let lm_head = {
+            let alias = unsafe { embed_tokens.buf.alias() };
+            WeightTensor {
+                buf: GpuTensor {
+                    buf: alias,
+                    shape: embed_tokens.shape.clone(),
+                    dtype: DType::F32,
+                },
+                gpu_dtype: DType::F32,
+                m: 1,
+                k: 1,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        };
+        assert!(lm_head.buf.buf.is_borrowed());
+
+        let gate_pool = gpu.upload_raw(&[0u8; 8], &[8]).expect("gate pool");
+        let down_pool = gpu.upload_raw(&[0u8; 8], &[8]).expect("down pool");
+        let expert_gate = WeightTensor {
+            buf: gate_pool.sub_offset(0, 4),
+            gpu_dtype: DType::Raw,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+        let expert_down = WeightTensor {
+            buf: down_pool.sub_offset(0, 4),
+            gpu_dtype: DType::Raw,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+        assert!(expert_gate.buf.buf.is_borrowed());
+        assert!(expert_down.buf.buf.is_borrowed());
+        let moe = MoeLayerExtras {
+            router_proj: weight(&mut gpu),
+            router_scale: tensor(&mut gpu),
+            per_expert_scale: tensor(&mut gpu),
+            per_expert_scale_host: vec![1.0],
+            pre_feedforward_layernorm_2: tensor(&mut gpu),
+            post_feedforward_layernorm_1: tensor(&mut gpu),
+            post_feedforward_layernorm_2: tensor(&mut gpu),
+            experts_gate_up_pool: gate_pool,
+            experts_down_pool: down_pool,
+            gate_up_bytes: 4,
+            down_bytes: 4,
+            experts: vec![MoeExpertWeights {
+                gate_up_proj: expert_gate,
+                down_proj: expert_down,
+            }],
+            experts_gate_up_ptrs: tensor(&mut gpu),
+            experts_down_ptrs: tensor(&mut gpu),
+        };
+        let mut q_proj = weight(&mut gpu);
+        q_proj.awq_scale = Some(tensor(&mut gpu));
+        let weights = Gemma4Weights {
+            embed_tokens,
+            embd_format: EmbeddingFormat::F32,
+            lm_head,
+            final_norm: tensor(&mut gpu),
+            layers: vec![LayerWeights::Sliding(SlidingLayerWeights {
+                input_layernorm: tensor(&mut gpu),
+                post_attention_layernorm: tensor(&mut gpu),
+                pre_feedforward_layernorm: tensor(&mut gpu),
+                post_feedforward_layernorm: tensor(&mut gpu),
+                layer_scalar: tensor(&mut gpu),
+                layer_scalar_host: 1.0,
+                q_proj,
+                k_proj: weight(&mut gpu),
+                v_proj: weight(&mut gpu),
+                o_proj: weight(&mut gpu),
+                q_norm: tensor(&mut gpu),
+                k_norm: tensor(&mut gpu),
+                gate_proj: weight(&mut gpu),
+                up_proj: weight(&mut gpu),
+                down_proj: weight(&mut gpu),
+                moe: Some(moe),
+            })],
+        };
+        assert!(weights.owner_bytes() > 0);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        assert!(
+            baseline.abs_diff(vram_free(&gpu)) < 64 * 1024 * 1024,
+            "weight teardown did not reclaim sidecars and MoE pools"
+        );
     }
 }

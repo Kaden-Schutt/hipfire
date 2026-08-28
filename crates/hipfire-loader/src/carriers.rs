@@ -1903,15 +1903,7 @@ impl Carrier for Gemma4Carrier {
                     ctx.max_seq,
                     ctx.spec,
                 );
-                let owner_bytes = l.owner_bytes();
-                hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
-                    "publish",
-                    hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
-                    owner_bytes,
-                    ctx.gpu,
-                    Vec::new(),
-                );
-                Ok(LoadedModel {
+                let model = LoadedModel {
                     state: Some(Box::new(crate::Gemma4LoweredBundle {
                         config: l.config,
                         weights: l.weights,
@@ -1931,7 +1923,32 @@ impl Carrier for Gemma4Carrier {
                         ctx.path.to_string(),
                         meta.chat_template,
                     )
-                })
+                };
+                let owner_bytes = model
+                    .gemma4_lowered()
+                    .map_or(0, crate::Gemma4LoweredBundle::owner_bytes);
+                if let Err(error) =
+                    hipfire_arch_gemma4::lowered::fail_after_construction_stage(
+                        hipfire_arch_gemma4::lowered::Gemma4ConstructionStage::Session,
+                    )
+                {
+                    let cleanup = crate::unload_model(model, ctx.gpu);
+                    let cleanup_note = cleanup
+                        .err()
+                        .map(|cleanup| format!("; cleanup failed: {cleanup}"))
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "gemma4 (lowered) session stage: {error:?}{cleanup_note}"
+                    ));
+                }
+                hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+                    "publish",
+                    hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
+                    owner_bytes,
+                    ctx.gpu,
+                    Vec::new(),
+                );
+                Ok(model)
             }
             hipfire_arch_gemma4::Gemma4Bundle::Eager(e) => {
                 let eos_tok = resolve_eos_tok(

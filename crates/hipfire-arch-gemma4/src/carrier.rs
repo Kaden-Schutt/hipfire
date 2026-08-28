@@ -258,11 +258,6 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::FullKv)
             .map_err(|e| format!("gemma4 (lowered) full KV stage: {e:?}"))?;
 
-        // The final intermediate bundle has no GPU-side session object yet;
-        // this boundary protects publication and lets loader integration
-        // inject a deterministic session/cache failure before exposure.
-        lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Session)
-            .map_err(|e| format!("gemma4 (lowered) session stage: {e:?}"))?;
         eprintln!(
             "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
             lcfg.enable_moe_block, want_batched,
