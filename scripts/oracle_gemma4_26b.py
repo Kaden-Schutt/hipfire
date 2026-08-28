@@ -11,27 +11,31 @@ intermediates (router logits, topk indices, expert outputs).
 Compares against hipfire's HIPFIRE_GEMMA4_DUMP=1 output.
 
 Usage:
-  # Quick test with short prompt
+  # Quick test with short prompt (uses the historical default checkpoint)
   .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids 2,105,2364,107 --out findings/oracle_26b_short.json
 
-  # Full framed prompt
-  .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids-file /tmp/ids.txt --out findings/oracle_26b.json
+  # Portable checkpoint path via CLI
+  .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --model /path/to/gemma-4-26B-A4B-it --ids-file /tmp/ids.txt --out findings/oracle_26b.json
+
+  # Or set GEMMA4_26B_MODEL to avoid repeating --model
+  GEMMA4_26B_MODEL=/path/to/gemma-4-26B-A4B-it .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids-file /tmp/ids.txt --out findings/oracle_26b.json
 """
 import argparse, json, sys, os
-import torch
-import torch.nn.functional as F
-import numpy as np
 
 MODEL = "/local/models/google/gemma-4-26B-A4B-it"
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", help="HF checkpoint path (overrides GEMMA4_26B_MODEL)")
     ap.add_argument("--ids", help="Comma-separated token IDs (e.g. 2,105,2364)")
     ap.add_argument("--ids-file", help="File with space-separated token IDs")
     ap.add_argument("--out", help="Output JSON path")
     ap.add_argument("--layers", help="Layers to dump (e.g. 0,1,5) or 'all'", default="0,1,5")
     args = ap.parse_args()
+
+    # Resolve in precedence order: CLI, environment, historical default.
+    model_path = args.model if args.model is not None else os.environ.get("GEMMA4_26B_MODEL", MODEL)
 
     # Parse IDs
     if args.ids:
@@ -49,11 +53,12 @@ def main():
         dump_layers = set(int(x) for x in args.layers.split(","))
 
     print(f"IDs: {ids[:10]}{'...' if len(ids)>10 else ''} ({len(ids)} tokens)", file=sys.stderr)
-    print(f"Loading model from {MODEL} (float32 CPU)...", file=sys.stderr)
+    print(f"Loading model from {model_path} (float32 CPU)...", file=sys.stderr)
 
+    import torch
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.bfloat16, device_map={"": "cpu"}
+        model_path, torch_dtype=torch.bfloat16, device_map={"": "cpu"}
     ).eval()
 
     # Get model config
@@ -126,7 +131,7 @@ def main():
     # model already applies it via Gemma4ForCausalLM → logit softcap
     topv, topi = torch.topk(logits, 20)
     result = {
-        "model": MODEL,
+        "model": model_path,
         "n_ids": len(ids),
         "ids_first10": ids[:10],
         "logits_top5": [[int(i), round(float(x), 4)] for i, x in zip(topi[:5].tolist(), topv[:5].tolist())],
