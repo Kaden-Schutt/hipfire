@@ -1946,7 +1946,7 @@ trait GemmaStepAdapter {
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct GemmaStepRun {
     generated: usize,
     hit_eos: bool,
@@ -1954,6 +1954,7 @@ struct GemmaStepRun {
     prefill_ms: f64,
     decode_ms: f64,
     ttft_ms: Option<f64>,
+    final_logits: Vec<f32>,
 }
 
 /// Drive one Gemma request through per-token prefill and decode Steps.
@@ -2070,6 +2071,7 @@ where
         prefill_ms,
         decode_ms,
         ttft_ms,
+        final_logits: last_logits,
     })
 }
 /// Production adapter for the lowered Gemma4 bundle.
@@ -2130,6 +2132,26 @@ impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
             .map_err(|error| format!("gemma4 lowered decode logits download failed: {error:?}"))
     }
 }
+/// Reset lowered state before a new request when cache reuse is disabled.
+///
+/// The reset closure is the attested architecture reset. The caller must clear
+/// host cursor/history only after this returns `Ok(true)`, so a failed reset
+/// never discards the host state it was meant to protect.
+fn gemma_lowered_reset_before_request<Reset>(
+    cursor: usize,
+    force_reset: bool,
+    reset: Reset,
+) -> Result<bool, String>
+where
+    Reset: FnOnce() -> Result<(), String>,
+{
+    if cursor == 0 && !force_reset {
+        return Ok(false);
+    }
+    reset()?;
+    Ok(true)
+}
+
 
 
 /// Render one Gemma4 chat turn with the same Jinja/BOS behavior used by the
@@ -2884,8 +2906,8 @@ mod gemma4_token_transaction_tests {
 #[cfg(test)]
 mod gemma4_lowered_lifecycle_tests {
     use super::{
-        run_gemma_step_lifecycle, GemmaEmit, GemmaPreparedToken, GemmaStepAdapter,
-        GemmaStepRun,
+        gemma_lowered_reset_before_request, run_gemma_step_lifecycle, GemmaDoneMetrics, GemmaEmit,
+        GemmaPreparedToken, GemmaStepAdapter, GemmaStepRun,
     };
 
     #[derive(Default)]
@@ -2981,6 +3003,230 @@ mod gemma4_lowered_lifecycle_tests {
         assert_eq!(result.generated, 1);
         assert!(result.hit_eos);
         assert!(!result.hit_length);
+    }
+    #[test]
+    fn gemma4_lowered_second_request_starts_cold_without_cache_reuse() {
+        let mut adapter = FakeAdapter::default();
+        let mut history = vec![1_u32];
+        let mut generated = Vec::new();
+
+        run_gemma_step_lifecycle(
+            &mut adapter,
+            &[1],
+            1,
+            100,
+            &[99],
+            |_| Ok(99),
+            |_token| {
+                Ok(GemmaPreparedToken {
+                    events: Vec::new(),
+                    stop: false,
+                })
+            },
+            |token, _prepared, _sampled_logits, _next_logits| {
+                history.push(token);
+                generated.push(token);
+            },
+        )
+        .expect("first request");
+        assert_eq!(adapter.cursor(), 1);
+
+        let mut reset_order = Vec::new();
+        let did_reset = super::gemma_lowered_reset_before_request(
+            adapter.cursor(),
+            false,
+            || {
+                reset_order.push("reset");
+                adapter.set_cursor(0);
+                Ok(())
+            },
+        )
+        .expect("lowered request reset");
+        assert!(did_reset);
+        if did_reset {
+            reset_order.push("host_clear");
+            history.clear();
+            generated.clear();
+        }
+
+        run_gemma_step_lifecycle(
+            &mut adapter,
+            &[2],
+            1,
+            100,
+            &[99],
+            |_| Ok(99),
+            |_token| {
+                Ok(GemmaPreparedToken {
+                    events: Vec::new(),
+                    stop: false,
+                })
+            },
+            |token, _prepared, _sampled_logits, _next_logits| {
+                history.push(token);
+                generated.push(token);
+            },
+        )
+        .expect("second request");
+        history.extend_from_slice(&[2]);
+
+        assert_eq!(reset_order, ["reset", "host_clear"]);
+        assert_eq!(adapter.calls, ["prefill(1@0)", "prefill(2@0)"]);
+        assert_eq!(adapter.cursor(), 1);
+        assert_eq!(history, vec![2]);
+        assert!(generated.is_empty());
+        let metrics = GemmaDoneMetrics {
+            generated: 0,
+            prompt_tokens: 1,
+            cached_tokens: 0,
+            tok_s: 0.0,
+            prefill_ms: 0.0,
+            decode_tok_s: 0.0,
+            ttft_ms: 0.0,
+            total_ms: 0.0,
+        };
+        assert_eq!(metrics.cached_tokens, 0);
+    }
+
+}
+
+#[cfg(test)]
+mod gemma4_lowered_oracle_tests {
+    use super::{
+        run_gemma_step_lifecycle, Gemma4LoweredAdapter, GemmaEmit, GemmaPreparedToken,
+    };
+    use hipfire_runtime::arch_model::ArchModel;
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::llama::KvCache;
+    use std::path::Path;
+
+    fn fnv1a64_f32(values: &[f32]) -> u64 {
+        values.iter().fold(0xcbf29ce484222325_u64, |hash, value| {
+            value.to_bits().to_le_bytes().iter().fold(hash, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            })
+        })
+    }
+
+    fn run_lowered_oracle(
+        model_path: &Path,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+    ) -> Result<(Vec<u32>, u64), String> {
+        if prompt_ids.is_empty() {
+            return Err("oracle prompt must not be empty".to_string());
+        }
+        let mut gpu =
+            rdna_compute::Gpu::init().map_err(|error| format!("oracle GPU init: {error:?}"))?;
+        let mut hfq =
+            HfqFile::open(model_path).map_err(|error| format!("oracle HFQ open: {error:?}"))?;
+        let config = hipfire_arch_gemma4::lowered::config_from_hfq(&hfq)
+            .ok_or_else(|| "oracle Gemma config missing from HFQ metadata".to_string())?;
+        assert!(
+            config.num_experts > 0,
+            "oracle fixture must be the canonical MoE Gemma4 artifact"
+        );
+        let weights = hipfire_arch_gemma4::lowered::load_weights(&mut hfq, &config, &mut gpu)
+            .map_err(|error| format!("oracle Gemma weights: {error:?}"))?;
+        let scratch = hipfire_arch_gemma4::lowered::Gemma4Scratch::new(&mut gpu, &config, 1)
+            .map_err(|error| format!("oracle Gemma scratch: {error:?}"))?;
+        hipfire_arch_gemma4::lowered::init_scratch_constants(
+            &mut gpu,
+            &scratch,
+            config.full_head_dim,
+        )
+        .map_err(|error| format!("oracle Gemma scratch constants: {error:?}"))?;
+        let max_seq = prompt_ids.len() + max_tokens + 16;
+        let kv_sliding = KvCache::new_gpu_q8_capped(
+            &mut gpu,
+            config.n_layers,
+            config.sliding_n_kv_heads,
+            config.sliding_head_dim,
+            max_seq,
+            max_seq,
+        )
+        .map_err(|error| format!("oracle sliding KV: {error:?}"))?;
+        let kv_full = KvCache::new_gpu_asym3_gemma4(
+            &mut gpu,
+            config.n_layers,
+            config.full_n_kv_heads,
+            config.full_head_dim,
+            max_seq,
+        )
+        .map_err(|error| format!("oracle full KV: {error:?}"))?;
+        let mut bundle = hipfire_loader::Gemma4LoweredBundle {
+            eos_tok: config.eos_token,
+            cursor: hipfire_arch_gemma4::lowered::Gemma4Cursor::default(),
+            prefix_cache: hipfire_loader::GemmaPrefixCache::default(),
+            config,
+            weights,
+            scratch,
+            kv_sliding,
+            kv_full,
+        };
+        let oracle_eos = bundle.config.eos_token;
+
+        let (ids, final_logits) = {
+            let mut adapter = Gemma4LoweredAdapter {
+                gpu: &mut gpu,
+                bundle: &mut bundle,
+            };
+            let mut ids = Vec::new();
+            let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(0x13579BDF);
+            let result = run_gemma_step_lifecycle(
+                &mut adapter,
+                prompt_ids,
+                max_tokens,
+                max_seq,
+                &[oracle_eos, 106],
+                |logits| {
+                    Ok(hipfire_arch_deepseek4::sampling::sample_token(
+                        logits, 0.0, 0, 1.0, &mut rng,
+                    ))
+                },
+                |_token| {
+                    Ok(GemmaPreparedToken {
+                        events: Vec::<GemmaEmit>::new(),
+                        stop: false,
+                    })
+                },
+                |token, _prepared, _sampled_logits, _next_logits| ids.push(token),
+            )
+            .map_err(|error| format!("oracle Step lifecycle: {error}"))?;
+            (ids, result.final_logits)
+        };
+
+        <hipfire_loader::Gemma4LoweredBundle as ArchModel>::free_gpu(
+            Box::new(bundle),
+            &mut gpu,
+        );
+        Ok((ids, fnv1a64_f32(&final_logits)))
+    }
+
+    #[test]
+    #[ignore = "requires canonical Gemma4 MoE artifact and AMD GPU"]
+    fn gemma4_lowered_product_matches_accepted_direct_oracle() {
+        let path = std::env::var_os("HIPFIRE_GEMMA4_MOE_ORACLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("/home/bjoern/.hipfire/models/gemma4-26b-a4b.mq4")
+            });
+        assert!(
+            path.is_file(),
+            "canonical Gemma4 MoE artifact is missing: {}",
+            path.display()
+        );
+        let prompt_ids = [2, 9259, 236888, 575, 106];
+        let (ids, fnv) = run_lowered_oracle(&path, &prompt_ids, 32).expect("oracle run");
+        assert_eq!(
+            ids,
+            [
+                1852, 236772, 236770, 1852, 237597, 236770, 29802, 237089, 1852, 1852,
+                237610, 1852, 1852, 1852, 237610, 237610, 237610, 2165, 236775, 569, 1852,
+                5596, 236779, 237610, 236771, 1852, 870, 237372, 1852, 237610, 236770, 5596
+            ]
+        );
+        assert_eq!(fnv, 0x831756562b0ab110);
     }
 }
 
@@ -3740,19 +3986,31 @@ pub(crate) fn generate_gemma4_lowered(
         tokens
     };
 
-    // Lowered cache bytes are not reused by this task. If the existing cursor
-    // cannot fit this complete request, use Task 3's total reset authority
-    // before starting the new prompt.
+    // Lowered cache bytes are not reused by this task. Every non-cold request
+    // starts from a total architecture reset before its full prompt prefill;
+    // capacity overflow uses the same reset path.
     let exceeds_capacity = bundle_cursor
         .saturating_add(prompt_ids.len())
         .saturating_add(max_tokens)
         > capacity;
-    if exceeds_capacity {
-        let reset_result = match m.gemma4_lowered_mut() {
+    let reset_requested = bundle_cursor != 0 || exceeds_capacity;
+    let reset_result = gemma_lowered_reset_before_request(
+        bundle_cursor,
+        reset_requested,
+        || match m.gemma4_lowered_mut() {
             Some(bundle) => bundle.cold_reset(gpu),
             None => Err("gemma4 lowered bundle disappeared during reset".to_string()),
-        };
-        if let Err(error) = reset_result {
+        },
+    );
+    match reset_result {
+        Ok(true) => {
+            // Only clear host state after the architecture reset has
+            // succeeded and its cursor/KV metadata are known to be cold.
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+        }
+        Ok(false) => {}
+        Err(error) => {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -3764,8 +4022,6 @@ pub(crate) fn generate_gemma4_lowered(
             let _ = stdout.flush();
             return;
         }
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
     }
     if prompt_ids.len() >= capacity {
         emit_active_attempt_error(
