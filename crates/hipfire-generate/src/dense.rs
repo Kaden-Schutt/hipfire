@@ -1809,10 +1809,9 @@ enum GemmaSample {
 
 /// Validate one eager Gemma logits result before sampling.
 ///
-/// The eager forward contract is one full vocabulary row. Sampling may
-/// tolerate a few non-finite entries, but it must have at least one finite
-/// candidate; an all-nonfinite row is not a token decision and must fail
-/// closed instead of silently becoming token zero.
+/// The eager forward contract is one full vocabulary row. Every candidate must
+/// be finite: retaining a mixed row lets greedy or sampled fallback select an
+/// infinity and publish a token derived from invalid GPU state.
 fn validate_gemma_logits(logits: &[f32], vocab_size: usize) -> Result<(), String> {
     if logits.len() != vocab_size {
         return Err(format!(
@@ -1821,8 +1820,29 @@ fn validate_gemma_logits(logits: &[f32], vocab_size: usize) -> Result<(), String
             vocab_size
         ));
     }
-    if !logits.iter().any(|value| value.is_finite()) {
-        return Err("gemma4 logits contain no finite candidate".to_string());
+    if let Some((index, value)) = logits
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "gemma4 logits contain non-finite value at index {index}: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate every framed prompt token before an embedding lookup can run.
+fn validate_gemma_prompt_tokens(prompt: &[u32], vocab_size: usize) -> Result<(), String> {
+    if let Some((index, token)) = prompt
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, token)| (*token as usize) >= vocab_size)
+    {
+        return Err(format!(
+            "gemma4 prompt token {token} at index {index} is outside vocabulary size {vocab_size}"
+        ));
     }
     Ok(())
 }
@@ -1889,20 +1909,23 @@ enum GemmaTokenTransactionResult {
 /// Run one sampled Gemma token as a two-phase transaction.
 ///
 /// EOS is terminal before parser preparation, forward, or any host mutation.
-/// Every other sample prepares output first, then forwards and validates the
-/// next full-vocabulary logits row. Only after both succeed is the commit
-/// callback allowed to publish events/history/count/cache state. Any failure
-/// invokes exactly one rollback callback.
-fn gemma_token_transaction<Prepare, Forward, Commit, Rollback>(
+/// Every other sample prepares output first, polls cancellation immediately
+/// before forwarding, then validates the next full-vocabulary logits row.
+/// Only after both succeed is the commit callback allowed to publish
+/// events/history/count/cache state. Any failure invokes exactly one rollback
+/// callback.
+fn gemma_token_transaction<Prepare, BeforeForward, Forward, Commit, Rollback>(
     sample: GemmaSample,
     vocab_size: usize,
     prepare: Prepare,
+    before_forward: BeforeForward,
     forward: Forward,
     commit: Commit,
     rollback: Rollback,
 ) -> Result<GemmaTokenTransactionResult, String>
 where
     Prepare: FnOnce(u32) -> Result<GemmaPreparedToken, String>,
+    BeforeForward: FnOnce() -> Result<(), String>,
     Forward: FnOnce(u32) -> Result<Vec<f32>, String>,
     Commit: FnOnce(u32, GemmaPreparedToken, Vec<f32>),
     Rollback: FnOnce(),
@@ -1917,6 +1940,10 @@ where
             return Err(error);
         }
     };
+    if let Err(error) = before_forward() {
+        rollback();
+        return Err(error);
+    }
     let next_logits = match forward(token) {
         Ok(logits) => logits,
         Err(error) => {
@@ -1932,6 +1959,27 @@ where
     commit(token, prepared, next_logits);
     Ok(GemmaTokenTransactionResult::Committed { stopped })
 }
+
+/// Errors from the shared Gemma Step lifecycle. Cancellation is kept distinct
+/// from a forward/validation failure so callers emit the cancelled terminal
+/// only after the single rollback epilogue has been attested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GemmaStepLifecycleError {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for GemmaStepLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str(GEMMA_STEP_CANCELLED),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
+const GEMMA_STEP_CANCELLED: &str = "gemma4 request cancelled";
+
 /// Architecture adapter used by the shared Gemma Step-only lifecycle.
 ///
 /// The adapter owns only the device forward and logical cursor operations.
@@ -1942,17 +1990,33 @@ trait GemmaStepAdapter {
     fn cursor(&self) -> usize;
     fn set_cursor(&mut self, cursor: usize);
     fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
-    fn prefill_prompt(&mut self, prompt: &[u32], capacity: usize) -> Result<Vec<f32>, String> {
+    fn prefill_prompt<Abort>(
+        &mut self,
+        prompt: &[u32],
+        capacity: usize,
+        should_abort: &mut Abort,
+    ) -> Result<Vec<f32>, GemmaStepLifecycleError>
+    where
+        Abort: FnMut() -> bool,
+    {
+        validate_gemma_prompt_tokens(prompt, self.vocab_size())
+            .map_err(GemmaStepLifecycleError::Failed)?;
         let mut position = self.cursor();
         let mut last_logits = Vec::new();
         for &token in prompt {
-            if position >= capacity {
-                return Err(format!(
-                    "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
-                ));
+            if should_abort() {
+                return Err(GemmaStepLifecycleError::Cancelled);
             }
-            let logits = self.prefill(token, position)?;
-            validate_gemma_logits(&logits, self.vocab_size())?;
+            if position >= capacity {
+                return Err(GemmaStepLifecycleError::Failed(format!(
+                    "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
+                )));
+            }
+            let logits = self
+                .prefill(token, position)
+                .map_err(GemmaStepLifecycleError::Failed)?;
+            validate_gemma_logits(&logits, self.vocab_size())
+                .map_err(GemmaStepLifecycleError::Failed)?;
             position += 1;
             self.set_cursor(position);
             last_logits = logits;
@@ -1984,19 +2048,22 @@ struct GemmaStepRun {
 /// adapter and the fake lifecycle test use this exact transaction boundary.
 /// Prompt tokens advance the adapter cursor only after a successful forward
 /// and logits validation. A sampled EOS is terminal before preparation,
-/// forwarding, or host history/event mutation.
-fn run_gemma_step_lifecycle<A, Sample, Prepare, Commit>(
+/// forwarding, or host history/event mutation. `should_abort` is polled before
+/// every prefill batch/token and immediately before every decode forward.
+fn run_gemma_step_lifecycle<A, Abort, Sample, Prepare, Commit>(
     adapter: &mut A,
     prompt: &[u32],
     max_tokens: usize,
     capacity: usize,
     stop_tokens: &[u32],
+    mut should_abort: Abort,
     mut sample: Sample,
     mut prepare: Prepare,
     mut commit: Commit,
-) -> Result<GemmaStepRun, String>
+) -> Result<GemmaStepRun, GemmaStepLifecycleError>
 where
     A: GemmaStepAdapter,
+    Abort: FnMut() -> bool,
     Sample: FnMut(&[f32]) -> Result<u32, String>,
     Prepare: FnMut(u32) -> Result<GemmaPreparedToken, String>,
     Commit: FnMut(u32, GemmaPreparedToken, &[f32], &[f32]),
@@ -2005,18 +2072,23 @@ where
     let prefill_t0 = Instant::now();
     let vocab_size = adapter.vocab_size();
     let mut position = adapter.cursor();
-    let mut last_logits = Vec::new();
-    if prompt.is_empty() {
+    let mut last_logits = if prompt.is_empty() {
         if position == 0 {
-            return Err("gemma4 prompt is empty".to_string());
+            return Err(GemmaStepLifecycleError::Failed(
+                "gemma4 prompt is empty".to_string(),
+            ));
         }
-        last_logits = adapter.cached_logits()?;
-        validate_gemma_logits(&last_logits, vocab_size)?;
+        if should_abort() {
+            return Err(GemmaStepLifecycleError::Cancelled);
+        }
+        adapter
+            .cached_logits()
+            .map_err(GemmaStepLifecycleError::Failed)?
     } else {
-        last_logits = adapter.prefill_prompt(prompt, capacity)?;
-        position = adapter.cursor();
-        validate_gemma_logits(&last_logits, vocab_size)?;
-    }
+        adapter.prefill_prompt(prompt, capacity, &mut should_abort)?
+    };
+    position = adapter.cursor();
+    validate_gemma_logits(&last_logits, vocab_size).map_err(GemmaStepLifecycleError::Failed)?;
     let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
     let decode_t0 = Instant::now();
     let mut ttft_ms = None;
@@ -2025,12 +2097,16 @@ where
     let mut hit_eos = false;
     let mut hit_length = false;
     loop {
+        if should_abort() {
+            return Err(GemmaStepLifecycleError::Cancelled);
+        }
         if generated >= max_tokens {
             hit_length = true;
             break;
         }
-        let next_token = sample(&last_logits)?;
-        let classified = classify_gemma_sample_for_stops(next_token, stop_tokens, vocab_size)?;
+        let next_token = sample(&last_logits).map_err(GemmaStepLifecycleError::Failed)?;
+        let classified = classify_gemma_sample_for_stops(next_token, stop_tokens, vocab_size)
+            .map_err(GemmaStepLifecycleError::Failed)?;
         if matches!(classified, GemmaSample::Eos) {
             hit_eos = true;
             break;
@@ -2047,6 +2123,13 @@ where
             classified,
             vocab_size,
             |token| prepare(token),
+            || {
+                if should_abort() {
+                    Err(GEMMA_STEP_CANCELLED.to_string())
+                } else {
+                    Ok(())
+                }
+            },
             |token| adapter.forward(token, position),
             |token, prepared, next_logits| {
                 if ttft_ms.is_none() {
@@ -2064,16 +2147,21 @@ where
                 hit_eos = true;
                 break;
             }
-            Err(error) => return Err(error),
+            Err(error) if error == GEMMA_STEP_CANCELLED => {
+                return Err(GemmaStepLifecycleError::Cancelled);
+            }
+            Err(error) => return Err(GemmaStepLifecycleError::Failed(error)),
         };
         if !committed {
-            return Err("gemma4 token transaction completed without commit".to_string());
+            return Err(GemmaStepLifecycleError::Failed(
+                "gemma4 token transaction completed without commit".to_string(),
+            ));
         }
         position += 1;
         adapter.set_cursor(position);
-        last_logits = committed_next_logits
-            .take()
-            .ok_or_else(|| "gemma4 token transaction lost next logits".to_string())?;
+        last_logits = committed_next_logits.take().ok_or_else(|| {
+            GemmaStepLifecycleError::Failed("gemma4 token transaction lost next logits".to_string())
+        })?;
         generated += 1;
         if stopped {
             break;
@@ -2259,7 +2347,17 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
         self.forward_step(token, position)
     }
 
-    fn prefill_prompt(&mut self, prompt: &[u32], capacity: usize) -> Result<Vec<f32>, String> {
+    fn prefill_prompt<Abort>(
+        &mut self,
+        prompt: &[u32],
+        capacity: usize,
+        should_abort: &mut Abort,
+    ) -> Result<Vec<f32>, GemmaStepLifecycleError>
+    where
+        Abort: FnMut() -> bool,
+    {
+        validate_gemma_prompt_tokens(prompt, self.vocab_size())
+            .map_err(GemmaStepLifecycleError::Failed)?;
         let requested_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok());
@@ -2276,13 +2374,16 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
         };
         let start_pos = self.cursor();
         if start_pos.saturating_add(prompt.len()) > capacity {
-            return Err(format!(
+            return Err(GemmaStepLifecycleError::Failed(format!(
                 "gemma4 prompt exceeds context capacity at position {start_pos} (capacity {capacity})"
-            ));
+            )));
         }
         let mut offset = 0usize;
         let mut last_logits = Vec::new();
         while offset < prompt.len() {
+            if should_abort() {
+                return Err(GemmaStepLifecycleError::Cancelled);
+            }
             let width = prefill_batch.min(prompt.len() - offset);
             let position = self.cursor();
             let physical_cap = self.bundle.state.kv_sliding.physical_cap;
@@ -2313,9 +2414,11 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
                     position,
                 )
             };
-            let logits =
-                result.map_err(|error| format!("gemma4 eager prefill failed: {error:?}"))?;
-            validate_gemma_logits(&logits, self.vocab_size())?;
+            let logits = result.map_err(|error| {
+                GemmaStepLifecycleError::Failed(format!("gemma4 eager prefill failed: {error:?}"))
+            })?;
+            validate_gemma_logits(&logits, self.vocab_size())
+                .map_err(GemmaStepLifecycleError::Failed)?;
             self.set_cursor(position + width);
             self.max_prefill_width = self.max_prefill_width.max(width);
             offset += width;
@@ -2323,7 +2426,6 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
         }
         Ok(last_logits)
     }
-
     fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
         self.forward_step(token, position)
     }
@@ -2332,13 +2434,8 @@ impl GemmaStepAdapter for Gemma4EagerAdapter<'_> {
         gemma_recompute_eager_cached_logits(self.bundle, self.gpu)
     }
 }
-/// Run one eager Gemma request through the production framing boundary.
-///
-/// The caller owns request history and terminal publication; this helper owns
-/// the same parser/stop quarantine and shared token transaction used by the
-/// serving route. Keeping those boundaries here lets the ignored product
-/// oracle exercise the production adapter rather than a test-only duplicate.
-fn run_gemma4_eager_product_lifecycle<Commit>(
+
+fn run_gemma4_eager_product_lifecycle<Abort, Commit>(
     adapter: &mut Gemma4EagerAdapter<'_>,
     prompt: &[u32],
     max_tokens: usize,
@@ -2354,9 +2451,11 @@ fn run_gemma4_eager_product_lifecycle<Commit>(
     id: &str,
     logprobs_top_k: Option<usize>,
     rng_seed: u64,
+    mut should_abort: Abort,
     mut commit: Commit,
-) -> Result<GemmaStepRun, String>
+) -> Result<GemmaStepRun, GemmaStepLifecycleError>
 where
+    Abort: FnMut() -> bool,
     Commit: FnMut(u32),
 {
     let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
@@ -2368,6 +2467,7 @@ where
         max_tokens,
         capacity,
         stop_tokens,
+        &mut should_abort,
         |logits| {
             Ok(deepseek4::sampling::sample_token(
                 logits, temp, 0, top_p, &mut rng,
@@ -2390,7 +2490,8 @@ where
             );
         },
     )?;
-    let trailing_events = gemma_flush_prepared_events(&mut eos_filter, &mut router)?;
+    let trailing_events = gemma_flush_prepared_events(&mut eos_filter, &mut router)
+        .map_err(GemmaStepLifecycleError::Failed)?;
     emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
     Ok(lifecycle)
 }
@@ -2472,6 +2573,7 @@ fn generate_gemma4_eager_ar_lifecycle(
             id,
             logprobs_top_k,
             rng_seed,
+            || check_abort(id),
             |token| {
                 m.conversation_tokens.push(token);
                 generated += 1;
@@ -2480,7 +2582,11 @@ fn generate_gemma4_eager_ar_lifecycle(
     };
     let lifecycle = match lifecycle {
         Ok(run) => run,
-        Err(error) => {
+        Err(GemmaStepLifecycleError::Cancelled) => {
+            gemma_eager_client_abort(stdout, id, m, generated, gpu);
+            return;
+        }
+        Err(GemmaStepLifecycleError::Failed(error)) => {
             gemma_eager_fail_closed(
                 stdout,
                 id,
@@ -2498,6 +2604,7 @@ fn generate_gemma4_eager_ar_lifecycle(
     let metrics = GemmaDoneMetrics {
         generated,
         prompt_tokens,
+        prefill_tokens: prefill_tokens.len(),
         cached_tokens,
         tok_s,
         prefill_ms: lifecycle.prefill_ms,
@@ -2815,15 +2922,24 @@ fn gemma_cache_rollback(
     gpu: &mut rdna_compute::Gpu,
     identity: &str,
 ) -> RollbackEpilogue {
-    let rollback = if let Some(bundle) = m.gemma4_mut() {
+    let rollback_result = if let Some(bundle) = m.gemma4_mut() {
         Some(bundle.rollback_working_request(identity, gpu))
     } else if let Some(bundle) = m.gemma4_lowered_mut() {
         Some(bundle.rollback_working_request(identity, gpu))
     } else {
         None
     };
-    let Some(rollback) = rollback else {
-        return production_fail_closed_rollback(m, gpu, None, None);
+    let rollback = match rollback_result {
+        Some(Ok(outcome)) => outcome,
+        Some(Err(error)) => {
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            return RollbackEpilogue {
+                rolled_back: false,
+                context: Some(format!("Gemma cold reset failed: {error}")),
+            };
+        }
+        None => return production_fail_closed_rollback(m, gpu, None, None),
     };
 
     match rollback {
@@ -3056,7 +3172,10 @@ fn gemma_eos_filter_config(stop: &[String]) -> EosFilterConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct GemmaDoneMetrics {
     pub generated: usize,
+    /// Total framed prompt length, including an exact-prefix cache hit.
     pub prompt_tokens: usize,
+    /// Uncached suffix actually executed by prefill.
+    pub prefill_tokens: usize,
     pub cached_tokens: usize,
     pub tok_s: f64,
     pub prefill_ms: f64,
@@ -3086,13 +3205,14 @@ pub fn gemma_pending_done(
     finish_reason: &str,
     metrics: &GemmaDoneMetrics,
 ) -> serde_json::Value {
-    let prefill_tok_s = metrics.prompt_tokens as f64 * 1000.0 / metrics.prefill_ms.max(1.0);
+    let prefill_tok_s = metrics.prefill_tokens as f64 * 1000.0 / metrics.prefill_ms.max(1.0);
     serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": metrics.generated,
+        "prompt_tokens": metrics.prompt_tokens,
         "tok_s": metrics.tok_s,
-        "prefill_tokens": metrics.prompt_tokens,
+        "prefill_tokens": metrics.prefill_tokens,
         "cached_tokens": metrics.cached_tokens,
         "prefill_ms": metrics.prefill_ms,
         "prefill_tok_s": prefill_tok_s,
@@ -3345,6 +3465,7 @@ mod gemma4_prefill_batch_tests {
         let metrics = GemmaDoneMetrics {
             generated: 7,
             prompt_tokens: 11,
+            prefill_tokens: 8,
             cached_tokens: 3,
             tok_s: 1.0,
             prefill_ms: 2.0,
@@ -3355,9 +3476,31 @@ mod gemma4_prefill_batch_tests {
         let done = gemma_pending_done("r", "length", &metrics);
         assert_eq!(done["finish_reason"], "length");
         assert_eq!(done["tokens"], 7);
-        assert_eq!(done["prefill_tokens"], 11);
+        assert_eq!(done["prompt_tokens"], 11);
+        assert_eq!(done["prefill_tokens"], 8);
         assert_eq!(done["cached_tokens"], 3);
+        assert_eq!(done["prefill_tok_s"], 4000.0);
         assert!(done.get("attempt_id").is_some());
+    }
+
+    #[test]
+    fn gemma_pending_done_reports_total_prompt_and_uncached_prefill() {
+        let metrics = GemmaDoneMetrics {
+            generated: 0,
+            prompt_tokens: 4096,
+            prefill_tokens: 0,
+            cached_tokens: 4096,
+            tok_s: 0.0,
+            prefill_ms: 10.0,
+            decode_tok_s: 0.0,
+            ttft_ms: 10.0,
+            total_ms: 10.0,
+        };
+        let done = gemma_pending_done("cache-hit", "stop", &metrics);
+        assert_eq!(done["prompt_tokens"], 4096);
+        assert_eq!(done["prefill_tokens"], 0);
+        assert_eq!(done["cached_tokens"], 4096);
+        assert_eq!(done["prefill_tok_s"], 0.0);
     }
 }
 
@@ -3560,6 +3703,7 @@ mod gemma_fake_two_turn_cache_tests {
             max_tokens,
             64,
             &[31],
+            || false,
             move |_| Ok(samples.next().expect("sample fixture")),
             |_token| {
                 Ok(GemmaPreparedToken {
@@ -3700,8 +3844,9 @@ mod gemma4_token_transaction_tests {
     use super::{
         classify_gemma_sample, gemma_eagle_publish_after_settle, gemma_eos_filter_config,
         gemma_prepare_token, gemma_sync_host_cursor, gemma_token_transaction,
-        validate_gemma_logits, validate_gemma_token, EosFilter, GemmaEmit, GemmaPreparedToken,
-        GemmaSample, GemmaThoughtRouter, GemmaTokenTransactionResult,
+        validate_gemma_logits, validate_gemma_prompt_tokens, validate_gemma_token, EosFilter,
+        GemmaEmit, GemmaPreparedToken, GemmaSample, GemmaThoughtRouter,
+        GemmaTokenTransactionResult,
     };
 
     #[derive(Default)]
@@ -3738,6 +3883,26 @@ mod gemma4_token_transaction_tests {
     fn gemma_rejects_all_nonfinite_logits() {
         assert!(validate_gemma_logits(&[f32::NAN, f32::INFINITY], 2).is_err());
     }
+    #[test]
+    fn gemma_rejects_mixed_nonfinite_logits() {
+        for logits in [
+            vec![f32::INFINITY, 0.0],
+            vec![f32::NEG_INFINITY, 0.0],
+            vec![f32::NAN, 0.0],
+            vec![0.0, f32::INFINITY, f32::NEG_INFINITY],
+        ] {
+            assert!(
+                validate_gemma_logits(&logits, logits.len()).is_err(),
+                "mixed non-finite logits must fail closed: {logits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_rejects_out_of_range_prompt_before_prefill() {
+        assert!(validate_gemma_prompt_tokens(&[2, 7, 8], 8).is_err());
+        assert!(validate_gemma_prompt_tokens(&[2, 7], 8).is_ok());
+    }
 
     #[test]
     fn gemma_rejects_out_of_range_sample() {
@@ -3762,6 +3927,7 @@ mod gemma4_token_transaction_tests {
             GemmaSample::Eos,
             8,
             |_| panic!("EOS must not enter parser preparation"),
+            || Ok(()),
             |_| panic!("EOS must not enter forward"),
             |_, _, _| panic!("EOS must not commit"),
             || panic!("EOS must not roll back"),
@@ -3789,6 +3955,7 @@ mod gemma4_token_transaction_tests {
                     stop: false,
                 })
             },
+            || Ok(()),
             move |_| {
                 forward_order.borrow_mut().push("forward");
                 Ok(vec![0.0; 8])
@@ -3818,6 +3985,7 @@ mod gemma4_token_transaction_tests {
                     stop: true,
                 })
             },
+            || Ok(()),
             |_| Err("forced forward failure".to_string()),
             |token, prepared, logits| adapter.borrow_mut().commit(token, prepared, logits),
             || adapter.borrow_mut().rollback_count += 1,
@@ -4015,6 +4183,7 @@ mod gemma4_lowered_lifecycle_tests {
             2,
             100,
             &[99],
+            || false,
             move |_| {
                 let token = samples.next().expect("sample fixture");
                 sample_calls.borrow_mut().push(format!("sample({token})"));
@@ -4061,6 +4230,7 @@ mod gemma4_lowered_lifecycle_tests {
             1,
             100,
             &[99],
+            || false,
             |_| Ok(99),
             |_token| {
                 Ok(GemmaPreparedToken {
@@ -4096,6 +4266,7 @@ mod gemma4_lowered_lifecycle_tests {
             1,
             100,
             &[99],
+            || false,
             |_| Ok(99),
             |_token| {
                 Ok(GemmaPreparedToken {
@@ -4119,6 +4290,7 @@ mod gemma4_lowered_lifecycle_tests {
         let metrics = GemmaDoneMetrics {
             generated: 0,
             prompt_tokens: 1,
+            prefill_tokens: 1,
             cached_tokens: 0,
             tok_s: 0.0,
             prefill_ms: 0.0,
@@ -4127,6 +4299,69 @@ mod gemma4_lowered_lifecycle_tests {
             total_ms: 0.0,
         };
         assert_eq!(metrics.cached_tokens, 0);
+    }
+    #[test]
+    fn gemma_lifecycle_aborts_before_prefill_forward() {
+        let mut adapter = FakeAdapter::default();
+        let result = run_gemma_step_lifecycle(
+            &mut adapter,
+            &[1, 2],
+            1,
+            100,
+            &[99],
+            || true,
+            |_| Ok(3),
+            |_token| {
+                Ok(GemmaPreparedToken {
+                    events: Vec::new(),
+                    stop: false,
+                })
+            },
+            |_, _, _, _| panic!("cancelled lifecycle must not commit"),
+        );
+        assert!(matches!(
+            result,
+            Err(super::GemmaStepLifecycleError::Cancelled)
+        ));
+        assert!(adapter.calls.is_empty());
+    }
+
+    #[test]
+    fn gemma_lifecycle_stops_decode_after_abort_without_post_abort_commit() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let abort = Rc::new(Cell::new(false));
+        let mut adapter = FakeAdapter::default();
+        let committed = Rc::new(Cell::new(0usize));
+        let committed_for_cb = Rc::clone(&committed);
+        let abort_for_commit = Rc::clone(&abort);
+        let result = run_gemma_step_lifecycle(
+            &mut adapter,
+            &[1],
+            2,
+            100,
+            &[99],
+            move || abort.get(),
+            |_| Ok(3),
+            |_token| {
+                Ok(GemmaPreparedToken {
+                    events: vec![GemmaEmit::Token("visible".to_string())],
+                    stop: false,
+                })
+            },
+            move |_, prepared, _, _| {
+                committed_for_cb.set(committed_for_cb.get() + 1);
+                assert_eq!(prepared.events.len(), 1);
+                abort_for_commit.set(true);
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(super::GemmaStepLifecycleError::Cancelled)
+        ));
+        assert_eq!(committed.get(), 1);
+        assert_eq!(adapter.calls, ["prefill(1@0)", "forward(3@1)"]);
     }
 }
 
@@ -4221,6 +4456,7 @@ mod gemma4_lowered_oracle_tests {
                 max_tokens,
                 max_seq,
                 &[oracle_eos, 106],
+                || false,
                 |logits| {
                     Ok(hipfire_arch_deepseek4::sampling::sample_token(
                         logits, 0.0, 0, 1.0, &mut rng,
@@ -4266,6 +4502,27 @@ mod gemma4_lowered_oracle_tests {
             ]
         );
         assert_eq!(fnv, 0x831756562b0ab110);
+    }
+    #[test]
+    #[ignore = "requires canonical Gemma4 MoE artifact and AMD GPU"]
+    fn lowered_product_supports_prompt_beyond_sliding_window() {
+        let path = std::env::var_os("HIPFIRE_GEMMA4_MOE_ORACLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("/home/bjoern/.hipfire/models/gemma4-26b-a4b.mq4")
+            });
+        assert!(
+            path.is_file(),
+            "canonical Gemma4 MoE artifact is missing: {}",
+            path.display()
+        );
+        let prompt_ids: Vec<u32> = [2_u32, 9259, 236888, 575]
+            .into_iter()
+            .cycle()
+            .take(1025)
+            .collect();
+        let (ids, _) = run_lowered_oracle(&path, &prompt_ids, 2).expect("long-context oracle run");
+        assert!(ids.len() <= 2);
     }
 }
 
@@ -4427,8 +4684,10 @@ mod gemma4_eager_oracle_tests {
                 "oracle",
                 None,
                 0x13579BDF,
+                || false,
                 |token| ids.push(token),
-            )?;
+            )
+            .map_err(|error| format!("eager product lifecycle: {error}"))?;
             (lifecycle, adapter.max_prefill_width)
         };
         let final_logits = lifecycle.final_logits;
@@ -4729,6 +4988,10 @@ pub fn generate_gemma4(
         emit_error_with_id(stdout, id, "empty prompt after tokenize");
         return;
     }
+    if let Err(error) = validate_gemma_prompt_tokens(&prompt_ids, bundle.config.vocab_size) {
+        emit_error_with_id(stdout, id, error);
+        return;
+    }
 
     // Stop set (see doc comment item 4). `bundle.eos_tok` already resolved
     // `<end_of_turn>` / `<turn|>` at load; union with config.eos_token
@@ -4828,6 +5091,7 @@ pub fn generate_gemma4(
     // reading projection weights once for a small token block. Keep the path
     // opt-in until long-context parity is certified on each supported board.
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
     {
         let requested_prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
             .ok()
@@ -4846,6 +5110,10 @@ pub fn generate_gemma4(
         };
         let mut offset = 0usize;
         while offset < prefill_tokens.len() {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
             let width = prefill_batch.min(prefill_tokens.len() - offset);
             let start_pos = bundle.state.n_tokens;
             let physical_cap = bundle.state.kv_sliding.physical_cap;
@@ -4895,6 +5163,10 @@ pub fn generate_gemma4(
                 }
             };
         }
+    }
+    if prefill_aborted || check_abort(id) {
+        gemma_eager_client_abort(stdout, id, m, 0, gpu);
+        return;
     }
     if let Err(error) = validate_gemma_logits(&last_logits, bundle.config.vocab_size) {
         gemma_eager_fail_closed(stdout, id, m, gpu, &error);
@@ -4974,8 +5246,11 @@ pub fn generate_gemma4(
         let mut hit_length = false;
         let mut ttft_ms: Option<f64> = None;
         let decode_t0 = Instant::now();
-
         while !stop && generated_count < max_tokens {
+            if check_abort(id) {
+                gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
+                return;
+            }
             let committed_len = bundle.state.n_tokens;
             // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
             if committed_len + draft_len + 1 >= cache_cap {
@@ -5078,6 +5353,10 @@ pub fn generate_gemma4(
             // `spec_step` leaves the final bonus's KV slot unwritten. Settle
             // this block now, validate its logits, then publish only this
             // block so EAGLE keeps streaming/TTFT behavior round by round.
+            if check_abort(id) {
+                gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
+                return;
+            }
             let settle_res = if let Some(&last_tok) = block_tokens.last() {
                 let last_pos = (prefill_end + generated_count + block_tokens.len() - 1) as u32;
                 let physical_cap = bundle.state.kv_sliding.physical_cap;
@@ -5128,6 +5407,10 @@ pub fn generate_gemma4(
                 break;
             }
 
+            if check_abort(id) {
+                gemma_eager_client_abort(stdout, id, m, generated_count, gpu);
+                return;
+            }
             let mut rollback_requested = false;
             let publish_result = gemma_eagle_publish_after_settle(
                 bundle.config.vocab_size,
@@ -5186,6 +5469,7 @@ pub fn generate_gemma4(
         let metrics = GemmaDoneMetrics {
             generated: generated_count,
             prompt_tokens: prompt_ids.len(),
+            prefill_tokens: prefill_tokens.len(),
             cached_tokens,
             tok_s,
             prefill_ms: prefill_ms as f64,
@@ -5314,6 +5598,13 @@ pub(crate) fn generate_gemma4_lowered(
         let _ = stdout.flush();
         return;
     }
+    if let Some(bundle) = m.gemma4_lowered() {
+        if let Err(error) = validate_gemma_prompt_tokens(&prompt_ids, bundle.config.vocab_size) {
+            emit_active_attempt_error(stdout, Some(id), &error, "validation", false, false);
+            let _ = stdout.flush();
+            return;
+        }
+    }
 
     let stop_set = {
         let eos_tok = m.gemma4_lowered().unwrap().eos_tok;
@@ -5407,6 +5698,7 @@ pub(crate) fn generate_gemma4_lowered(
                 max_tokens,
                 capacity,
                 &stop_set,
+                || check_abort(id),
                 |logits| {
                     Ok(deepseek4::sampling::sample_token(
                         logits, temp, 0, top_p, &mut rng,
@@ -5438,12 +5730,18 @@ pub(crate) fn generate_gemma4_lowered(
                 },
             )
         }
-        None => Err("gemma4 lowered bundle missing during generation".to_string()),
+        None => Err(GemmaStepLifecycleError::Failed(
+            "gemma4 lowered bundle missing during generation".to_string(),
+        )),
     };
 
     let run = match run_result {
         Ok(run) => run,
-        Err(error) => {
+        Err(GemmaStepLifecycleError::Cancelled) => {
+            gemma_eager_client_abort(stdout, id, m, generated_tokens.len(), gpu);
+            return;
+        }
+        Err(GemmaStepLifecycleError::Failed(error)) => {
             gemma_eager_fail_closed(
                 stdout,
                 id,
@@ -5488,6 +5786,7 @@ pub(crate) fn generate_gemma4_lowered(
     let metrics = GemmaDoneMetrics {
         generated: run.generated,
         prompt_tokens: prompt_ids.len(),
+        prefill_tokens: prefill_tokens.len(),
         cached_tokens,
         tok_s,
         prefill_ms: run.prefill_ms,

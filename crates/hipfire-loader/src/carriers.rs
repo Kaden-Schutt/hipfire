@@ -1790,7 +1790,17 @@ fn gemma4_use_lowered(
     enable_moe_block || (want_batched && !has_drafter && !is_e_series)
 }
 
-fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
+fn gemma4_validate_drafter_route(
+    is_e_series: bool,
+    is_moe: bool,
+    has_drafter: bool,
+) -> Result<(), String> {
+    if is_moe && has_drafter {
+        return Err(
+            "gemma4: lowered/MoE EAGLE spec-decode is not supported; load the MoE target without params.drafter"
+                .into(),
+        );
+    }
     if is_e_series && has_drafter {
         return Err(
             "gemma4: E2B/E4B EAGLE spec-decode is not yet supported; load the E-series target without params.drafter"
@@ -2008,9 +2018,7 @@ impl Carrier for Gemma4Carrier {
                         meta.chat_template,
                     )
                 };
-                let owner_bytes = model
-                    .gemma4()
-                    .map_or(0, crate::Gemma4Bundle::owner_bytes);
+                let owner_bytes = model.gemma4().map_or(0, crate::Gemma4Bundle::owner_bytes);
                 hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
                     "publish",
                     hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
@@ -2586,8 +2594,15 @@ mod gemma4_route_tests {
 
     #[test]
     fn e_series_drafter_fails_closed() {
-        assert!(gemma4_validate_drafter_route(true, true).is_err());
-        assert!(gemma4_validate_drafter_route(true, false).is_ok());
-        assert!(gemma4_validate_drafter_route(false, true).is_ok());
+        assert!(gemma4_validate_drafter_route(true, false, true).is_err());
+        assert!(gemma4_validate_drafter_route(true, false, false).is_ok());
+        assert!(gemma4_validate_drafter_route(false, false, true).is_ok());
+    }
+
+    #[test]
+    fn moe_drafter_fails_closed_instead_of_falling_back_to_ar() {
+        let error = gemma4_validate_drafter_route(false, true, true).unwrap_err();
+        assert!(error.contains("lowered/MoE"));
+        assert!(error.contains("without params.drafter"));
     }
 }

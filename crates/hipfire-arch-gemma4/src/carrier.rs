@@ -15,8 +15,9 @@
 use crate::config::Gemma4Config;
 use crate::gemma4::{Gemma4State, Gemma4Weights};
 use crate::lowered;
+use hipfire_runtime::gpu_cleanup::enqueue_cleanup_failure;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::{KvCache, KvCacheExt};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 // ─── Helpers moved verbatim from carriers.rs ─────────────────────────────
@@ -30,7 +31,17 @@ fn gemma4_use_lowered(
     enable_moe_block || (want_batched && !has_drafter && !is_e_series)
 }
 
-fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
+fn gemma4_validate_drafter_route(
+    is_e_series: bool,
+    is_moe: bool,
+    has_drafter: bool,
+) -> Result<(), String> {
+    if is_moe && has_drafter {
+        return Err(
+            "gemma4: lowered/MoE EAGLE spec-decode is not supported; load the MoE target without params.drafter"
+                .into(),
+        );
+    }
     if is_e_series && has_drafter {
         return Err(
             "gemma4: E2B/E4B EAGLE spec-decode is not yet supported; load the E-series target without params.drafter"
@@ -38,6 +49,14 @@ fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result
         );
     }
     Ok(())
+}
+#[inline]
+fn lowered_sliding_physical_cap(max_seq: usize) -> usize {
+    // The lowered sliding attention kernel applies `sliding_window` as its
+    // logical mask, while its position addressing remains absolute. Allocate
+    // the physical rows to the logical horizon so positions beyond the window
+    // cannot index past the cache.
+    max_seq
 }
 
 // ─── Bundle types ─────────────────────────────────────────────────────────
@@ -113,6 +132,43 @@ fn emit_rollback_boundary(phase: &'static str, owner_bytes: usize, gpu: &rdna_co
     }
 }
 
+fn release_lowered_kv(label: &str, kv: KvCache, gpu: &mut rdna_compute::Gpu) {
+    let owner_bytes = lowered::kv_owner_bytes(&kv);
+    emit_rollback_boundary(
+        match label {
+            "full" => "rollback_full_kv_before",
+            "sliding" => "rollback_sliding_kv_before",
+            _ => "rollback_kv_before",
+        },
+        owner_bytes,
+        gpu,
+    );
+    let remaining_bytes = match kv.free_checked(gpu) {
+        Ok(()) => {
+            lowered::unregister_live_owner_bytes(owner_bytes);
+            0
+        }
+        Err(remaining) => {
+            let failure = lowered::kv_cleanup_failure_from_remaining(remaining);
+            let remaining_bytes = lowered::kv_cleanup_failure_bytes(&failure);
+            lowered::unregister_live_owner_bytes(owner_bytes.saturating_sub(remaining_bytes));
+            enqueue_cleanup_failure(lowered::tracked_kv_cleanup_failure(
+                failure,
+                remaining_bytes,
+            ));
+            remaining_bytes
+        }
+    };
+    emit_rollback_boundary(
+        match label {
+            "full" => "rollback_full_kv_after",
+            "sliding" => "rollback_sliding_kv_after",
+            _ => "rollback_kv_after",
+        },
+        remaining_bytes,
+        gpu,
+    );
+}
 impl<'a> Gemma4LoweredStaging<'a> {
     fn new(gpu: &'a mut rdna_compute::Gpu) -> Self {
         Self {
@@ -143,18 +199,10 @@ impl<'a> Gemma4LoweredStaging<'a> {
 
     fn release(&mut self) {
         if let Some(kv_full) = self.kv_full.take() {
-            let owner_bytes = lowered::kv_owner_bytes(&kv_full);
-            emit_rollback_boundary("rollback_full_kv_before", owner_bytes, self.gpu);
-            let _ = kv_full.free_gpu(self.gpu);
-            lowered::unregister_live_owner_bytes(owner_bytes);
-            emit_rollback_boundary("rollback_full_kv_after", 0, self.gpu);
+            release_lowered_kv("full", kv_full, self.gpu);
         }
         if let Some(kv_sliding) = self.kv_sliding.take() {
-            let owner_bytes = lowered::kv_owner_bytes(&kv_sliding);
-            emit_rollback_boundary("rollback_sliding_kv_before", owner_bytes, self.gpu);
-            let _ = kv_sliding.free_gpu(self.gpu);
-            lowered::unregister_live_owner_bytes(owner_bytes);
-            emit_rollback_boundary("rollback_sliding_kv_after", 0, self.gpu);
+            release_lowered_kv("sliding", kv_sliding, self.gpu);
         }
         if let Some(scratch) = self.scratch.take() {
             emit_rollback_boundary("rollback_scratch_before", scratch.owner_bytes(), self.gpu);
@@ -194,7 +242,7 @@ pub fn preflight_gemma4(hfq: &HfqFile, has_drafter: bool) -> Result<(), String> 
     if is_e_series {
         eager_config.as_ref().unwrap().e_series_variant()?;
     }
-    gemma4_validate_drafter_route(is_e_series, has_drafter)
+    gemma4_validate_drafter_route(is_e_series, lowered_is_moe, has_drafter)
 }
 
 /// Build the Gemma 4 GPU bundle from an HFQ source.
@@ -237,7 +285,11 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     if is_e_series {
         eager_config.as_ref().unwrap().e_series_variant()?;
     }
-    gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
+    gemma4_validate_drafter_route(
+        is_e_series,
+        lowered_is_moe,
+        ctx.gemma4_drafter_path.is_some(),
+    )?;
     let use_lowered = if let Some(ref lcfg) = lowered_cfg {
         gemma4_use_lowered(
             lcfg.enable_moe_block,
@@ -274,14 +326,13 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         }
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Scratch)
             .map_err(|e| format!("gemma4 (lowered) scratch stage: {e:?}"))?;
-
         let kv_sliding = KvCache::new_gpu_q8_capped(
             staging.gpu_mut(),
             lcfg.n_layers,
             lcfg.sliding_n_kv_heads,
             lcfg.sliding_head_dim,
             ctx.max_seq,
-            lcfg.sliding_window,
+            lowered_sliding_physical_cap(ctx.max_seq),
         )
         .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
         staging.kv_sliding = Some(kv_sliding);
@@ -336,3 +387,17 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
 
 // Alias for task's naming convention if callers use `load_bundle`.
 pub use load_gemma4_bundle as load_bundle;
+
+#[cfg(test)]
+mod tests {
+    use super::lowered_sliding_physical_cap;
+
+    #[test]
+    fn lowered_sliding_kv_uses_logical_context_capacity() {
+        assert_eq!(lowered_sliding_physical_cap(2048), 2048);
+        assert!(
+            lowered_sliding_physical_cap(4096) > 1024,
+            "configured contexts beyond the 1024-token window must remain allocatable"
+        );
+    }
+}

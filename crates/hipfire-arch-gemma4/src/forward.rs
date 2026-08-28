@@ -1592,6 +1592,41 @@ fn argmax_f32_row(v: &[f32]) -> u32 {
     bi
 }
 
+/// Validate one target verify row before its argmax can become an accepted
+/// token. EAGLE must fail closed for mixed rows as well as all-nonfinite rows.
+fn validate_finite_logits_row(
+    row: &[f32],
+    vocab_size: usize,
+    row_index: usize,
+) -> Result<(), String> {
+    if row.len() != vocab_size {
+        return Err(format!(
+            "gemma4 verify logits row {row_index} shape mismatch: got {}, expected {vocab_size}",
+            row.len()
+        ));
+    }
+    if let Some((index, value)) = row.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(format!(
+            "gemma4 verify logits row {row_index} contains non-finite value at index {index}: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_batch_token_ids(tokens: &[u32], vocab_size: usize) -> Result<(), String> {
+    if let Some((index, token)) = tokens
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, token)| (*token as usize) >= vocab_size)
+    {
+        return Err(format!(
+            "gemma4 verify token {token} at row {index} is outside vocabulary size {vocab_size}"
+        ));
+    }
+    Ok(())
+}
+
 fn checked_batch_seq_len(start_pos: usize, batch: usize, max_seq: usize) -> Result<usize, String> {
     let seq_len = start_pos
         .checked_add(batch)
@@ -1660,6 +1695,7 @@ pub fn forward_batch_spec(
             "gemma4 forward_batch: B={b} exceeds kernel cap {GEMMA4_FORWARD_BATCH_MAX}"
         ));
     }
+    validate_batch_token_ids(tokens, cfg.vocab_size)?;
     let dim = cfg.dim;
     let eps = cfg.norm_eps;
     let ffn_hd = cfg.max_ffn_hidden_dim();
@@ -2006,6 +2042,22 @@ pub fn forward_batch_spec(
                 };
                 lm_result
                     .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
+                // A GPU argmax alone cannot attest mixed finite/non-finite
+                // rows. Download the verify matrix once, validate every row,
+                // then retain the existing low-bandwidth index download.
+                let logits_host = gpu
+                    .download_f32(&logits_b)
+                    .map_err(|e| format!("gemma4 forward_batch_spec verify logits dtoh: {e:?}"))?;
+                let mut rows = logits_host.chunks_exact(vocab);
+                for (i, row) in rows.by_ref().enumerate() {
+                    validate_finite_logits_row(row, vocab, i)?;
+                }
+                if !rows.remainder().is_empty() {
+                    return Err(format!(
+                        "gemma4 forward_batch_spec verify logits shape mismatch: got {} values for {b} rows of {vocab}",
+                        logits_host.len()
+                    ));
+                }
                 // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
                 let idx_buf = alloc(gpu, b, "spec_argmax_idx")?;
                 gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
@@ -2041,6 +2093,7 @@ pub fn forward_batch_spec(
                     let row = gpu.download_f32(&state.logits).map_err(|e| {
                         format!("gemma4 forward_batch_spec download row {i}: {e:?}")
                     })?;
+                    validate_finite_logits_row(&row, vocab, i)?;
                     out.push(argmax_f32_row(&row));
                 }
             }
@@ -2614,6 +2667,7 @@ mod tests {
     use super::{
         checked_batch_seq_len, supports_batched_projection_dtype,
         supports_exact_batched_q8_ple_projection, supports_gemma4_batched_prefill_arch,
+        validate_batch_token_ids, validate_finite_logits_row,
     };
     use rdna_compute::DType;
 
@@ -2661,5 +2715,24 @@ mod tests {
         assert!(supports_gemma4_batched_prefill_arch("gfx1201"));
         assert!(!supports_gemma4_batched_prefill_arch("gfx1151"));
         assert!(!supports_gemma4_batched_prefill_arch("gfx1200"));
+    }
+    #[test]
+    fn verify_logits_reject_every_nonfinite_value_before_argmax() {
+        for row in [
+            vec![f32::NAN, 0.0],
+            vec![f32::INFINITY, 0.0],
+            vec![f32::NEG_INFINITY, 0.0],
+        ] {
+            assert!(
+                validate_finite_logits_row(&row, row.len(), 0).is_err(),
+                "invalid verify row must fail closed: {row:?}"
+            );
+        }
+        assert!(validate_finite_logits_row(&[0.0, 1.0], 2, 0).is_ok());
+    }
+    #[test]
+    fn verify_token_ids_are_validated_before_embedding() {
+        assert!(validate_batch_token_ids(&[2, 7, 8], 8).is_err());
+        assert!(validate_batch_token_ids(&[2, 7], 8).is_ok());
     }
 }

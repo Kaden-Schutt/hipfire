@@ -771,16 +771,16 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
 /// declared here rather than in their arch crates, so — orphan rule — the impls
 /// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
 /// freeing less leaks, freeing more double-frees.
+fn checked_gemma_graph_invalidation(route: &str, result: Result<(), String>) -> Result<(), String> {
+    result.map_err(|error| format!("{route} graph invalidation failed: {error}"))
+}
 impl Gemma4Bundle {
     /// Actual bytes owned by eager weights, state, and optional EAGLE state.
     /// Aliased LM-head and sidecar views are excluded by the arch helpers.
     pub fn owner_bytes(&self) -> usize {
         self.weights.owner_bytes()
             + self.state.owner_bytes()
-            + self
-                .eagle
-                .as_ref()
-                .map_or(0, Gemma4EagleState::owner_bytes)
+            + self.eagle.as_ref().map_or(0, Gemma4EagleState::owner_bytes)
     }
 
     /// Total cold reset for eager Gemma state and its wrapper-owned cache.
@@ -792,9 +792,13 @@ impl Gemma4Bundle {
             &mut self.state.kv_full.compact_offset,
         );
         self.state.ar_warmed_up = false;
-        gpu.invalidate_graph_state();
+        let graph_result = checked_gemma_graph_invalidation(
+            "gemma4 eager",
+            gpu.invalidate_graph_state_checked()
+                .map_err(|error| error.to_string()),
+        );
         gpu.replay.invalidate_replay_observation_window();
-        Ok(())
+        graph_result
     }
 
     /// Roll back one working request without invoking cold reset when the
@@ -804,7 +808,7 @@ impl Gemma4Bundle {
         &mut self,
         identity: &str,
         gpu: &mut rdna_compute::Gpu,
-    ) -> gemma4::lowered::GemmaRollback {
+    ) -> Result<gemma4::lowered::GemmaRollback, String> {
         let committed = self.prefix_cache.committed_cursor;
         let overwrite_boundary = self.prefix_cache.overwrite_boundary;
         let identity_matches = self.prefix_cache.valid && self.prefix_cache.identity == identity;
@@ -816,10 +820,10 @@ impl Gemma4Bundle {
                 self.prefix_cache.restore_committed();
             }
             gemma4::lowered::GemmaRollback::Invalidated => {
-                let _ = self.cold_reset(gpu);
+                self.cold_reset(gpu)?;
             }
         }
-        outcome
+        Ok(outcome)
     }
 }
 
@@ -830,9 +834,13 @@ impl Gemma4LoweredBundle {
         self.cursor.reset();
         gemma4::lowered::reset_kv_offsets(&mut self.kv_sliding, &mut self.kv_full);
         self.prefix_cache.invalidate();
-        gpu.invalidate_graph_state();
+        let graph_result = checked_gemma_graph_invalidation(
+            "gemma4 lowered",
+            gpu.invalidate_graph_state_checked()
+                .map_err(|error| error.to_string()),
+        );
         gpu.replay.invalidate_replay_observation_window();
-        Ok(())
+        graph_result
     }
     /// Actual bytes owned by lowered weights, scratch, and both KV families.
     /// Borrowed LM-head/expert views are excluded by the architecture helpers.
@@ -850,7 +858,7 @@ impl Gemma4LoweredBundle {
         &mut self,
         identity: &str,
         gpu: &mut rdna_compute::Gpu,
-    ) -> gemma4::lowered::GemmaRollback {
+    ) -> Result<gemma4::lowered::GemmaRollback, String> {
         let committed = self.prefix_cache.committed_cursor;
         let overwrite_boundary = self.prefix_cache.overwrite_boundary;
         let identity_matches = self.prefix_cache.valid && self.prefix_cache.identity == identity;
@@ -862,10 +870,10 @@ impl Gemma4LoweredBundle {
                 self.prefix_cache.restore_committed();
             }
             gemma4::lowered::GemmaRollback::Invalidated => {
-                let _ = self.cold_reset(gpu);
+                self.cold_reset(gpu)?;
             }
         }
-        outcome
+        Ok(outcome)
     }
 }
 
@@ -936,23 +944,61 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
         let full_kv_bytes = gemma4::lowered::kv_owner_bytes(&b.kv_full);
         let sliding_kv_bytes = gemma4::lowered::kv_owner_bytes(&b.kv_sliding);
         let owner_bytes = b.owner_bytes();
-        b.kv_full.free_gpu(gpu).ok();
-        gemma4::lowered::unregister_live_owner_bytes(full_kv_bytes);
-        b.kv_sliding.free_gpu(gpu).ok();
-        gemma4::lowered::unregister_live_owner_bytes(sliding_kv_bytes);
+        let mut cleanup = hipfire_runtime::gpu_cleanup::GpuCleanupFailure::empty();
+        let mut freed_labels = Vec::with_capacity(4);
+
+        match b.kv_full.free_checked(gpu) {
+            Ok(()) => {
+                gemma4::lowered::unregister_live_owner_bytes(full_kv_bytes);
+                freed_labels.push("kv_full".to_string());
+            }
+            Err(remaining) => {
+                let failure = gemma4::lowered::kv_cleanup_failure_from_remaining(remaining);
+                let failed_bytes = gemma4::lowered::kv_cleanup_failure_bytes(&failure);
+                gemma4::lowered::unregister_live_owner_bytes(
+                    full_kv_bytes.saturating_sub(failed_bytes),
+                );
+                cleanup.merge(gemma4::lowered::tracked_kv_cleanup_failure(
+                    failure,
+                    failed_bytes,
+                ));
+            }
+        }
+        match b.kv_sliding.free_checked(gpu) {
+            Ok(()) => {
+                gemma4::lowered::unregister_live_owner_bytes(sliding_kv_bytes);
+                freed_labels.push("kv_sliding".to_string());
+            }
+            Err(remaining) => {
+                let failure = gemma4::lowered::kv_cleanup_failure_from_remaining(remaining);
+                let failed_bytes = gemma4::lowered::kv_cleanup_failure_bytes(&failure);
+                gemma4::lowered::unregister_live_owner_bytes(
+                    sliding_kv_bytes.saturating_sub(failed_bytes),
+                );
+                cleanup.merge(gemma4::lowered::tracked_kv_cleanup_failure(
+                    failure,
+                    failed_bytes,
+                ));
+            }
+        }
         b.scratch.free_gpu(gpu);
         b.weights.free_gpu(gpu);
+        freed_labels.extend(["scratch", "weights"].into_iter().map(str::to_string));
+        if !cleanup.is_empty() {
+            let pending = cleanup.num_failed();
+            let summaries = cleanup.error_summaries();
+            hipfire_runtime::gpu_cleanup::enqueue_cleanup_failure(cleanup);
+            eprintln!(
+                "gemma4 lowered unload retained {pending} KV owner(s): {}",
+                summaries.join("; ")
+            );
+        }
         gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
             "unload",
             gemma4::lowered::allocation_telemetry_cycle(),
             owner_bytes,
             gpu,
-            vec![
-                "kv_full".to_string(),
-                "kv_sliding".to_string(),
-                "scratch".to_string(),
-                "weights".to_string(),
-            ],
+            freed_labels,
         );
     }
 }
@@ -1044,7 +1090,6 @@ fn gemma4_eager_freed_owner_labels(has_eagle: bool) -> Vec<String> {
     labels.extend(["state", "weights"]);
     labels.into_iter().map(str::to_string).collect()
 }
-
 
 /// Gemma 4 dense text (arch_id=13) GPU bundle — eager dense path. Re-exported
 /// from the arch crate, which owns config/weights/state so `impl SpecTarget`
@@ -5207,17 +5252,28 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             let _ = batch_state.free_gpu(gpu);
         }
     }
+    let retained_before_state = hipfire_runtime::gpu_cleanup::backlog_pending();
     // Free arch-specific GPU state from the carrier bundle via `ArchModel::free_gpu`.
     if let Some(state) = m.state {
         state.free_gpu(gpu);
     }
     // deepseek4 single-GPU scratch now lives inside `Deepseek4Bundle.pbs` and is
+    let retained_after_state = hipfire_runtime::gpu_cleanup::backlog_pending();
+    if retained_after_state > retained_before_state {
+        note(Err(format!(
+            "Gemma KV unload retained {} owner(s) for retry",
+            retained_after_state - retained_before_state
+        )));
+    }
     // freed via `ArchModel::free_gpu` above — no separate `m.deepseek4_pbs` block.
     // Qwen35 vision tower is now inside the bundle and freed via
     // `ArchModel::free_gpu` above. Nothing to do here — the old
     // `m.vision_weights` field is gone.
     gpu.invalidate_weight_caches();
-    gpu.invalidate_graph_state();
+    note(
+        gpu.invalidate_graph_state_checked()
+            .map_err(|error| format!("unload graph invalidation failed: {error:?}")),
+    );
     gpu.drain_pool();
     // After ordinary frees/pool drain, retry any VMM arenas retained by a
     // failed free_tensor. Success is reported only when none remain.
@@ -5225,6 +5281,22 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     match first_err {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod gemma_reset_tests {
+    use super::checked_gemma_graph_invalidation;
+
+    #[test]
+    fn graph_invalidation_failure_is_not_attested_as_success() {
+        let result = checked_gemma_graph_invalidation(
+            "gemma4 lowered",
+            Err("injected graph destruction failure".to_string()),
+        );
+        let error = result.expect_err("injected graph failure must propagate");
+        assert!(error.contains("graph invalidation failed"));
+        assert!(error.contains("injected graph destruction failure"));
     }
 }
 

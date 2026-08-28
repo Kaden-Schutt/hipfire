@@ -28,6 +28,7 @@ use hipfire_dispatch::families::moe::{
     launch_moe_gelu_experts, MoeGeluExpertsRef, MoeRouterBackend,
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_runtime::gpu_cleanup::{GpuCleanupFailure, RetainedGpuTensor, RetryableOwner};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1446,6 +1447,84 @@ pub fn kv_owner_bytes(kv: &llama::KvCache) -> usize {
         .chain(kv.givens_cos.iter().map(tensor_owner_bytes))
         .chain(kv.givens_sin.iter().map(tensor_owner_bytes))
         .sum()
+}
+
+/// Convert a checked KV teardown's failed tensors into the common retained
+/// cleanup container. Successful frees have already been consumed.
+pub fn kv_cleanup_failure_from_remaining(remaining: Vec<(String, GpuTensor)>) -> GpuCleanupFailure {
+    let mut failure = GpuCleanupFailure::empty();
+    for (label, tensor) in remaining {
+        failure.add_retained(RetainedGpuTensor {
+            label,
+            tensor,
+            last_error: "kv free_checked failed".to_string(),
+        });
+    }
+    failure
+}
+
+/// Sum actual bytes still held by a retained KV cleanup failure.
+pub fn kv_cleanup_failure_bytes(failure: &GpuCleanupFailure) -> usize {
+    failure
+        .failed_tensors
+        .iter()
+        .map(|retained| tensor_owner_bytes(&retained.tensor))
+        .sum()
+}
+
+#[derive(Debug)]
+struct TrackedKvCleanup {
+    failure: Option<GpuCleanupFailure>,
+    live_bytes: usize,
+}
+
+impl RetryableOwner for TrackedKvCleanup {
+    fn retry_boxed(mut self: Box<Self>, gpu: &mut Gpu) -> Result<(), Box<dyn RetryableOwner>> {
+        let failure = self
+            .failure
+            .take()
+            .expect("tracked KV cleanup retry called without retained failure");
+        let before = self.live_bytes;
+        match failure.retry(gpu) {
+            Ok(()) => {
+                unregister_live_owner_bytes(before);
+                Ok(())
+            }
+            Err(remaining) => {
+                let after = kv_cleanup_failure_bytes(&remaining);
+                unregister_live_owner_bytes(before.saturating_sub(after));
+                self.live_bytes = after;
+                self.failure = Some(remaining);
+                Err(self)
+            }
+        }
+    }
+
+    fn num_failed(&self) -> usize {
+        self.failure
+            .as_ref()
+            .map_or(0, GpuCleanupFailure::num_failed)
+    }
+
+    fn error_summaries(&self) -> Vec<String> {
+        self.failure
+            .as_ref()
+            .map_or_else(Vec::new, GpuCleanupFailure::error_summaries)
+    }
+}
+
+/// Wrap a failed KV free with live-owner accounting so a later retained
+/// cleanup retry decrements bytes only for allocations actually released.
+pub fn tracked_kv_cleanup_failure(
+    failure: GpuCleanupFailure,
+    live_bytes: usize,
+) -> GpuCleanupFailure {
+    let mut tracked = GpuCleanupFailure::empty();
+    tracked.add_other(Box::new(TrackedKvCleanup {
+        failure: Some(failure),
+        live_bytes,
+    }));
+    tracked
 }
 
 // ─── Loading helpers ───────────────────────────────────────────────────
@@ -6961,6 +7040,22 @@ mod tests {
             GemmaRollback::RestoredCommitted
         );
         assert_eq!(cursor.position(), 3);
+    }
+
+    #[test]
+    fn failed_kv_teardown_is_retained_with_exact_owner_labels() {
+        let failure = kv_cleanup_failure_from_remaining(vec![(
+            "kv_full.k_gpu[0]".to_string(),
+            GpuTensor::null_for_test(),
+        )]);
+        assert_eq!(failure.num_failed(), 1);
+        assert_eq!(
+            failure.error_summaries(),
+            vec!["kv_full.k_gpu[0]: kv free_checked failed"]
+        );
+        let tracked = tracked_kv_cleanup_failure(failure, 0);
+        assert_eq!(tracked.num_failed(), 1);
+        assert!(tracked.error_summaries()[0].contains("kv_full.k_gpu[0]"));
     }
 
     use super::{gemma4_op_sequence, Gemma4Op, Gemma4Variant};

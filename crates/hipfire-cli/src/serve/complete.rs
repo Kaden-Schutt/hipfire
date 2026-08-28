@@ -5163,6 +5163,7 @@ mod tests {
                 serde_json::json!({
                     "type": "commit_ready",
                     "finish_reason": "stop",
+                    "prompt_tokens": 11,
                     "prefill_tokens": 8,
                     "tokens": 7,
                     "cached_tokens": 3,
@@ -5177,6 +5178,9 @@ mod tests {
         let done = folded
             .done
             .expect("commit_ready must become the generic v2 terminal");
+        assert_eq!(done["prompt_tokens"], 11);
+        assert_eq!(done["prefill_tokens"], 8);
+        assert_eq!(done["cached_tokens"], 3);
         let completion = Completion {
             id: "req-gemma4".into(),
             created: 42,
