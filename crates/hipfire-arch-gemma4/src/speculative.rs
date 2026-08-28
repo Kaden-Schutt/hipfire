@@ -263,16 +263,22 @@ mod owner_tests {
     use super::*;
     use crate::config::{LayerType, RopeType};
 
-    #[test]
-    #[ignore = "requires an AMD GPU"]
-    fn eager_spec_scratch_owner_bytes_includes_all_verify_buffers() {
-        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(mut gpu) = Gpu::init() else {
-            eprintln!("skip: no GPU");
-            return;
-        };
-        let cfg = Gemma4Config {
+    fn expected_tensor(tensor: &GpuTensor) -> usize {
+        if tensor.buf.is_borrowed() {
+            0
+        } else {
+            tensor.buf.size()
+        }
+    }
+
+    fn expected_spec_scratch(scratch: &Gemma4SpecScratch) -> usize {
+        expected_tensor(&scratch.seed_hidden)
+            + expected_tensor(&scratch.draft_hidden)
+            + expected_tensor(&scratch.verify_hidden)
+    }
+
+    fn config() -> Gemma4Config {
+        Gemma4Config {
             dim: 4,
             n_layers: 1,
             vocab_size: 8,
@@ -303,9 +309,20 @@ mod owner_tests {
             max_position_embeddings: 128,
             layer_types: vec![LayerType::Sliding],
             norm_plus_one: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_spec_scratch_owner_bytes_exactly_sums_all_verify_buffers() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
         };
-        let scratch = Gemma4SpecScratch::new(&mut gpu, &cfg, 3).expect("tiny spec scratch");
-        assert!(scratch.owner_bytes() > 3 * cfg.dim * std::mem::size_of::<f32>());
+        let scratch = Gemma4SpecScratch::new(&mut gpu, &config(), 3).expect("tiny spec scratch");
+        assert_eq!(scratch.owner_bytes(), expected_spec_scratch(&scratch));
         scratch.free(&mut gpu);
         gpu.drain_pool();
     }

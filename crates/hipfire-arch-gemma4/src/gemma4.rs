@@ -727,6 +727,7 @@ impl Gemma4Weights {
             lm_head.free_all(gpu);
         }
         let _ = gpu.free_tensor(self.embed_tokens);
+        let _ = gpu.free_tensor(self.final_norm);
         if let Some(ple) = self.per_layer_input {
             let _ = gpu.free_tensor(ple.embed_tokens);
             ple.model_projection.free_all(gpu);
@@ -1267,19 +1268,109 @@ impl Gemma4State {
 #[cfg(test)]
 mod owner_tests {
     use super::*;
-    use hipfire_runtime::llama::ParoRotation;
+    use hipfire_runtime::llama::{ParoRotation, WeightTensor};
 
-    #[test]
-    #[ignore = "requires an AMD GPU"]
-    fn eager_weights_owner_bytes_counts_sidecars_once_and_excludes_tied_alias() {
-        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(mut gpu) = Gpu::init() else {
-            eprintln!("skip: no GPU");
-            return;
-        };
-        let tensor = |gpu: &mut Gpu| gpu.zeros(&[1], DType::F32).expect("tiny tensor");
-        let weight = |gpu: &mut Gpu| WeightTensor {
+    fn expected_tensor(tensor: &GpuTensor) -> usize {
+        if tensor.buf.is_borrowed() {
+            0
+        } else {
+            tensor.buf.size()
+        }
+    }
+
+    fn expected_buffer(buffer: &hip_bridge::DeviceBuffer) -> usize {
+        if buffer.is_borrowed() {
+            0
+        } else {
+            buffer.size()
+        }
+    }
+
+    fn expected_weight(weight: &WeightTensor) -> usize {
+        let mut bytes = expected_tensor(&weight.buf);
+        if let Some(awq_scale) = weight.awq_scale.as_ref() {
+            bytes += expected_tensor(awq_scale);
+        }
+        if let Some(paro) = weight.paro.as_ref() {
+            if !paro.is_alias {
+                bytes += expected_tensor(&paro.pairs);
+                bytes += expected_tensor(&paro.theta);
+                bytes += expected_tensor(&paro.channel_scales);
+            }
+        }
+        bytes
+    }
+
+    fn expected_branch(branch: &PerLayerBranchWeights) -> usize {
+        expected_weight(&branch.input_gate)
+            + expected_weight(&branch.projection)
+            + expected_tensor(&branch.post_input_norm)
+    }
+
+    fn expected_ple(ple: &PerLayerInputWeights) -> usize {
+        expected_tensor(&ple.embed_tokens)
+            + expected_weight(&ple.model_projection)
+            + expected_tensor(&ple.projection_norm)
+    }
+
+    fn expected_sliding(layer: &SlidingLayerWeights) -> usize {
+        expected_tensor(&layer.input_layernorm)
+            + expected_tensor(&layer.post_attention_layernorm)
+            + expected_tensor(&layer.pre_feedforward_layernorm)
+            + expected_tensor(&layer.post_feedforward_layernorm)
+            + expected_weight(&layer.q_proj)
+            + expected_weight(&layer.k_proj)
+            + expected_weight(&layer.v_proj)
+            + expected_weight(&layer.o_proj)
+            + expected_tensor(&layer.q_norm)
+            + expected_tensor(&layer.k_norm)
+            + expected_weight(&layer.gate_proj)
+            + expected_weight(&layer.up_proj)
+            + expected_weight(&layer.down_proj)
+            + layer.per_layer.as_ref().map_or(0, expected_branch)
+    }
+
+    fn expected_full(layer: &FullLayerWeights) -> usize {
+        expected_tensor(&layer.input_layernorm)
+            + expected_tensor(&layer.post_attention_layernorm)
+            + expected_tensor(&layer.pre_feedforward_layernorm)
+            + expected_tensor(&layer.post_feedforward_layernorm)
+            + expected_weight(&layer.q_proj)
+            + expected_weight(&layer.k_proj)
+            + layer.v_proj.as_ref().map_or(0, expected_weight)
+            + expected_weight(&layer.o_proj)
+            + expected_tensor(&layer.q_norm)
+            + expected_tensor(&layer.k_norm)
+            + expected_weight(&layer.gate_proj)
+            + expected_weight(&layer.up_proj)
+            + expected_weight(&layer.down_proj)
+            + layer.per_layer.as_ref().map_or(0, expected_branch)
+    }
+
+    fn expected_weights(weights: &Gemma4Weights) -> usize {
+        expected_tensor(&weights.embed_tokens)
+            + expected_weight(&weights.lm_head)
+            + expected_tensor(&weights.final_norm)
+            + weights
+                .per_layer_input
+                .as_ref()
+                .map_or(0, expected_ple)
+            + weights
+                .layers
+                .iter()
+                .map(|layer| match layer {
+                    LayerWeights::Sliding(layer) => expected_sliding(layer),
+                    LayerWeights::Full(layer) => expected_full(layer),
+                })
+                .sum::<usize>()
+    }
+
+    fn tensor(gpu: &mut Gpu) -> GpuTensor {
+        gpu.zeros(&[1], DType::F32).expect("tiny tensor")
+    }
+
+    fn weight(gpu: &mut Gpu) -> WeightTensor {
+        WeightTensor {
             buf: tensor(gpu),
             gpu_dtype: DType::F32,
             m: 1,
@@ -1287,15 +1378,38 @@ mod owner_tests {
             row_stride: 0,
             paro: None,
             awq_scale: None,
+        }
+    }
+
+    fn alias(tensor: &GpuTensor) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { tensor.buf.alias() },
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        }
+    }
+
+    fn branch(gpu: &mut Gpu) -> PerLayerBranchWeights {
+        PerLayerBranchWeights {
+            input_gate: weight(gpu),
+            projection: weight(gpu),
+            post_input_norm: tensor(gpu),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_weights_owner_bytes_exactly_sums_every_field_and_excludes_aliases() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
         };
 
         let embed_tokens = tensor(&mut gpu);
         let lm_head = WeightTensor {
-            buf: GpuTensor {
-                buf: unsafe { embed_tokens.buf.alias() },
-                shape: embed_tokens.shape.clone(),
-                dtype: DType::F32,
-            },
+            buf: alias(&embed_tokens),
             gpu_dtype: DType::F32,
             m: 1,
             k: 1,
@@ -1304,17 +1418,29 @@ mod owner_tests {
             awq_scale: None,
         };
         let final_norm = tensor(&mut gpu);
-        let mut q_proj = weight(&mut gpu);
-        let q_buf_bytes = q_proj.buf.buf.size();
-        let awq_scale = tensor(&mut gpu);
-        let awq_bytes = awq_scale.buf.size();
+
+        let ple_embed = tensor(&mut gpu);
+        let ple_projection = weight(&mut gpu);
+        let ple_norm = tensor(&mut gpu);
+        let per_layer_input = Some(PerLayerInputWeights {
+            embed_tokens: ple_embed,
+            embd_format: EmbeddingFormat::F32,
+            model_projection: ple_projection,
+            projection_norm: ple_norm,
+        });
+
         let paro_pairs = tensor(&mut gpu);
         let paro_theta = tensor(&mut gpu);
         let paro_channel_scales = tensor(&mut gpu);
-        let paro_bytes =
-            paro_pairs.buf.size() + paro_theta.buf.size() + paro_channel_scales.buf.size();
-        q_proj.awq_scale = Some(awq_scale);
-        q_proj.paro = Some(ParoRotation {
+        let paro_pairs_alias = alias(&paro_pairs);
+        let paro_theta_alias = alias(&paro_theta);
+        let paro_channel_scales_alias = alias(&paro_channel_scales);
+        let awq_owner = tensor(&mut gpu);
+        let awq_alias = alias(&awq_owner);
+
+        let mut sliding_q = weight(&mut gpu);
+        sliding_q.awq_scale = Some(awq_owner);
+        sliding_q.paro = Some(ParoRotation {
             pairs: paro_pairs,
             theta: paro_theta,
             channel_scales: paro_channel_scales,
@@ -1322,15 +1448,24 @@ mod owner_tests {
             group_size: 1,
             is_alias: false,
         });
-
-        let layer = LayerWeights::Sliding(SlidingLayerWeights {
+        let mut sliding_k = weight(&mut gpu);
+        sliding_k.awq_scale = Some(awq_alias);
+        sliding_k.paro = Some(ParoRotation {
+            pairs: paro_pairs_alias,
+            theta: paro_theta_alias,
+            channel_scales: paro_channel_scales_alias,
+            krot: 1,
+            group_size: 1,
+            is_alias: true,
+        });
+        let sliding = LayerWeights::Sliding(SlidingLayerWeights {
             input_layernorm: tensor(&mut gpu),
             post_attention_layernorm: tensor(&mut gpu),
             pre_feedforward_layernorm: tensor(&mut gpu),
             post_feedforward_layernorm: tensor(&mut gpu),
             layer_scalar_host: 1.0,
-            q_proj,
-            k_proj: weight(&mut gpu),
+            q_proj: sliding_q,
+            k_proj: sliding_k,
             v_proj: weight(&mut gpu),
             o_proj: weight(&mut gpu),
             q_norm: tensor(&mut gpu),
@@ -1339,43 +1474,55 @@ mod owner_tests {
             up_proj: weight(&mut gpu),
             down_proj: weight(&mut gpu),
             ffn_hidden_dim: 1,
-            per_layer: None,
+            per_layer: Some(branch(&mut gpu)),
+        });
+        let full = LayerWeights::Full(FullLayerWeights {
+            input_layernorm: tensor(&mut gpu),
+            post_attention_layernorm: tensor(&mut gpu),
+            pre_feedforward_layernorm: tensor(&mut gpu),
+            post_feedforward_layernorm: tensor(&mut gpu),
+            layer_scalar_host: 1.0,
+            q_proj: weight(&mut gpu),
+            k_proj: weight(&mut gpu),
+            v_proj: Some(weight(&mut gpu)),
+            o_proj: weight(&mut gpu),
+            q_norm: tensor(&mut gpu),
+            k_norm: tensor(&mut gpu),
+            gate_proj: weight(&mut gpu),
+            up_proj: weight(&mut gpu),
+            down_proj: weight(&mut gpu),
+            ffn_hidden_dim: 1,
+            per_layer: Some(branch(&mut gpu)),
         });
         let weights = Gemma4Weights {
             embed_tokens,
             embd_format: EmbeddingFormat::F32,
             lm_head,
             final_norm,
-            per_layer_input: None,
-            layers: vec![layer],
+            per_layer_input,
+            layers: vec![sliding, full],
         };
 
-        let expected = weights.embed_tokens.buf.size()
-            + weights.final_norm.buf.size()
-            + weights.layers[0].owner_bytes();
+        let expected = expected_weights(&weights);
         assert_eq!(weights.owner_bytes(), expected);
-        assert!(
-            weights.layers[0].owner_bytes() >= q_buf_bytes + awq_bytes + paro_bytes,
-            "layer owner total must include weight and both sidecar families"
+        assert_eq!(expected_tensor(&weights.lm_head.buf), 0);
+        let LayerWeights::Sliding(sliding) = &weights.layers[0] else {
+            unreachable!("first fixture layer must be sliding")
+        };
+        assert_eq!(
+            expected_weight(&sliding.k_proj),
+            expected_tensor(&sliding.k_proj.buf),
+            "aliased AWQ/Paro sidecars must not be counted"
         );
-        assert_eq!(weights.lm_head.buf.buf.size(), weights.embed_tokens.buf.size());
-        assert!(weights.lm_head.buf.buf.is_borrowed());
 
         weights.free_gpu(&mut gpu);
         gpu.drain_pool();
     }
-    #[test]
-    #[ignore = "requires an AMD GPU"]
-    fn eager_state_owner_bytes_includes_kv_position_and_scratch_owners() {
-        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(mut gpu) = Gpu::init() else {
-            eprintln!("skip: no GPU");
-            return;
-        };
-        let cfg = Gemma4Config {
+
+    fn state_config() -> Gemma4Config {
+        Gemma4Config {
             dim: 4,
-            n_layers: 1,
+            n_layers: 2,
             vocab_size: 8,
             norm_eps: 1e-6,
             bos_token: 2,
@@ -1402,12 +1549,74 @@ mod owner_tests {
             tie_word_embeddings: true,
             embed_scale: 2.0,
             max_position_embeddings: 128,
-            layer_types: vec![LayerType::Sliding],
+            layer_types: vec![LayerType::Sliding, LayerType::Full],
             norm_plus_one: false,
+        }
+    }
+
+    fn expected_kv(kv: &hipfire_runtime::llama::KvCache) -> usize {
+        kv.k_gpu
+            .iter()
+            .chain(kv.v_gpu.iter())
+            .chain(kv.k_scales.iter())
+            .chain(kv.v_scales.iter())
+            .map(expected_tensor)
+            .sum::<usize>()
+            + kv.givens_cos.as_ref().map_or(0, expected_tensor)
+            + kv.givens_sin.as_ref().map_or(0, expected_tensor)
+    }
+
+    fn expected_state(state: &Gemma4State) -> usize {
+        expected_kv(&state.kv_sliding)
+            + expected_kv(&state.kv_full)
+            + expected_buffer(&state.pos_buf)
+            + [
+                &state.x,
+                &state.residual,
+                &state.tmp,
+                &state.tmp_rot,
+                &state.q,
+                &state.k,
+                &state.v,
+                &state.attn_out,
+                &state.q8_flash_partials,
+                &state.v_norm_ones,
+                &state.gate_ffn,
+                &state.up_ffn,
+                &state.ffn_hidden,
+                &state.ffn_out,
+                &state.logits,
+            ]
+            .into_iter()
+            .map(expected_tensor)
+            .sum::<usize>()
+            + [
+                &state.ple_token_inputs,
+                &state.ple_projection_all,
+                &state.ple_gate,
+                &state.ple_hidden,
+                &state.ple_out,
+            ]
+            .into_iter()
+            .flatten()
+            .map(expected_tensor)
+            .sum::<usize>()
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_state_owner_bytes_exactly_sums_kv_scratch_and_position() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
         };
+        let cfg = state_config();
         let state =
             Gemma4State::new_with_max_seq(&mut gpu, &cfg, 128).expect("tiny eager state");
-        assert!(state.owner_bytes() > state.pos_buf.size());
+        assert_eq!(state.owner_bytes(), expected_state(&state));
+        assert_eq!(expected_buffer(&state.pos_buf), state.pos_buf.size());
         state.free_gpu(&mut gpu);
         gpu.drain_pool();
     }

@@ -649,6 +649,7 @@ impl Gemma4DrafterWeights {
             lm_head.free_all(gpu);
         }
         let _ = gpu.free_tensor(self.embed_tokens);
+        let _ = gpu.free_tensor(self.final_norm);
         self.pre_projection.free_all(gpu);
         self.post_projection.free_all(gpu);
         for l in self.layers {
@@ -1142,17 +1143,201 @@ fn argmax_f32(v: &[f32]) -> u32 {
 #[cfg(test)]
 mod owner_tests {
     use super::*;
+    use hipfire_runtime::llama::{ParoRotation, WeightTensor};
+
+    fn expected_tensor(tensor: &GpuTensor) -> usize {
+        if tensor.buf.is_borrowed() {
+            0
+        } else {
+            tensor.buf.size()
+        }
+    }
+
+    fn expected_buffer(buffer: &hip_bridge::DeviceBuffer) -> usize {
+        if buffer.is_borrowed() {
+            0
+        } else {
+            buffer.size()
+        }
+    }
+
+    fn expected_weight(weight: &WeightTensor) -> usize {
+        let mut bytes = expected_tensor(&weight.buf);
+        if let Some(awq_scale) = weight.awq_scale.as_ref() {
+            bytes += expected_tensor(awq_scale);
+        }
+        if let Some(paro) = weight.paro.as_ref() {
+            if !paro.is_alias {
+                bytes += expected_tensor(&paro.pairs);
+                bytes += expected_tensor(&paro.theta);
+                bytes += expected_tensor(&paro.channel_scales);
+            }
+        }
+        bytes
+    }
+
+    fn expected_layer(layer: &DrafterLayerWeights) -> usize {
+        expected_tensor(&layer.input_layernorm)
+            + expected_tensor(&layer.post_attention_layernorm)
+            + expected_tensor(&layer.pre_feedforward_layernorm)
+            + expected_tensor(&layer.post_feedforward_layernorm)
+            + expected_weight(&layer.q_proj)
+            + expected_weight(&layer.o_proj)
+            + expected_tensor(&layer.q_norm)
+            + expected_weight(&layer.gate_proj)
+            + expected_weight(&layer.up_proj)
+            + expected_weight(&layer.down_proj)
+    }
+
+    fn expected_weights(weights: &Gemma4DrafterWeights) -> usize {
+        expected_weight(&weights.lm_head)
+            + expected_tensor(&weights.embed_tokens)
+            + expected_tensor(&weights.final_norm)
+            + expected_weight(&weights.pre_projection)
+            + expected_weight(&weights.post_projection)
+            + weights
+                .layers
+                .iter()
+                .map(expected_layer)
+                .sum::<usize>()
+    }
+
+    fn expected_scratch(scratch: &Gemma4DrafterScratch) -> usize {
+        [
+            &scratch.concat,
+            &scratch.embed_half,
+            &scratch.x,
+            &scratch.residual,
+            &scratch.tmp,
+            &scratch.q,
+            &scratch.attn_out,
+            &scratch.gate_ffn,
+            &scratch.up_ffn,
+            &scratch.ffn_hidden,
+            &scratch.ffn_out,
+            &scratch.normed,
+            &scratch.post_proj,
+            &scratch.logits,
+        ]
+        .into_iter()
+        .map(expected_tensor)
+        .sum::<usize>()
+            + expected_buffer(&scratch.pos_buf)
+    }
+
+    fn tensor(gpu: &mut Gpu) -> GpuTensor {
+        gpu.zeros(&[1], DType::F32).expect("tiny tensor")
+    }
+
+    fn weight(gpu: &mut Gpu) -> WeightTensor {
+        WeightTensor {
+            buf: tensor(gpu),
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        }
+    }
+
+    fn alias(tensor: &GpuTensor) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { tensor.buf.alias() },
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        }
+    }
+
+    fn layer(gpu: &mut Gpu) -> DrafterLayerWeights {
+        DrafterLayerWeights {
+            input_layernorm: tensor(gpu),
+            post_attention_layernorm: tensor(gpu),
+            pre_feedforward_layernorm: tensor(gpu),
+            post_feedforward_layernorm: tensor(gpu),
+            layer_scalar_host: 1.0,
+            q_proj: weight(gpu),
+            o_proj: weight(gpu),
+            q_norm: tensor(gpu),
+            gate_proj: weight(gpu),
+            up_proj: weight(gpu),
+            down_proj: weight(gpu),
+        }
+    }
 
     #[test]
     #[ignore = "requires an AMD GPU"]
-    fn eager_drafter_scratch_owner_bytes_includes_all_scratch_and_position() {
+    fn eager_drafter_weights_owner_bytes_exactly_sums_fields_and_excludes_aliases() {
         static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(mut gpu) = Gpu::init() else {
             eprintln!("skip: no GPU");
             return;
         };
-        let cfg = Gemma4DrafterConfig {
+
+        let embed_tokens = tensor(&mut gpu);
+        let lm_head = WeightTensor {
+            buf: alias(&embed_tokens),
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        };
+        let final_norm = tensor(&mut gpu);
+        let mut pre_projection = weight(&mut gpu);
+        let awq_owner = tensor(&mut gpu);
+        let awq_alias = alias(&awq_owner);
+        pre_projection.awq_scale = Some(awq_owner);
+        let mut post_projection = weight(&mut gpu);
+        let paro_pairs = tensor(&mut gpu);
+        let paro_theta = tensor(&mut gpu);
+        let paro_scales = tensor(&mut gpu);
+        let paro_pairs_alias = alias(&paro_pairs);
+        let paro_theta_alias = alias(&paro_theta);
+        let paro_scales_alias = alias(&paro_scales);
+        post_projection.paro = Some(ParoRotation {
+            pairs: paro_pairs,
+            theta: paro_theta,
+            channel_scales: paro_scales,
+            krot: 1,
+            group_size: 1,
+            is_alias: false,
+        });
+        let mut first_layer = layer(&mut gpu);
+        first_layer.q_proj.awq_scale = Some(awq_alias);
+        first_layer.q_proj.paro = Some(ParoRotation {
+            pairs: paro_pairs_alias,
+            theta: paro_theta_alias,
+            channel_scales: paro_scales_alias,
+            krot: 1,
+            group_size: 1,
+            is_alias: true,
+        });
+        let weights = Gemma4DrafterWeights {
+            lm_head,
+            embed_tokens,
+            final_norm,
+            pre_projection,
+            post_projection,
+            layers: vec![first_layer, layer(&mut gpu)],
+            embd_q8: false,
+        };
+
+        assert_eq!(weights.owner_bytes(), expected_weights(&weights));
+        assert_eq!(expected_tensor(&weights.lm_head.buf), 0);
+        assert_eq!(
+            expected_weight(&weights.layers[0].q_proj),
+            expected_tensor(&weights.layers[0].q_proj.buf),
+            "aliased AWQ/Paro sidecars must not be counted"
+        );
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+    }
+
+    fn drafter_config() -> Gemma4DrafterConfig {
+        Gemma4DrafterConfig {
             hidden: 4,
             n_layers: 1,
             vocab_size: 8,
@@ -1175,9 +1360,21 @@ mod owner_tests {
             use_ordered_embeddings: false,
             layer_types: vec![crate::config::LayerType::Sliding],
             norm_plus_one: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eager_drafter_scratch_owner_bytes_exactly_sums_all_fields_and_position() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
         };
-        let scratch = Gemma4DrafterScratch::new(&mut gpu, &cfg).expect("tiny drafter scratch");
-        assert!(scratch.owner_bytes() > scratch.pos_buf.size());
+        let scratch =
+            Gemma4DrafterScratch::new(&mut gpu, &drafter_config()).expect("tiny drafter scratch");
+        assert_eq!(scratch.owner_bytes(), expected_scratch(&scratch));
         scratch.free_gpu(&mut gpu);
         gpu.drain_pool();
     }
