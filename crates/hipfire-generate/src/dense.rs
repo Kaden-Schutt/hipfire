@@ -1933,6 +1933,290 @@ where
     commit(token, prepared, next_logits);
     Ok(GemmaTokenTransactionResult::Committed { stopped })
 }
+/// Architecture adapter used by the shared Gemma Step-only lifecycle.
+///
+/// The adapter owns only the device forward and logical cursor operations.
+/// Host history, parser output, and terminal state stay in the caller so a
+/// failed forward cannot publish a token before the transaction completes.
+trait GemmaStepAdapter {
+    fn vocab_size(&self) -> usize;
+    fn cursor(&self) -> usize;
+    fn set_cursor(&mut self, cursor: usize);
+    fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
+    fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GemmaStepRun {
+    generated: usize,
+    hit_eos: bool,
+    hit_length: bool,
+    prefill_ms: f64,
+    decode_ms: f64,
+    ttft_ms: Option<f64>,
+}
+
+/// Drive one Gemma request through per-token prefill and decode Steps.
+///
+/// The caller supplies parser/commit closures so both the lowered product
+/// adapter and the fake lifecycle test use this exact transaction boundary.
+/// Prompt tokens advance the adapter cursor only after a successful forward
+/// and logits validation. A sampled EOS is terminal before preparation,
+/// forwarding, or host history/event mutation.
+fn run_gemma_step_lifecycle<A, Sample, Prepare, Commit>(
+    adapter: &mut A,
+    prompt: &[u32],
+    max_tokens: usize,
+    capacity: usize,
+    stop_tokens: &[u32],
+    mut sample: Sample,
+    mut prepare: Prepare,
+    mut commit: Commit,
+) -> Result<GemmaStepRun, String>
+where
+    A: GemmaStepAdapter,
+    Sample: FnMut(&[f32]) -> Result<u32, String>,
+    Prepare: FnMut(u32) -> Result<GemmaPreparedToken, String>,
+    Commit: FnMut(u32, GemmaPreparedToken, &[f32], &[f32]),
+{
+    if prompt.is_empty() {
+        return Err("gemma4 prompt is empty".to_string());
+    }
+    let request_t0 = Instant::now();
+    let prefill_t0 = Instant::now();
+    let vocab_size = adapter.vocab_size();
+    let mut position = adapter.cursor();
+    let mut last_logits = Vec::new();
+    for &token in prompt {
+        if position >= capacity {
+            return Err(format!(
+                "gemma4 prompt exceeds context capacity at position {position} (capacity {capacity})"
+            ));
+        }
+        let logits = adapter.prefill(token, position)?;
+        validate_gemma_logits(&logits, vocab_size)?;
+        position += 1;
+        adapter.set_cursor(position);
+        last_logits = logits;
+    }
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
+    let decode_t0 = Instant::now();
+    let mut ttft_ms = None;
+
+    let mut generated = 0usize;
+    let mut hit_eos = false;
+    let mut hit_length = false;
+    loop {
+        if generated >= max_tokens {
+            hit_length = true;
+            break;
+        }
+        let next_token = sample(&last_logits)?;
+        let classified = classify_gemma_sample_for_stops(next_token, stop_tokens, vocab_size)?;
+        if matches!(classified, GemmaSample::Eos) {
+            hit_eos = true;
+            break;
+        }
+        if position >= capacity {
+            hit_length = true;
+            break;
+        }
+
+        let sampled_logits = &last_logits;
+        let mut committed_next_logits: Option<Vec<f32>> = None;
+        let mut committed = false;
+        let transaction = gemma_token_transaction(
+            classified,
+            vocab_size,
+            |token| prepare(token),
+            |token| adapter.forward(token, position),
+            |token, prepared, next_logits| {
+                if ttft_ms.is_none() {
+                    ttft_ms = Some(request_t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                commit(token, prepared, sampled_logits, &next_logits);
+                committed_next_logits = Some(next_logits);
+                committed = true;
+            },
+            || {},
+        );
+        let stopped = match transaction {
+            Ok(GemmaTokenTransactionResult::Committed { stopped }) => stopped,
+            Ok(GemmaTokenTransactionResult::Eos) => {
+                hit_eos = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        if !committed {
+            return Err("gemma4 token transaction completed without commit".to_string());
+        }
+        position += 1;
+        adapter.set_cursor(position);
+        last_logits = committed_next_logits
+            .take()
+            .ok_or_else(|| "gemma4 token transaction lost next logits".to_string())?;
+        generated += 1;
+        if stopped {
+            break;
+        }
+    }
+
+    let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(GemmaStepRun {
+        generated,
+        hit_eos,
+        hit_length,
+        prefill_ms,
+        decode_ms,
+        ttft_ms,
+    })
+}
+/// Production adapter for the lowered Gemma4 bundle.
+///
+/// The lowered architecture owns both KV families and one cursor. This
+/// adapter deliberately exposes only per-token Step forwards and logits
+/// downloads; prompt history and terminal publication stay in the shared
+/// lifecycle below.
+struct Gemma4LoweredAdapter<'a> {
+    gpu: &'a mut rdna_compute::Gpu,
+    bundle: &'a mut hipfire_loader::Gemma4LoweredBundle,
+}
+
+impl GemmaStepAdapter for Gemma4LoweredAdapter<'_> {
+    fn vocab_size(&self) -> usize {
+        self.bundle.config.vocab_size
+    }
+
+    fn cursor(&self) -> usize {
+        self.bundle.cursor.position()
+    }
+
+    fn set_cursor(&mut self, cursor: usize) {
+        self.bundle.cursor.set_materialized_cursor(cursor);
+    }
+
+    fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        gemma4::lowered::forward_scratch(
+            self.gpu,
+            &self.bundle.weights,
+            &self.bundle.config,
+            token,
+            position,
+            &mut self.bundle.kv_sliding,
+            &mut self.bundle.kv_full,
+            &self.bundle.scratch,
+        )
+        .map_err(|error| format!("gemma4 lowered prefill failed: {error:?}"))?;
+        self.gpu
+            .download_f32(&self.bundle.scratch.logits)
+            .map_err(|error| format!("gemma4 lowered prefill logits download failed: {error:?}"))
+    }
+
+    fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        gemma4::lowered::forward_scratch(
+            self.gpu,
+            &self.bundle.weights,
+            &self.bundle.config,
+            token,
+            position,
+            &mut self.bundle.kv_sliding,
+            &mut self.bundle.kv_full,
+            &self.bundle.scratch,
+        )
+        .map_err(|error| format!("gemma4 lowered decode failed: {error:?}"))?;
+        self.gpu
+            .download_f32(&self.bundle.scratch.logits)
+            .map_err(|error| format!("gemma4 lowered decode logits download failed: {error:?}"))
+    }
+}
+
+
+/// Render one Gemma4 chat turn with the same Jinja/BOS behavior used by the
+/// eager route. Keeping prompt construction shared prevents dense and MoE
+/// bundles from drifting onto different token prefixes.
+fn gemma4_prompt_ids(
+    m: &LoadedModel,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    bos_tok: u32,
+    enable_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) -> Result<Vec<u32>, String> {
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "tokenizer not loaded".to_string())?;
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut ids: Vec<u32> = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+            bos_token: Some("<bos>"),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                match messages_history {
+                    Some(history) => history,
+                    None => {
+                        let mut messages = Vec::new();
+                        if let Some(system) = system_prompt {
+                            messages.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: system.to_string(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                        }
+                        messages.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                        synthesized = messages;
+                        &synthesized
+                    }
+                };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(error) => {
+                eprintln!(
+                    "[daemon] jinja render failed in Gemma4 path ({error}) — falling back to raw prompt"
+                );
+                tokenizer.encode(prompt)
+            }
+        }
+    } else {
+        tokenizer.encode(prompt)
+    };
+    if ids.first() != Some(&bos_tok) {
+        ids.insert(0, bos_tok);
+    }
+    Ok(ids)
+}
+
 /// Publish one staged EAGLE block only after its cursor-settle forward
 /// succeeds. The speculative verifier may leave its final bonus unwritten
 /// until that settle step, so host output/history/count must remain staged.
@@ -2597,6 +2881,109 @@ mod gemma4_token_transaction_tests {
 
 }
 
+#[cfg(test)]
+mod gemma4_lowered_lifecycle_tests {
+    use super::{
+        run_gemma_step_lifecycle, GemmaEmit, GemmaPreparedToken, GemmaStepAdapter,
+        GemmaStepRun,
+    };
+
+    #[derive(Default)]
+    struct FakeAdapter {
+        cursor: usize,
+        calls: Vec<String>,
+    }
+
+    impl GemmaStepAdapter for FakeAdapter {
+        fn vocab_size(&self) -> usize {
+            100
+        }
+
+        fn cursor(&self) -> usize {
+            self.cursor
+        }
+
+        fn set_cursor(&mut self, cursor: usize) {
+            self.cursor = cursor;
+        }
+
+        fn prefill(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+            self.calls
+                .push(format!("prefill({token}@{position})"));
+            Ok(vec![0.0; self.vocab_size()])
+        }
+
+        fn forward(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+            self.calls.push(format!("forward({token}@{position})"));
+            Ok(vec![0.0; self.vocab_size()])
+        }
+    }
+
+    #[test]
+    fn gemma4_lowered_adapter_lifecycle_does_not_materialize_eos() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut adapter = FakeAdapter::default();
+        let mut samples = [3_u32, 99_u32].into_iter();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let history = Rc::new(RefCell::new(vec![1_u32, 2_u32]));
+        let prompt = history.borrow().clone();
+        let generated = Rc::new(RefCell::new(Vec::new()));
+        let sample_calls = Rc::clone(&calls);
+        let commit_calls = Rc::clone(&calls);
+        let committed_history = Rc::clone(&history);
+        let committed_generated = Rc::clone(&generated);
+
+        let result: GemmaStepRun = run_gemma_step_lifecycle(
+            &mut adapter,
+            &prompt,
+            2,
+            100,
+            &[99],
+            move |_| {
+                let token = samples.next().expect("sample fixture");
+                sample_calls
+                    .borrow_mut()
+                    .push(format!("sample({token})"));
+                Ok(token)
+            },
+            |_token| {
+                Ok(GemmaPreparedToken {
+                    events: vec![GemmaEmit::Token("visible".to_string())],
+                    stop: false,
+                })
+            },
+            move |token, _prepared, _sampled_logits, _next_logits| {
+                commit_calls
+                    .borrow_mut()
+                    .push(format!("commit({token})"));
+                committed_history.borrow_mut().push(token);
+                committed_generated.borrow_mut().push(token);
+            },
+        )
+        .expect("lifecycle");
+        calls.borrow_mut().push("terminal".to_string());
+        let calls = calls.borrow().clone();
+        let history = history.borrow().clone();
+        let generated = generated.borrow().clone();
+
+        assert_eq!(
+            adapter.calls,
+            ["prefill(1@0)", "prefill(2@1)", "forward(3@2)"]
+        );
+        assert_eq!(
+            calls,
+            ["sample(3)", "commit(3)", "sample(99)", "terminal"]
+        );
+        assert_eq!(history, vec![1, 2, 3]);
+        assert_eq!(generated, vec![3]);
+        assert_eq!(result.generated, 1);
+        assert!(result.hit_eos);
+        assert!(!result.hit_length);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
@@ -2637,7 +3024,7 @@ pub fn generate_gemma4(
         emit_error_with_id(
             stdout,
             id,
-            "gemma4 bundle missing on arch_id=13 generate (eager dense only;              EAGLE/lowered not yet wired)",
+            "gemma4 eager bundle missing on arch_id=13 generate",
         );
         return;
     };
@@ -3253,6 +3640,274 @@ pub fn generate_gemma4(
         }
     }
 }
+/// Run the lowered/MoE Gemma4 bundle through the same staged terminal and
+/// per-token transaction used by the eager route.
+///
+/// This is intentionally Step-only: no eager downcast, batched prefill,
+/// lowered speculative path, graph claim, or prefix-cache reuse/publication.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_gemma4_lowered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+    logprobs_top_k: Option<usize>,
+) {
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
+    let (bos_tok, cfg_eos_tok, bundle_cursor, capacity) = match m.gemma4_lowered() {
+        Some(bundle) => (
+            bundle.config.bos_token,
+            bundle.config.eos_token,
+            bundle.cursor.position(),
+            bundle
+                .kv_sliding
+                .physical_cap
+                .min(bundle.kv_full.physical_cap),
+        ),
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "gemma4 lowered bundle missing on arch_id=13 generate",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+
+    let prompt_ids = match gemma4_prompt_ids(
+        m,
+        prompt,
+        system_prompt,
+        bos_tok,
+        enable_thinking,
+        tools,
+        messages_history,
+    ) {
+        Ok(ids) => ids,
+        Err(error) => {
+            emit_active_attempt_error(stdout, Some(id), &error, "validation", false, false);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let stop_set = {
+        let eos_tok = m.gemma4_lowered().unwrap().eos_tok;
+        let mut tokens = vec![cfg_eos_tok, eos_tok, 106];
+        tokens.sort_unstable();
+        tokens.dedup();
+        tokens
+    };
+
+    // Lowered cache bytes are not reused by this task. If the existing cursor
+    // cannot fit this complete request, use Task 3's total reset authority
+    // before starting the new prompt.
+    let exceeds_capacity = bundle_cursor
+        .saturating_add(prompt_ids.len())
+        .saturating_add(max_tokens)
+        > capacity;
+    if exceeds_capacity {
+        let reset_result = match m.gemma4_lowered_mut() {
+            Some(bundle) => bundle.cold_reset(gpu),
+            None => Err("gemma4 lowered bundle disappeared during reset".to_string()),
+        };
+        if let Err(error) = reset_result {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("gemma4 lowered context reset failed: {error}"),
+                "gpu",
+                true,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+    if prompt_ids.len() >= capacity {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "gemma4 prompt is {} tokens but max_seq is {capacity}",
+                prompt_ids.len()
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let mut eos_filter = EosFilter::new(gemma_eos_filter_config(stop));
+    let mut gemma_router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut generated_tokens = Vec::new();
+    let total_t0 = Instant::now();
+
+    let run_result = match m.state.as_mut().and_then(|state| {
+        (state.as_mut() as &mut dyn Any)
+            .downcast_mut::<hipfire_loader::Gemma4LoweredBundle>()
+    }) {
+        Some(bundle) => {
+            let mut adapter = Gemma4LoweredAdapter { gpu, bundle };
+            run_gemma_step_lifecycle(
+                &mut adapter,
+                &prompt_ids,
+                max_tokens,
+                capacity,
+                &stop_set,
+                |logits| {
+                    Ok(deepseek4::sampling::sample_token(
+                        logits, temp, 0, top_p, &mut rng,
+                    ))
+                },
+                |token| {
+                    let raw_bytes = tokenizer.decode_bytes(&[token]);
+                    gemma_prepare_token(&mut eos_filter, &mut gemma_router, &raw_bytes)
+                },
+                |token, prepared, sampled_logits, _next_logits| {
+                    let token_position = generated_tokens.len();
+                    emit_gemma_prepared_events(
+                        stdout,
+                        id,
+                        tokenizer,
+                        token,
+                        sampled_logits,
+                        logprobs_top_k,
+                        prepared.events,
+                    );
+                    emit_committed_event(
+                        stdout,
+                        id,
+                        token,
+                        token_position,
+                        total_t0.elapsed().as_millis() as u64,
+                    );
+                    generated_tokens.push(token);
+                },
+            )
+        }
+        None => Err("gemma4 lowered bundle missing during generation".to_string()),
+    };
+
+    let run = match run_result {
+        Ok(run) => run,
+        Err(error) => {
+            gemma_eager_fail_closed(
+                stdout,
+                id,
+                m,
+                gpu,
+                &format!("gemma4 lowered generation failed: {error}"),
+            );
+            return;
+        }
+    };
+    if check_abort(id) {
+        gemma_eager_client_abort(stdout, id, m, generated_tokens.len(), gpu);
+        return;
+    }
+
+    let trailing_events =
+        match gemma_flush_prepared_events(&mut eos_filter, &mut gemma_router) {
+            Ok(events) => events,
+            Err(error) => {
+                gemma_eager_fail_closed(stdout, id, m, gpu, &error);
+                return;
+            }
+        };
+    emit_gemma_prepared_events(stdout, id, tokenizer, 0, &[], None, trailing_events);
+
+    // Host history is committed only after all per-token forwards and the
+    // terminal parser flush succeed. EOS is absent from generated_tokens.
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.conversation_tokens.extend_from_slice(&generated_tokens);
+    let materialized_cursor = m
+        .gemma4_lowered()
+        .map(|bundle| bundle.cursor.position())
+        .unwrap_or(0);
+    gemma_sync_host_cursor(&mut m.seq_pos, materialized_cursor);
+
+    let total_ms = total_t0.elapsed().as_secs_f64() * 1000.0;
+    let decode_ms = run.decode_ms.max(1.0);
+    let tok_s = if run.generated > 0 {
+        run.generated as f64 * 1000.0 / decode_ms
+    } else {
+        0.0
+    };
+    let metrics = GemmaDoneMetrics {
+        generated: run.generated,
+        prompt_tokens: prompt_ids.len(),
+        cached_tokens: 0,
+        tok_s,
+        prefill_ms: run.prefill_ms,
+        decode_tok_s: tok_s,
+        ttft_ms: run.ttft_ms.unwrap_or(total_ms),
+        total_ms,
+    };
+    let pending_done = gemma_pending_done(
+        id,
+        gemma_finish_reason(run.hit_eos, run.hit_length),
+        &metrics,
+    );
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {
+            gemma_eager_client_abort(stdout, id, m, run.generated, gpu);
+        }
+    }
+}
+
 /// Muse Glimmer dense text (arch_id=14) eager AR path.
 ///
 /// Mirrors `generate_gemma4` shape (prefill loop / decode loop, JSONL

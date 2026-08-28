@@ -731,6 +731,22 @@ pub fn truncate_checkpoints(
     }
 }
 
+/// The two mutually-exclusive Gemma4 product bundles selected by the loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmaGenerationVariant {
+    Lowered,
+    Eager,
+}
+
+#[inline]
+pub const fn gemma_generation_variant(lowered: bool) -> GemmaGenerationVariant {
+    if lowered {
+        GemmaGenerationVariant::Lowered
+    } else {
+        GemmaGenerationVariant::Eager
+    }
+}
+
 /// Exhaustive producer-route identity for one generate turn.
 ///
 /// Selected once at the top of [`generate`] and is the sole authority for
@@ -1133,19 +1149,10 @@ pub fn generate(
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
-            // The loader publishes one of two mutually-exclusive Gemma4 states:
-            // eager dense (ModelState::Gemma4) and lowered/MoE
-            // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
-            // lowered load must fail loudly here rather than silently run eager
-            // against lowered weights.
-            if m.gemma4_lowered_mut().is_some() {
-                emit_error_with_id(
-                stdout,
-                id,
-                "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant",
-            );
-                return;
-            }
+            // The loader publishes one of two mutually-exclusive Gemma4
+            // bundles. Keep route selection at this boundary so neither
+            // product path can downcast or fall back to the other owner.
+            let variant = gemma_generation_variant(m.gemma4_lowered().is_some());
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
@@ -1164,7 +1171,11 @@ pub fn generate(
                 presence_penalty,
                 frequency_penalty,
             );
-            crate::dense::generate_gemma4(
+            let generate_gemma = match variant {
+                GemmaGenerationVariant::Lowered => crate::dense::generate_gemma4_lowered,
+                GemmaGenerationVariant::Eager => crate::dense::generate_gemma4,
+            };
+            generate_gemma(
                 m,
                 gpu,
                 stdout,
@@ -4576,5 +4587,30 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         13 => "gemma4",
         14 => "muse_glimmer",
         _ => "unknown",
+    }
+}
+#[cfg(test)]
+mod gemma_generation_route_tests {
+    use super::{gemma_generation_variant, GemmaGenerationVariant};
+
+    #[test]
+    fn lowered_gemma_routes_to_product_generator() {
+        assert_eq!(
+            gemma_generation_variant(true),
+            GemmaGenerationVariant::Lowered
+        );
+        assert_eq!(
+            gemma_generation_variant(false),
+            GemmaGenerationVariant::Eager
+        );
+    }
+
+    #[test]
+    fn lowered_route_does_not_emit_historical_refusal() {
+        let historical = ["lowered/MoE", " generate not yet wired"].concat();
+        assert!(
+            !include_str!("ar.rs").contains(&historical),
+            "the production route must not retain the historical lowered refusal"
+        );
     }
 }
