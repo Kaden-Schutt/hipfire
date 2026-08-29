@@ -32,8 +32,13 @@ def main():
     ap.add_argument("--ids-file", help="File with space-separated token IDs")
     ap.add_argument("--out", help="Output JSON path")
     ap.add_argument("--layers", help="Layers to dump (e.g. 0,1,5) or 'all'", default="0,1,5")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--boundaries",
+        action="store_true",
+        help="Also capture attention, dense-FFN, router, and MoE branch boundaries",
+    )
 
+    args = ap.parse_args()
     # Resolve in precedence order: CLI, environment, historical default.
     model_path = args.model if args.model is not None else os.environ.get("GEMMA4_26B_MODEL", MODEL)
 
@@ -57,8 +62,10 @@ def main():
 
     import torch
     from transformers import AutoModelForCausalLM
+    # Loading without `device_map` keeps this oracle usable in the lightweight
+    # torch environment used on the validation host; the default device is CPU.
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, device_map={"": "cpu"}
+        model_path, torch_dtype=torch.bfloat16
     ).eval()
 
     # Get model config
@@ -71,26 +78,31 @@ def main():
           f"moe={text_config.enable_moe_block} n_experts={text_config.num_experts} "
           f"top_k={text_config.top_k_experts}", file=sys.stderr)
 
-    # Hook into model layers to capture intermediates
+    # Hook into model layers to capture intermediates.  Every record follows
+    # the same last-position schema as the layer_out/embedding_last records.
     captured = {}
+
+    def capture_tensor(key, tensor):
+        t = tensor[0] if isinstance(tensor, tuple) else tensor
+        v = t.reshape(-1, t.shape[-1])[-1].detach().float()
+        captured[key] = {
+            "first8": [round(float(x), 5) for x in v[:8]],
+            "sum": round(float(v.sum()), 4),
+            "norm": round(float(v.norm()), 4),
+            "min": round(float(v.min()), 4),
+            "max": round(float(v.max()), 4),
+        }
 
     def make_hook(layer_idx, name):
         def hook(module, input, output):
-            key = f"L{layer_idx}_{name}"
-            # output can be tuple or tensor
-            if isinstance(output, tuple):
-                t = output[0]
-            else:
-                t = output
-            # Capture last-position hidden state
-            v = t[0, -1].detach().float()  # [hidden_size]
-            captured[key] = {
-                "first8": [round(float(x), 5) for x in v[:8]],
-                "sum": round(float(v.sum()), 4),
-                "norm": round(float(v.norm()), 4),
-                "min": round(float(v.min()), 4),
-                "max": round(float(v.max()), 4),
-            }
+            capture_tensor(f"L{layer_idx}_{name}", output)
+
+        return hook
+
+    def make_pre_hook(layer_idx, name):
+        def hook(module, input):
+            capture_tensor(f"L{layer_idx}_{name}", input[0])
+
         return hook
 
     # Register hooks on decoder layers
@@ -99,9 +111,53 @@ def main():
     for li, layer in enumerate(layers):
         if dump_layers is not None and li not in dump_layers:
             continue
-        # Hook post-self-attention (input_layernorm output → attention)
-        # Actually, hook the layer forward to get hidden_states
         hooks.append(layer.register_forward_hook(make_hook(li, "layer_out")))
+        if args.boundaries:
+            hooks.extend(
+                [
+                    layer.self_attn.register_forward_hook(make_hook(li, "attention_output")),
+                    layer.post_attention_layernorm.register_forward_hook(
+                        make_hook(li, "attention_norm")
+                    ),
+                    layer.pre_feedforward_layernorm.register_forward_pre_hook(
+                        make_pre_hook(li, "attention_residual")
+                    ),
+                    layer.mlp.register_forward_pre_hook(
+                        make_pre_hook(li, "pre_ffn_norm")
+                    ),
+                    layer.mlp.register_forward_hook(make_hook(li, "dense_ffn")),
+                ]
+            )
+            if layer.enable_moe_block:
+                hooks.extend(
+                    [
+                        layer.post_feedforward_layernorm_1.register_forward_hook(
+                            make_hook(li, "dense_branch_norm")
+                        ),
+                        layer.pre_feedforward_layernorm_2.register_forward_hook(
+                            make_hook(li, "moe_pre2")
+                        ),
+                        layer.router.proj.register_forward_hook(
+                            make_hook(li, "router_logits")
+                        ),
+                        layer.experts.register_forward_hook(make_hook(li, "moe_branch")),
+                        layer.post_feedforward_layernorm_2.register_forward_hook(
+                            make_hook(li, "moe_branch_norm")
+                        ),
+                        layer.post_feedforward_layernorm.register_forward_pre_hook(
+                            make_pre_hook(li, "moe_combined")
+                        ),
+                        layer.post_feedforward_layernorm.register_forward_hook(
+                            make_hook(li, "outer_norm")
+                        ),
+                    ]
+                )
+            else:
+                hooks.append(
+                    layer.post_feedforward_layernorm.register_forward_hook(
+                        make_hook(li, "dense_ffn_norm")
+                    )
+                )
 
     # Also capture embedding output
     def embed_hook(module, input, output):

@@ -640,6 +640,153 @@ fn dbg_dump(gpu: &mut Gpu, label: &str, t: &GpuTensor, take: usize) {
         "[dump] {label:42} sum={sum:>+14.4e} n={take:>6} head={head:?} nan={nans} inf={infs}"
     );
 }
+/// Optional last-position diagnostic capture for the lowered MoE path.
+///
+/// Set `HIPFIRE_GEMMA4_LAYER_DUMP` to a JSON output path and
+/// `HIPFIRE_GEMMA4_LAYER_DUMP_POS` to the absolute token position to capture.
+/// `HIPFIRE_GEMMA4_LAYER_DUMP_BOUNDARIES=1` additionally captures the
+/// attention, dense-FFN, router, and MoE branch boundaries.  The path is
+/// deliberately separate from `HIPFIRE_GEMMA4_DUMP`: the latter is an older
+/// stderr probe used by the hand implementation.  No D2H work occurs unless
+/// the JSON path and position are both configured.
+#[derive(Debug, PartialEq, Eq)]
+struct Gemma4LayerDumpConfig {
+    path: String,
+    position: usize,
+    boundaries: bool,
+}
+
+fn parse_layer_dump_config(
+    path: Option<String>,
+    position: Option<&str>,
+    boundaries: Option<&str>,
+) -> Option<Gemma4LayerDumpConfig> {
+    Some(Gemma4LayerDumpConfig {
+        path: path?,
+        position: position?.parse().ok()?,
+        boundaries: boundaries == Some("1"),
+    })
+}
+
+fn layer_dump_config() -> Option<&'static Gemma4LayerDumpConfig> {
+    static CONFIG: std::sync::OnceLock<Option<Gemma4LayerDumpConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let position = std::env::var("HIPFIRE_GEMMA4_LAYER_DUMP_POS").ok();
+            let boundaries = std::env::var("HIPFIRE_GEMMA4_LAYER_DUMP_BOUNDARIES").ok();
+            parse_layer_dump_config(
+                std::env::var("HIPFIRE_GEMMA4_LAYER_DUMP").ok(),
+                position.as_deref(),
+                boundaries.as_deref(),
+            )
+        })
+        .as_ref()
+}
+
+struct Gemma4LayerDump {
+    path: String,
+    position: usize,
+    boundaries: bool,
+    captured: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Gemma4LayerDump {
+    fn for_position(position: usize) -> Option<Self> {
+        let config = layer_dump_config()?;
+        (config.position == position).then(|| Self {
+            path: config.path.clone(),
+            position,
+            boundaries: config.boundaries,
+            captured: serde_json::Map::new(),
+        })
+    }
+
+    fn capture(&mut self, gpu: &mut Gpu, label: impl Into<String>, tensor: &GpuTensor) {
+        if let Some(stats) = gemma4_tensor_stats(gpu, tensor) {
+            self.captured.insert(label.into(), stats);
+        }
+    }
+
+    fn capture_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        label: &str,
+        tensor: &GpuTensor,
+    ) {
+        self.capture(gpu, format!("L{layer_idx}_{label}"), tensor);
+    }
+
+    fn write(self, gpu: &mut Gpu, logits: &GpuTensor) {
+        let logit_argmax = gpu.download_f32(logits).ok().and_then(|values| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index as u32)
+        });
+        let mut output = serde_json::Map::new();
+        output.insert(
+            "position".to_string(),
+            serde_json::Value::from(self.position as u64),
+        );
+        output.insert(
+            "captured".to_string(),
+            serde_json::Value::Object(self.captured),
+        );
+        if let Some(argmax) = logit_argmax {
+            output.insert("logit_argmax".to_string(), serde_json::Value::from(argmax));
+        }
+        if let Err(error) = std::fs::write(
+            &self.path,
+            serde_json::to_vec_pretty(&serde_json::Value::Object(output))
+                .unwrap_or_else(|_| b"{}".to_vec()),
+        ) {
+            eprintln!("[gemma4 layer dump] failed to write {}: {error}", self.path);
+        }
+    }
+}
+
+fn rounded_json(value: f64, decimals: f64) -> serde_json::Value {
+    if value.is_finite() {
+        serde_json::Value::from((value * decimals).round() / decimals)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn gemma4_tensor_stats(gpu: &mut Gpu, tensor: &GpuTensor) -> Option<serde_json::Value> {
+    let data = gpu.download_f32(tensor).ok()?;
+    if data.is_empty() {
+        return None;
+    }
+    let first8 = data
+        .iter()
+        .take(8)
+        .map(|&value| rounded_json(value as f64, 100_000.0))
+        .collect::<Vec<_>>();
+    let sum = data.iter().map(|&value| value as f64).sum::<f64>();
+    let norm = data
+        .iter()
+        .map(|&value| (value as f64) * (value as f64))
+        .sum::<f64>()
+        .sqrt();
+    let min = data
+        .iter()
+        .map(|&value| value as f64)
+        .fold(f64::INFINITY, f64::min);
+    let max = data
+        .iter()
+        .map(|&value| value as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
+    Some(serde_json::json!({
+        "first8": first8,
+        "sum": rounded_json(sum, 10_000.0),
+        "norm": rounded_json(norm, 10_000.0),
+        "min": rounded_json(min, 10_000.0),
+        "max": rounded_json(max, 10_000.0),
+    }))
+}
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -3416,6 +3563,7 @@ pub fn forward_scratch(
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
+    let mut layer_dump = Gemma4LayerDump::for_position(pos);
 
     // 1) Embedding lookup + sqrt(dim) scale.
     // ALWAYS direct — the captured graph can't bake in `token` (varies per
@@ -3443,6 +3591,9 @@ pub fn forward_scratch(
         }
     }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
+    if let Some(dump) = layer_dump.as_mut() {
+        dump.capture(gpu, "embedding_last", &scratch.x);
+    }
 
     // hipGraph capture/replay policy.
     //   - DEFAULT-OFF for Gemma 4 (until cross-arch / long-context validation).
@@ -3472,6 +3623,7 @@ pub fn forward_scratch(
         }
     });
     let use_graph = graph_override.unwrap_or(false)
+        && layer_dump.is_none()
         && kv_sliding.compact_offset == 0
         && kv_full.compact_offset == 0;
 
@@ -3497,7 +3649,16 @@ pub fn forward_scratch(
             /* graph-capture-not-wired */
             gpu.hip
                 .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+            forward_scratch_inner(
+                gpu,
+                weights,
+                config,
+                pos,
+                kv_sliding,
+                kv_full,
+                scratch,
+                layer_dump.as_mut(),
+            )?;
         } else {
             // ── First post-warmup call: capture the forward into a graph. ──
             if gpu.active_stream.is_none() {
@@ -3510,7 +3671,16 @@ pub fn forward_scratch(
                 gpu.device_id,
                 gpu.active_stream.as_ref().unwrap(),
             )?;
-            forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+            forward_scratch_inner(
+                gpu,
+                weights,
+                config,
+                pos,
+                kv_sliding,
+                kv_full,
+                scratch,
+                layer_dump.as_mut(),
+            )?;
             gpu.graphs.end_graph_capture(
                 &gpu.hip,
                 gpu.device_id,
@@ -3534,7 +3704,19 @@ pub fn forward_scratch(
         let pos_i32 = pos as i32;
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+        forward_scratch_inner(
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_sliding,
+            kv_full,
+            scratch,
+            layer_dump.as_mut(),
+        )?;
+    }
+    if let Some(dump) = layer_dump {
+        dump.write(gpu, &scratch.logits);
     }
     Ok(())
 }
@@ -5980,6 +6162,24 @@ fn execute_bound_gemma4_steps(
     })
 }
 
+fn execute_bound_gemma4_steps_dumped(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    steps: &[Step<'_>],
+    boundaries: &[(usize, &str, &GpuTensor)],
+    dump: &mut Gemma4LayerDump,
+) -> HipResult<()> {
+    let mut start = 0usize;
+    for &(end, label, tensor) in boundaries {
+        debug_assert!(start <= end && end <= steps.len());
+        execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps[start..end])?;
+        dump.capture_boundary(gpu, layer_idx, label, tensor);
+        start = end;
+    }
+    execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps[start..])
+}
+
 fn validate_gemma4_layer(
     layer_idx: usize,
     layer_type: LayerType,
@@ -6089,6 +6289,7 @@ fn execute_gemma4_layer(
     sliding_kv_idx: usize,
     full_kv_idx: usize,
     layer_idx: usize,
+    layer_dump: Option<&mut Gemma4LayerDump>,
 ) -> HipResult<()> {
     validate_gemma4_layer(layer_idx, layer_type, layer, config)?;
     let ctx = DispatchCtx::new(gpu);
@@ -6104,6 +6305,7 @@ fn execute_gemma4_layer(
                 pos,
                 kv_sliding,
                 sliding_kv_idx,
+                layer_dump,
             )
         }
         (Gemma4Variant::SlidingMoe, LayerWeights::Sliding(weights)) => execute_sliding_moe_steps(
@@ -6116,6 +6318,7 @@ fn execute_gemma4_layer(
             pos,
             kv_sliding,
             sliding_kv_idx,
+            layer_dump,
         ),
         (Gemma4Variant::FullDense, LayerWeights::Full(weights)) => execute_full_dense_steps(
             gpu,
@@ -6127,6 +6330,7 @@ fn execute_gemma4_layer(
             pos,
             kv_full,
             full_kv_idx,
+            layer_dump,
         ),
         (Gemma4Variant::FullMoe, LayerWeights::Full(weights)) => execute_full_moe_steps(
             gpu,
@@ -6138,6 +6342,7 @@ fn execute_gemma4_layer(
             pos,
             kv_full,
             full_kv_idx,
+            layer_dump,
         ),
         _ => unreachable!("validate_gemma4_layer rejected the mismatch"),
     }
@@ -6153,6 +6358,7 @@ fn execute_sliding_dense_steps(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     kv_layer_idx: usize,
+    layer_dump: Option<&mut Gemma4LayerDump>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let head_dim = config.sliding_head_dim;
@@ -6301,6 +6507,25 @@ fn execute_sliding_dense_steps(
             scale: weights.layer_scalar_host,
         },
     ];
+    if let Some(dump) = layer_dump {
+        if dump.boundaries {
+            return execute_bound_gemma4_steps_dumped(
+                gpu,
+                ctx,
+                layer_idx,
+                &steps,
+                &[
+                    (11, "attention_output", &scratch.tmp),
+                    (12, "attention_norm", &scratch.tmp),
+                    (13, "attention_residual", &scratch.x),
+                    (15, "pre_ffn_norm", &scratch.tmp),
+                    (19, "dense_ffn", &scratch.ffn_out),
+                    (20, "dense_ffn_norm", &scratch.tmp),
+                ],
+                dump,
+            );
+        }
+    }
     execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
 }
 
@@ -6314,6 +6539,7 @@ fn execute_full_dense_steps(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     kv_layer_idx: usize,
+    layer_dump: Option<&mut Gemma4LayerDump>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let head_dim = config.full_head_dim;
@@ -6462,6 +6688,25 @@ fn execute_full_dense_steps(
             scale: weights.layer_scalar_host,
         },
     ];
+    if let Some(dump) = layer_dump {
+        if dump.boundaries {
+            return execute_bound_gemma4_steps_dumped(
+                gpu,
+                ctx,
+                layer_idx,
+                &steps,
+                &[
+                    (11, "attention_output", &scratch.tmp),
+                    (12, "attention_norm", &scratch.tmp),
+                    (13, "attention_residual", &scratch.x),
+                    (15, "pre_ffn_norm", &scratch.tmp),
+                    (19, "dense_ffn", &scratch.ffn_out),
+                    (20, "dense_ffn_norm", &scratch.tmp),
+                ],
+                dump,
+            );
+        }
+    }
     execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
 }
 
@@ -6475,6 +6720,7 @@ fn execute_sliding_moe_steps(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     kv_layer_idx: usize,
+    layer_dump: Option<&mut Gemma4LayerDump>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let head_dim = config.sliding_head_dim;
@@ -6698,6 +6944,31 @@ fn execute_sliding_moe_steps(
             scale: weights.layer_scalar_host,
         },
     ];
+    if let Some(dump) = layer_dump {
+        if dump.boundaries {
+            return execute_bound_gemma4_steps_dumped(
+                gpu,
+                ctx,
+                layer_idx,
+                &steps,
+                &[
+                    (11, "attention_output", &scratch.tmp),
+                    (12, "attention_norm", &scratch.tmp),
+                    (13, "attention_residual", &scratch.x),
+                    (15, "pre_ffn_norm", &scratch.tmp),
+                    (19, "dense_ffn", &scratch.ffn_out),
+                    (20, "dense_branch_norm", &scratch.moe_cur_mlp),
+                    (21, "moe_pre2", &scratch.moe_pre2),
+                    (24, "router_logits", &scratch.moe_router_logits),
+                    (26, "moe_branch", &scratch.moe_cur_moe),
+                    (27, "moe_branch_norm", &scratch.moe_cur_moe),
+                    (28, "moe_combined", &scratch.moe_cur_mlp),
+                    (29, "outer_norm", &scratch.tmp),
+                ],
+                dump,
+            );
+        }
+    }
     execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
 }
 
@@ -6711,6 +6982,7 @@ fn execute_full_moe_steps(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     kv_layer_idx: usize,
+    layer_dump: Option<&mut Gemma4LayerDump>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let head_dim = config.full_head_dim;
@@ -6934,6 +7206,31 @@ fn execute_full_moe_steps(
             scale: weights.layer_scalar_host,
         },
     ];
+    if let Some(dump) = layer_dump {
+        if dump.boundaries {
+            return execute_bound_gemma4_steps_dumped(
+                gpu,
+                ctx,
+                layer_idx,
+                &steps,
+                &[
+                    (11, "attention_output", &scratch.tmp),
+                    (12, "attention_norm", &scratch.tmp),
+                    (13, "attention_residual", &scratch.x),
+                    (15, "pre_ffn_norm", &scratch.tmp),
+                    (19, "dense_ffn", &scratch.ffn_out),
+                    (20, "dense_branch_norm", &scratch.moe_cur_mlp),
+                    (21, "moe_pre2", &scratch.moe_pre2),
+                    (24, "router_logits", &scratch.moe_router_logits),
+                    (26, "moe_branch", &scratch.moe_cur_moe),
+                    (27, "moe_branch_norm", &scratch.moe_cur_moe),
+                    (28, "moe_combined", &scratch.moe_cur_mlp),
+                    (29, "outer_norm", &scratch.tmp),
+                ],
+                dump,
+            );
+        }
+    }
     execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps)
 }
 
@@ -6946,6 +7243,7 @@ fn forward_scratch_inner(
     kv_sliding: &mut llama::KvCache,
     kv_full: &mut llama::KvCache,
     scratch: &Gemma4Scratch,
+    mut layer_dump: Option<&mut Gemma4LayerDump>,
 ) -> HipResult<()> {
     let mut sliding_kv_idx = 0usize;
     let mut full_kv_idx = 0usize;
@@ -6963,7 +7261,11 @@ fn forward_scratch_inner(
             sliding_kv_idx,
             full_kv_idx,
             layer_idx,
+            layer_dump.as_mut().map(|dump| &mut **dump),
         )?;
+        if let Some(dump) = layer_dump.as_mut() {
+            dump.capture(gpu, format!("L{layer_idx}_layer_out"), &scratch.x);
+        }
         match layer_type {
             LayerType::Sliding => sliding_kv_idx += 1,
             LayerType::Full => full_kv_idx += 1,
@@ -7162,6 +7464,31 @@ mod tests {
         assert!(!allocation_telemetry_enabled_value(None));
         assert!(!allocation_telemetry_enabled_value(Some("0")));
         assert!(allocation_telemetry_enabled_value(Some("1")));
+    }
+
+    #[test]
+    fn layer_dump_config_is_silent_without_path_and_position() {
+        assert!(parse_layer_dump_config(None, None, None).is_none());
+        assert!(parse_layer_dump_config(Some("/tmp/gemma.json".into()), None, None).is_none());
+        assert!(parse_layer_dump_config(
+            Some("/tmp/gemma.json".into()),
+            Some("not-a-position"),
+            Some("1")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn layer_dump_config_parses_position_and_boundary_gate() {
+        let config = parse_layer_dump_config(Some("/tmp/gemma.json".into()), Some("4"), Some("1"))
+            .expect("valid dump config");
+        assert_eq!(config.path, "/tmp/gemma.json");
+        assert_eq!(config.position, 4);
+        assert!(config.boundaries);
+
+        let config = parse_layer_dump_config(Some("/tmp/gemma.json".into()), Some("0"), Some("0"))
+            .expect("valid dump config");
+        assert!(!config.boundaries);
     }
     #[test]
     #[ignore = "requires an AMD GPU"]
