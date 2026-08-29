@@ -18,12 +18,18 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_oracle)
 
 
-def test_parser_accepts_absolute_capture_position_and_boundaries():
+def test_parser_accepts_absolute_capture_position_boundaries_and_dtype():
     args = _oracle.build_parser().parse_args(
-        ["--ids", "2,9259,106", "--position", "1", "--boundaries"]
+        ["--ids", "2,9259,106", "--position", "1", "--boundaries", "--dtype", "f32"]
     )
     assert args.position == 1
     assert args.boundaries is True
+    assert args.dtype == "f32"
+
+
+def test_parser_defaults_to_bf16():
+    args = _oracle.build_parser().parse_args(["--ids", "2,9259,106"])
+    assert args.dtype == "bf16"
 
 
 def test_cli_rejects_invalid_position_with_argparse_error():

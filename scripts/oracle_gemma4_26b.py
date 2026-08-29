@@ -42,6 +42,12 @@ def build_parser():
         type=int,
         help="Absolute sequence position to capture (default: last position)",
     )
+    ap.add_argument(
+        "--dtype",
+        choices=("bf16", "f32"),
+        default="bf16",
+        help="Model/activation dtype for the oracle (default: bf16)",
+    )
     return ap
 
 
@@ -57,6 +63,8 @@ def resolve_capture_position(position, n_ids):
 def finite_round(value, decimals):
     value = float(value)
     return round(value, decimals) if math.isfinite(value) else None
+
+
 def format_stat(value, spec):
     return "None" if value is None else format(value, spec)
 
@@ -87,22 +95,27 @@ def main():
         capture_position = resolve_capture_position(args.position, len(ids))
     except ValueError as error:
         parser.error(str(error))
-
-    # Parse layers to dump
+    # Parse layers to dump.
     if args.layers == "all":
         dump_layers = None  # all
     else:
         dump_layers = set(int(x) for x in args.layers.split(","))
 
-    print(f"IDs: {ids[:10]}{'...' if len(ids)>10 else ''} ({len(ids)} tokens)", file=sys.stderr)
-    print(f"Loading model from {model_path} (float32 CPU)...", file=sys.stderr)
+
+    print(
+        f"IDs: {ids[:10]}{'...' if len(ids)>10 else ''} "
+        f"({len(ids)} tokens), dtype={args.dtype}",
+        file=sys.stderr,
+    )
+    print(f"Loading model from {model_path} ({args.dtype} CPU)...", file=sys.stderr)
 
     import torch
     from transformers import AutoModelForCausalLM
+    model_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     # Loading without `device_map` keeps this oracle usable in the lightweight
     # torch environment used on the validation host; the default device is CPU.
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16
+        model_path, torch_dtype=model_dtype
     ).eval()
 
     # Get model config
@@ -222,6 +235,7 @@ def main():
         "model": model_path,
         "n_ids": len(ids),
         "position": capture_position,
+        "dtype": args.dtype,
         "ids_first10": ids[:10],
         "logits_top5": [
             [int(i), finite_round(x, 4)]
