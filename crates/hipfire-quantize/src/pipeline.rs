@@ -49,6 +49,15 @@ struct PerTensorCtx<'a> {
     dtype: &'a str,
     is_vision: bool,
 }
+/// Recognize the stacked expert tensors before the global passthrough handlers
+/// claim them. Their source tensor must be split into the per-expert names that
+/// the lowered Gemma loader indexes.
+#[inline]
+fn is_moe_expert_3d_tensor(is_moe: bool, is_gemma4: bool, name: &str, shape: &[usize]) -> bool {
+    (is_moe || is_gemma4)
+        && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+        && shape.len() == 3
+}
 struct MainQuantFlags {
     use_fast: bool,
     use_gptq_e8: bool,
@@ -1896,6 +1905,11 @@ pub(crate) fn run() {
                 );
             }
         }
+        let is_moe_expert_3d = is_moe_expert_3d_tensor(is_moe, is_gemma4, name, &meta.shape);
+        // Qwen's existing passthrough helpers already split `mlp.experts.*`
+        // (including optional FP8-scale sources); only Gemma needs to defer
+        // here because its stacked names omit the `mlp.` segment.
+        let defer_global_passthrough = is_gemma4 && is_moe_expert_3d;
 
         // ── F1 native-bf16 oracle passthrough ──────────────────────────────
         // Store EVERY tensor as F32 (qt=2): no quantization, bf16/f16->f32
@@ -1913,19 +1927,21 @@ pub(crate) fn run() {
                 dtype: &meta.dtype,
                 is_vision,
             };
-            if handle_f32_passthrough(
-                &__ctx,
-                meta,
-                raw_data,
-                is_cohere2moe,
-                is_moe,
-                use_f32_passthrough,
-                &fp8_scale_for,
-                &st_files,
-                &mut hfq_tensors,
-                &mut quantized_params,
-                &mut spill,
-            ) {
+            if !defer_global_passthrough
+                && handle_f32_passthrough(
+                    &__ctx,
+                    meta,
+                    raw_data,
+                    is_cohere2moe,
+                    is_moe,
+                    use_f32_passthrough,
+                    &fp8_scale_for,
+                    &st_files,
+                    &mut hfq_tensors,
+                    &mut quantized_params,
+                    &mut spill,
+                )
+            {
                 continue;
             }
         }
@@ -1945,20 +1961,22 @@ pub(crate) fn run() {
                 dtype: &meta.dtype,
                 is_vision,
             };
-            if handle_bf16_passthrough(
-                &__ctx,
-                meta,
-                raw_data,
-                use_bf16,
-                arch_id,
-                is_vision,
-                is_moe,
-                &fp8_scale_for,
-                &st_files,
-                &mut hfq_tensors,
-                &mut quantized_params,
-                &mut spill,
-            ) {
+            if !defer_global_passthrough
+                && handle_bf16_passthrough(
+                    &__ctx,
+                    meta,
+                    raw_data,
+                    use_bf16,
+                    arch_id,
+                    is_vision,
+                    is_moe,
+                    &fp8_scale_for,
+                    &st_files,
+                    &mut hfq_tensors,
+                    &mut quantized_params,
+                    &mut spill,
+                )
+            {
                 continue;
             }
         }
@@ -2395,9 +2413,6 @@ pub(crate) fn run() {
         //   model.language_model.layers.{N}.experts.down_proj
         // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
         // and gemma4 (experts.*) without prefix-specific conditions.
-        let is_moe_expert_3d = (is_moe || is_gemma4)
-            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
-            && meta.shape.len() == 3;
         if is_moe_expert_3d {
             let __ctx = PerTensorCtx {
                 name,
@@ -2414,6 +2429,9 @@ pub(crate) fn run() {
                 raw_data,
                 is_moe,
                 is_gemma4,
+                use_f32_passthrough,
+                use_bf16,
+                use_f16,
                 &kmap,
                 &mq3_tier_layers,
                 &imatrix_gguf,
@@ -3828,12 +3846,112 @@ fn handle_cohere2moe(
     true
 }
 
+fn moe_expert_passthrough_quant_type(
+    use_f32_passthrough: bool,
+    use_bf16: bool,
+    use_f16: bool,
+) -> Option<QuantType> {
+    if use_f32_passthrough {
+        Some(QuantType::F32)
+    } else if use_bf16 {
+        Some(QuantType::BF16)
+    } else if use_f16 {
+        Some(QuantType::F16)
+    } else {
+        None
+    }
+}
+
+fn emit_moe_expert_passthrough(
+    name: &str,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    target: QuantType,
+    slots: &[(usize, usize)],
+) -> Vec<HfqTensor> {
+    let base_name = if name.ends_with("gate_up_proj") {
+        "gate_up_proj"
+    } else if name.ends_with("down_proj") {
+        "down_proj"
+    } else {
+        panic!("unsupported 3D MoE expert tensor name: {name}");
+    };
+    assert_eq!(
+        meta.shape.len(),
+        3,
+        "3D MoE expert passthrough requires [experts, m, k]"
+    );
+    let n_experts = meta.shape[0];
+    let inner_n: usize = meta.shape[1..].iter().product();
+    let elem_size = match meta.dtype.as_str() {
+        "F32" => 4,
+        "F16" | "BF16" => 2,
+        other => panic!("unsupported expert tensor dtype: {other}"),
+    };
+    let inner_bytes = inner_n * elem_size;
+    let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&s| s as u32).collect();
+    let parent = &name[..name.len() - base_name.len()];
+
+    slots
+        .iter()
+        .map(|&(slot, expert)| {
+            assert!(
+                expert < n_experts,
+                "expert slot {expert} out of range {n_experts}"
+            );
+            let slice_off = expert * inner_bytes;
+            let slice = &raw_data[slice_off..slice_off + inner_bytes];
+            let data = match target {
+                QuantType::F32 => to_f32(slice, &meta.dtype)
+                    .into_iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                QuantType::BF16 => {
+                    if meta.dtype == "BF16" {
+                        slice.to_vec()
+                    } else {
+                        to_f32(slice, &meta.dtype)
+                            .into_iter()
+                            .flat_map(|value| {
+                                let bits = value.to_bits();
+                                let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                                ((rounded >> 16) as u16).to_le_bytes()
+                            })
+                            .collect()
+                    }
+                }
+                QuantType::F16 => {
+                    if meta.dtype == "F16" {
+                        slice.to_vec()
+                    } else {
+                        to_f32(slice, &meta.dtype)
+                            .into_iter()
+                            .flat_map(|value| f32_to_f16(value).to_le_bytes())
+                            .collect()
+                    }
+                }
+                other => panic!("unsupported MoE passthrough quant type: {other:?}"),
+            };
+            HfqTensor {
+                name: format!("{parent}{slot}.{base_name}.weight"),
+                quant_type: target,
+                shape: inner_shape.clone(),
+                group_size: 0,
+                data,
+                spilled_len: 0,
+            }
+        })
+        .collect()
+}
 fn handle_moe_expert_3d(
     ctx: &PerTensorCtx,
     meta: &TensorMeta,
     raw_data: &[u8],
     is_moe: bool,
     is_gemma4: bool,
+    use_f32_passthrough: bool,
+    use_bf16: bool,
+    use_f16: bool,
     kmap: &HashMap<String, QuantLevel>,
     mq3_tier_layers: &std::collections::HashSet<usize>,
     imatrix_gguf: &Option<gguf_input::GgufFile>,
@@ -4101,6 +4219,26 @@ fn handle_moe_expert_3d(
         (0..n_experts).map(|i| (i, i)).collect()
     };
     let n_out_experts = bake_slots.len();
+    // Passthrough formats must win over k-map, AWQ, and every low-bit recipe.
+    // Keep BF16 bytes verbatim when the source is BF16; F16/F32 use the same
+    // conversion helpers as the ordinary non-expert fallback paths.
+    if let Some(qt) = moe_expert_passthrough_quant_type(use_f32_passthrough, use_bf16, use_f16) {
+        let mut new_tensors = emit_moe_expert_passthrough(name, meta, raw_data, qt, &bake_slots);
+        *quantized_params += inner_n as u64 * n_out_experts as u64;
+        eprintln!(
+            "  {:>8}: {parent}{{0..{n_out_experts}}}.{base_name}.weight {:?} \
+             ({} experts, source passthrough)",
+            format!("{qt:?}"),
+            inner_shape,
+            n_out_experts
+        );
+        hfq_tensors.append(&mut new_tensors);
+        st_files[file_idx].drop_tensor_pages(name);
+        if let Some(s) = spill.as_mut() {
+            maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+        }
+        return true;
+    }
 
     // ── Per-expert AWQ (Route A) ──────────────────────────────────────
     // When `--awq` is active with a GGUF imatrix, MQ4 experts get
@@ -6679,6 +6817,116 @@ mod handle_main_quant_f16_fallback_tests {
         assert_eq!(hfq_tensors[0].data.len(), 16 * 2);
         let expected = f16_bytes_of(&vals);
         assert_eq!(hfq_tensors[0].data, expected);
+    }
+    #[test]
+    fn gemma_3d_passthrough_preserves_expert_slices_and_requested_dtype() {
+        let shape = vec![2usize, 2, 4];
+        let values: Vec<f32> = vec![
+            1.0, -2.5, 0.25, 3.0, 4.0, -5.0, 0.125, 6.0, 7.0, -8.0, 0.0625, 9.0, 10.0, -11.0,
+            0.03125, 12.0,
+        ];
+        let raw_bf16 = bf16_bytes_of(&values);
+        let source = meta("BF16", shape);
+        let slots = [(0usize, 0usize), (1usize, 1usize)];
+        let name = "model.language_model.layers.0.experts.gate_up_proj";
+
+        let f32_out = emit_moe_expert_passthrough(name, &source, &raw_bf16, QuantType::F32, &slots);
+        assert_eq!(f32_out.len(), 2);
+        assert_eq!(
+            f32_out[0].name,
+            "model.language_model.layers.0.experts.0.gate_up_proj.weight"
+        );
+        assert_eq!(
+            f32_out[1].name,
+            "model.language_model.layers.0.experts.1.gate_up_proj.weight"
+        );
+        assert_eq!(f32_out[0].quant_type, QuantType::F32);
+        assert_eq!(f32_out[0].shape, vec![2, 4]);
+        assert_eq!(
+            f32_out[0].data,
+            values[..8]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            f32_out[1].data,
+            values[8..]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+
+        let bf16_out =
+            emit_moe_expert_passthrough(name, &source, &raw_bf16, QuantType::BF16, &slots);
+        assert_eq!(
+            bf16_out.iter().map(|t| t.data.len()).sum::<usize>(),
+            raw_bf16.len()
+        );
+        assert_eq!(bf16_out[0].data, raw_bf16[..16]);
+        assert_eq!(bf16_out[1].data, raw_bf16[16..]);
+
+        let f16_out = emit_moe_expert_passthrough(name, &source, &raw_bf16, QuantType::F16, &slots);
+        let expected_f16: Vec<u8> = values
+            .iter()
+            .map(|&v| f32_to_f16(v).to_le_bytes())
+            .flat_map(|b| b)
+            .collect();
+        assert_eq!(f16_out[0].data, expected_f16[..16]);
+        assert_eq!(f16_out[1].data, expected_f16[16..]);
+        let roundtrip = tempfile::NamedTempFile::new().unwrap();
+        write_hfq(roundtrip.path(), 13, "{}", &f32_out, None).unwrap();
+        let loaded = hipfire_runtime::hfq::HfqFile::open(roundtrip.path()).unwrap();
+        for tensor in &f32_out {
+            let (info, bytes) = loaded.tensor_data(&tensor.name).unwrap();
+            assert_eq!(info.quant_type, QuantType::F32 as u8);
+            assert_eq!(info.shape, tensor.shape);
+            assert_eq!(bytes, tensor.data.as_slice());
+        }
+    }
+
+    #[test]
+    fn gemma_3d_passthrough_flags_have_f32_priority() {
+        assert_eq!(
+            moe_expert_passthrough_quant_type(true, true, true),
+            Some(QuantType::F32)
+        );
+        assert_eq!(
+            moe_expert_passthrough_quant_type(false, true, true),
+            Some(QuantType::BF16)
+        );
+        assert_eq!(
+            moe_expert_passthrough_quant_type(false, false, true),
+            Some(QuantType::F16)
+        );
+        assert_eq!(moe_expert_passthrough_quant_type(false, false, false), None);
+    }
+    #[test]
+    fn gemma_3d_experts_bypass_global_passthrough_handlers() {
+        assert!(is_moe_expert_3d_tensor(
+            false,
+            true,
+            "model.language_model.layers.0.experts.gate_up_proj",
+            &[2, 4, 8],
+        ));
+        assert!(is_moe_expert_3d_tensor(
+            false,
+            true,
+            "model.language_model.layers.0.experts.down_proj",
+            &[2, 8, 4],
+        ));
+        assert!(!is_moe_expert_3d_tensor(
+            false,
+            true,
+            "model.language_model.layers.0.experts.gate_up_proj.weight",
+            &[2, 4, 8],
+        ));
+        assert!(!is_moe_expert_3d_tensor(
+            false,
+            true,
+            "model.language_model.layers.0.experts.gate_up_proj",
+            &[4, 8],
+        ));
     }
 }
 

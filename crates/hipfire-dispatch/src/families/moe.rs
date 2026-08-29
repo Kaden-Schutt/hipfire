@@ -3345,4 +3345,15 @@ mod tests {
             "an expert at n_experts must not produce a view"
         );
     }
+    #[test]
+    fn gelu_expert_passthrough_dtypes_use_generic_fallback() {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            assert_eq!(
+                select_moe_gelu_backend(dtype, dtype),
+                MoeGeluBackend::PerExpert,
+                "{dtype:?} must use the generic per-expert GEMV fallback"
+            );
+        }
+        assert!(validate_moe_gelu_shape(2, 4, 2, 3).is_ok());
+    }
 }

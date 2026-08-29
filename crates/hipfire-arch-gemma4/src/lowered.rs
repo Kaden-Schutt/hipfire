@@ -1739,6 +1739,30 @@ fn load_gemma4_weight(
     Ok(wt)
 }
 
+fn gemma_moe_pool_dtype(quant_type: u8) -> Option<DType> {
+    Some(match quant_type {
+        1 => DType::F16,
+        2 => DType::F32,
+        3 => DType::Q8_0,
+        4 => DType::Q4K,
+        6 => DType::HFQ4G256,
+        7 => DType::HFQ4G128,
+        8 => DType::HFQ6G256,
+        9 => DType::HFQ2G256,
+        10 => DType::HFQ2G128,
+        11 => DType::HFQ3G256,
+        12 => DType::HFQ3G128,
+        // MQ4G256 (13) and MG4G256 (30) share dispatch.
+        13 | 30 => DType::MQ4G256,
+        14 => DType::MQ8G256,
+        15 => DType::MQ6G256,
+        16 => DType::BF16,
+        17 => DType::MQ3G256,
+        18 => DType::MQ2G256,
+        _ => return None,
+    })
+}
+
 /// Load all experts of one MoE projection into a single owning pool.
 fn load_moe_pool(
     hfq: &HfqFile,
@@ -1753,29 +1777,15 @@ fn load_moe_pool(
         hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {first_name}"))
     })?;
     let bytes_per_expert = first_data.len();
-    let dtype = match first_info.quant_type {
-        3 => DType::Q8_0,
-        4 => DType::Q4K,
-        6 => DType::HFQ4G256,
-        7 => DType::HFQ4G128,
-        8 => DType::HFQ6G256,
-        9 => DType::HFQ2G256,
-        10 => DType::HFQ2G128,
-        11 => DType::HFQ3G256,
-        12 => DType::HFQ3G128,
-        // MQ4G256 (13) and MG4G256 (30) share dispatch.
-        13 | 30 => DType::MQ4G256,
-        14 => DType::MQ8G256,
-        15 => DType::MQ6G256,
-        17 => DType::MQ3G256,
-        18 => DType::MQ2G256,
-        qt => {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("unsupported MoE expert quant_type {qt} for {first_name}"),
-            ))
-        }
-    };
+    let dtype = gemma_moe_pool_dtype(first_info.quant_type).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "unsupported MoE expert quant_type {} for {first_name}",
+                first_info.quant_type
+            ),
+        )
+    })?;
     // Concat all experts' bytes into one CPU buffer, upload once.
     let mut concat = Vec::with_capacity(bytes_per_expert * n_exp);
     concat.extend_from_slice(first_data);
@@ -7320,5 +7330,13 @@ mod tests {
             baseline.abs_diff(vram_free(&gpu)) < 64 * 1024 * 1024,
             "weight teardown did not reclaim sidecars and MoE pools"
         );
+    }
+    #[test]
+    fn moe_pool_dtype_accepts_passthrough_quant_types() {
+        assert_eq!(gemma_moe_pool_dtype(1), Some(DType::F16));
+        assert_eq!(gemma_moe_pool_dtype(2), Some(DType::F32));
+        assert_eq!(gemma_moe_pool_dtype(16), Some(DType::BF16));
+        assert_eq!(gemma_moe_pool_dtype(13), Some(DType::MQ4G256));
+        assert_eq!(gemma_moe_pool_dtype(255), None);
     }
 }
