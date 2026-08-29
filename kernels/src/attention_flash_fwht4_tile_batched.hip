@@ -172,8 +172,64 @@ __global__ void attention_flash_fwht4_tile_batched(
             p[2 + d_base + 2] = out_vec[half * 4 + 2];
             p[2 + d_base + 3] = out_vec[half * 4 + 3];
         }
+    } else if (v_mode == 4) {
+        // Dedicated full-256 Lloyd4 reader. Keep the V record unchanged;
+        // unroll four tokens to overlap global loads and eliminate the
+        // dynamic bit-width/codebook branch from the hot path.
+        const int d0 = tid * 8;
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        const int v_bytes_per_head = 4 + head_dim / 2;
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        int tv = 0;
+        for (; tv + 3 < tile_len; tv += 4) {
+            float w0 = scores[tv + 0], w1 = scores[tv + 1];
+            float w2 = scores[tv + 2], w3 = scores[tv + 3];
+            const unsigned char* vb0 = v_cache + (size_t)(tile_start + tv + 0) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb1 = v_cache + (size_t)(tile_start + tv + 1) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb2 = v_cache + (size_t)(tile_start + tv + 2) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb3 = v_cache + (size_t)(tile_start + tv + 3) * v_bytes_per_pos + v_head_off;
+            float cn0 = *(const float*)vb0, cn1 = *(const float*)vb1;
+            float cn2 = *(const float*)vb2, cn3 = *(const float*)vb3;
+            unsigned int pk0 = *(const unsigned int*)(vb0 + 4 + tid * 4);
+            unsigned int pk1 = *(const unsigned int*)(vb1 + 4 + tid * 4);
+            unsigned int pk2 = *(const unsigned int*)(vb2 + 4 + tid * 4);
+            unsigned int pk3 = *(const unsigned int*)(vb3 + 4 + tid * 4);
+            #define ACC4(W, CN, PK) do { \
+                ov[0] += (W) * ((CN) * TURBO_C4_256[(PK)         & 15]); \
+                ov[1] += (W) * ((CN) * TURBO_C4_256[((PK) >> 4)  & 15]); \
+                ov[2] += (W) * ((CN) * TURBO_C4_256[((PK) >> 8)  & 15]); \
+                ov[3] += (W) * ((CN) * TURBO_C4_256[((PK) >> 12) & 15]); \
+                ov[4] += (W) * ((CN) * TURBO_C4_256[((PK) >> 16) & 15]); \
+                ov[5] += (W) * ((CN) * TURBO_C4_256[((PK) >> 20) & 15]); \
+                ov[6] += (W) * ((CN) * TURBO_C4_256[((PK) >> 24) & 15]); \
+                ov[7] += (W) * ((CN) * TURBO_C4_256[((PK) >> 28) & 15]); \
+            } while (0)
+            ACC4(w0, cn0, pk0);
+            ACC4(w1, cn1, pk1);
+            ACC4(w2, cn2, pk2);
+            ACC4(w3, cn3, pk3);
+            #undef ACC4
+        }
+        for (; tv < tile_len; tv++) {
+            float w = scores[tv];
+            const unsigned char* vb =
+                v_cache + (size_t)(tile_start + tv) * v_bytes_per_pos + v_head_off;
+            float cnorm = *(const float*)vb;
+            unsigned int packed = *(const unsigned int*)(vb + 4 + tid * 4);
+            ov[0] += w * (cnorm * TURBO_C4_256[ packed        & 15]);
+            ov[1] += w * (cnorm * TURBO_C4_256[(packed >> 4)  & 15]);
+            ov[2] += w * (cnorm * TURBO_C4_256[(packed >> 8)  & 15]);
+            ov[3] += w * (cnorm * TURBO_C4_256[(packed >> 12) & 15]);
+            ov[4] += w * (cnorm * TURBO_C4_256[(packed >> 16) & 15]);
+            ov[5] += w * (cnorm * TURBO_C4_256[(packed >> 20) & 15]);
+            ov[6] += w * (cnorm * TURBO_C4_256[(packed >> 24) & 15]);
+            ov[7] += w * (cnorm * TURBO_C4_256[(packed >> 28) & 15]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) p[2 + d0 + i] = ov[i];
     } else {
-        // ── 256-wide lloyd2/3/4 V: FWHT-rotated centroid (head_dim==256 only).
+        // ── 256-wide lloyd2/3 V: FWHT-rotated centroid (head_dim==256 only).
         // Own tid*8 contiguous layout — required by fwht_shfl_inverse_256.
         const int d0 = tid * 8;
         float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
