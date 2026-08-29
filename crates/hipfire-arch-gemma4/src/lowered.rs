@@ -716,6 +716,25 @@ impl Gemma4LayerDump {
     ) {
         self.capture(gpu, format!("L{layer_idx}_{label}"), tensor);
     }
+    fn capture_i32_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        label: &str,
+        tensor: &GpuTensor,
+    ) {
+        let Some(data) = gpu.download_f32(tensor).ok() else {
+            return;
+        };
+        let indices = data
+            .iter()
+            .map(|value| serde_json::Value::from(value.to_bits() as i32))
+            .collect::<Vec<_>>();
+        self.captured.insert(
+            format!("L{layer_idx}_{label}"),
+            serde_json::json!({"indices": indices}),
+        );
+    }
 
     fn write(self, gpu: &mut Gpu, logits: &GpuTensor) {
         let logit_argmax = gpu.download_f32(logits).ok().and_then(|values| {
@@ -6174,7 +6193,11 @@ fn execute_bound_gemma4_steps_dumped(
     for &(end, label, tensor) in boundaries {
         debug_assert!(start <= end && end <= steps.len());
         execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps[start..end])?;
-        dump.capture_boundary(gpu, layer_idx, label, tensor);
+        if label == "router_topk_indices" {
+            dump.capture_i32_boundary(gpu, layer_idx, label, tensor);
+        } else {
+            dump.capture_boundary(gpu, layer_idx, label, tensor);
+        }
         start = end;
     }
     execute_bound_gemma4_steps(gpu, ctx, layer_idx, &steps[start..])
@@ -6515,11 +6538,7 @@ fn execute_sliding_dense_steps(
                 layer_idx,
                 &steps,
                 &[
-                    (11, "attention_output", &scratch.tmp),
-                    (12, "attention_norm", &scratch.tmp),
                     (13, "attention_residual", &scratch.x),
-                    (15, "pre_ffn_norm", &scratch.tmp),
-                    (19, "dense_ffn", &scratch.ffn_out),
                     (20, "dense_ffn_norm", &scratch.tmp),
                 ],
                 dump,
@@ -6696,11 +6715,7 @@ fn execute_full_dense_steps(
                 layer_idx,
                 &steps,
                 &[
-                    (11, "attention_output", &scratch.tmp),
-                    (12, "attention_norm", &scratch.tmp),
                     (13, "attention_residual", &scratch.x),
-                    (15, "pre_ffn_norm", &scratch.tmp),
-                    (19, "dense_ffn", &scratch.ffn_out),
                     (20, "dense_ffn_norm", &scratch.tmp),
                 ],
                 dump,
@@ -6952,18 +6967,16 @@ fn execute_sliding_moe_steps(
                 layer_idx,
                 &steps,
                 &[
-                    (11, "attention_output", &scratch.tmp),
-                    (12, "attention_norm", &scratch.tmp),
+                    (10, "attention_kernel_out", &scratch.attn_out),
                     (13, "attention_residual", &scratch.x),
-                    (15, "pre_ffn_norm", &scratch.tmp),
-                    (19, "dense_ffn", &scratch.ffn_out),
                     (20, "dense_branch_norm", &scratch.moe_cur_mlp),
                     (21, "moe_pre2", &scratch.moe_pre2),
                     (24, "router_logits", &scratch.moe_router_logits),
+                    (25, "router_topk_indices", &scratch.moe_topk_indices),
+                    (25, "router_topk_weights", &scratch.moe_topk_weights),
                     (26, "moe_branch", &scratch.moe_cur_moe),
                     (27, "moe_branch_norm", &scratch.moe_cur_moe),
                     (28, "moe_combined", &scratch.moe_cur_mlp),
-                    (29, "outer_norm", &scratch.tmp),
                 ],
                 dump,
             );
@@ -7214,18 +7227,16 @@ fn execute_full_moe_steps(
                 layer_idx,
                 &steps,
                 &[
-                    (11, "attention_output", &scratch.tmp),
-                    (12, "attention_norm", &scratch.tmp),
+                    (10, "attention_kernel_out", &scratch.attn_out),
                     (13, "attention_residual", &scratch.x),
-                    (15, "pre_ffn_norm", &scratch.tmp),
-                    (19, "dense_ffn", &scratch.ffn_out),
                     (20, "dense_branch_norm", &scratch.moe_cur_mlp),
                     (21, "moe_pre2", &scratch.moe_pre2),
                     (24, "router_logits", &scratch.moe_router_logits),
+                    (25, "router_topk_indices", &scratch.moe_topk_indices),
+                    (25, "router_topk_weights", &scratch.moe_topk_weights),
                     (26, "moe_branch", &scratch.moe_cur_moe),
                     (27, "moe_branch_norm", &scratch.moe_cur_moe),
                     (28, "moe_combined", &scratch.moe_cur_mlp),
-                    (29, "outer_norm", &scratch.tmp),
                 ],
                 dump,
             );

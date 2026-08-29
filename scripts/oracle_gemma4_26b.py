@@ -148,6 +148,11 @@ def main():
             capture_tensor(f"L{layer_idx}_{name}", output)
 
         return hook
+    def make_tuple_hook(layer_idx, name, index):
+        def hook(module, input, output):
+            capture_tensor(f"L{layer_idx}_{name}", output[index])
+
+        return hook
 
     def make_pre_hook(layer_idx, name):
         def hook(module, input):
@@ -189,6 +194,12 @@ def main():
                         ),
                         layer.router.proj.register_forward_hook(
                             make_hook(li, "router_logits")
+                        ),
+                        layer.router.register_forward_hook(
+                            make_tuple_hook(li, "router_topk_weights", 1)
+                        ),
+                        layer.router.register_forward_hook(
+                            make_tuple_hook(li, "router_topk_indices", 2)
                         ),
                         layer.experts.register_forward_hook(make_hook(li, "moe_branch")),
                         layer.post_feedforward_layernorm_2.register_forward_hook(
