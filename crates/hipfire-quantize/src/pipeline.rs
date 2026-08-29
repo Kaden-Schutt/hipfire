@@ -2432,6 +2432,7 @@ pub(crate) fn run() {
                 use_f32_passthrough,
                 use_bf16,
                 use_f16,
+                use_q8,
                 &kmap,
                 &mq3_tier_layers,
                 &imatrix_gguf,
@@ -3852,6 +3853,7 @@ fn moe_expert_passthrough_quant_type(
     use_f32_passthrough: bool,
     use_bf16: bool,
     use_f16: bool,
+    use_q8: bool,
 ) -> Option<QuantType> {
     if use_f32_passthrough {
         Some(QuantType::F32)
@@ -3859,6 +3861,8 @@ fn moe_expert_passthrough_quant_type(
         Some(QuantType::BF16)
     } else if use_f16 {
         Some(QuantType::F16)
+    } else if use_q8 {
+        Some(QuantType::Q8F16)
     } else {
         None
     }
@@ -3932,13 +3936,14 @@ fn emit_moe_expert_passthrough(
                             .collect()
                     }
                 }
+                QuantType::Q8F16 => quantize_q8f16(&to_f32(slice, &meta.dtype)),
                 other => panic!("unsupported MoE passthrough quant type: {other:?}"),
             };
             HfqTensor {
                 name: format!("{parent}{slot}.{base_name}.weight"),
                 quant_type: target,
                 shape: inner_shape.clone(),
-                group_size: 0,
+                group_size: if target == QuantType::Q8F16 { 32 } else { 0 },
                 data,
                 spilled_len: 0,
             }
@@ -3954,6 +3959,7 @@ fn handle_moe_expert_3d(
     use_f32_passthrough: bool,
     use_bf16: bool,
     use_f16: bool,
+    use_q8: bool,
     kmap: &HashMap<String, QuantLevel>,
     mq3_tier_layers: &std::collections::HashSet<usize>,
     imatrix_gguf: &Option<gguf_input::GgufFile>,
@@ -4221,11 +4227,17 @@ fn handle_moe_expert_3d(
         (0..n_experts).map(|i| (i, i)).collect()
     };
     let n_out_experts = bake_slots.len();
-    // Passthrough formats must win over k-map, AWQ, and every low-bit recipe.
-    // Keep BF16 bytes verbatim when the source is BF16; F16/F32 use the same
-    // conversion helpers as the ordinary non-expert fallback paths.
-    if let Some(qt) = moe_expert_passthrough_quant_type(use_f32_passthrough, use_bf16, use_f16) {
-        let mut new_tensors = emit_moe_expert_passthrough(name, meta, raw_data, qt, &bake_slots);
+    // Requested Gemma reference formats must win over k-map, AWQ, and every
+    // low-bit recipe. Q8 is gated to Gemma here; Qwen keeps its established
+    // MQ/HFQ expert recipe even when the global format is q8.
+    if let Some(qt) = moe_expert_passthrough_quant_type(
+        use_f32_passthrough,
+        use_bf16,
+        use_f16,
+        use_q8 && is_gemma4,
+    ) {
+        let mut new_tensors =
+            emit_moe_expert_passthrough(name, meta, raw_data, qt, &bake_slots);
         *quantized_params += inner_n as u64 * n_out_experts as u64;
         eprintln!(
             "  {:>8}: {parent}{{0..{n_out_experts}}}.{base_name}.weight {:?} \
@@ -6876,6 +6888,25 @@ mod handle_main_quant_f16_fallback_tests {
             .collect();
         assert_eq!(f16_out[0].data, expected_f16[..16]);
         assert_eq!(f16_out[1].data, expected_f16[16..]);
+        let q8_out =
+            emit_moe_expert_passthrough(name, &source, &raw_bf16, QuantType::Q8F16, &slots);
+        assert_eq!(q8_out.len(), 2);
+        for tensor in &q8_out {
+            assert_eq!(tensor.quant_type, QuantType::Q8F16);
+            assert_eq!(tensor.group_size, 32);
+            assert_eq!(tensor.shape, vec![2, 4]);
+            assert_eq!(tensor.data.len(), 34);
+        }
+        let q8_roundtrip = tempfile::NamedTempFile::new().unwrap();
+        write_hfq(q8_roundtrip.path(), 13, "{}", &q8_out, None).unwrap();
+        let q8_loaded = hipfire_runtime::hfq::HfqFile::open(q8_roundtrip.path()).unwrap();
+        for tensor in &q8_out {
+            let (info, bytes) = q8_loaded.tensor_data(&tensor.name).unwrap();
+            assert_eq!(info.quant_type, QuantType::Q8F16 as u8);
+            assert_eq!(info.shape, tensor.shape);
+            assert_eq!(info.group_size, tensor.group_size);
+            assert_eq!(bytes, tensor.data.as_slice());
+        }
         let roundtrip = tempfile::NamedTempFile::new().unwrap();
         write_hfq(roundtrip.path(), 13, "{}", &f32_out, None).unwrap();
         let loaded = hipfire_runtime::hfq::HfqFile::open(roundtrip.path()).unwrap();
@@ -6890,18 +6921,25 @@ mod handle_main_quant_f16_fallback_tests {
     #[test]
     fn gemma_3d_passthrough_flags_have_f32_priority() {
         assert_eq!(
-            moe_expert_passthrough_quant_type(true, true, true),
+            moe_expert_passthrough_quant_type(true, true, true, false),
             Some(QuantType::F32)
         );
         assert_eq!(
-            moe_expert_passthrough_quant_type(false, true, true),
+            moe_expert_passthrough_quant_type(false, true, true, false),
             Some(QuantType::BF16)
         );
         assert_eq!(
-            moe_expert_passthrough_quant_type(false, false, true),
+            moe_expert_passthrough_quant_type(false, false, true, false),
             Some(QuantType::F16)
         );
-        assert_eq!(moe_expert_passthrough_quant_type(false, false, false), None);
+        assert_eq!(
+            moe_expert_passthrough_quant_type(false, false, false, true),
+            Some(QuantType::Q8F16)
+        );
+        assert_eq!(
+            moe_expert_passthrough_quant_type(false, false, false, false),
+            None
+        );
     }
     #[test]
     fn gemma_3d_experts_bypass_global_passthrough_handlers() {
