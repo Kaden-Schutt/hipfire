@@ -28,13 +28,13 @@
 //! `gelu_tanh_f32`, `logit_softcap_f32`, plus the shared GEMV path.
 
 pub mod arch;
+pub mod carrier;
 pub mod config;
 pub mod drafter;
 pub mod forward;
 pub mod gemma4;
 pub mod lowered;
 pub mod speculative;
-pub mod carrier;
 pub use carrier::{
     load_gemma4_bundle, load_gemma4_bundle_with_route, lowered_kv_policy, preflight_gemma4,
     preflight_lowered_kv_budget, required_kv_bytes, Gemma4Bundle, Gemma4EagerBundle,

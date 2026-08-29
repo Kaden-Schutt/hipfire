@@ -1167,9 +1167,7 @@ pub enum MoeGeluBackend {
 /// known dispatch error, so it intentionally stays on the generic fallback.
 pub fn select_moe_gelu_backend(gate_up_dtype: DType, down_dtype: DType) -> MoeGeluBackend {
     match (gate_up_dtype, down_dtype) {
-        (DType::MQ4G256, DType::Q8_0) | (DType::Q8_0, DType::Q8_0) => {
-            MoeGeluBackend::Indexed
-        }
+        (DType::MQ4G256, DType::Q8_0) | (DType::Q8_0, DType::Q8_0) => MoeGeluBackend::Indexed,
         _ => MoeGeluBackend::PerExpert,
     }
 }
@@ -1264,9 +1262,9 @@ fn f32_prefix_view(
             tensor.dtype
         )));
     }
-    let bytes = elements.checked_mul(4).ok_or_else(|| {
-        DispatchError::Hip(format!("MoeGeluExperts: {kind} byte size overflows"))
-    })?;
+    let bytes = elements
+        .checked_mul(4)
+        .ok_or_else(|| DispatchError::Hip(format!("MoeGeluExperts: {kind} byte size overflows")))?;
     if bytes > tensor.buf.size() {
         return Err(DispatchError::Hip(format!(
             "MoeGeluExperts: {kind} scratch needs {bytes} bytes, has {}",
@@ -1276,11 +1274,7 @@ fn f32_prefix_view(
     Ok(tensor.sub_offset(0, elements))
 }
 
-fn zero_moe_output(
-    gpu: &mut Gpu,
-    out: &GpuTensor,
-    hidden_dim: usize,
-) -> Result<(), DispatchError> {
+fn zero_moe_output(gpu: &mut Gpu, out: &GpuTensor, hidden_dim: usize) -> Result<(), DispatchError> {
     let bytes = hidden_dim.checked_mul(4).ok_or_else(|| {
         DispatchError::Hip("MoeGeluExperts: output byte size overflows".to_owned())
     })?;
@@ -1703,14 +1697,8 @@ pub fn launch_moe_softmax_topk_fused(
     n_exp: usize,
     norm_topk_prob: bool,
 ) -> Result<(), DispatchError> {
-    gpu.moe_softmax_topk_renorm_k8(
-        logits,
-        topk_indices,
-        topk_weights,
-        n_exp,
-        norm_topk_prob,
-    )
-    .map_err(|e| DispatchError::Hip(e.to_string()))
+    gpu.moe_softmax_topk_renorm_k8(logits, topk_indices, topk_weights, n_exp, norm_topk_prob)
+        .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
 /// Architecture-selected Qwen decode router backend. The generic
@@ -3326,10 +3314,7 @@ mod tests {
     fn gelu_expert_fallback_views_use_pool_byte_offsets() {
         let pool = GpuTensor {
             buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(
-                    0x1000usize as *mut std::ffi::c_void,
-                    3 * 24,
-                )
+                hip_bridge::DeviceBuffer::from_raw(0x1000usize as *mut std::ffi::c_void, 3 * 24)
             },
             shape: vec![3 * 24],
             dtype: DType::Raw,

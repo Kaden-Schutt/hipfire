@@ -177,7 +177,6 @@ impl Drop for Asym3KvStaging<'_> {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvMapGrowth {
     pub offset_bytes: usize,
@@ -3707,7 +3706,6 @@ impl KvCache {
         )
     }
 
-
     fn new_gpu_asym3_capped_inner(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -4544,8 +4542,7 @@ mod fault_seam {
 
     /// True while an arm is pending (tests assert the arm is consumed).
     pub fn is_armed() -> bool {
-        FAIL_NEXT_Q8_ALLOC.load(Ordering::SeqCst)
-            || FAIL_NEXT_ASYM3_ALLOC.load(Ordering::SeqCst)
+        FAIL_NEXT_Q8_ALLOC.load(Ordering::SeqCst) || FAIL_NEXT_ASYM3_ALLOC.load(Ordering::SeqCst)
     }
 
     /// Clear any pending arm (suite-isolation backstop).
@@ -4779,15 +4776,11 @@ mod allocation_fault_tests {
         const MAX_SEQ: usize = 1024;
 
         {
-            let kv = KvCache::new_gpu_asym3_gemma4(
-                &mut gpu,
-                N_LAYERS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                MAX_SEQ,
-            )
-            .expect("warm-up Gemma asym3 KV must succeed");
-            kv.free_gpu(&mut gpu).expect("warm-up asym3 free must succeed");
+            let kv =
+                KvCache::new_gpu_asym3_gemma4(&mut gpu, N_LAYERS, N_KV_HEADS, HEAD_DIM, MAX_SEQ)
+                    .expect("warm-up Gemma asym3 KV must succeed");
+            kv.free_gpu(&mut gpu)
+                .expect("warm-up asym3 free must succeed");
         }
         gpu.drain_pool();
         let baseline = vram_free(&gpu);
@@ -4796,11 +4789,7 @@ mod allocation_fault_tests {
         fault_seam::arm_fail_next_asym3_alloc();
         assert!(fault_seam::is_armed(), "asym3 fault arm must be set");
         let err = match KvCache::new_gpu_asym3_gemma4(
-            &mut gpu,
-            N_LAYERS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            MAX_SEQ,
+            &mut gpu, N_LAYERS, N_KV_HEADS, HEAD_DIM, MAX_SEQ,
         ) {
             Ok(_) => panic!("armed asym3 KV fault must fail construction"),
             Err(error) => error,
@@ -4809,10 +4798,7 @@ mod allocation_fault_tests {
             err.to_string().contains("asym3 fault seam"),
             "expected asym3 fault seam, got: {err}"
         );
-        assert!(
-            !fault_seam::is_armed(),
-            "asym3 fault arm must be one-shot"
-        );
+        assert!(!fault_seam::is_armed(), "asym3 fault arm must be one-shot");
         gpu.drain_pool();
         let after = vram_free(&gpu);
         assert!(
@@ -4820,15 +4806,10 @@ mod allocation_fault_tests {
             "asym3 rollback did not reclaim staged owners: baseline={baseline} after={after}"
         );
 
-        let kv = KvCache::new_gpu_asym3_gemma4(
-            &mut gpu,
-            N_LAYERS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            MAX_SEQ,
-        )
-        .expect("asym3 construction must recover after injected failure");
-        kv.free_gpu(&mut gpu).expect("post-fault asym3 free must succeed");
+        let kv = KvCache::new_gpu_asym3_gemma4(&mut gpu, N_LAYERS, N_KV_HEADS, HEAD_DIM, MAX_SEQ)
+            .expect("asym3 construction must recover after injected failure");
+        kv.free_gpu(&mut gpu)
+            .expect("post-fault asym3 free must succeed");
         gpu.drain_pool();
         let recovered = vram_free(&gpu);
         assert!(

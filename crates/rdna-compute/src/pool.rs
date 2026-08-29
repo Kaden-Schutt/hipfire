@@ -102,7 +102,6 @@ impl GpuPool {
             .sum()
     }
 
-
     /// Actually free all pooled buffers (call on cleanup).
     pub fn drain(&mut self, hip: &HipRuntime) {
         for (_, list) in self.free_lists.drain() {

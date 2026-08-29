@@ -1903,8 +1903,7 @@ fn main() {
                         // both eager and lowered routes: only a committed,
                         // identity-matched prefix is reused, while mismatches
                         // take a total cold reset.
-                        let cache_capable =
-                            matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 13 | 14);
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 13 | 14);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
                         let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)

@@ -4555,7 +4555,10 @@ mod gemma4_lowered_oracle_tests {
         )
         .expect("carrier-created MoE F32 B=2 prefill");
         bundle.kv_full.free_gpu(&mut gpu).expect("free full KV");
-        bundle.kv_sliding.free_gpu(&mut gpu).expect("free sliding KV");
+        bundle
+            .kv_sliding
+            .free_gpu(&mut gpu)
+            .expect("free sliding KV");
         bundle.scratch.free_gpu(&mut gpu);
         bundle.weights.free_gpu(&mut gpu);
     }
@@ -4579,8 +4582,8 @@ mod gemma4_lowered_oracle_tests {
             ids,
             [
                 1852, 128677, 138, 1852, 23960, 64255, 870, 3785, 71642, 23960, 236743, 1852,
-                23960, 23960, 23960, 236743, 1852, 569, 1360, 15371, 23960, 7881, 1852, 870,
-                23960, 7881, 1010, 23960, 1852, 862, 569, 236772,
+                23960, 23960, 23960, 236743, 1852, 569, 1360, 15371, 23960, 7881, 1852, 870, 23960,
+                7881, 1010, 23960, 1852, 862, 569, 236772,
             ]
         );
         assert_eq!(fnv, 0x770f9d304edad4dc);

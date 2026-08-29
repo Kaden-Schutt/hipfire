@@ -4236,8 +4236,7 @@ fn handle_moe_expert_3d(
         use_f16,
         use_q8 && is_gemma4,
     ) {
-        let mut new_tensors =
-            emit_moe_expert_passthrough(name, meta, raw_data, qt, &bake_slots);
+        let mut new_tensors = emit_moe_expert_passthrough(name, meta, raw_data, qt, &bake_slots);
         *quantized_params += inner_n as u64 * n_out_experts as u64;
         eprintln!(
             "  {:>8}: {parent}{{0..{n_out_experts}}}.{base_name}.weight {:?} \
@@ -6994,7 +6993,8 @@ mod handle_main_quant_f16_fallback_tests {
         let mut header = serde_json::Map::new();
         header.insert(name.to_string(), serde_json::Value::Object(tensor));
         let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
-        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
         file.write_all(&header).unwrap();
         file.write_all(raw_data).unwrap();
         let safetensors = SafetensorsFile::open(file.path()).unwrap();
@@ -7055,7 +7055,10 @@ mod handle_main_quant_f16_fallback_tests {
             ));
             assert_eq!(output.len(), 1);
             assert_eq!(output[0].quant_type, QuantType::BF16);
-            assert_eq!(output[0].shape, shape.iter().map(|&dim| dim as u32).collect::<Vec<_>>());
+            assert_eq!(
+                output[0].shape,
+                shape.iter().map(|&dim| dim as u32).collect::<Vec<_>>()
+            );
             assert_eq!(output[0].data, raw);
             assert_eq!(quantized_params, values.len() as u64);
         }

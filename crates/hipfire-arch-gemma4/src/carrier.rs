@@ -110,10 +110,7 @@ fn f32_kv_bytes(
     n_kv_heads: usize,
     head_dim: usize,
 ) -> Result<usize, String> {
-    checked_product(
-        &[layers, max_seq, n_kv_heads, head_dim, 2, 4],
-        "F32 KV",
-    )
+    checked_product(&[layers, max_seq, n_kv_heads, head_dim, 2, 4], "F32 KV")
 }
 
 fn compressed_kv_bytes(
@@ -182,12 +179,13 @@ pub fn required_kv_bytes(
                 sliding_bytes_per_head,
                 sliding_bytes_per_head,
             )?;
-            let full_k_bytes_per_head = checked_product(&[3, config.full_head_dim], "Asym3 full K")?
-                .checked_div(8)
-                .and_then(|bytes| bytes.checked_add(4))
-                .ok_or_else(|| {
-                    "gemma4 lowered Asym3 full K byte calculation overflowed".to_string()
-                })?;
+            let full_k_bytes_per_head =
+                checked_product(&[3, config.full_head_dim], "Asym3 full K")?
+                    .checked_div(8)
+                    .and_then(|bytes| bytes.checked_add(4))
+                    .ok_or_else(|| {
+                        "gemma4 lowered Asym3 full K byte calculation overflowed".to_string()
+                    })?;
             let full_v_bytes_per_head =
                 checked_product(&[config.full_head_dim / 32, 34], "Asym3 full V")?;
             let full_tensors = compressed_kv_bytes(
@@ -197,18 +195,19 @@ pub fn required_kv_bytes(
                 full_k_bytes_per_head,
                 full_v_bytes_per_head,
             )?;
-            let full_tables =
-                checked_product(&[2, config.full_head_dim / 2, 4], "compressed rotation tables")?;
+            let full_tables = checked_product(
+                &[2, config.full_head_dim / 2, 4],
+                "compressed rotation tables",
+            )?;
             let full = full_tensors.checked_add(full_tables).ok_or_else(|| {
                 "gemma4 lowered compressed KV byte calculation overflowed".to_string()
             })?;
-            sliding
-                .checked_add(full)
-                .ok_or_else(|| "gemma4 lowered compressed KV byte calculation overflowed".to_string())
+            sliding.checked_add(full).ok_or_else(|| {
+                "gemma4 lowered compressed KV byte calculation overflowed".to_string()
+            })
         }
     }
 }
-
 
 /// Reject a lowered KV allocation before it can partially construct a cache.
 ///
@@ -830,20 +829,14 @@ mod tests {
     #[test]
     fn kv_budget_rejects_overflow_before_gpu_allocation() {
         let cfg = config(vec![LayerType::Sliding]);
-        let error =
-            required_kv_bytes(&cfg, usize::MAX, Gemma4LoweredKvPolicy::MoeF32).unwrap_err();
+        let error = required_kv_bytes(&cfg, usize::MAX, Gemma4LoweredKvPolicy::MoeF32).unwrap_err();
         assert!(error.contains("overflow"), "{error}");
     }
 
     #[test]
     fn kv_budget_error_is_explicit_and_names_policy_need_free_and_capacity() {
-        let error = preflight_lowered_kv_budget(
-            Gemma4LoweredKvPolicy::MoeF32,
-            4096,
-            1024,
-            8192,
-        )
-        .unwrap_err();
+        let error = preflight_lowered_kv_budget(Gemma4LoweredKvPolicy::MoeF32, 4096, 1024, 8192)
+            .unwrap_err();
         assert!(error.contains("moe-f32"), "{error}");
         assert!(error.contains("required=4096"), "{error}");
         assert!(error.contains("free=1024"), "{error}");

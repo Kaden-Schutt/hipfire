@@ -687,9 +687,7 @@ mod tests {
     fn lower_layer_rejects_moe_gelu_experts() {
         let x = meta_tensor(1);
         let pool = GpuTensor {
-            buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(2 as *mut std::ffi::c_void, 4096)
-            },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(2 as *mut std::ffi::c_void, 4096) },
             shape: vec![4096],
             dtype: rdna_compute::DType::Raw,
         };

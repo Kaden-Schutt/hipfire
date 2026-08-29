@@ -18,10 +18,10 @@ use crate::families::moe::{
     launch_indexed_down_residual_i64, launch_indexed_down_residual_i64_batched,
     launch_indexed_gate_up, launch_indexed_gate_up_batched, launch_moe_activation,
     launch_moe_combine, launch_moe_combine_grouped, launch_moe_gate_up_unscatter,
-    launch_moe_route, launch_moe_scatter, launch_moe_softmax_topk, launch_moe_softmax_topk_fused,
-    launch_qwen_down_indexed, launch_qwen_gate_up_indexed, launch_scaled_add_gpu_scalar,
-    launch_score_activation, launch_shared_expert_down_body, launch_shared_gate_side,
-    launch_moe_gelu_experts, DeepSeekIndexedForm, MoeExpertRef, MoeGeluExpertsRef,
+    launch_moe_gelu_experts, launch_moe_route, launch_moe_scatter, launch_moe_softmax_topk,
+    launch_moe_softmax_topk_fused, launch_qwen_down_indexed, launch_qwen_gate_up_indexed,
+    launch_scaled_add_gpu_scalar, launch_score_activation, launch_shared_expert_down_body,
+    launch_shared_gate_side, DeepSeekIndexedForm, MoeExpertRef, MoeGeluExpertsRef,
     MoeRouterBackend,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -557,10 +557,7 @@ pub enum Step<'a> {
     },
     /// In-place scalar scale `x *= scale`. Present for layer-scalar and
     /// Q-prescale steps (Gemma4); per-op only, never fused.
-    Scale {
-        x: &'a GpuTensor,
-        scale: f32,
-    },
+    Scale { x: &'a GpuTensor, scale: f32 },
     /// GELU-tanh SwiGLU elementwise: `out = gelu_tanh(gate) * up` over the
     /// first `n` elements. Present so an FFN block is one contiguous step
     /// list; per-op only, never fused.
@@ -2659,7 +2656,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
-        Step::RmsNorm { x, weight, out, eps } => gpu
+        Step::RmsNorm {
+            x,
+            weight,
+            out,
+            eps,
+        } => gpu
             .rmsnorm_f32(x, weight, out, *eps)
             .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::Copy { src, dst, bytes } => {
@@ -4543,9 +4545,7 @@ mod tests {
     #[test]
     fn fused_softmax_topk_backend_is_explicitly_bound_to_steps() {
         let tensor = |ptr: usize| GpuTensor {
-            buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096)
-            },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
             shape: vec![8],
             dtype: DType::F32,
         };
@@ -4580,22 +4580,12 @@ mod tests {
     #[test]
     fn gelu_expert_step_has_indexed_identity_and_no_collective_output() {
         let f32_tensor = |ptr: usize| GpuTensor {
-            buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(
-                    ptr as *mut std::ffi::c_void,
-                    4096,
-                )
-            },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
             shape: vec![1024],
             dtype: DType::F32,
         };
         let raw_tensor = |ptr: usize| GpuTensor {
-            buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(
-                    ptr as *mut std::ffi::c_void,
-                    4096,
-                )
-            },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
             shape: vec![4096],
             dtype: DType::Raw,
         };

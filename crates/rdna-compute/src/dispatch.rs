@@ -3601,8 +3601,6 @@ impl Gpu {
         self.modules.len()
     }
 
-
-
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
