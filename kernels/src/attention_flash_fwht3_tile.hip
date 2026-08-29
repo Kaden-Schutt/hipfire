@@ -202,8 +202,67 @@ __global__ void attention_flash_fwht3_tile(
                 out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
             }
         }
+    } else if (v_mode == 3) {
+        // Dedicated full-256 Lloyd3 reader. Keep the V1 record and transform
+        // unchanged; unroll four tokens to overlap global loads and remove the
+        // dynamic bit-width/codebook branch from the hot path.
+        const int v_bytes_per_head = 4 + (head_dim * 3) / 8;
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        int tv = 0;
+        for (; tv + 3 < tile_len; tv += 4) {
+            float w0 = scores[tv + 0], w1 = scores[tv + 1];
+            float w2 = scores[tv + 2], w3 = scores[tv + 3];
+            const unsigned char* vb0 = v_cache + (size_t)(tile_start + tv + 0) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb1 = v_cache + (size_t)(tile_start + tv + 1) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb2 = v_cache + (size_t)(tile_start + tv + 2) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb3 = v_cache + (size_t)(tile_start + tv + 3) * v_bytes_per_pos + v_head_off;
+            float cn0 = *(const float*)vb0, cn1 = *(const float*)vb1;
+            float cn2 = *(const float*)vb2, cn3 = *(const float*)vb3;
+            const unsigned char* base0 = vb0 + 4 + tid * 3;
+            const unsigned char* base1 = vb1 + 4 + tid * 3;
+            const unsigned char* base2 = vb2 + 4 + tid * 3;
+            const unsigned char* base3 = vb3 + 4 + tid * 3;
+            unsigned int pk0 = (unsigned int)base0[0] | ((unsigned int)base0[1] << 8) | ((unsigned int)base0[2] << 16);
+            unsigned int pk1 = (unsigned int)base1[0] | ((unsigned int)base1[1] << 8) | ((unsigned int)base1[2] << 16);
+            unsigned int pk2 = (unsigned int)base2[0] | ((unsigned int)base2[1] << 8) | ((unsigned int)base2[2] << 16);
+            unsigned int pk3 = (unsigned int)base3[0] | ((unsigned int)base3[1] << 8) | ((unsigned int)base3[2] << 16);
+            #define ACC3(W, CN, PK) do { \
+                out_vec[0] += (W) * ((CN) * TURBO_C3_256[(PK)        & 7]); \
+                out_vec[1] += (W) * ((CN) * TURBO_C3_256[((PK) >> 3)  & 7]); \
+                out_vec[2] += (W) * ((CN) * TURBO_C3_256[((PK) >> 6)  & 7]); \
+                out_vec[3] += (W) * ((CN) * TURBO_C3_256[((PK) >> 9)  & 7]); \
+                out_vec[4] += (W) * ((CN) * TURBO_C3_256[((PK) >> 12) & 7]); \
+                out_vec[5] += (W) * ((CN) * TURBO_C3_256[((PK) >> 15) & 7]); \
+                out_vec[6] += (W) * ((CN) * TURBO_C3_256[((PK) >> 18) & 7]); \
+                out_vec[7] += (W) * ((CN) * TURBO_C3_256[((PK) >> 21) & 7]); \
+            } while (0)
+            ACC3(w0, cn0, pk0);
+            ACC3(w1, cn1, pk1);
+            ACC3(w2, cn2, pk2);
+            ACC3(w3, cn3, pk3);
+            #undef ACC3
+        }
+        for (; tv < tile_len; tv++) {
+            float w = scores[tv];
+            const unsigned char* vb =
+                v_cache + (size_t)(tile_start + tv) * v_bytes_per_pos + v_head_off;
+            float cnorm = *(const float*)vb;
+            const unsigned char* base = vb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            out_vec[0] += w * (cnorm * TURBO_C3_256[ packed        & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3_256[(packed >> 3)  & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3_256[(packed >> 6)  & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3_256[(packed >> 9)  & 7]);
+            out_vec[4] += w * (cnorm * TURBO_C3_256[(packed >> 12) & 7]);
+            out_vec[5] += w * (cnorm * TURBO_C3_256[(packed >> 15) & 7]);
+            out_vec[6] += w * (cnorm * TURBO_C3_256[(packed >> 18) & 7]);
+            out_vec[7] += w * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        }
     } else {
-        // lloyd2/3/4: 256-wide FWHT-rotated centroid V. v_mode = bit width.
+        // lloyd2/4: 256-wide FWHT-rotated centroid V. v_mode = bit width.
         // Layout: 4B cnorm + (tid * v_mode) bytes packed (8 indices, LSB-first, i*v_mode shift).
         const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
         const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
