@@ -4,16 +4,16 @@
 
 // Batched flash attention reduce for the lloyd-V (FWHT-rotated centroid) path.
 //
-// Based on attention_flash_asym_reduce_batched (which is already tid*8 with
-// g[8] and d_base = tid*8). The one difference: the lloyd tile kernels now
-// write their V partials in ROTATED space (the per-tile inverse FWHT was
-// removed), so this reduce applies the inverse FWHT exactly ONCE, after the
-// cross-tile combine and before the scalar normalize.
+// V2 split-norm layout: tile kernels write rotated-V partials with two
+// independent 128-wide halves at d = half*128 + tid*4 + i. This reduce
+// combines those partials, then applies fwht_shfl_inverse once per half
+// (two independent FWHT-128 inverses over four registers each) after the
+// cross-tile combine — never fwht_shfl_inverse_256.
 //
-// Math: tile partials are rotated (g_tile ≈ H·Σ_tile w·v). The cross-tile
-// combine forms g = Σ_tile corr·g_tile (weighted sum); the inverse H⁻¹ is
-// linear and corr/inv_sum are scalars, so H⁻¹(Σ corr·g_tile)·inv_sum equals
-// (Σ corr·H⁻¹(g_tile))·inv_sum — applying inverse once at the end is
+// Math: tile partials are rotated per half (g_tile ≈ H₁₂₈·Σ_tile w·v). The
+// cross-tile combine forms g = Σ_tile corr·g_tile (weighted sum); the inverse
+// H⁻¹ is linear and corr/inv_sum are scalars, so H⁻¹(Σ corr·g_tile)·inv_sum
+// equals (Σ corr·H⁻¹(g_tile))·inv_sum — applying inverse once at the end is
 // equivalent to per-tile.
 //
 // 2-pass numerics preserved EXACTLY (global max pass 1; single corr per tile
@@ -59,10 +59,6 @@ __global__ void attention_flash_lloyd_reduce_batched(
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
-    // Thread tid owns 8 contiguous dims (d_base = tid*8), covering all 256
-    // dims of the lloyd-V head — the layout fwht_shfl_inverse_256 requires.
-    const int d_base = tid * 8;
-
     // Pass 1: global max
     float global_max = -1e30f;
     for (int tile = 0; tile < n_tiles; tile++) {
@@ -71,7 +67,7 @@ __global__ void attention_flash_lloyd_reduce_batched(
             global_max = fmaxf(global_max, p[0]);
     }
 
-    // Pass 2: accumulate 8 (ROTATED) dims per thread
+    // Pass 2: accumulate ROTATED dims — V2 half layout d = half*128 + tid*4 + i
     float global_sum = 0.0f;
     float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -82,22 +78,33 @@ __global__ void attention_flash_lloyd_reduce_batched(
         if (tile_sum <= 0.0f) continue;
         float corr = expf(tile_max - global_max);
         #pragma unroll
-        for (int i = 0; i < 8; i++)
-            g[i] += p[2 + d_base + i] * corr;
+        for (int half = 0; half < 2; half++) {
+            const int d = half * 128 + tid * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                g[half * 4 + i] += p[2 + d + i] * corr;
+        }
         global_sum += tile_sum * corr;
     }
 
     float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
 
-    // g is the cross-tile-combined accumulator in ROTATED space. Undo the
-    // FWHT once (cooperatively across all 32 lanes), then normalize.
-    fwht_shfl_inverse_256(g[0], g[1], g[2], g[3],
-                          g[4], g[5], g[6], g[7],
-                          signs1, signs2, tid);
-
+    // g is the cross-tile-combined accumulator in ROTATED space. Undo each
+    // half's FWHT-128 independently (cooperatively across 32 lanes), then
+    // normalize. signs1/signs2[0..127] shared by both halves.
     const int q_dim = n_heads * head_dim;
     float* my_out = out + local_bid * q_dim + h * head_dim;
     #pragma unroll
-    for (int i = 0; i < 8; i++)
-        my_out[d_base + i] = g[i] * inv_sum;
+    for (int half = 0; half < 2; half++) {
+        float a = g[half * 4 + 0];
+        float b = g[half * 4 + 1];
+        float c = g[half * 4 + 2];
+        float dv = g[half * 4 + 3];
+        fwht_shfl_inverse(a, b, c, dv, signs1, signs2, tid);
+        const int d0 = half * 128 + tid * 4;
+        my_out[d0 + 0] = a * inv_sum;
+        my_out[d0 + 1] = b * inv_sum;
+        my_out[d0 + 2] = c * inv_sum;
+        my_out[d0 + 3] = dv * inv_sum;
+    }
 }

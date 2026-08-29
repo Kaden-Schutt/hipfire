@@ -4,18 +4,14 @@
 
 // Flash attention reduce kernel for the lloyd-V (FWHT-rotated centroid) path.
 //
-// Based on attention_flash_q8_0_reduce, with two differences:
-//   1. The lloyd tile kernels now write their V partials in ROTATED space
-//      (the per-tile inverse FWHT was removed). This reduce applies the
-//      inverse exactly ONCE, after the cross-tile combine.
-//   2. Because fwht_shfl_inverse_256 requires the 256-wide head distributed
-//      as 8 contiguous dims per lane (d0 = tid*8) and uses cross-lane
-//      shuffles across all 32 lanes cooperatively, the Pass-2 combine here
-//      uses a single tid*8 pass over all 256 dims (head_dim is fixed at 256
-//      for lloyd-V) — NOT the per-half (tid*4) loop the Q8/asym reduce uses.
+// V2 split-norm layout: tile kernels write rotated-V partials with two
+// independent 128-wide halves at d = half*128 + tid*4 + i. This reduce
+// combines those partials, then applies fwht_shfl_inverse once per half
+// (two independent FWHT-128 inverses over four registers each) after the
+// cross-tile combine — never fwht_shfl_inverse_256.
 //
-// Math: the tile partials g_tile are rotated (g_tile ≈ H·Σ_tile w·v). The
-// cross-tile combine forms g = Σ_tile corr·g_tile (a weighted sum) and the
+// Math: the tile partials g_tile are rotated per half (g_tile ≈ H₁₂₈·Σ_tile w·v).
+// The cross-tile combine forms g = Σ_tile corr·g_tile (a weighted sum) and the
 // final normalize multiplies by the scalar inv_sum. Both the weighted sum
 // and the scalar multiply commute with the linear inverse H⁻¹, so
 //   H⁻¹(Σ corr·g_tile) · inv_sum == (Σ corr·H⁻¹(g_tile)) · inv_sum,
@@ -61,10 +57,8 @@ __global__ void attention_flash_lloyd_reduce(
 
     // ═══ Pass 2: accumulate (ROTATED) with single correction factor per tile ═══
     //
-    // head_dim is 256 for lloyd-V. Thread tid owns the 8 contiguous dims
-    // d0 = tid*8 .. d0+7, covering all 256 dims in ONE pass (no n_halves
-    // loop) — this is the layout fwht_shfl_inverse_256 requires.
-    const int d0 = tid * 8;
+    // V2: two independent 128-wide halves. Thread tid owns four dims per half
+    // at d = half*128 + tid*4 + {0,1,2,3} — layout shared with tile writers.
     float global_sum = 0.0f;
     float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -78,20 +72,31 @@ __global__ void attention_flash_lloyd_reduce(
         // Exact: no running corrections, no compounding error.
         float corr = expf(tile_max - global_max);
         #pragma unroll
-        for (int i = 0; i < 8; i++)
-            g[i] += p[2 + d0 + i] * corr;
+        for (int half = 0; half < 2; half++) {
+            const int d = half * 128 + tid * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                g[half * 4 + i] += p[2 + d + i] * corr;
+        }
         global_sum += tile_sum * corr;
     }
 
     float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
 
-    // g is the cross-tile-combined accumulator in ROTATED space. Undo the
-    // FWHT once (cooperatively across all 32 lanes), then normalize.
-    fwht_shfl_inverse_256(g[0], g[1], g[2], g[3],
-                          g[4], g[5], g[6], g[7],
-                          signs1, signs2, tid);
-
+    // g is the cross-tile-combined accumulator in ROTATED space. Undo each
+    // half's FWHT-128 independently (cooperatively across 32 lanes), then
+    // normalize. signs1/signs2[0..127] shared by both halves.
     #pragma unroll
-    for (int i = 0; i < 8; i++)
-        out[h * head_dim + d0 + i] = g[i] * inv_sum;
+    for (int half = 0; half < 2; half++) {
+        float a = g[half * 4 + 0];
+        float b = g[half * 4 + 1];
+        float c = g[half * 4 + 2];
+        float dv = g[half * 4 + 3];
+        fwht_shfl_inverse(a, b, c, dv, signs1, signs2, tid);
+        const int d0 = half * 128 + tid * 4;
+        out[h * head_dim + d0 + 0] = a * inv_sum;
+        out[h * head_dim + d0 + 1] = b * inv_sum;
+        out[h * head_dim + d0 + 2] = c * inv_sum;
+        out[h * head_dim + d0 + 3] = dv * inv_sum;
+    }
 }

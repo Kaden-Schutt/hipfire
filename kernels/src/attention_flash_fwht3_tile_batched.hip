@@ -2,9 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched flash attention tile — fwht3 KV (K FWHT-rotated 3-bit; V at Q8_0
-// OR lloyd3 FWHT-rotated centroid, gated by v_mode).
-// Single-pass 256-element signed-FWHT on Q to match the K-write rotation.
+// Batched flash attention tile — fwht3 KV V2 (K two-half FWHT-128 3-bit;
+// V at Q8_0 OR two-half lloyd2/3/4, gated by v_mode).
 // Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
 //
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
@@ -33,7 +32,7 @@ __global__ void attention_flash_fwht3_tile_batched(
     int batch_offset,
     int block_start,
     int block_cols,
-    int v_mode          // 8 = legacy Q8_0 V; 3 = lloyd3 FWHT-rotated centroid V
+    int v_mode          // 8 = legacy Q8_0 V; 2/3/4 = two-half lloyd FWHT-rotated centroid V
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -68,30 +67,39 @@ __global__ void attention_flash_fwht3_tile_batched(
     float* scores = sdata;
 
     const float* q_head = q + local_bid * q_dim + h * head_dim;
-    const int d0 = tid * 8;
-    float mq0 = q_head[d0 + 0], mq1 = q_head[d0 + 1];
-    float mq2 = q_head[d0 + 2], mq3 = q_head[d0 + 3];
-    float mq4 = q_head[d0 + 4], mq5 = q_head[d0 + 5];
-    float mq6 = q_head[d0 + 6], mq7 = q_head[d0 + 7];
+    float mq[8];
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int d0 = half * 128 + tid * 4;
+        float a = q_head[d0 + 0];
+        float b = q_head[d0 + 1];
+        float c = q_head[d0 + 2];
+        float d = q_head[d0 + 3];
+        fwht_shfl_forward(a, b, c, d, signs1, signs2, tid);
+        mq[half * 4 + 0] = a;
+        mq[half * 4 + 1] = b;
+        mq[half * 4 + 2] = c;
+        mq[half * 4 + 3] = d;
+    }
 
-    fwht_shfl_forward_256(mq0, mq1, mq2, mq3, mq4, mq5, mq6, mq7, signs1, signs2, tid);
-
+    // Phase A: Q·K V2 — two fp16 cnorms; 24-bit pack = half0-four then half1-four.
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
+        const float cn0 = (float)((const _Float16*)kb)[0];
+        const float cn1 = (float)((const _Float16*)kb)[1];
         const unsigned char* base = kb + 4 + tid * 3;
         unsigned int packed = (unsigned int)base[0]
                             | ((unsigned int)base[1] << 8)
                             | ((unsigned int)base[2] << 16);
-        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
-                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
-                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
-                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
-                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
-                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
-                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
-                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        float partial = mq[0] * (cn0 * TURBO_C3[ packed        & 7])
+                      + mq[1] * (cn0 * TURBO_C3[(packed >> 3)  & 7])
+                      + mq[2] * (cn0 * TURBO_C3[(packed >> 6)  & 7])
+                      + mq[3] * (cn0 * TURBO_C3[(packed >> 9)  & 7])
+                      + mq[4] * (cn1 * TURBO_C3[(packed >> 12) & 7])
+                      + mq[5] * (cn1 * TURBO_C3[(packed >> 15) & 7])
+                      + mq[6] * (cn1 * TURBO_C3[(packed >> 18) & 7])
+                      + mq[7] * (cn1 * TURBO_C3[(packed >> 21) & 7]);
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0) {
@@ -122,9 +130,17 @@ __global__ void attention_flash_fwht3_tile_batched(
     float tile_sum = local_sum;
     __syncthreads();
 
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                        + tile_id * (2 + head_dim);
+    if (tid == 0) {
+        p[0] = tile_max;
+        p[1] = tile_sum;
+    }
+
     if (v_mode == 8) {
         // Legacy Q8_0 V (normal space) — unchanged behavior.
+        const int d0 = tid * 8;
+        float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         const int v_blocks_per_head = head_dim / 32;
         const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
         const int v_kv_head_blk     = kv_h * v_blocks_per_head;
@@ -144,9 +160,80 @@ __global__ void attention_flash_fwht3_tile_batched(
                 out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
             }
         }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            p[2 + d0 + i] = out_vec[i];
+        }
+    } else if (v_mode == 3) {
+        // Dedicated TURBO_C3 four-token-unrolled Lloyd3 V (no dynamic bit-width branch).
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        const int v_bytes_per_head = 4 + (head_dim * 3) / 8;
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        int tv = 0;
+        for (; tv + 3 < tile_len; tv += 4) {
+            float w0 = scores[tv + 0], w1 = scores[tv + 1];
+            float w2 = scores[tv + 2], w3 = scores[tv + 3];
+            const unsigned char* vb0 = v_cache + (size_t)(tile_start + tv + 0) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb1 = v_cache + (size_t)(tile_start + tv + 1) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb2 = v_cache + (size_t)(tile_start + tv + 2) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb3 = v_cache + (size_t)(tile_start + tv + 3) * v_bytes_per_pos + v_head_off;
+            float c00 = (float)((const _Float16*)vb0)[0], c01 = (float)((const _Float16*)vb0)[1];
+            float c10 = (float)((const _Float16*)vb1)[0], c11 = (float)((const _Float16*)vb1)[1];
+            float c20 = (float)((const _Float16*)vb2)[0], c21 = (float)((const _Float16*)vb2)[1];
+            float c30 = (float)((const _Float16*)vb3)[0], c31 = (float)((const _Float16*)vb3)[1];
+            const unsigned char* base0 = vb0 + 4 + tid * 3;
+            const unsigned char* base1 = vb1 + 4 + tid * 3;
+            const unsigned char* base2 = vb2 + 4 + tid * 3;
+            const unsigned char* base3 = vb3 + 4 + tid * 3;
+            unsigned int pk0 = (unsigned int)base0[0] | ((unsigned int)base0[1] << 8) | ((unsigned int)base0[2] << 16);
+            unsigned int pk1 = (unsigned int)base1[0] | ((unsigned int)base1[1] << 8) | ((unsigned int)base1[2] << 16);
+            unsigned int pk2 = (unsigned int)base2[0] | ((unsigned int)base2[1] << 8) | ((unsigned int)base2[2] << 16);
+            unsigned int pk3 = (unsigned int)base3[0] | ((unsigned int)base3[1] << 8) | ((unsigned int)base3[2] << 16);
+            #define ACC3(W, CN0, CN1, PK) do { \
+                ov[0] += (W) * ((CN0) * TURBO_C3[(PK)        & 7]); \
+                ov[1] += (W) * ((CN0) * TURBO_C3[((PK) >> 3)  & 7]); \
+                ov[2] += (W) * ((CN0) * TURBO_C3[((PK) >> 6)  & 7]); \
+                ov[3] += (W) * ((CN0) * TURBO_C3[((PK) >> 9)  & 7]); \
+                ov[4] += (W) * ((CN1) * TURBO_C3[((PK) >> 12) & 7]); \
+                ov[5] += (W) * ((CN1) * TURBO_C3[((PK) >> 15) & 7]); \
+                ov[6] += (W) * ((CN1) * TURBO_C3[((PK) >> 18) & 7]); \
+                ov[7] += (W) * ((CN1) * TURBO_C3[((PK) >> 21) & 7]); \
+            } while (0)
+            ACC3(w0, c00, c01, pk0);
+            ACC3(w1, c10, c11, pk1);
+            ACC3(w2, c20, c21, pk2);
+            ACC3(w3, c30, c31, pk3);
+            #undef ACC3
+        }
+        for (; tv < tile_len; tv++) {
+            float w = scores[tv];
+            const unsigned char* vb = v_cache + (size_t)(tile_start + tv) * v_bytes_per_pos + v_head_off;
+            const float cn0 = (float)((const _Float16*)vb)[0];
+            const float cn1 = (float)((const _Float16*)vb)[1];
+            const unsigned char* base = vb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            ov[0] += w * (cn0 * TURBO_C3[ packed        & 7]);
+            ov[1] += w * (cn0 * TURBO_C3[(packed >> 3)  & 7]);
+            ov[2] += w * (cn0 * TURBO_C3[(packed >> 6)  & 7]);
+            ov[3] += w * (cn0 * TURBO_C3[(packed >> 9)  & 7]);
+            ov[4] += w * (cn1 * TURBO_C3[(packed >> 12) & 7]);
+            ov[5] += w * (cn1 * TURBO_C3[(packed >> 15) & 7]);
+            ov[6] += w * (cn1 * TURBO_C3[(packed >> 18) & 7]);
+            ov[7] += w * (cn1 * TURBO_C3[(packed >> 21) & 7]);
+        }
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int d_base = half * 128 + tid * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                p[2 + d_base + i] = ov[half * 4 + i];
+        }
     } else {
-        // lloyd2/3/4: 256-wide FWHT-rotated centroid V. v_mode = bit width.
-        // Layout: 4B cnorm + (tid * v_mode) bytes packed (8 indices, LSB-first, i*v_mode shift).
+        // lloyd2/4: two-half V2; one-token-at-a-time ok for this screen.
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
         const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
         const int v_head_off       = kv_h * v_bytes_per_head;
@@ -154,35 +241,33 @@ __global__ void attention_flash_fwht3_tile_batched(
             float w = scores[t_local];
             int t = tile_start + t_local;
             const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
-            float cnorm = *(const float*)vb;
-            const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
+            const float cn_h0 = (float)((const _Float16*)vb)[0];
+            const float cn_h1 = (float)((const _Float16*)vb)[1];
+            const unsigned char* base = vb + 4 + tid * v_mode;
             unsigned int packed = (unsigned int)base[0];
             if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
             if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
             if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
             #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                float c;
-                if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
-                else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
-                else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
-                out_vec[i] += w * (cnorm * c);
+            for (int half = 0; half < 2; half++) {
+                const float cnorm = (half == 0) ? cn_h0 : cn_h1;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const int idx = half * 4 + i;
+                    const int shift = idx * v_mode;
+                    float c = (v_mode == 2)
+                        ? TURBO_C2[(packed >> shift) & 3]
+                        : TURBO_C4[(packed >> shift) & 15];
+                    ov[idx] += w * (cnorm * c);
+                }
             }
         }
-        // V accumulated in ROTATED space (out_vec ≈ H·Σw·v). The inverse FWHT
-        // is deferred to the dedicated lloyd reduce kernel, which applies it
-        // once after the cross-tile combine (inverse is linear, so it commutes
-        // with the weighted-sum + scalar normalize the reduce performs).
-    }
-
-    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
-                        + tile_id * (2 + head_dim);
-    if (tid == 0) {
-        p[0] = tile_max;
-        p[1] = tile_sum;
-    }
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        p[2 + d0 + i] = out_vec[i];
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int d_base = half * 128 + tid * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                p[2 + d_base + i] = ov[half * 4 + i];
+        }
     }
 }

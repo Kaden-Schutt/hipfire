@@ -2,13 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// 256-wide V write at 2-bit: signed-FWHT-256 rotation + 2-bit quantize (Lloyd-Max N(0, 1/256)).
-// Identical rotation layout to kv_cache_write_asym_k_fwht3 (8 dims/thread, tid*8); only the
-// quant fn (turbo_quantize_2bit_256), centroid LUT (TURBO_C2_256), bytes_per_head, and packing
-// width differ. This matches the 256-wide fwht3 attention kernel's rotation so V can be read back
-// under fwht3 K.
+// V2 Lloyd2 V write: two independent 128-wide halves (signed-FWHT-128 + 2-bit
+// Lloyd-Max N(0, 1/128)). Each half is L2-normalized, FWHT'd with shared
+// signs1/signs2[0..127], and quantized with TURBO_C2 / turbo_quantize_2bit.
+// Header is two IEEE fp16 cnorms (half0 at bytes 0..1, half1 at 2..3) with
+// cnorm_h = orig_half_norm / recon_centroid_half_norm.
 //
-// Byte layout: [4B cnorm][32 threads × 2 bytes packed 2-bit indices] = 68 B/head at head_dim=256.
+// Byte layout: [2×fp16 cnorm][32 threads × 2 bytes packed 2-bit indices] =
+// 68 B/head at head_dim=256. Each lane packs four half-0 indices (low bits)
+// then four half-1 indices into its 2 payload bytes.
 //
 // Grid: [n_kv_heads]. Block: [32]. LDS: (head_dim + 32) * 4 bytes.
 #include <hip/hip_runtime.h>
@@ -41,47 +43,60 @@ extern "C" __global__ void kv_cache_write_fwht256_2bit(
     for (int d = tid; d < head_dim; d += nthreads) x[d] = src[d];
     __syncthreads();
 
-    float lsq = 0.0f;
-    for (int d = tid; d < head_dim; d += nthreads) lsq += x[d] * x[d];
-    scratch[tid] = lsq;
-    __syncthreads();
-    for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
-    float orig_norm = sqrtf(scratch[0]);
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
-
-    for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_norm;
-    __syncthreads();
-
-    // Each thread handles 8 consecutive dims = tid*8 .. tid*8+7.
-    const int d0 = tid * 8;
-    float v0 = x[d0 + 0], v1 = x[d0 + 1];
-    float v2 = x[d0 + 2], v3 = x[d0 + 3];
-    float v4 = x[d0 + 4], v5 = x[d0 + 5];
-    float v6 = x[d0 + 6], v7 = x[d0 + 7];
-
-    // Single-pass signed-FWHT over the full 256 dims.
-    fwht_shfl_forward_256(v0, v1, v2, v3, v4, v5, v6, v7, signs1, signs2, tid);
-
     int idx[8];
-    idx[0] = turbo_quantize_2bit_256(v0);
-    idx[1] = turbo_quantize_2bit_256(v1);
-    idx[2] = turbo_quantize_2bit_256(v2);
-    idx[3] = turbo_quantize_2bit_256(v3);
-    idx[4] = turbo_quantize_2bit_256(v4);
-    idx[5] = turbo_quantize_2bit_256(v5);
-    idx[6] = turbo_quantize_2bit_256(v6);
-    idx[7] = turbo_quantize_2bit_256(v7);
+    float cnorm_h[2];
 
-    float local_rsq = 0.0f;
-    for (int i = 0; i < 8; i++) local_rsq += TURBO_C2_256[idx[i]] * TURBO_C2_256[idx[i]];
+    // Two independent 128-wide halves: L2 → FWHT-128 → 2-bit quantize.
+    for (int half = 0; half < 2; half++) {
+        const int base = half * 128;
+        const int d0 = base + tid * 4;
 
-    scratch[tid] = local_rsq;
-    __syncthreads();
-    for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
-    float recon_norm = sqrtf(scratch[0]);
-    float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
-    if (tid == 0) *(float*)out = cnorm;
+        float lsq = 0.0f;
+        float v0 = x[d0 + 0], v1 = x[d0 + 1], v2 = x[d0 + 2], v3 = x[d0 + 3];
+        lsq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+        scratch[tid] = lsq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        float orig_norm = sqrtf(scratch[0]);
+        float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
 
+        float fa = v0 * inv_norm, fb = v1 * inv_norm;
+        float fc = v2 * inv_norm, fd = v3 * inv_norm;
+        fwht_shfl_forward(fa, fb, fc, fd, signs1, signs2, tid);
+
+        int i0 = half * 4 + 0;
+        int i1 = half * 4 + 1;
+        int i2 = half * 4 + 2;
+        int i3 = half * 4 + 3;
+        idx[i0] = turbo_quantize_2bit(fa);
+        idx[i1] = turbo_quantize_2bit(fb);
+        idx[i2] = turbo_quantize_2bit(fc);
+        idx[i3] = turbo_quantize_2bit(fd);
+
+        float local_rsq =
+            TURBO_C2[idx[i0]] * TURBO_C2[idx[i0]] +
+            TURBO_C2[idx[i1]] * TURBO_C2[idx[i1]] +
+            TURBO_C2[idx[i2]] * TURBO_C2[idx[i2]] +
+            TURBO_C2[idx[i3]] * TURBO_C2[idx[i3]];
+        scratch[tid] = local_rsq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        float recon_norm = sqrtf(scratch[0]);
+        cnorm_h[half] = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+    }
+
+    if (tid == 0) {
+        ((__half*)out)[0] = __float2half(cnorm_h[0]);
+        ((__half*)out)[1] = __float2half(cnorm_h[1]);
+    }
+
+    // Pack half0's four indices first, then half1's four into 2 bytes/lane.
     unsigned int packed = 0;
     for (int i = 0; i < 8; i++) packed |= ((unsigned int)(idx[i] & 3)) << (i * 2);
     unsigned char* base = out + 4 + tid * 2;

@@ -2,11 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched 256-wide V write at 4-bit: signed-FWHT-256 + 4-bit quantize.
-// Processes N positions in one launch. Identical rotation layout to
-// kv_cache_write_asym_k_fwht3_batched; only quant fn / LUT / bytes_per_head / packing differ.
+// Batched V2 Lloyd4 V write: two independent 128-wide halves (signed-FWHT-128
+// + 4-bit Lloyd-Max N(0, 1/128)). Processes N positions in one launch.
+// Identical format to kv_cache_write_fwht256_4bit: two fp16 cnorms, half0
+// indices then half1 indices per lane.
 //
-// Byte layout: [4B cnorm][32 threads × 4 bytes packed 4-bit indices] = 132 B/head at head_dim=256.
+// Byte layout: [2×fp16 cnorm][32 threads × 4 bytes packed 4-bit indices] =
+// 132 B/head at head_dim=256.
 //
 // Grid: [n_kv_heads, batch_size, 1]. Block: [32, 1, 1].
 // LDS: (head_dim + 32) * 4 bytes.
@@ -41,50 +43,63 @@ extern "C" __global__ void kv_cache_write_fwht256_4bit_batched(
     for (int d = tid; d < head_dim; d += 32) x[d] = head_src[d];
     __syncthreads();
 
-    float lsq = 0.0f;
-    for (int d = tid; d < head_dim; d += 32) lsq += x[d] * x[d];
-    scratch[tid] = lsq;
-    __syncthreads();
-    for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
-    float orig_norm = sqrtf(scratch[0]);
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
-    for (int d = tid; d < head_dim; d += 32) x[d] *= inv_norm;
-    __syncthreads();
-
-    const int d0 = tid * 8;
-    float v0 = x[d0 + 0], v1 = x[d0 + 1];
-    float v2 = x[d0 + 2], v3 = x[d0 + 3];
-    float v4 = x[d0 + 4], v5 = x[d0 + 5];
-    float v6 = x[d0 + 6], v7 = x[d0 + 7];
-
-    fwht_shfl_forward_256(v0, v1, v2, v3, v4, v5, v6, v7, signs1, signs2, tid);
-
     int idx[8];
-    idx[0] = turbo_quantize_4bit_256(v0);
-    idx[1] = turbo_quantize_4bit_256(v1);
-    idx[2] = turbo_quantize_4bit_256(v2);
-    idx[3] = turbo_quantize_4bit_256(v3);
-    idx[4] = turbo_quantize_4bit_256(v4);
-    idx[5] = turbo_quantize_4bit_256(v5);
-    idx[6] = turbo_quantize_4bit_256(v6);
-    idx[7] = turbo_quantize_4bit_256(v7);
+    float cnorm_h[2];
 
-    float local_rsq = 0.0f;
-    for (int i = 0; i < 8; i++) local_rsq += TURBO_C4_256[idx[i]] * TURBO_C4_256[idx[i]];
+    for (int half = 0; half < 2; half++) {
+        const int base = half * 128;
+        const int d0 = base + tid * 4;
 
-    scratch[tid] = local_rsq;
-    __syncthreads();
-    for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
-    float recon_norm = sqrtf(scratch[0]);
-    float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+        float lsq = 0.0f;
+        float v0 = x[d0 + 0], v1 = x[d0 + 1], v2 = x[d0 + 2], v3 = x[d0 + 3];
+        lsq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+        scratch[tid] = lsq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        float orig_norm = sqrtf(scratch[0]);
+        float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+
+        float fa = v0 * inv_norm, fb = v1 * inv_norm;
+        float fc = v2 * inv_norm, fd = v3 * inv_norm;
+        fwht_shfl_forward(fa, fb, fc, fd, signs1, signs2, tid);
+
+        int i0 = half * 4 + 0;
+        int i1 = half * 4 + 1;
+        int i2 = half * 4 + 2;
+        int i3 = half * 4 + 3;
+        idx[i0] = turbo_quantize_4bit(fa);
+        idx[i1] = turbo_quantize_4bit(fb);
+        idx[i2] = turbo_quantize_4bit(fc);
+        idx[i3] = turbo_quantize_4bit(fd);
+
+        float local_rsq =
+            TURBO_C4[idx[i0]] * TURBO_C4[idx[i0]] +
+            TURBO_C4[idx[i1]] * TURBO_C4[idx[i1]] +
+            TURBO_C4[idx[i2]] * TURBO_C4[idx[i2]] +
+            TURBO_C4[idx[i3]] * TURBO_C4[idx[i3]];
+        scratch[tid] = local_rsq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        float recon_norm = sqrtf(scratch[0]);
+        cnorm_h[half] = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+    }
 
     unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
-    if (tid == 0) *(float*)out = cnorm;
+    if (tid == 0) {
+        ((__half*)out)[0] = __float2half(cnorm_h[0]);
+        ((__half*)out)[1] = __float2half(cnorm_h[1]);
+    }
 
     unsigned int packed = 0;
     for (int i = 0; i < 8; i++) packed |= ((unsigned int)(idx[i] & 15)) << (i * 4);
     unsigned char* base = out + 4 + tid * 4;
-    base[0] = (unsigned char)(packed       & 0xFF);
+    base[0] = (unsigned char)(packed        & 0xFF);
     base[1] = (unsigned char)((packed >> 8)  & 0xFF);
     base[2] = (unsigned char)((packed >> 16) & 0xFF);
     base[3] = (unsigned char)((packed >> 24) & 0xFF);

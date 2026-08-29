@@ -2,15 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Flash attention tile — fwht3 KV: K at FWHT-256 rotated 3-bit; V at Q8_0 OR
-// lloyd3 FWHT-rotated centroid (normal space), gated by v_mode.
+// Flash attention tile — fwht3 KV V2: K at two independent FWHT-128 3-bit
+// halves; V at Q8_0 OR two-half lloyd2/3/4 FWHT-rotated centroid, gated by
+// v_mode.
 //
-// Single-pass 256-element signed-FWHT on Q to match the K-write rotation.
-// K cache byte-identical to asym3 (4B cnorm + 32 threads × 3 bytes packed 3-bit).
+// V2 header: two IEEE fp16 cnorms (bytes 0..1 half0, 2..3 half1).
+// Per-lane 24-bit K payload: four half-0 indices then four half-1 indices.
+// Lloyd rotated-V partials at half*128 + tid*4 + i.
 //
-// Tuned for head_dim=256 (Qwen 3.5): 32 threads × 8 values = 256 dims single pass.
-// Reduce works as-is for V at Q8_0 OR lloyd3 FWHT-rotated centroid, gated by
-// v_mode (lloyd3 V is tail-inverted per tile, so partials stay normal-space).
+// Tuned for head_dim=256 (Qwen 3.5): 32 threads × 4 values × 2 halves.
 //
 // Grid: [n_heads, n_tiles, 1]. Block: [32, 1, 1]. LDS: tile_size * 4.
 #include <hip/hip_runtime.h>
@@ -32,7 +32,7 @@ __global__ void attention_flash_fwht3_tile(
     float scale_attn,
     int tile_size,
     int max_tiles,
-    int v_mode          // 8 = legacy Q8_0 V; 3 = lloyd3 FWHT-rotated centroid V
+    int v_mode          // 8 = legacy Q8_0 V; 2/3/4 = two-half lloyd FWHT-rotated centroid V
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -54,27 +54,37 @@ __global__ void attention_flash_fwht3_tile(
     extern __shared__ float sdata[];
     float* scores = sdata;
 
-    // Load Q (8 values per thread) + signed-FWHT-256 forward.
+    // Load Q (4 values per half) + two independent signed-FWHT-128 forwards.
     const float* q_head = q + h * head_dim;
-    const int d0 = tid * 8;
-    float mq0 = q_head[d0 + 0], mq1 = q_head[d0 + 1];
-    float mq2 = q_head[d0 + 2], mq3 = q_head[d0 + 3];
-    float mq4 = q_head[d0 + 4], mq5 = q_head[d0 + 5];
-    float mq6 = q_head[d0 + 6], mq7 = q_head[d0 + 7];
+    float mq[8];
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int d0 = half * 128 + tid * 4;
+        float a = q_head[d0 + 0];
+        float b = q_head[d0 + 1];
+        float c = q_head[d0 + 2];
+        float d = q_head[d0 + 3];
+        fwht_shfl_forward(a, b, c, d, signs1, signs2, tid);
+        mq[half * 4 + 0] = a;
+        mq[half * 4 + 1] = b;
+        mq[half * 4 + 2] = c;
+        mq[half * 4 + 3] = d;
+    }
 
-    fwht_shfl_forward_256(mq0, mq1, mq2, mq3, mq4, mq5, mq6, mq7, signs1, signs2, tid);
-
-    // Phase A: Q·K (3-bit K). Keep four token dots independent so global-load
+    // Phase A: Q·K (3-bit K, V2). Keep four token dots independent so global-load
     // latency and the five shuffle-reduction steps can overlap, matching the
     // scheduling shape of the tuned Q8 flash tile.
+    // Pack order: four half-0 3-bit indices (bits 0..11), then four half-1 (12..23).
     int t_local = 0;
     for (; t_local + 3 < tile_len; t_local += 4) {
         const unsigned char* kb0 = k_cache + (size_t)(tile_start + t_local + 0) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb1 = k_cache + (size_t)(tile_start + t_local + 1) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb2 = k_cache + (size_t)(tile_start + t_local + 2) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb3 = k_cache + (size_t)(tile_start + t_local + 3) * k_bytes_per_pos + k_head_off;
-        float cn0 = *(const float*)kb0, cn1 = *(const float*)kb1;
-        float cn2 = *(const float*)kb2, cn3 = *(const float*)kb3;
+        float cn0_0 = (float)((const _Float16*)kb0)[0], cn0_1 = (float)((const _Float16*)kb0)[1];
+        float cn1_0 = (float)((const _Float16*)kb1)[0], cn1_1 = (float)((const _Float16*)kb1)[1];
+        float cn2_0 = (float)((const _Float16*)kb2)[0], cn2_1 = (float)((const _Float16*)kb2)[1];
+        float cn3_0 = (float)((const _Float16*)kb3)[0], cn3_1 = (float)((const _Float16*)kb3)[1];
         const unsigned char* b0 = kb0 + 4 + tid * 3;
         const unsigned char* b1 = kb1 + 4 + tid * 3;
         const unsigned char* b2 = kb2 + 4 + tid * 3;
@@ -83,19 +93,19 @@ __global__ void attention_flash_fwht3_tile(
         unsigned int pk1 = (unsigned int)b1[0] | ((unsigned int)b1[1] << 8) | ((unsigned int)b1[2] << 16);
         unsigned int pk2 = (unsigned int)b2[0] | ((unsigned int)b2[1] << 8) | ((unsigned int)b2[2] << 16);
         unsigned int pk3 = (unsigned int)b3[0] | ((unsigned int)b3[1] << 8) | ((unsigned int)b3[2] << 16);
-        #define DOT3(CN, PK) ( \
-            mq0 * ((CN) * TURBO_C3_256[(PK)        & 7]) \
-          + mq1 * ((CN) * TURBO_C3_256[((PK) >> 3)  & 7]) \
-          + mq2 * ((CN) * TURBO_C3_256[((PK) >> 6)  & 7]) \
-          + mq3 * ((CN) * TURBO_C3_256[((PK) >> 9)  & 7]) \
-          + mq4 * ((CN) * TURBO_C3_256[((PK) >> 12) & 7]) \
-          + mq5 * ((CN) * TURBO_C3_256[((PK) >> 15) & 7]) \
-          + mq6 * ((CN) * TURBO_C3_256[((PK) >> 18) & 7]) \
-          + mq7 * ((CN) * TURBO_C3_256[((PK) >> 21) & 7]))
-        float partial0 = DOT3(cn0, pk0);
-        float partial1 = DOT3(cn1, pk1);
-        float partial2 = DOT3(cn2, pk2);
-        float partial3 = DOT3(cn3, pk3);
+        #define DOT3(CN0, CN1, PK) ( \
+            mq[0] * ((CN0) * TURBO_C3[(PK)        & 7]) \
+          + mq[1] * ((CN0) * TURBO_C3[((PK) >> 3)  & 7]) \
+          + mq[2] * ((CN0) * TURBO_C3[((PK) >> 6)  & 7]) \
+          + mq[3] * ((CN0) * TURBO_C3[((PK) >> 9)  & 7]) \
+          + mq[4] * ((CN1) * TURBO_C3[((PK) >> 12) & 7]) \
+          + mq[5] * ((CN1) * TURBO_C3[((PK) >> 15) & 7]) \
+          + mq[6] * ((CN1) * TURBO_C3[((PK) >> 18) & 7]) \
+          + mq[7] * ((CN1) * TURBO_C3[((PK) >> 21) & 7]))
+        float partial0 = DOT3(cn0_0, cn0_1, pk0);
+        float partial1 = DOT3(cn1_0, cn1_1, pk1);
+        float partial2 = DOT3(cn2_0, cn2_1, pk2);
+        float partial3 = DOT3(cn3_0, cn3_1, pk3);
         for (int off = 16; off > 0; off >>= 1) {
             partial0 += __shfl_xor(partial0, off);
             partial1 += __shfl_xor(partial1, off);
@@ -113,19 +123,20 @@ __global__ void attention_flash_fwht3_tile(
     for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
+        const float cn0 = (float)((const _Float16*)kb)[0];
+        const float cn1 = (float)((const _Float16*)kb)[1];
         const unsigned char* base = kb + 4 + tid * 3;
         unsigned int packed = (unsigned int)base[0]
                             | ((unsigned int)base[1] << 8)
                             | ((unsigned int)base[2] << 16);
-        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
-                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
-                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
-                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
-                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
-                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
-                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
-                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        float partial = mq[0] * (cn0 * TURBO_C3[ packed        & 7])
+                      + mq[1] * (cn0 * TURBO_C3[(packed >> 3)  & 7])
+                      + mq[2] * (cn0 * TURBO_C3[(packed >> 6)  & 7])
+                      + mq[3] * (cn0 * TURBO_C3[(packed >> 9)  & 7])
+                      + mq[4] * (cn1 * TURBO_C3[(packed >> 12) & 7])
+                      + mq[5] * (cn1 * TURBO_C3[(packed >> 15) & 7])
+                      + mq[6] * (cn1 * TURBO_C3[(packed >> 18) & 7])
+                      + mq[7] * (cn1 * TURBO_C3[(packed >> 21) & 7]);
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
@@ -153,10 +164,17 @@ __global__ void attention_flash_fwht3_tile(
     float tile_sum = local_sum;
     __syncthreads();
 
-    // Phase D: V — 8 output dims per thread (thread tid owns dims d0..d0+7).
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    // Phase D: V — Q8 unchanged (tid*8 contiguous); Lloyd two-half layout.
+    float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+    if (tid == 0) {
+        p[0] = tile_max;
+        p[1] = tile_sum;
+    }
+
     if (v_mode == 8) {
         // Legacy Q8_0 V (normal space) — unchanged behavior.
+        const int d0 = tid * 8;
+        float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         const int v_blocks_per_head = head_dim / 32;
         const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
         const int v_kv_head_blk     = kv_h * v_blocks_per_head;
@@ -202,9 +220,83 @@ __global__ void attention_flash_fwht3_tile(
                 out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
             }
         }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            p[2 + d0 + i] = out_vec[i];
+        }
+    } else if (v_mode == 3) {
+        // Dedicated TURBO_C3 four-token-unrolled Lloyd3 V (no dynamic bit-width branch).
+        // Pack: four half-0 indices then four half-1 into 24-bit per-lane payload.
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        const int v_bytes_per_head = 4 + (head_dim * 3) / 8;
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        int tv = 0;
+        for (; tv + 3 < tile_len; tv += 4) {
+            float w0 = scores[tv + 0], w1 = scores[tv + 1];
+            float w2 = scores[tv + 2], w3 = scores[tv + 3];
+            const unsigned char* vb0 = v_cache + (size_t)(tile_start + tv + 0) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb1 = v_cache + (size_t)(tile_start + tv + 1) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb2 = v_cache + (size_t)(tile_start + tv + 2) * v_bytes_per_pos + v_head_off;
+            const unsigned char* vb3 = v_cache + (size_t)(tile_start + tv + 3) * v_bytes_per_pos + v_head_off;
+            float c00 = (float)((const _Float16*)vb0)[0], c01 = (float)((const _Float16*)vb0)[1];
+            float c10 = (float)((const _Float16*)vb1)[0], c11 = (float)((const _Float16*)vb1)[1];
+            float c20 = (float)((const _Float16*)vb2)[0], c21 = (float)((const _Float16*)vb2)[1];
+            float c30 = (float)((const _Float16*)vb3)[0], c31 = (float)((const _Float16*)vb3)[1];
+            const unsigned char* base0 = vb0 + 4 + tid * 3;
+            const unsigned char* base1 = vb1 + 4 + tid * 3;
+            const unsigned char* base2 = vb2 + 4 + tid * 3;
+            const unsigned char* base3 = vb3 + 4 + tid * 3;
+            unsigned int pk0 = (unsigned int)base0[0] | ((unsigned int)base0[1] << 8) | ((unsigned int)base0[2] << 16);
+            unsigned int pk1 = (unsigned int)base1[0] | ((unsigned int)base1[1] << 8) | ((unsigned int)base1[2] << 16);
+            unsigned int pk2 = (unsigned int)base2[0] | ((unsigned int)base2[1] << 8) | ((unsigned int)base2[2] << 16);
+            unsigned int pk3 = (unsigned int)base3[0] | ((unsigned int)base3[1] << 8) | ((unsigned int)base3[2] << 16);
+            #define ACC3(W, CN0, CN1, PK) do { \
+                ov[0] += (W) * ((CN0) * TURBO_C3[(PK)        & 7]); \
+                ov[1] += (W) * ((CN0) * TURBO_C3[((PK) >> 3)  & 7]); \
+                ov[2] += (W) * ((CN0) * TURBO_C3[((PK) >> 6)  & 7]); \
+                ov[3] += (W) * ((CN0) * TURBO_C3[((PK) >> 9)  & 7]); \
+                ov[4] += (W) * ((CN1) * TURBO_C3[((PK) >> 12) & 7]); \
+                ov[5] += (W) * ((CN1) * TURBO_C3[((PK) >> 15) & 7]); \
+                ov[6] += (W) * ((CN1) * TURBO_C3[((PK) >> 18) & 7]); \
+                ov[7] += (W) * ((CN1) * TURBO_C3[((PK) >> 21) & 7]); \
+            } while (0)
+            ACC3(w0, c00, c01, pk0);
+            ACC3(w1, c10, c11, pk1);
+            ACC3(w2, c20, c21, pk2);
+            ACC3(w3, c30, c31, pk3);
+            #undef ACC3
+        }
+        for (; tv < tile_len; tv++) {
+            float w = scores[tv];
+            const unsigned char* vb = v_cache + (size_t)(tile_start + tv) * v_bytes_per_pos + v_head_off;
+            const float cn0 = (float)((const _Float16*)vb)[0];
+            const float cn1 = (float)((const _Float16*)vb)[1];
+            const unsigned char* base = vb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            ov[0] += w * (cn0 * TURBO_C3[ packed        & 7]);
+            ov[1] += w * (cn0 * TURBO_C3[(packed >> 3)  & 7]);
+            ov[2] += w * (cn0 * TURBO_C3[(packed >> 6)  & 7]);
+            ov[3] += w * (cn0 * TURBO_C3[(packed >> 9)  & 7]);
+            ov[4] += w * (cn1 * TURBO_C3[(packed >> 12) & 7]);
+            ov[5] += w * (cn1 * TURBO_C3[(packed >> 15) & 7]);
+            ov[6] += w * (cn1 * TURBO_C3[(packed >> 18) & 7]);
+            ov[7] += w * (cn1 * TURBO_C3[(packed >> 21) & 7]);
+        }
+        // V accumulated in ROTATED space per half. Inverse deferred to lloyd reduce.
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int d_base = half * 128 + tid * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                p[2 + d_base + i] = ov[half * 4 + i];
+        }
     } else {
-        // lloyd2/3/4: 256-wide FWHT-rotated centroid V. v_mode = bit width.
-        // Layout: 4B cnorm + (tid * v_mode) bytes packed (8 indices, LSB-first, i*v_mode shift).
+        // lloyd2/4: two-half V2 format; one-token-at-a-time is fine for this screen.
+        // Bit order: four half-0 indices first, then four half-1 (shift = idx * v_mode).
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
         const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
         const int v_head_off       = kv_h * v_bytes_per_head;
@@ -212,34 +304,33 @@ __global__ void attention_flash_fwht3_tile(
             float w = scores[t_local];
             int t = tile_start + t_local;
             const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
-            float cnorm = *(const float*)vb;
-            const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
+            const float cn_h0 = (float)((const _Float16*)vb)[0];
+            const float cn_h1 = (float)((const _Float16*)vb)[1];
+            const unsigned char* base = vb + 4 + tid * v_mode;
             unsigned int packed = (unsigned int)base[0];
             if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
             if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
             if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
             #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                float c;
-                if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
-                else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
-                else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
-                out_vec[i] += w * (cnorm * c);
+            for (int half = 0; half < 2; half++) {
+                const float cnorm = (half == 0) ? cn_h0 : cn_h1;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const int idx = half * 4 + i;
+                    const int shift = idx * v_mode;
+                    float c = (v_mode == 2)
+                        ? TURBO_C2[(packed >> shift) & 3]
+                        : TURBO_C4[(packed >> shift) & 15];
+                    ov[idx] += w * (cnorm * c);
+                }
             }
         }
-        // V accumulated in ROTATED space (out_vec ≈ H·Σw·v). The inverse FWHT
-        // is deferred to the dedicated lloyd reduce kernel, which applies it
-        // once after the cross-tile combine (inverse is linear, so it commutes
-        // with the weighted-sum + scalar normalize the reduce performs).
-    }
-
-    float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
-    if (tid == 0) {
-        p[0] = tile_max;
-        p[1] = tile_sum;
-    }
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        p[2 + d0 + i] = out_vec[i];
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int d_base = half * 128 + tid * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                p[2 + d_base + i] = ov[half * 4 + i];
+        }
     }
 }
