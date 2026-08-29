@@ -20,12 +20,12 @@ Usage:
   # Or set GEMMA4_26B_MODEL to avoid repeating --model
   GEMMA4_26B_MODEL=/path/to/gemma-4-26B-A4B-it .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids-file /tmp/ids.txt --out findings/oracle_26b.json
 """
-import argparse, json, sys, os
+import argparse, json, sys, os, math
 
 MODEL = "/local/models/google/gemma-4-26B-A4B-it"
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", help="HF checkpoint path (overrides GEMMA4_26B_MODEL)")
     ap.add_argument("--ids", help="Comma-separated token IDs (e.g. 2,105,2364)")
@@ -37,8 +37,40 @@ def main():
         action="store_true",
         help="Also capture attention, dense-FFN, router, and MoE branch boundaries",
     )
+    ap.add_argument(
+        "--position",
+        type=int,
+        help="Absolute sequence position to capture (default: last position)",
+    )
+    return ap
 
-    args = ap.parse_args()
+
+def resolve_capture_position(position, n_ids):
+    capture_position = n_ids - 1 if position is None else position
+    if not 0 <= capture_position < n_ids:
+        raise ValueError(
+            f"capture position {capture_position} is outside sequence of length {n_ids}"
+        )
+    return capture_position
+
+
+def finite_round(value, decimals):
+    value = float(value)
+    return round(value, decimals) if math.isfinite(value) else None
+def format_stat(value, spec):
+    return "None" if value is None else format(value, spec)
+
+
+def tensor_at_position(tensor, position):
+    if tensor.ndim >= 3:
+        return tensor[0, position]
+    if tensor.ndim == 2:
+        return tensor[position]
+    return tensor
+
+
+def main():
+    args = build_parser().parse_args()
     # Resolve in precedence order: CLI, environment, historical default.
     model_path = args.model if args.model is not None else os.environ.get("GEMMA4_26B_MODEL", MODEL)
 
@@ -50,6 +82,10 @@ def main():
     else:
         print("Need --ids or --ids-file", file=sys.stderr)
         sys.exit(1)
+    try:
+        capture_position = resolve_capture_position(args.position, len(ids))
+    except ValueError as error:
+        ap.error(str(error))
 
     # Parse layers to dump
     if args.layers == "all":
@@ -77,20 +113,20 @@ def main():
           f"global_head_dim={text_config.global_head_dim} vocab={text_config.vocab_size} "
           f"moe={text_config.enable_moe_block} n_experts={text_config.num_experts} "
           f"top_k={text_config.top_k_experts}", file=sys.stderr)
-
     # Hook into model layers to capture intermediates.  Every record follows
-    # the same last-position schema as the layer_out/embedding_last records.
+    # the same position-indexed schema as the layer_out/embedding_last records.
     captured = {}
+
 
     def capture_tensor(key, tensor):
         t = tensor[0] if isinstance(tensor, tuple) else tensor
-        v = t.reshape(-1, t.shape[-1])[-1].detach().float()
+        v = tensor_at_position(t, capture_position).detach().float()
         captured[key] = {
-            "first8": [round(float(x), 5) for x in v[:8]],
-            "sum": round(float(v.sum()), 4),
-            "norm": round(float(v.norm()), 4),
-            "min": round(float(v.min()), 4),
-            "max": round(float(v.max()), 4),
+            "first8": [finite_round(x, 5) for x in v[:8]],
+            "sum": finite_round(v.sum(), 4),
+            "norm": finite_round(v.norm(), 4),
+            "min": finite_round(v.min(), 4),
+            "max": finite_round(v.max(), 4),
         }
 
     def make_hook(layer_idx, name):
@@ -161,13 +197,8 @@ def main():
 
     # Also capture embedding output
     def embed_hook(module, input, output):
-        # output is the embedded tensor [1, seq, hidden]
-        v = output[0, -1].detach().float() if isinstance(output, tuple) else output[0, -1].detach().float()
-        captured["embedding_last"] = {
-            "first8": [round(float(x), 5) for x in v[:8]],
-            "sum": round(float(v.sum()), 4),
-            "norm": round(float(v.norm()), 4),
-        }
+        # output is the embedded tensor [1, seq, hidden].
+        capture_tensor("embedding_last", output)
     hooks.append(model.model.language_model.embed_tokens.register_forward_hook(embed_hook))
 
     # Forward pass
@@ -180,8 +211,8 @@ def main():
     for h in hooks:
         h.remove()
 
-    # Collect results
-    logits = out.logits[0, -1].float()
+    # Collect results at the same absolute position used by the lowered dump.
+    logits = tensor_at_position(out.logits, capture_position).float()
 
     # Apply logit softcapping (Gemma4 does this inside the model, but verify)
     # model already applies it via Gemma4ForCausalLM → logit softcap
@@ -189,42 +220,58 @@ def main():
     result = {
         "model": model_path,
         "n_ids": len(ids),
+        "position": capture_position,
         "ids_first10": ids[:10],
-        "logits_top5": [[int(i), round(float(x), 4)] for i, x in zip(topi[:5].tolist(), topv[:5].tolist())],
-        "logit_argmax": int(topi[0]),
+        "logits_top5": [
+            [int(i), finite_round(x, 4)]
+            for i, x in zip(topi[:5].tolist(), topv[:5].tolist())
+        ],
+        "logit_argmax": (
+            int(topi[0]) if math.isfinite(float(topv[0])) else None
+        ),
         "captured": captured,
         "hidden_states_layers": [],
     }
 
-    # Also dump per-layer hidden states from the model's output_hidden_states
+    # Also dump per-layer hidden states from the model's output_hidden_states.
     for li, hs in enumerate(out.hidden_states):
-        v = hs[0, -1].float()
-        result["hidden_states_layers"].append({
-            "layer": li,  # 0 = embeddings, 1..n = after decoder layer i-1
-            "first8": [round(float(x), 5) for x in v[:8]],
-            "sum": round(float(v.sum()), 4),
-            "norm": round(float(v.norm()), 4),
-            "min": round(float(v.min()), 4),
-            "max": round(float(v.max()), 4),
-        })
+        v = tensor_at_position(hs, capture_position).float()
+        result["hidden_states_layers"].append(
+            {
+                "layer": li,  # 0 = embeddings, 1..n = after decoder layer i-1
+                "first8": [finite_round(x, 5) for x in v[:8]],
+                "sum": finite_round(v.sum(), 4),
+                "norm": finite_round(v.norm(), 4),
+                "min": finite_round(v.min(), 4),
+                "max": finite_round(v.max(), 4),
+            }
+        )
 
     if args.out:
-        json.dump(result, open(args.out, "w"), indent=2)
+        with open(args.out, "w") as output_file:
+            json.dump(result, output_file, indent=2, allow_nan=False)
         print(f"Wrote {args.out}", file=sys.stderr)
 
     # Print summary
     print(f"\nargmax: {result['logit_argmax']}")
     print(f"top5: {result['logits_top5']}")
-    print(f"\nPer-layer hidden states (last position):")
+    print(f"\nPer-layer hidden states (position {capture_position}):")
     for l in result["hidden_states_layers"]:
         li = l["layer"]
         tag = "embed" if li == 0 else f"L{li-1}"
-        print(f"  {tag:6s}: first4={l['first8'][:4]} sum={l['sum']:+.2e} norm={l['norm']:.2f}")
+        print(
+            f"  {tag:6s}: first4={l['first8'][:4]} "
+            f"sum={format_stat(l['sum'], '+.2e')} "
+            f"norm={format_stat(l['norm'], '.2f')}"
+        )
 
-    print(f"\nCaptured layer outputs:")
+    print(f"\nCaptured layer outputs (position {capture_position}):")
     for k in sorted(captured.keys()):
         c = captured[k]
-        print(f"  {k:25s}: first4={c.get('first8',['?'])[:4]} sum={c.get('sum',0):+.2e}")
+        print(
+            f"  {k:25s}: first4={c.get('first8', ['?'])[:4]} "
+            f"sum={format_stat(c.get('sum'), '+.2e')}"
+        )
 
 
 if __name__ == "__main__":
