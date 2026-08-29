@@ -36,10 +36,12 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 historical evidence for the forward paths present when it closed, but the
 2026-08-26 mainline absorption added or re-enabled production `SuperOp` and
 bespoke decoder paths that were not represented by that completion claim.
-`STEP-005` now owns retirement of the production `SuperOp` substrate;
-`STEP-006` owns newly absorbed bespoke decoder families; and `GEN-003` owns
-the duplicated prefill and continuous-batch drivers. No earlier completion
-claim waives these correction tasks.
+`STEP-005` is in progress: its Gemma4 increment is complete with reviewed
+source, lifecycle, dense/E-series parity, and Q8-expert/F32-KV MoE quality
+evidence; LFM2, MiniMax, Qwen35 Single/EP, and DeepSeek4 Single/EP remain open.
+`STEP-006` owns newly absorbed bespoke decoder families, and `GEN-003` owns the
+duplicated prefill and continuous-batch drivers. No earlier completion claim
+waives these correction tasks.
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`)
 confirmed balanced Qwen35 PP allocation and peer access, but did not close
@@ -730,13 +732,13 @@ toward completion.
 
 ### STEP-005 Retire Production SuperOp Execution
 
-- **Status:** ready
+- **Status:** in progress — Gemma4 increment complete; LFM2, MiniMax, Qwen35 Single/EP, and DeepSeek4 Single/EP remain
 - **Dependencies:** STEP-004
 - **Goal:** Make `execute_steps` and its mesh variants the sole production forward executor and retire the parallel `SuperOp` orchestration substrate.
 - **Acceptance criteria:** Qwen35 dense/MoE Single and EP, DeepSeek4 Single and EP, MiniMax Single, LFM2, and Gemma4 no longer reach `run_layer_program`, `run_layer_program_ep`, `ForwardBindings`, `LayerProgram`, `SuperOpKind`, or architecture-owned SuperOp handlers; EP/TP/PP collectives are explicit Step operations owned by the common executor; MLA/compressor/indexer, recurrent/conv, interleaved or partial RoPE, routing, and other real operation gaps become typed Steps or executor-owned fused Step patterns rather than `EscapeKind`/SuperOp bypasses; pre-resolved kernel keys and graph/capture optimization remain executor backends below the Step contract; parity switches and duplicate hand loops are removed after deterministic parity is established; the obsolete SuperOp modules are deleted after their final callers.
 - **Validation:** Inventory every production caller and default-on lowered toggle; migrate Gemma4 and LFM2 first, then MiniMax, Qwen35 Single/EP, and DeepSeek4 Single/EP; run per-family deterministic legacy-versus-Step parity during migration, emulated EP/PP/TP parity where supported, capture/graph parity, lifecycle/reset/unload tests, and a final source inventory proving no production SuperOp symbols or fallback executor remain.
 - **Hardware:** One supported AMD GPU for per-family single and emulated-mesh parity; physical production closure remains with HW-001 through HW-013.
-- **Evidence:** Pending
+- **Evidence:** Gemma4 complete in `.agent-progress/step-005-production-inventory.md`: production SuperOp removal; reviewed eager/lowered lifecycle, rollback, cache, reset, and ownership contracts; dense Q8 B=1/2/4/8 parity; exact E2B/E4B parity; and coherent admitted Q8-expert/F32-KV MoE battery/chain evidence. The historical MQ4 MoE artifact is explicitly rejected as over-quantized. Final reviewers approved the Gemma4 Step and quality contracts with no findings; `cargo build && cargo test` passed 4,024 tests with 75 ignored. This is one family increment, not STEP-005 aggregate completion; the remaining family rows are authoritative in `.agent-progress/step-005-production-inventory.md`.
 
 ### STEP-006 Migrate Newly Absorbed Bespoke Decoder Families
 

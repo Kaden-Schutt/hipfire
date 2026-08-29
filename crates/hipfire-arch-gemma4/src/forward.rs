@@ -1352,11 +1352,25 @@ fn apply_per_layer_input_branch(
 // ADDITIVE: does not touch `decode_step` / `decode_step_with_graph`. The eager
 // path is unchanged.
 
-/// Gemma's dense Q8 batched projections use the scalar parity reference.
+/// Gemma4 dense Q8 batches intentionally use scalar batched GEMM, not WMMA.
 ///
-/// The architecture and historical fused-prefill request are accepted only
-/// to make the no-WMMA policy explicit at every call site. They intentionally
-/// do not alter the selected family key.
+/// The rejected WMMA route produced plausible final logits but failed strict
+/// post-batch parity: in the canonical B=2 case the immediate argmax matched,
+/// while the KV-conditioned next-token argmax diverged (sequential=2921,
+/// WMMA=236906; next-logit cosine=0.9975923). `GemmQ8_0Batched` restored both
+/// immediate-logit and post-KV next-token parity for B=1/2/4/8; it remains one
+/// batched launch, not B sequential GEMVs.
+///
+/// Measured gfx1151 B=2 forward latency was 56.629 ms for WMMA versus 93.811 ms
+/// for scalar (+65.7%). That is a forward-call microbenchmark, not end-to-end
+/// latency. The failure was artifact/shape-sensitive, so neither close logits
+/// nor one passing fixture justifies restoring architecture-default or fused
+/// Q8 routing. Re-enable WMMA only after pinned B=1/2/4/8 tests prove immediate
+/// and post-KV parity, then measure serve TTFT/prefill.
+///
+/// The architecture and historical fused-prefill request are accepted only to
+/// make this no-WMMA policy explicit at every call site. They intentionally do
+/// not alter the selected family key.
 #[inline]
 fn q8_batched_projection_key(
     _arch: &str,
