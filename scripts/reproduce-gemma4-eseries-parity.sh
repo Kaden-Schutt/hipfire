@@ -68,7 +68,7 @@ run_eseries() {
 
     env HIP_VISIBLE_DEVICES="$GPU_ID" HIPFIRE_GEMMA4_GRAPH=0 HIPFIRE_GEMMA4_EAGLE=0 \
         ./target/release/examples/infer_gemma4 \
-        --model "$model" --token-ids 2,9259 --max 1 --rep-pen 1.0 \
+        --model "$model" --route auto --token-ids 2,9259 --max 1 --rep-pen 1.0 \
         2>&1 | tee "$OUT_DIR/$label-top1.log"
     grep -Fq "$expected_shape" "$OUT_DIR/$label-top1.log"
     grep -Fq 'token ids: [236888]' "$OUT_DIR/$label-top1.log"
@@ -87,7 +87,7 @@ run_eseries e4b "$E4B_MODEL" 'gemma4 dim=2560 layers=42 sliding=35 full=7'
 if [[ -n "$DENSE_MODEL" ]]; then
     env HIP_VISIBLE_DEVICES="$GPU_ID" HIPFIRE_GEMMA4_GRAPH=0 HIPFIRE_GEMMA4_EAGLE=0 \
         ./target/release/examples/infer_gemma4 \
-        --model "$DENSE_MODEL" --token-ids 2,9259 --max 1 --rep-pen 1.0 \
+        --model "$DENSE_MODEL" --route eager --token-ids 2,9259 --max 1 --rep-pen 1.0 \
         2>&1 | tee "$OUT_DIR/dense-top1.log"
     grep -Fq 'gemma4 dim=3840 layers=48 sliding=40 full=8' "$OUT_DIR/dense-top1.log"
     grep -Fq 'token ids: [575]' "$OUT_DIR/dense-top1.log"

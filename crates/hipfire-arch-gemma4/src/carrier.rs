@@ -88,6 +88,54 @@ pub enum Gemma4Bundle {
     Eager(Gemma4EagerBundle),
     Lowered(Gemma4LoweredBundle),
 }
+
+/// Requested execution route for Gemma 4 diagnostic callers.
+///
+/// `Auto` is the production policy used by [`load_gemma4_bundle`]. The
+/// explicit variants are intentionally only a loader override for diagnostics;
+/// architecture-incompatible requests fail before any GPU allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gemma4Route {
+    Auto,
+    Eager,
+    Lowered,
+}
+
+fn select_gemma4_route(
+    requested: Gemma4Route,
+    auto_use_lowered: bool,
+    is_moe: bool,
+    is_e_series: bool,
+    has_drafter: bool,
+) -> Result<bool, String> {
+    match requested {
+        Gemma4Route::Auto => Ok(auto_use_lowered),
+        Gemma4Route::Eager => {
+            if is_moe {
+                return Err(
+                    "gemma4: --route eager is incompatible with MoE; use --route lowered or --route auto"
+                        .into(),
+                );
+            }
+            Ok(false)
+        }
+        Gemma4Route::Lowered => {
+            if is_e_series {
+                return Err(
+                    "gemma4: --route lowered is incompatible with E-series PLE/KV sharing; use --route eager or --route auto"
+                        .into(),
+                );
+            }
+            if has_drafter {
+                return Err(
+                    "gemma4: --route lowered is incompatible with EAGLE; use --route eager or --route auto"
+                        .into(),
+                );
+            }
+            Ok(true)
+        }
+    }
+}
 impl Gemma4Bundle {
     /// Actual bytes owned by whichever Gemma execution route was selected.
     pub fn owner_bytes(&self) -> usize {
@@ -245,13 +293,31 @@ pub fn preflight_gemma4(hfq: &HfqFile, has_drafter: bool) -> Result<(), String> 
     gemma4_validate_drafter_route(is_e_series, lowered_is_moe, has_drafter)
 }
 
-/// Build the Gemma 4 GPU bundle from an HFQ source.
+/// Build the Gemma 4 GPU bundle from an HFQ source using the production
+/// architecture policy.
 ///
-/// `ModelSource::Dir` returns the same error string the carrier previously
-/// emitted inline. HFQ path is verbatim: lowered/eager selection,
-/// `want_batched` env gate, E-series validation, weight/state/KV allocation,
-/// and the preserved `eprintln!` diagnostics for the chosen path.
+/// This is intentionally the default `Auto` route. Diagnostic callers that
+/// need to compare the two implementations should use
+/// [`load_gemma4_bundle_with_route`] instead.
 pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4Bundle, String> {
+    load_gemma4_bundle_with_route(src, ctx, Gemma4Route::Auto)
+}
+
+/// Build the Gemma 4 GPU bundle with an explicit diagnostic route override.
+///
+/// `Auto` is the same policy used by the production loader. Forced routes are
+/// checked against the model topology before loading any GPU weights, so an
+/// E-series PLE/KV-sharing model cannot silently enter the lowered path and a
+/// MoE model cannot silently lose its expert branch.
+pub fn load_gemma4_bundle_with_route(
+    src: ModelSource,
+    ctx: &mut LoadCtx,
+    route: Gemma4Route,
+) -> Result<Gemma4Bundle, String> {
+    // `ModelSource::Dir` returns the same error string the carrier previously
+    // emitted inline. HFQ path is verbatim: lowered/eager selection,
+    // `want_batched` env gate, E-series validation, weight/state/KV allocation,
+    // and the preserved `eprintln!` diagnostics for the chosen path.
     let hfq = match src {
         ModelSource::Hfq(h) => h,
         ModelSource::Dir(_) => {
@@ -290,16 +356,26 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         lowered_is_moe,
         ctx.gemma4_drafter_path.is_some(),
     )?;
-    let use_lowered = if let Some(ref lcfg) = lowered_cfg {
+    let auto_use_lowered = lowered_cfg.as_ref().is_some_and(|lcfg| {
         gemma4_use_lowered(
             lcfg.enable_moe_block,
             want_batched,
             ctx.gemma4_drafter_path.is_some(),
             is_e_series,
         )
-    } else {
-        false
-    };
+    });
+    let use_lowered = select_gemma4_route(
+        route,
+        auto_use_lowered,
+        lowered_is_moe,
+        is_e_series,
+        ctx.gemma4_drafter_path.is_some(),
+    )?;
+    if use_lowered && lowered_cfg.is_none() {
+        return Err(
+            "gemma4: --route lowered requested, but the lowered config could not be parsed".into(),
+        );
+    }
     if use_lowered {
         let lcfg = lowered_cfg.unwrap();
         let mut hfq2 = hfq;
@@ -342,14 +418,37 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::SlidingKv)
             .map_err(|e| format!("gemma4 (lowered) sliding KV stage: {e:?}"))?;
 
-        let kv_full = KvCache::new_gpu_asym3_gemma4(
-            staging.gpu_mut(),
-            lcfg.n_layers,
-            lcfg.full_n_kv_heads,
-            lcfg.full_head_dim,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
+        let kv_full = if ctx.kv_mode_override == Some("fwht3") {
+            eprintln!("  gemma4 lowered full KV: FWHT-512 3-bit K + Q8_0 V");
+            staging
+                .gpu_mut()
+                .ensure_mq_signs()
+                .map_err(|e| format!("gemma4 (lowered) fwht3 signs: {e:?}"))?;
+            let n_full = lcfg
+                .layer_types
+                .iter()
+                .filter(|layer| matches!(layer, lowered::LayerType::Full))
+                .count();
+            let all_true = vec![true; n_full];
+            KvCache::new_gpu_fwht3_capped_filtered_gemma4(
+                staging.gpu_mut(),
+                &all_true,
+                lcfg.full_n_kv_heads,
+                lcfg.full_head_dim,
+                ctx.max_seq,
+                ctx.max_seq,
+            )
+            .map_err(|e| format!("gemma4 (lowered) full KV (fwht3): {e:?}"))?
+        } else {
+            KvCache::new_gpu_asym3_gemma4(
+                staging.gpu_mut(),
+                lcfg.n_layers,
+                lcfg.full_n_kv_heads,
+                lcfg.full_head_dim,
+                ctx.max_seq,
+            )
+            .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?
+        };
         staging.kv_full = Some(kv_full);
         lowered::register_live_owner_bytes(lowered::kv_owner_bytes(
             staging.kv_full.as_ref().expect("full KV staged"),
@@ -357,8 +456,13 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::FullKv)
             .map_err(|e| format!("gemma4 (lowered) full KV stage: {e:?}"))?;
 
+        let full_kv_mode = if ctx.kv_mode_override == Some("fwht3") {
+            "fwht3"
+        } else {
+            "asym3"
+        };
         eprintln!(
-            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
+            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {full_kv_mode} KV)",
             lcfg.enable_moe_block, want_batched,
         );
         return Ok(Gemma4Bundle::Lowered(staging.publish(lcfg)));
@@ -375,9 +479,14 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         );
     }
     let weights = Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
-    let state = Gemma4State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-        .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
-    let _ = &weights;
+    let state = if ctx.kv_mode_override == Some("fwht3") {
+        eprintln!("  gemma4 eager full KV: FWHT-512 3-bit K + Q8_0 V");
+        Gemma4State::new_with_fwht3_max_seq(ctx.gpu, &config, ctx.max_seq)
+            .map_err(|e| format!("gemma4: Gemma4State::new_with_fwht3_max_seq failed: {e}"))?
+    } else {
+        Gemma4State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+            .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?
+    };
     Ok(Gemma4Bundle::Eager(Gemma4EagerBundle {
         config,
         weights,
@@ -390,7 +499,7 @@ pub use load_gemma4_bundle as load_bundle;
 
 #[cfg(test)]
 mod tests {
-    use super::lowered_sliding_physical_cap;
+    use super::{lowered_sliding_physical_cap, select_gemma4_route, Gemma4Route};
 
     #[test]
     fn lowered_sliding_kv_uses_logical_context_capacity() {
@@ -399,5 +508,49 @@ mod tests {
             lowered_sliding_physical_cap(4096) > 1024,
             "configured contexts beyond the 1024-token window must remain allocatable"
         );
+    }
+
+    #[test]
+    fn explicit_routes_follow_architecture_capabilities() {
+        assert_eq!(
+            select_gemma4_route(Gemma4Route::Auto, false, false, true, false).unwrap(),
+            false,
+            "E-series auto route must stay eager for PLE/KV sharing"
+        );
+        assert_eq!(
+            select_gemma4_route(Gemma4Route::Auto, true, true, false, false).unwrap(),
+            true,
+            "MoE auto route must retain the lowered expert branch"
+        );
+        assert_eq!(
+            select_gemma4_route(Gemma4Route::Lowered, false, false, true, false)
+                .unwrap_err()
+                .to_string(),
+            "gemma4: --route lowered is incompatible with E-series PLE/KV sharing; use --route eager or --route auto"
+        );
+        assert_eq!(
+            select_gemma4_route(Gemma4Route::Eager, true, true, false, false)
+                .unwrap_err()
+                .to_string(),
+            "gemma4: --route eager is incompatible with MoE; use --route lowered or --route auto"
+        );
+        assert_eq!(
+            select_gemma4_route(Gemma4Route::Lowered, false, false, false, false).unwrap(),
+            true,
+            "dense diagnostics may explicitly select lowered"
+        );
+        assert_eq!(
+            select_gemma4_route(Gemma4Route::Eager, true, false, false, false).unwrap(),
+            false,
+            "dense diagnostics may explicitly select eager"
+        );
+    }
+
+    #[test]
+    fn lowered_route_rejects_eagle_drafter_even_for_dense_models() {
+        let error =
+            select_gemma4_route(Gemma4Route::Lowered, false, false, false, true).unwrap_err();
+        assert!(error.contains("--route lowered"));
+        assert!(error.contains("EAGLE"));
     }
 }
