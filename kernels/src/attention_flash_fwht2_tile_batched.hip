@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched flash attention tile for fwht2: K at FWHT-rotated 2-bit (V2 split-norm),
+// Batched flash attention tile for fwht2: K at FWHT-rotated 2-bit (legacy one-f32 cnorm),
 // V at Q8_0 or Lloyd2/3/4. Processes sub_batch_size positions via blockIdx.z.
-// V2 header = two IEEE fp16 cnorms (half0, half1). Partials: [sub_batch × n_heads × max_tiles × (2+head_dim)].
+// K header = one IEEE f32 cnorm shared across halves. Partials: [sub_batch × n_heads × max_tiles × (2+head_dim)].
 //
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
@@ -87,11 +87,9 @@ __global__ void attention_flash_fwht2_tile_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        const float cn0 = (float)((const _Float16*)kb)[0];
-        const float cn1 = (float)((const _Float16*)kb)[1];
+        float cnorm = *(const float*)kb;
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
-            const float cnorm = (half == 0) ? cn0 : cn1;
             unsigned char packed = kb[4 + half * 32 + tid];
             partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
                      + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])

@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched flash attention tile — fwht3 KV V2 (K two-half FWHT-128 3-bit;
-// V at Q8_0 OR two-half lloyd2/3/4, gated by v_mode).
+// Batched flash attention tile — hybrid: K legacy FWHT-256 3-bit (V1);
+// V at Q8_0 OR two-half lloyd2/3/4 V2, gated by v_mode.
 // Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
 //
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
@@ -67,39 +67,31 @@ __global__ void attention_flash_fwht3_tile_batched(
     float* scores = sdata;
 
     const float* q_head = q + local_bid * q_dim + h * head_dim;
-    float mq[8];
-    #pragma unroll
-    for (int half = 0; half < 2; half++) {
-        const int d0 = half * 128 + tid * 4;
-        float a = q_head[d0 + 0];
-        float b = q_head[d0 + 1];
-        float c = q_head[d0 + 2];
-        float d = q_head[d0 + 3];
-        fwht_shfl_forward(a, b, c, d, signs1, signs2, tid);
-        mq[half * 4 + 0] = a;
-        mq[half * 4 + 1] = b;
-        mq[half * 4 + 2] = c;
-        mq[half * 4 + 3] = d;
-    }
+    const int d0 = tid * 8;
+    float mq0 = q_head[d0 + 0], mq1 = q_head[d0 + 1];
+    float mq2 = q_head[d0 + 2], mq3 = q_head[d0 + 3];
+    float mq4 = q_head[d0 + 4], mq5 = q_head[d0 + 5];
+    float mq6 = q_head[d0 + 6], mq7 = q_head[d0 + 7];
 
-    // Phase A: Q·K V2 — two fp16 cnorms; 24-bit pack = half0-four then half1-four.
+    fwht_shfl_forward_256(mq0, mq1, mq2, mq3, mq4, mq5, mq6, mq7, signs1, signs2, tid);
+
+    // Phase A: Q·K V1 — one f32 cnorm; 24-bit pack = tid*8 contiguous 3-bit indices.
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        const float cn0 = (float)((const _Float16*)kb)[0];
-        const float cn1 = (float)((const _Float16*)kb)[1];
+        float cnorm = *(const float*)kb;
         const unsigned char* base = kb + 4 + tid * 3;
         unsigned int packed = (unsigned int)base[0]
                             | ((unsigned int)base[1] << 8)
                             | ((unsigned int)base[2] << 16);
-        float partial = mq[0] * (cn0 * TURBO_C3[ packed        & 7])
-                      + mq[1] * (cn0 * TURBO_C3[(packed >> 3)  & 7])
-                      + mq[2] * (cn0 * TURBO_C3[(packed >> 6)  & 7])
-                      + mq[3] * (cn0 * TURBO_C3[(packed >> 9)  & 7])
-                      + mq[4] * (cn1 * TURBO_C3[(packed >> 12) & 7])
-                      + mq[5] * (cn1 * TURBO_C3[(packed >> 15) & 7])
-                      + mq[6] * (cn1 * TURBO_C3[(packed >> 18) & 7])
-                      + mq[7] * (cn1 * TURBO_C3[(packed >> 21) & 7]);
+        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
+                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
+                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
+                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
+                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
+                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
+                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
+                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0) {

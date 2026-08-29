@@ -92,16 +92,10 @@ __global__ void attention_flash_fwht4_tile(
         const unsigned char* kb1 = k_cache + (size_t)(tile_start + t_local + 1) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb2 = k_cache + (size_t)(tile_start + t_local + 2) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb3 = k_cache + (size_t)(tile_start + t_local + 3) * k_bytes_per_pos + k_head_off;
-        float cn0_0 = (float)((const _Float16*)kb0)[0], cn0_1 = (float)((const _Float16*)kb0)[1];
-        float cn1_0 = (float)((const _Float16*)kb1)[0], cn1_1 = (float)((const _Float16*)kb1)[1];
-        float cn2_0 = (float)((const _Float16*)kb2)[0], cn2_1 = (float)((const _Float16*)kb2)[1];
-        float cn3_0 = (float)((const _Float16*)kb3)[0], cn3_1 = (float)((const _Float16*)kb3)[1];
+        float cn0 = *(const float*)kb0, cn1 = *(const float*)kb1;
+        float cn2 = *(const float*)kb2, cn3 = *(const float*)kb3;
         float partial0 = 0.0f, partial1 = 0.0f, partial2 = 0.0f, partial3 = 0.0f;
         for (int half = 0; half < n_halves; half++) {
-            float cn0 = (half == 0) ? cn0_0 : cn0_1;
-            float cn1 = (half == 0) ? cn1_0 : cn1_1;
-            float cn2 = (half == 0) ? cn2_0 : cn2_1;
-            float cn3 = (half == 0) ? cn3_0 : cn3_1;
             unsigned short pk0 = *(const unsigned short*)(kb0 + 4 + half * 64 + tid * 2);
             unsigned short pk1 = *(const unsigned short*)(kb1 + 4 + half * 64 + tid * 2);
             unsigned short pk2 = *(const unsigned short*)(kb2 + 4 + half * 64 + tid * 2);
@@ -134,11 +128,9 @@ __global__ void attention_flash_fwht4_tile(
     for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cn0 = (float)((const _Float16*)kb)[0];
-        float cn1 = (float)((const _Float16*)kb)[1];
+        float cnorm = *(const float*)kb;
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
-            float cnorm = (half == 0) ? cn0 : cn1;
             unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
             partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
                      + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])

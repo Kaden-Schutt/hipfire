@@ -2,15 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Flash attention tile — fwht3 KV V2: K at two independent FWHT-128 3-bit
-// halves; V at Q8_0 OR two-half lloyd2/3/4 FWHT-rotated centroid, gated by
-// v_mode.
+// Flash attention tile — hybrid: K at legacy FWHT-256 rotated 3-bit (V1);
+// V at Q8_0 OR two-half lloyd2/3/4 FWHT-rotated centroid V2, gated by v_mode.
 //
-// V2 header: two IEEE fp16 cnorms (bytes 0..1 half0, 2..3 half1).
-// Per-lane 24-bit K payload: four half-0 indices then four half-1 indices.
+// Single-pass 256-element signed-FWHT on Q to match the V1 K-write rotation.
+// K cache: 4B f32 cnorm + 32 threads × 3 bytes packed 3-bit (tid*8 layout).
 // Lloyd rotated-V partials at half*128 + tid*4 + i.
 //
-// Tuned for head_dim=256 (Qwen 3.5): 32 threads × 4 values × 2 halves.
+// Tuned for head_dim=256 (Qwen 3.5): 32 threads × 8 values = 256 dims single pass.
 //
 // Grid: [n_heads, n_tiles, 1]. Block: [32, 1, 1]. LDS: tile_size * 4.
 #include <hip/hip_runtime.h>
@@ -54,37 +53,27 @@ __global__ void attention_flash_fwht3_tile(
     extern __shared__ float sdata[];
     float* scores = sdata;
 
-    // Load Q (4 values per half) + two independent signed-FWHT-128 forwards.
+    // Load Q (8 values per thread) + signed-FWHT-256 forward.
     const float* q_head = q + h * head_dim;
-    float mq[8];
-    #pragma unroll
-    for (int half = 0; half < 2; half++) {
-        const int d0 = half * 128 + tid * 4;
-        float a = q_head[d0 + 0];
-        float b = q_head[d0 + 1];
-        float c = q_head[d0 + 2];
-        float d = q_head[d0 + 3];
-        fwht_shfl_forward(a, b, c, d, signs1, signs2, tid);
-        mq[half * 4 + 0] = a;
-        mq[half * 4 + 1] = b;
-        mq[half * 4 + 2] = c;
-        mq[half * 4 + 3] = d;
-    }
+    const int d0 = tid * 8;
+    float mq0 = q_head[d0 + 0], mq1 = q_head[d0 + 1];
+    float mq2 = q_head[d0 + 2], mq3 = q_head[d0 + 3];
+    float mq4 = q_head[d0 + 4], mq5 = q_head[d0 + 5];
+    float mq6 = q_head[d0 + 6], mq7 = q_head[d0 + 7];
 
-    // Phase A: Q·K (3-bit K, V2). Keep four token dots independent so global-load
+    fwht_shfl_forward_256(mq0, mq1, mq2, mq3, mq4, mq5, mq6, mq7, signs1, signs2, tid);
+
+    // Phase A: Q·K (3-bit K, V1). Keep four token dots independent so global-load
     // latency and the five shuffle-reduction steps can overlap, matching the
     // scheduling shape of the tuned Q8 flash tile.
-    // Pack order: four half-0 3-bit indices (bits 0..11), then four half-1 (12..23).
     int t_local = 0;
     for (; t_local + 3 < tile_len; t_local += 4) {
         const unsigned char* kb0 = k_cache + (size_t)(tile_start + t_local + 0) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb1 = k_cache + (size_t)(tile_start + t_local + 1) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb2 = k_cache + (size_t)(tile_start + t_local + 2) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb3 = k_cache + (size_t)(tile_start + t_local + 3) * k_bytes_per_pos + k_head_off;
-        float cn0_0 = (float)((const _Float16*)kb0)[0], cn0_1 = (float)((const _Float16*)kb0)[1];
-        float cn1_0 = (float)((const _Float16*)kb1)[0], cn1_1 = (float)((const _Float16*)kb1)[1];
-        float cn2_0 = (float)((const _Float16*)kb2)[0], cn2_1 = (float)((const _Float16*)kb2)[1];
-        float cn3_0 = (float)((const _Float16*)kb3)[0], cn3_1 = (float)((const _Float16*)kb3)[1];
+        float cn0 = *(const float*)kb0, cn1 = *(const float*)kb1;
+        float cn2 = *(const float*)kb2, cn3 = *(const float*)kb3;
         const unsigned char* b0 = kb0 + 4 + tid * 3;
         const unsigned char* b1 = kb1 + 4 + tid * 3;
         const unsigned char* b2 = kb2 + 4 + tid * 3;
@@ -93,19 +82,19 @@ __global__ void attention_flash_fwht3_tile(
         unsigned int pk1 = (unsigned int)b1[0] | ((unsigned int)b1[1] << 8) | ((unsigned int)b1[2] << 16);
         unsigned int pk2 = (unsigned int)b2[0] | ((unsigned int)b2[1] << 8) | ((unsigned int)b2[2] << 16);
         unsigned int pk3 = (unsigned int)b3[0] | ((unsigned int)b3[1] << 8) | ((unsigned int)b3[2] << 16);
-        #define DOT3(CN0, CN1, PK) ( \
-            mq[0] * ((CN0) * TURBO_C3[(PK)        & 7]) \
-          + mq[1] * ((CN0) * TURBO_C3[((PK) >> 3)  & 7]) \
-          + mq[2] * ((CN0) * TURBO_C3[((PK) >> 6)  & 7]) \
-          + mq[3] * ((CN0) * TURBO_C3[((PK) >> 9)  & 7]) \
-          + mq[4] * ((CN1) * TURBO_C3[((PK) >> 12) & 7]) \
-          + mq[5] * ((CN1) * TURBO_C3[((PK) >> 15) & 7]) \
-          + mq[6] * ((CN1) * TURBO_C3[((PK) >> 18) & 7]) \
-          + mq[7] * ((CN1) * TURBO_C3[((PK) >> 21) & 7]))
-        float partial0 = DOT3(cn0_0, cn0_1, pk0);
-        float partial1 = DOT3(cn1_0, cn1_1, pk1);
-        float partial2 = DOT3(cn2_0, cn2_1, pk2);
-        float partial3 = DOT3(cn3_0, cn3_1, pk3);
+        #define DOT3(CN, PK) ( \
+            mq0 * ((CN) * TURBO_C3_256[(PK)        & 7]) \
+          + mq1 * ((CN) * TURBO_C3_256[((PK) >> 3)  & 7]) \
+          + mq2 * ((CN) * TURBO_C3_256[((PK) >> 6)  & 7]) \
+          + mq3 * ((CN) * TURBO_C3_256[((PK) >> 9)  & 7]) \
+          + mq4 * ((CN) * TURBO_C3_256[((PK) >> 12) & 7]) \
+          + mq5 * ((CN) * TURBO_C3_256[((PK) >> 15) & 7]) \
+          + mq6 * ((CN) * TURBO_C3_256[((PK) >> 18) & 7]) \
+          + mq7 * ((CN) * TURBO_C3_256[((PK) >> 21) & 7]))
+        float partial0 = DOT3(cn0, pk0);
+        float partial1 = DOT3(cn1, pk1);
+        float partial2 = DOT3(cn2, pk2);
+        float partial3 = DOT3(cn3, pk3);
         for (int off = 16; off > 0; off >>= 1) {
             partial0 += __shfl_xor(partial0, off);
             partial1 += __shfl_xor(partial1, off);
@@ -123,20 +112,19 @@ __global__ void attention_flash_fwht3_tile(
     for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        const float cn0 = (float)((const _Float16*)kb)[0];
-        const float cn1 = (float)((const _Float16*)kb)[1];
+        float cnorm = *(const float*)kb;
         const unsigned char* base = kb + 4 + tid * 3;
         unsigned int packed = (unsigned int)base[0]
                             | ((unsigned int)base[1] << 8)
                             | ((unsigned int)base[2] << 16);
-        float partial = mq[0] * (cn0 * TURBO_C3[ packed        & 7])
-                      + mq[1] * (cn0 * TURBO_C3[(packed >> 3)  & 7])
-                      + mq[2] * (cn0 * TURBO_C3[(packed >> 6)  & 7])
-                      + mq[3] * (cn0 * TURBO_C3[(packed >> 9)  & 7])
-                      + mq[4] * (cn1 * TURBO_C3[(packed >> 12) & 7])
-                      + mq[5] * (cn1 * TURBO_C3[(packed >> 15) & 7])
-                      + mq[6] * (cn1 * TURBO_C3[(packed >> 18) & 7])
-                      + mq[7] * (cn1 * TURBO_C3[(packed >> 21) & 7]);
+        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
+                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
+                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
+                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
+                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
+                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
+                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
+                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)

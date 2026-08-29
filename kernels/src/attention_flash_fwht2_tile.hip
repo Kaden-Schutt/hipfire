@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Flash attention tile for fwht2: K at FWHT-rotated 2-bit (V2 split-norm), V at Q8_0 or Lloyd2/3/4.
-// 2-pass over 128-element halves. V2 header = two IEEE fp16 cnorms (half0, half1).
+// Flash attention tile for fwht2: K at FWHT-rotated 2-bit (legacy one-f32 cnorm), V at Q8_0 or Lloyd2/3/4.
+// 2-pass over 128-element halves. K header = one IEEE f32 cnorm shared across halves.
 //
 // K cache: 4-byte header + half-major 2-bit payload (1 byte per 4 packed values).
 #include <hip/hip_runtime.h>
@@ -74,16 +74,10 @@ __global__ void attention_flash_fwht2_tile(
         const unsigned char* kb1 = k_cache + (size_t)(tile_start + t_local + 1) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb2 = k_cache + (size_t)(tile_start + t_local + 2) * k_bytes_per_pos + k_head_off;
         const unsigned char* kb3 = k_cache + (size_t)(tile_start + t_local + 3) * k_bytes_per_pos + k_head_off;
-        float cn0_0 = (float)((const _Float16*)kb0)[0], cn0_1 = (float)((const _Float16*)kb0)[1];
-        float cn1_0 = (float)((const _Float16*)kb1)[0], cn1_1 = (float)((const _Float16*)kb1)[1];
-        float cn2_0 = (float)((const _Float16*)kb2)[0], cn2_1 = (float)((const _Float16*)kb2)[1];
-        float cn3_0 = (float)((const _Float16*)kb3)[0], cn3_1 = (float)((const _Float16*)kb3)[1];
+        float cn0 = *(const float*)kb0, cn1 = *(const float*)kb1;
+        float cn2 = *(const float*)kb2, cn3 = *(const float*)kb3;
         float partial0 = 0.0f, partial1 = 0.0f, partial2 = 0.0f, partial3 = 0.0f;
         for (int half = 0; half < n_halves; half++) {
-            const float cn0 = (half == 0) ? cn0_0 : cn0_1;
-            const float cn1 = (half == 0) ? cn1_0 : cn1_1;
-            const float cn2 = (half == 0) ? cn2_0 : cn2_1;
-            const float cn3 = (half == 0) ? cn3_0 : cn3_1;
             unsigned char pk0 = kb0[4 + half * 32 + tid];
             unsigned char pk1 = kb1[4 + half * 32 + tid];
             unsigned char pk2 = kb2[4 + half * 32 + tid];
@@ -116,11 +110,9 @@ __global__ void attention_flash_fwht2_tile(
     for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        const float cn0 = (float)((const _Float16*)kb)[0];
-        const float cn1 = (float)((const _Float16*)kb)[1];
+        float cnorm = *(const float*)kb;
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
-            const float cnorm = (half == 0) ? cn0 : cn1;
             unsigned char packed = kb[4 + half * 32 + tid];
             partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
                      + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
