@@ -1176,6 +1176,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
+        "kv_cache_write_lloyd3_v2" => {
+            Some(vec![write(0), read(8), read(16), read(24), read(32)])
+        }
         "kv_cache_write_q8_0" => Some(vec![write(0), read(8), read(16)]),
         "attention_flash_fwht3_tile" => Some(vec![
             read(0),
@@ -1535,6 +1538,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
+        | "kv_cache_write_lloyd3_v2"
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
@@ -5497,6 +5501,7 @@ mod tests {
         "rmsnorm_f32",
         "rope_partial_halfsplit_f32",
         "kv_cache_write_asym_k_fwht3",
+        "kv_cache_write_lloyd3_v2",
         "kv_cache_write_q8_0",
         "kv_cache_write_q8_0_pair",
         "attention_flash_fwht3_tile",

@@ -4377,6 +4377,118 @@ impl Gpu {
         )
     }
 
+    /// Dedicated Lloyd3 V2 V-cache writer (full half-cnorm V2). K stays on fwht3 V1.
+    pub fn kv_cache_write_lloyd3_v2(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_lloyd3_v2",
+            kernels::KV_CACHE_WRITE_LLOYD3_V2_SRC,
+            "kv_cache_write_lloyd3_v2",
+        )?;
+        let mut kdp = dst.buf.as_ptr();
+        let mut ksp = src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_lloyd3_v2",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp);
+                b.push_ptr(ksp);
+                b.push_ptr(pp);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn kv_cache_write_lloyd3_v2_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_lloyd3_v2_batched",
+            kernels::KV_CACHE_WRITE_LLOYD3_V2_BATCHED_SRC,
+            "kv_cache_write_lloyd3_v2_batched",
+        )?;
+        let mut kdp = dst.buf.as_ptr();
+        let mut ksp = src.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_lloyd3_v2_batched",
+            [n_kv_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp);
+                b.push_ptr(ksp);
+                b.push_ptr(pp);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
     pub fn kv_cache_write_v256_2bit_vec(
         &mut self,
         dst: &GpuTensor,
@@ -4600,7 +4712,7 @@ impl Gpu {
             2 => self.kv_cache_write_v256_2bit_vec(
                 v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim,
             ),
-            3 => self.kv_cache_write_fwht3_vec(
+            3 => self.kv_cache_write_lloyd3_v2(
                 v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim,
             ),
             4 => self.kv_cache_write_v256_4bit_vec(
@@ -4626,7 +4738,7 @@ impl Gpu {
             2 => self.kv_cache_write_v256_2bit_vec_batched(
                 v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size,
             ),
-            3 => self.kv_cache_write_fwht3_vec_batched(
+            3 => self.kv_cache_write_lloyd3_v2_batched(
                 v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size,
             ),
             4 => self.kv_cache_write_v256_4bit_vec_batched(

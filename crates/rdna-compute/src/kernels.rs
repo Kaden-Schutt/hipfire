@@ -5359,6 +5359,12 @@ pub const KV_CACHE_WRITE_FWHT256_4BIT_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_fwht256_4bit.hip");
 pub const KV_CACHE_WRITE_FWHT256_4BIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_fwht256_4bit_batched.hip");
+// Lloyd3 V2 dedicated V writer (full half-cnorm V2; K stays on shared FWHT3 V1).
+pub const KV_CACHE_WRITE_LLOYD3_V2_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_lloyd3_v2.hip");
+pub const KV_CACHE_WRITE_LLOYD3_V2_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_lloyd3_v2_batched.hip");
+
 // Adaptive-KV V transcode kernels (re-quantize an existing V cache in place,
 // all positions of one FA layer, higher tier → lower tier).
 pub const KV_TRANSCODE_V_Q8_TO_LLOYD4_SRC: &str =

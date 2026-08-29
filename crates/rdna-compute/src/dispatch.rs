@@ -4340,6 +4340,14 @@ impl Gpu {
                     assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC),
                 ));
                 specs.push((
+                    "kv_cache_write_lloyd3_v2",
+                    assemble_asym(kernels::KV_CACHE_WRITE_LLOYD3_V2_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_lloyd3_v2_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_LLOYD3_V2_BATCHED_SRC),
+                ));
+                specs.push((
                     "attention_flash_fwht3_tile",
                     assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_SRC),
                 ));
