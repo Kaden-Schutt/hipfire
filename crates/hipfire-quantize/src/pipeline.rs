@@ -301,9 +301,9 @@ pub(crate) fn run() {
     let use_mq5g256v2 = format == "mq5v2" || format == "mq5g256v2";
     let use_mq3g256v2 = format == "mq3v2" || format == "mq3g256v2";
     let use_mq2g256v2 = format == "mq2v2" || format == "mq2g256v2";
-    // Native-bf16 reference. Cohere2MoE and Qwen3.5 store matmul weights as
-    // the exact downloaded BF16 bytes; `f16` is a lossy-reconvert alternative
-    // tier, while the all-F32 `oracle` doubles storage.
+    // Native-bf16 reference. Cohere2MoE, Qwen3.5, and Gemma4 store model
+    // tensors at source precision when requested; `f16` is a lossy-reconvert
+    // alternative tier, while the all-F32 `oracle` doubles storage.
     let use_bf16 = format == "bf16" || format == "bf16-passthrough" || format == "oracle";
     let use_f16 = format == "f16" || format == "f16-passthrough";
     // ── Graded per-expert mixed precision (HIPFIRE_MOE_GRADED) ────────────
@@ -1946,11 +1946,11 @@ pub(crate) fn run() {
             }
         }
 
-        // Source-precision BF16 passthrough for non-vision model tensors.
-        // Unlike the F32 oracle above, this preserves the checkpoint's native
-        // two-byte representation on disk. The qwen35 loader can consume
-        // qt=16 losslessly; vision remains on the established F16 ingest path
-        // because its kernels consume F16 matrices.
+        // Source-precision BF16 passthrough for non-vision model tensors on
+        // Qwen3.5/Gemma4. Unlike the F32 oracle above, this preserves the
+        // checkpoint's native two-byte representation on disk. The qwen35 and
+        // Gemma4 loaders can consume qt=16 losslessly; vision remains on the
+        // established F16 ingest path because its kernels consume F16 matrices.
         {
             let __ctx = PerTensorCtx {
                 name,
@@ -3608,7 +3608,9 @@ fn handle_bf16_passthrough(
     quantized_params: &mut u64,
     spill: &mut Option<TensorSpill>,
 ) -> bool {
-    if !use_bf16 || !matches!(arch_id, 5 | 6) || is_vision {
+    // Gemma4 text tensors use the same source-precision reference path as
+    // Qwen3.5; vision tensors stay on their established F16 path.
+    if !use_bf16 || !matches!(arch_id, 5 | 6 | 13) || is_vision {
         return false;
     }
     let bf16_bytes = if meta.dtype == "BF16" {
@@ -6926,6 +6928,145 @@ mod handle_main_quant_f16_fallback_tests {
             true,
             "model.language_model.layers.0.experts.gate_up_proj",
             &[4, 8],
+        ));
+    }
+    fn single_safetensors(
+        name: &str,
+        dtype: &str,
+        shape: &[usize],
+        raw_data: &[u8],
+    ) -> (tempfile::NamedTempFile, SafetensorsFile) {
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut tensor = serde_json::Map::new();
+        tensor.insert("dtype".into(), serde_json::Value::String(dtype.into()));
+        tensor.insert(
+            "shape".into(),
+            serde_json::Value::Array(
+                shape
+                    .iter()
+                    .map(|&dim| serde_json::Value::from(dim))
+                    .collect(),
+            ),
+        );
+        tensor.insert(
+            "data_offsets".into(),
+            serde_json::json!([0, raw_data.len()]),
+        );
+        let mut header = serde_json::Map::new();
+        header.insert(name.to_string(), serde_json::Value::Object(tensor));
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(raw_data).unwrap();
+        let safetensors = SafetensorsFile::open(file.path()).unwrap();
+        (file, safetensors)
+    }
+
+    #[test]
+    fn gemma_bf16_passthrough_keeps_reference_tensors_at_qt16() {
+        let cases = [
+            ("model.language_model.embed_tokens.weight", vec![2usize, 2]),
+            (
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                vec![2usize, 2],
+            ),
+            (
+                "model.language_model.layers.0.router.proj.weight",
+                vec![2usize, 2],
+            ),
+            (
+                "model.language_model.layers.0.input_layernorm.weight",
+                vec![2usize],
+            ),
+        ];
+        for (name, shape) in cases {
+            let values: Vec<f32> = (0..shape.iter().product())
+                .map(|i| i as f32 + 0.25)
+                .collect();
+            let raw = bf16_bytes_of(&values);
+            let (_file, safetensors) = single_safetensors(name, "BF16", &shape, &raw);
+            let st_files = vec![safetensors];
+            let ctx = PerTensorCtx {
+                name,
+                file_idx: 0,
+                shape: &shape,
+                n_elements: values.len(),
+                arch_id: 13,
+                dtype: "BF16",
+                is_vision: false,
+            };
+            let meta = meta("BF16", shape.clone());
+            let mut output = Vec::new();
+            let mut quantized_params = 0;
+            let fp8_scale_for = HashMap::new();
+            let mut spill = None;
+            assert!(handle_bf16_passthrough(
+                &ctx,
+                &meta,
+                &raw,
+                true,
+                13,
+                false,
+                false,
+                &fp8_scale_for,
+                &st_files,
+                &mut output,
+                &mut quantized_params,
+                &mut spill,
+            ));
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].quant_type, QuantType::BF16);
+            assert_eq!(output[0].shape, shape.iter().map(|&dim| dim as u32).collect::<Vec<_>>());
+            assert_eq!(output[0].data, raw);
+            assert_eq!(quantized_params, values.len() as u64);
+        }
+    }
+    #[test]
+    fn gemma_bf16_passthrough_is_opt_in_and_skips_vision() {
+        let shape = vec![2usize];
+        let meta = meta("BF16", shape.clone());
+        let ctx = PerTensorCtx {
+            name: "model.language_model.layers.0.norm.weight",
+            file_idx: 0,
+            shape: &shape,
+            n_elements: 2,
+            arch_id: 13,
+            dtype: "BF16",
+            is_vision: false,
+        };
+        let st_files = Vec::new();
+        let fp8_scale_for = HashMap::new();
+        let mut output = Vec::new();
+        let mut quantized_params = 0;
+        let mut spill = None;
+        assert!(!handle_bf16_passthrough(
+            &ctx,
+            &meta,
+            &[0; 4],
+            false,
+            13,
+            false,
+            false,
+            &fp8_scale_for,
+            &st_files,
+            &mut output,
+            &mut quantized_params,
+            &mut spill,
+        ));
+        assert!(!handle_bf16_passthrough(
+            &ctx,
+            &meta,
+            &[0; 4],
+            true,
+            13,
+            true,
+            false,
+            &fp8_scale_for,
+            &st_files,
+            &mut output,
+            &mut quantized_params,
+            &mut spill,
         ));
     }
 }
