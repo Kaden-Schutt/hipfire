@@ -4539,6 +4539,35 @@ pub fn forward_prefill_batch(
     kv_full: &mut hipfire_runtime::llama::KvCache,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
+    // F32 KV has no batched KvWrite/Attend implementation. The carrier's MoE
+    // policy is intentionally F32/F32, so preserve the proven single-token
+    // lifecycle instead of allowing the batched dispatcher to return
+    // MissingImpl. Dense compressed KV remains on the batched v2 path below.
+    if tokens.len() > scratch.max_prefill_batch {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "forward_prefill_batch: n_batch={} > max_prefill_batch={}",
+                tokens.len(),
+                scratch.max_prefill_batch
+            ),
+        ));
+    }
+    if !kv_sliding.quantized || !kv_full.quantized {
+        for (offset, &token) in tokens.iter().enumerate() {
+            forward_scratch(
+                gpu,
+                weights,
+                config,
+                token,
+                start_pos + offset,
+                kv_sliding,
+                kv_full,
+                scratch,
+            )?;
+        }
+        return Ok(());
+    }
     // v2 — batched dense projections + batched MoE. The +55% prefill win
     // from 521161f8 is back: the regressing bug was in `gemm_hfq4g128`'s
     // partial-trailing-group handling (used floor instead of ceil for

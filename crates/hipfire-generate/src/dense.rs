@@ -4491,6 +4491,77 @@ mod gemma4_lowered_oracle_tests {
 
     #[test]
     #[ignore = "requires canonical Gemma4 MoE artifact and AMD GPU"]
+    fn carrier_moe_f32_prefill_batch_b2_has_no_missing_impl() {
+        let path = std::env::var_os("HIPFIRE_GEMMA4_MOE_ORACLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("/home/bjoern/.hipfire/models/gemma4-26b-a4b.mq4")
+            });
+        assert!(
+            path.is_file(),
+            "canonical Gemma4 MoE artifact is missing: {}",
+            path.display()
+        );
+        let mut gpu = rdna_compute::Gpu::init().expect("oracle GPU init");
+        let hfq = HfqFile::open(&path).expect("oracle HFQ open");
+        let cask = hipfire_runtime::loader_api::CaskConfig::default();
+        let model_path = path.to_str().expect("model path must be UTF-8");
+        let mut ctx = hipfire_runtime::loader_api::LoadCtx {
+            path: model_path,
+            max_seq: 32,
+            deepseek4_compute_placement: Default::default(),
+            deepseek4_experts_per_token: None,
+            draft_path: None,
+            kv_mode_override: None,
+            kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
+            kv_adaptive_override: None,
+            state_quant_override: None,
+            cask: &cask,
+            pp: 1,
+            pp_bands: None,
+            mtp_mode: "auto",
+            mtp_k: 3,
+            spec: hipfire_runtime::loader_api::SpecLoadCfg::default(),
+            kv_physical_cap: None,
+            gpu: &mut gpu,
+            gemma4_drafter_path: None,
+            gemma4_draft_len: 3,
+        };
+        let bundle = hipfire_arch_gemma4::load_gemma4_bundle_with_route(
+            hipfire_runtime::loader_api::ModelSource::Hfq(hfq),
+            &mut ctx,
+            hipfire_arch_gemma4::Gemma4Route::Auto,
+        )
+        .expect("carrier load");
+        let mut bundle = match bundle {
+            hipfire_arch_gemma4::Gemma4Bundle::Lowered(bundle) => bundle,
+            hipfire_arch_gemma4::Gemma4Bundle::Eager(_) => {
+                panic!("canonical MoE carrier unexpectedly selected eager")
+            }
+        };
+        assert!(
+            !bundle.kv_sliding.quantized && !bundle.kv_full.quantized,
+            "carrier-created MoE caches must be F32"
+        );
+        hipfire_arch_gemma4::lowered::forward_prefill_batch(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            &[2, 9259],
+            0,
+            &mut bundle.kv_sliding,
+            &mut bundle.kv_full,
+            &bundle.scratch,
+        )
+        .expect("carrier-created MoE F32 B=2 prefill");
+        bundle.kv_full.free_gpu(&mut gpu).expect("free full KV");
+        bundle.kv_sliding.free_gpu(&mut gpu).expect("free sliding KV");
+        bundle.scratch.free_gpu(&mut gpu);
+        bundle.weights.free_gpu(&mut gpu);
+    }
+
+    #[test]
+    #[ignore = "requires canonical Gemma4 MoE artifact and AMD GPU"]
     fn gemma4_lowered_product_matches_accepted_direct_oracle() {
         let path = std::env::var_os("HIPFIRE_GEMMA4_MOE_ORACLE")
             .map(std::path::PathBuf::from)
