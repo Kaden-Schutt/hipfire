@@ -5819,9 +5819,12 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // One 16-row tile cannot amortize the query-tiled kernel's K/V
+        // dequantization; speculative verify stays on the scalar tile path.
         if self.arch_caps.has_wmma_w32_gfx12()
             && head_dim == 256
             && v_mode_bits == 4
+            && batch_size > 16
             && tree_bias.is_none()
             && block_start == 0
             && block_cols == 0
@@ -6278,9 +6281,12 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // One 16-row tile cannot amortize the query-tiled kernel's K/V
+        // dequantization; speculative verify stays on the scalar tile path.
         if self.arch_caps.has_wmma_w32_gfx12()
             && head_dim == 256
             && v_mode_bits == 3
+            && batch_size > 16
             && tree_bias.is_none()
             && block_start == 0
             && block_cols == 0
