@@ -9,8 +9,8 @@
 //! `LoadedModel` assembly, `SourceMeta`/`resolve_source_meta`, chat-template
 //! and tokenizer handling, `Gemma4EagleState` side-car load, and
 //! `spec_build::build_speculator`. This module owns the GPU bundle construction
-//! (lowered vs eager decision, weight/state/KV allocation) with error strings
-//! byte-identical to the prior inline block.
+//! (lowered vs eager decision, weight/state/KV allocation), including the
+//! topology-specific lowered KV quality policy and fail-closed budget gate.
 
 use crate::config::Gemma4Config;
 use crate::gemma4::{Gemma4State, Gemma4Weights};
@@ -57,6 +57,179 @@ fn lowered_sliding_physical_cap(max_seq: usize) -> usize {
     // the physical rows to the logical horizon so positions beyond the window
     // cannot index past the cache.
     max_seq
+}
+/// Lowered Gemma KV policy selected from the model topology.
+///
+/// The MoE path is intentionally pinned to F32 for both attention families:
+/// compressed KV was the root cause of the canonical 26B-A4B divergence. Dense
+/// lowered remains on its established Q8 sliding + Asym3 full policy; the
+/// explicit `fwht3` override is still available for dense diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gemma4LoweredKvPolicy {
+    MoeF32,
+    DenseCompressed,
+}
+
+impl Gemma4LoweredKvPolicy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MoeF32 => "moe-f32",
+            Self::DenseCompressed => "dense-compressed",
+        }
+    }
+}
+
+#[inline]
+pub fn lowered_kv_policy(enable_moe_block: bool) -> Gemma4LoweredKvPolicy {
+    if enable_moe_block {
+        Gemma4LoweredKvPolicy::MoeF32
+    } else {
+        Gemma4LoweredKvPolicy::DenseCompressed
+    }
+}
+
+fn checked_product(parts: &[usize], label: &str) -> Result<usize, String> {
+    parts.iter().try_fold(1usize, |value, part| {
+        value
+            .checked_mul(*part)
+            .ok_or_else(|| format!("gemma4 lowered {label} byte calculation overflowed"))
+    })
+}
+
+fn rounded_tensor_bytes(raw_bytes: usize, label: &str) -> Result<usize, String> {
+    raw_bytes
+        .checked_add(3)
+        .and_then(|bytes| bytes.checked_div(4))
+        .and_then(|words| words.checked_mul(4))
+        .ok_or_else(|| format!("gemma4 lowered {label} byte calculation overflowed"))
+}
+
+fn f32_kv_bytes(
+    layers: usize,
+    max_seq: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<usize, String> {
+    checked_product(
+        &[layers, max_seq, n_kv_heads, head_dim, 2, 4],
+        "F32 KV",
+    )
+}
+
+fn compressed_kv_bytes(
+    layers: usize,
+    max_seq: usize,
+    n_kv_heads: usize,
+    k_bytes_per_head: usize,
+    v_bytes_per_head: usize,
+) -> Result<usize, String> {
+    let k_raw = checked_product(&[max_seq, n_kv_heads, k_bytes_per_head], "compressed K")?;
+    let v_raw = checked_product(&[max_seq, n_kv_heads, v_bytes_per_head], "compressed V")?;
+    let k_bytes = rounded_tensor_bytes(k_raw, "compressed K")?;
+    let v_bytes = rounded_tensor_bytes(v_raw, "compressed V")?;
+    let per_layer = k_bytes
+        .checked_add(v_bytes)
+        .ok_or_else(|| "gemma4 lowered compressed KV byte calculation overflowed".to_string())?;
+    checked_product(&[layers, per_layer], "compressed KV")
+}
+
+/// Return the exact K/V owner bytes required by a lowered Gemma allocation.
+///
+/// Counts only layers that actually carry each attention family and both K/V
+/// tensors per layer. `max_seq` is both the logical and physical capacity on
+/// this route. The dense compressed estimate also includes the two shared
+/// rotation tables owned by the full cache.
+pub fn required_kv_bytes(
+    config: &lowered::Gemma4Config,
+    max_seq: usize,
+    policy: Gemma4LoweredKvPolicy,
+) -> Result<usize, String> {
+    let sliding_layers = config
+        .layer_types
+        .iter()
+        .filter(|layer| matches!(layer, lowered::LayerType::Sliding))
+        .count();
+    let full_layers = config
+        .layer_types
+        .iter()
+        .filter(|layer| matches!(layer, lowered::LayerType::Full))
+        .count();
+    match policy {
+        Gemma4LoweredKvPolicy::MoeF32 => {
+            let sliding = f32_kv_bytes(
+                sliding_layers,
+                max_seq,
+                config.sliding_n_kv_heads,
+                config.sliding_head_dim,
+            )?;
+            let full = f32_kv_bytes(
+                full_layers,
+                max_seq,
+                config.full_n_kv_heads,
+                config.full_head_dim,
+            )?;
+            sliding
+                .checked_add(full)
+                .ok_or_else(|| "gemma4 lowered F32 KV byte calculation overflowed".to_string())
+        }
+        Gemma4LoweredKvPolicy::DenseCompressed => {
+            let sliding_bytes_per_head =
+                checked_product(&[config.sliding_head_dim / 32, 34], "Q8 sliding")?;
+            let sliding = compressed_kv_bytes(
+                sliding_layers,
+                max_seq,
+                config.sliding_n_kv_heads,
+                sliding_bytes_per_head,
+                sliding_bytes_per_head,
+            )?;
+            let full_k_bytes_per_head = checked_product(&[3, config.full_head_dim], "Asym3 full K")?
+                .checked_div(8)
+                .and_then(|bytes| bytes.checked_add(4))
+                .ok_or_else(|| {
+                    "gemma4 lowered Asym3 full K byte calculation overflowed".to_string()
+                })?;
+            let full_v_bytes_per_head =
+                checked_product(&[config.full_head_dim / 32, 34], "Asym3 full V")?;
+            let full_tensors = compressed_kv_bytes(
+                full_layers,
+                max_seq,
+                config.full_n_kv_heads,
+                full_k_bytes_per_head,
+                full_v_bytes_per_head,
+            )?;
+            let full_tables =
+                checked_product(&[2, config.full_head_dim / 2, 4], "compressed rotation tables")?;
+            let full = full_tensors.checked_add(full_tables).ok_or_else(|| {
+                "gemma4 lowered compressed KV byte calculation overflowed".to_string()
+            })?;
+            sliding
+                .checked_add(full)
+                .ok_or_else(|| "gemma4 lowered compressed KV byte calculation overflowed".to_string())
+        }
+    }
+}
+
+
+/// Reject a lowered KV allocation before it can partially construct a cache.
+///
+/// This is deliberately fail-closed for the MoE F32 policy: an OOM must not
+/// silently retry with compressed KV, which would reintroduce the quality bug.
+pub fn preflight_lowered_kv_budget(
+    policy: Gemma4LoweredKvPolicy,
+    required: usize,
+    free: usize,
+    max_seq: usize,
+) -> Result<(), String> {
+    if required > free {
+        return Err(format!(
+            "gemma4 lowered KV allocation refused: policy={} required={} free={} max_seq={}",
+            policy.label(),
+            required,
+            free,
+            max_seq,
+        ));
+    }
+    Ok(())
 }
 
 // ─── Bundle types ─────────────────────────────────────────────────────────
@@ -402,15 +575,54 @@ pub fn load_gemma4_bundle_with_route(
         }
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::Scratch)
             .map_err(|e| format!("gemma4 (lowered) scratch stage: {e:?}"))?;
-        let kv_sliding = KvCache::new_gpu_q8_capped(
-            staging.gpu_mut(),
-            lcfg.n_layers,
-            lcfg.sliding_n_kv_heads,
-            lcfg.sliding_head_dim,
-            ctx.max_seq,
-            lowered_sliding_physical_cap(ctx.max_seq),
-        )
-        .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
+        let kv_policy = lowered_kv_policy(lcfg.enable_moe_block);
+        let required_kv = required_kv_bytes(&lcfg, ctx.max_seq, kv_policy)
+            .map_err(|e| format!("gemma4 (lowered) KV budget calculation: {e}"))?;
+        let (free_kv, _total_kv) = staging
+            .gpu_mut()
+            .hip
+            .get_vram_info()
+            .map_err(|e| format!("gemma4 (lowered) KV budget query: {e:?}"))?;
+        preflight_lowered_kv_budget(kv_policy, required_kv, free_kv, ctx.max_seq)?;
+
+        let n_sliding = lcfg
+            .layer_types
+            .iter()
+            .filter(|layer| matches!(layer, lowered::LayerType::Sliding))
+            .count();
+        let n_full = lcfg
+            .layer_types
+            .iter()
+            .filter(|layer| matches!(layer, lowered::LayerType::Full))
+            .count();
+        if matches!(kv_policy, Gemma4LoweredKvPolicy::MoeF32) {
+            if let Some(mode) = ctx.kv_mode_override {
+                eprintln!(
+                    "  gemma4 lowered KV override {mode:?} ignored for MoE; \
+                     policy=moe-f32 is required for canonical parity"
+                );
+            }
+        }
+        let sliding_physical_cap = lowered_sliding_physical_cap(ctx.max_seq);
+        let kv_sliding = match kv_policy {
+            Gemma4LoweredKvPolicy::MoeF32 => KvCache::new_gpu(
+                staging.gpu_mut(),
+                n_sliding,
+                lcfg.sliding_n_kv_heads,
+                lcfg.sliding_head_dim,
+                ctx.max_seq,
+            )
+            .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (f32): {e:?}"))?,
+            Gemma4LoweredKvPolicy::DenseCompressed => KvCache::new_gpu_q8_capped(
+                staging.gpu_mut(),
+                n_sliding,
+                lcfg.sliding_n_kv_heads,
+                lcfg.sliding_head_dim,
+                ctx.max_seq,
+                sliding_physical_cap,
+            )
+            .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?,
+        };
         staging.kv_sliding = Some(kv_sliding);
         lowered::register_live_owner_bytes(lowered::kv_owner_bytes(
             staging.kv_sliding.as_ref().expect("sliding KV staged"),
@@ -418,36 +630,43 @@ pub fn load_gemma4_bundle_with_route(
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::SlidingKv)
             .map_err(|e| format!("gemma4 (lowered) sliding KV stage: {e:?}"))?;
 
-        let kv_full = if ctx.kv_mode_override == Some("fwht3") {
-            eprintln!("  gemma4 lowered full KV: FWHT-512 3-bit K + Q8_0 V");
-            staging
-                .gpu_mut()
-                .ensure_mq_signs()
-                .map_err(|e| format!("gemma4 (lowered) fwht3 signs: {e:?}"))?;
-            let n_full = lcfg
-                .layer_types
-                .iter()
-                .filter(|layer| matches!(layer, lowered::LayerType::Full))
-                .count();
-            let all_true = vec![true; n_full];
-            KvCache::new_gpu_fwht3_capped_filtered_gemma4(
+        let kv_full = match kv_policy {
+            Gemma4LoweredKvPolicy::MoeF32 => KvCache::new_gpu(
                 staging.gpu_mut(),
-                &all_true,
-                lcfg.full_n_kv_heads,
-                lcfg.full_head_dim,
-                ctx.max_seq,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("gemma4 (lowered) full KV (fwht3): {e:?}"))?
-        } else {
-            KvCache::new_gpu_asym3_gemma4(
-                staging.gpu_mut(),
-                lcfg.n_layers,
+                n_full,
                 lcfg.full_n_kv_heads,
                 lcfg.full_head_dim,
                 ctx.max_seq,
             )
-            .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?
+            .map_err(|e| format!("gemma4 (lowered) full KV alloc (f32): {e:?}"))?,
+            Gemma4LoweredKvPolicy::DenseCompressed => {
+                if ctx.kv_mode_override == Some("fwht3") {
+                    eprintln!("  gemma4 lowered full KV: FWHT-512 3-bit K + Q8_0 V");
+                    staging
+                        .gpu_mut()
+                        .ensure_mq_signs()
+                        .map_err(|e| format!("gemma4 (lowered) fwht3 signs: {e:?}"))?;
+                    let all_true = vec![true; n_full];
+                    KvCache::new_gpu_fwht3_capped_filtered_gemma4(
+                        staging.gpu_mut(),
+                        &all_true,
+                        lcfg.full_n_kv_heads,
+                        lcfg.full_head_dim,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                    )
+                    .map_err(|e| format!("gemma4 (lowered) full KV (fwht3): {e:?}"))?
+                } else {
+                    KvCache::new_gpu_asym3_gemma4(
+                        staging.gpu_mut(),
+                        n_full,
+                        lcfg.full_n_kv_heads,
+                        lcfg.full_head_dim,
+                        ctx.max_seq,
+                    )
+                    .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?
+                }
+            }
         };
         staging.kv_full = Some(kv_full);
         lowered::register_live_owner_bytes(lowered::kv_owner_bytes(
@@ -456,14 +675,32 @@ pub fn load_gemma4_bundle_with_route(
         lowered::fail_after_construction_stage(lowered::Gemma4ConstructionStage::FullKv)
             .map_err(|e| format!("gemma4 (lowered) full KV stage: {e:?}"))?;
 
-        let full_kv_mode = if ctx.kv_mode_override == Some("fwht3") {
-            "fwht3"
-        } else {
-            "asym3"
+        let full_kv_mode = match kv_policy {
+            Gemma4LoweredKvPolicy::MoeF32 => "f32",
+            Gemma4LoweredKvPolicy::DenseCompressed => {
+                if ctx.kv_mode_override == Some("fwht3") {
+                    "fwht3"
+                } else {
+                    "asym3"
+                }
+            }
+        };
+        let sliding_kv_mode = match kv_policy {
+            Gemma4LoweredKvPolicy::MoeF32 => "f32",
+            Gemma4LoweredKvPolicy::DenseCompressed => "q8-ring",
         };
         eprintln!(
-            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {full_kv_mode} KV)",
-            lcfg.enable_moe_block, want_batched,
+            "  gemma4 lowered path: moe={} batched_opt_in={} kv_policy={} \
+             (sliding {sliding_kv_mode} + full {full_kv_mode} KV; \
+             sliding_layers={} full_layers={} max_seq={} physical_cap={} required_kv_bytes={})",
+            lcfg.enable_moe_block,
+            want_batched,
+            kv_policy.label(),
+            n_sliding,
+            n_full,
+            ctx.max_seq,
+            sliding_physical_cap,
+            required_kv,
         );
         return Ok(Gemma4Bundle::Lowered(staging.publish(lcfg)));
     }
@@ -499,7 +736,119 @@ pub use load_gemma4_bundle as load_bundle;
 
 #[cfg(test)]
 mod tests {
-    use super::{lowered_sliding_physical_cap, select_gemma4_route, Gemma4Route};
+    use super::{
+        lowered_kv_policy, lowered_sliding_physical_cap, preflight_lowered_kv_budget,
+        required_kv_bytes, select_gemma4_route, Gemma4LoweredKvPolicy, Gemma4Route,
+    };
+    use crate::lowered::{Gemma4Config, LayerType, RopeType};
+
+    fn config(layer_types: Vec<LayerType>) -> Gemma4Config {
+        Gemma4Config {
+            dim: 8,
+            n_layers: layer_types.len(),
+            vocab_size: 32,
+            norm_eps: 1e-6,
+            bos_token: 2,
+            eos_token: 1,
+            pad_token: 0,
+            n_heads: 2,
+            sliding_head_dim: 32,
+            sliding_n_kv_heads: 1,
+            sliding_rope_theta: 10_000.0,
+            sliding_window: 2,
+            full_head_dim: 64,
+            full_n_kv_heads: 1,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            hidden_dim: 16,
+            enable_moe_block: false,
+            moe_intermediate_size: 0,
+            num_experts: 0,
+            top_k_experts: 0,
+            final_logit_softcapping: 0.0,
+            tie_word_embeddings: true,
+            embed_scale: 1.0,
+            layer_types,
+            has_vision: false,
+            image_token_id: 0,
+            boi_token_id: 0,
+            eoi_token_id: 0,
+            audio_token_id: 0,
+            video_token_id: 0,
+        }
+    }
+
+    #[test]
+    fn lowered_moe_policy_is_f32_and_dense_policy_stays_compressed() {
+        assert_eq!(lowered_kv_policy(true), Gemma4LoweredKvPolicy::MoeF32);
+        assert_eq!(
+            lowered_kv_policy(false),
+            Gemma4LoweredKvPolicy::DenseCompressed
+        );
+        assert_eq!(Gemma4LoweredKvPolicy::MoeF32.label(), "moe-f32");
+        assert_eq!(
+            Gemma4LoweredKvPolicy::DenseCompressed.label(),
+            "dense-compressed"
+        );
+    }
+
+    #[test]
+    fn f32_budget_counts_only_real_sliding_and_full_layers_and_both_tensors() {
+        let cfg = config(vec![
+            LayerType::Sliding,
+            LayerType::Full,
+            LayerType::Sliding,
+            LayerType::Full,
+            LayerType::Sliding,
+        ]);
+        // 3 sliding × 4 tokens × 1 head × 32 dims × 2 tensors × 4 bytes
+        // + 2 full × 4 tokens × 1 head × 64 dims × 2 tensors × 4 bytes.
+        let expected = 3 * 4 * 1 * 32 * 2 * 4 + 2 * 4 * 1 * 64 * 2 * 4;
+        assert_eq!(
+            required_kv_bytes(&cfg, 4, Gemma4LoweredKvPolicy::MoeF32).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn dense_budget_matches_q8_sliding_and_asym3_full_storage() {
+        let cfg = config(vec![LayerType::Sliding, LayerType::Full]);
+        // Sliding Q8: one head × one 32-value block × 34 bytes/token,
+        // rounded to the F32 allocation unit for each K/V tensor.
+        let sliding = 4usize * 34 * 2;
+        // Full asym3: K=(4 + 3*64/8)=28 bytes/head and V=2*34 bytes/head,
+        // each tensor rounded to four bytes, plus the two 32-float Givens tables.
+        let full = 4usize * 28 + 4usize * (2 * 34) + 2 * (64 / 2) * 4;
+        assert_eq!(
+            required_kv_bytes(&cfg, 4, Gemma4LoweredKvPolicy::DenseCompressed).unwrap(),
+            sliding + full
+        );
+    }
+
+    #[test]
+    fn kv_budget_rejects_overflow_before_gpu_allocation() {
+        let cfg = config(vec![LayerType::Sliding]);
+        let error =
+            required_kv_bytes(&cfg, usize::MAX, Gemma4LoweredKvPolicy::MoeF32).unwrap_err();
+        assert!(error.contains("overflow"), "{error}");
+    }
+
+    #[test]
+    fn kv_budget_error_is_explicit_and_names_policy_need_free_and_capacity() {
+        let error = preflight_lowered_kv_budget(
+            Gemma4LoweredKvPolicy::MoeF32,
+            4096,
+            1024,
+            8192,
+        )
+        .unwrap_err();
+        assert!(error.contains("moe-f32"), "{error}");
+        assert!(error.contains("required=4096"), "{error}");
+        assert!(error.contains("free=1024"), "{error}");
+        assert!(error.contains("max_seq=8192"), "{error}");
+    }
 
     #[test]
     fn lowered_sliding_kv_uses_logical_context_capacity() {

@@ -931,8 +931,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
         "gemma4"
     }
     fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
-        // Two caches (q8 sliding + asym3 full) and no basis for preferring
-        // one, so expose neither rather than silently picking.
+        // Both caches are owned separately because sliding/full geometry differs;
+        // MoE uses F32 for both, while dense lowered keeps q8 sliding + compressed
+        // full KV. Expose neither rather than silently preferring one.
         None
     }
     fn reset_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
@@ -1109,10 +1110,11 @@ pub struct Gemma4Bundle {
 
 /// Lowered / MoE Gemma 4 execution bundle (arch_id=13 26B-A4B + opt-in
 /// batched/WMMA dense prefill). Uses `lowered::{Gemma4Config, Gemma4Weights,
-/// Gemma4Scratch}` plus TWO `hipfire_runtime::llama::KvCache`s (q8
-/// ring-buffered sliding + asym3 full) and `eos_tok`. Mutually exclusive
-/// with `Gemma4Bundle` (eager); a given `LoadedModel` populates exactly one
-/// wrapper/cache.
+/// Gemma4Scratch}` plus separate sliding/full `hipfire_runtime::llama::KvCache`
+/// owners. MoE uses F32 for both caches; dense lowered retains the established
+/// q8 sliding + compressed full policy (with the explicit fwht3 diagnostic
+/// override). Mutually exclusive with `Gemma4Bundle` (eager); a given
+/// `LoadedModel` populates exactly one wrapper/cache.
 pub struct Gemma4LoweredBundle {
     pub config: gemma4::lowered::Gemma4Config,
     pub weights: gemma4::lowered::Gemma4Weights,

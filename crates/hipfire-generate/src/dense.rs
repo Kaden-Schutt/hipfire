@@ -4414,23 +4414,34 @@ mod gemma4_lowered_oracle_tests {
         )
         .map_err(|error| format!("oracle Gemma scratch constants: {error:?}"))?;
         let max_seq = prompt_ids.len() + max_tokens + 16;
-        let kv_sliding = KvCache::new_gpu_q8_capped(
+        let n_sliding = config
+            .layer_types
+            .iter()
+            .filter(|layer| matches!(layer, hipfire_arch_gemma4::lowered::LayerType::Sliding))
+            .count();
+        let n_full = config
+            .layer_types
+            .iter()
+            .filter(|layer| matches!(layer, hipfire_arch_gemma4::lowered::LayerType::Full))
+            .count();
+        // This is the canonical MoE product oracle: keep it on the same
+        // F32/F32 policy as the carrier rather than validating compressed KV.
+        let kv_sliding = KvCache::new_gpu(
             &mut gpu,
-            config.n_layers,
+            n_sliding,
             config.sliding_n_kv_heads,
             config.sliding_head_dim,
             max_seq,
-            max_seq,
         )
-        .map_err(|error| format!("oracle sliding KV: {error:?}"))?;
-        let kv_full = KvCache::new_gpu_asym3_gemma4(
+        .map_err(|error| format!("oracle sliding F32 KV: {error:?}"))?;
+        let kv_full = KvCache::new_gpu(
             &mut gpu,
-            config.n_layers,
+            n_full,
             config.full_n_kv_heads,
             config.full_head_dim,
             max_seq,
         )
-        .map_err(|error| format!("oracle full KV: {error:?}"))?;
+        .map_err(|error| format!("oracle full F32 KV: {error:?}"))?;
         let mut bundle = hipfire_loader::Gemma4LoweredBundle {
             eos_tok: config.eos_token,
             cursor: hipfire_arch_gemma4::lowered::Gemma4Cursor::default(),
@@ -4496,12 +4507,12 @@ mod gemma4_lowered_oracle_tests {
         assert_eq!(
             ids,
             [
-                1852, 236772, 236770, 1852, 237597, 236770, 29802, 237089, 1852, 1852, 237610,
-                1852, 1852, 1852, 237610, 237610, 237610, 2165, 236775, 569, 1852, 5596, 236779,
-                237610, 236771, 1852, 870, 237372, 1852, 237610, 236770, 5596
+                1852, 128677, 138, 1852, 23960, 64255, 870, 3785, 71642, 23960, 236743, 1852,
+                23960, 23960, 23960, 236743, 1852, 569, 1360, 15371, 23960, 7881, 1852, 870,
+                23960, 7881, 1010, 23960, 1852, 862, 569, 236772,
             ]
         );
-        assert_eq!(fnv, 0x831756562b0ab110);
+        assert_eq!(fnv, 0x770f9d304edad4dc);
     }
     #[test]
     #[ignore = "requires canonical Gemma4 MoE artifact and AMD GPU"]
