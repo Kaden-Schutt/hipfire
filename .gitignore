@@ -164,6 +164,8 @@ redline/db/redline.db
 
 # Code-intelligence index (per-checkout, machine-local)
 .codegraph/
+# Graphify cache (regenerable, per-checkout)
+/graphify-out/cache/
 # Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate
 # with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
 # in commit messages and docs/investigations/.
