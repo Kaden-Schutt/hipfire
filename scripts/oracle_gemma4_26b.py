@@ -77,6 +77,19 @@ def tensor_at_position(tensor, position):
     return tensor
 
 
+def unscale_router_weights(weights, indices, scales):
+    """Convert post-scale router weights to the pre-scale HF probabilities."""
+    return [
+        [
+            math.nan
+            if (scale := float(scales[int(expert)])) == 0.0
+            else float(weight) / scale
+            for weight, expert in zip(row_weights, row_indices)
+        ]
+        for row_weights, row_indices in zip(weights, indices)
+    ]
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -154,6 +167,25 @@ def main():
 
         return hook
 
+    def make_router_weights_hook(layer_idx):
+        def hook(module, input, output):
+            scaled_weights = output[1]
+            indices = output[2]
+            capture_tensor(
+                f"L{layer_idx}_router_topk_weights_scaled", scaled_weights
+            )
+            pre_scale_rows = unscale_router_weights(
+                scaled_weights.detach().float().cpu().tolist(),
+                indices.detach().cpu().tolist(),
+                module.per_expert_scale.detach().float().cpu().tolist(),
+            )
+            pre_scale = torch.tensor(
+                pre_scale_rows, dtype=scaled_weights.dtype, device=scaled_weights.device
+            )
+            capture_tensor(f"L{layer_idx}_router_topk_weights", pre_scale)
+
+        return hook
+
     def make_pre_hook(layer_idx, name):
         def hook(module, input):
             capture_tensor(f"L{layer_idx}_{name}", input[0])
@@ -196,7 +228,7 @@ def main():
                             make_hook(li, "router_logits")
                         ),
                         layer.router.register_forward_hook(
-                            make_tuple_hook(li, "router_topk_weights", 1)
+                            make_router_weights_hook(li)
                         ),
                         layer.router.register_forward_hook(
                             make_tuple_hook(li, "router_topk_indices", 2)

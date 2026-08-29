@@ -59,3 +59,13 @@ def test_nonfinite_stats_become_json_null_under_strict_encoding():
     payload = {"nan": _oracle.finite_round(math.nan, 4)}
     assert json.dumps(payload, allow_nan=False) == '{"nan": null}'
     assert _oracle.finite_round(1.23456, 4) == 1.2346
+
+
+def test_router_weight_unscaling_guards_zero_expert_scale():
+    weights = _oracle.unscale_router_weights(
+        [[0.30, 0.25]],
+        [[2, 1]],
+        [1.0, 0.0, 2.0],
+    )
+    assert weights[0][0] == pytest.approx(0.15)
+    assert math.isnan(weights[0][1])

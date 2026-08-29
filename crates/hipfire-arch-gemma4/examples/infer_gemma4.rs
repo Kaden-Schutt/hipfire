@@ -39,10 +39,26 @@ fn full_kv_mode(value: &str) -> FullKvMode {
     }
 }
 
+#[cfg(feature = "deltanet")]
+fn ensure_bos(prompt_ids: &mut Vec<u32>, bos_token: u32) {
+    if prompt_ids.first() != Some(&bos_token) {
+        prompt_ids.insert(0, bos_token);
+    }
+}
+
 #[cfg(all(test, feature = "deltanet"))]
 mod tests {
-    use super::{full_kv_mode, parse_route, FullKvMode};
+    use super::{ensure_bos, full_kv_mode, parse_route, FullKvMode};
     use hipfire_arch_gemma4::Gemma4Route;
+
+    #[test]
+    fn non_default_bos_is_prepended_once_after_route_config_is_known() {
+        let mut ids = vec![7, 8];
+        ensure_bos(&mut ids, 3);
+        assert_eq!(ids, vec![3, 7, 8]);
+        ensure_bos(&mut ids, 3);
+        assert_eq!(ids, vec![3, 7, 8]);
+    }
 
     #[test]
     fn route_parser_defaults_to_carrier_auto() {
@@ -323,16 +339,11 @@ fn main() {
         None
     };
 
-    // Prepend the conventional Gemma BOS before sizing the loader's state.
-    // The loaded bundle remains authoritative for the final BOS value below.
     let mut prompt_ids = match token_ids {
         Some(ids) => ids,
         None => tok.as_ref().unwrap().encode(&prompt),
     };
-    if prompt_ids.first() != Some(&2) {
-        prompt_ids.insert(0, 2);
-    }
-    // Keep a small margin for a bundle-specific BOS correction after loading.
+    // Leave room for the bundle-specific BOS token inserted after loading.
     let max_seq = prompt_ids.len().saturating_add(max).saturating_add(17);
 
     let cask = CaskConfig::default();
@@ -376,9 +387,7 @@ fn main() {
         Gemma4Bundle::Eager(bundle) => bundle.config.bos_token,
         Gemma4Bundle::Lowered(bundle) => bundle.config.bos_token,
     };
-    if prompt_ids.first() != Some(&bos_token) {
-        prompt_ids.insert(0, bos_token);
-    }
+    ensure_bos(&mut prompt_ids, bos_token);
     let actual_route = match &bundle {
         Gemma4Bundle::Eager(bundle) => {
             eprintln!(
