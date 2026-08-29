@@ -5,7 +5,7 @@ Authority: `.agent-progress/device-mesh-refactor-tracker.md` STEP-005
 
 | Family | Mode | Production entry | SuperOp route | Default | Hand/state oracle | Replacement owner | Status |
 |---|---|---|---|---|---|---|---|
-| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | source remediation Gates A–C complete at `d4995096b` (review Spec APPROVED + Quality APPROVED); original Task 7 remains open for malformed MoE/attractor, the B=2 reference failure, absent HF/high-precision reference, absent E2B/E4B fixtures, and unrelated workspace baseline observations |
+| Gemma4 | Single | `forward_scratch_inner` | `forward_scratch_inner_lowered` -> `run_layer_program` | on | `sliding_layer_decode` / `full_layer_decode` | Gemma4 increment | complete: source Gates A–C pass; dense B=1/2/4/8 and E2B/E4B parity pass; official HF MoE oracle established; Q8-expert/F32-KV product reference is coherent; the historical MQ4 MoE artifact is rejected as over-quantized |
 | LFM2 | Single | `decode_step_layers_and_head` | `decode_step_layers_and_head_lowered` -> `run_layer_program` | on | direct layer loop with capture | LFM2 increment | open |
 | MiniMax | Single | `decode_step_body` | `decode_step_body_lowered` -> `run_layer_program` | on | direct attention + sealed MoE loop | MiniMax increment | open |
 | Qwen35 | Single | `forward_scratch_layers` | `forward_scratch_layers_lowered` -> `run_layer_program` | on when no hidden ring or mRoPE | direct hybrid/DeltaNet loop | Qwen35 Single increment | open |
@@ -541,6 +541,49 @@ The canonical dense route used isolated HOME/config, `HIP_VISIBLE_DEVICES=0`, gr
 - No exact local HF or higher-precision Gemma reference checkpoint was found; historical Task 7 decode logs remain non-promoted.
 - The exact E-series arm remains externally blocked: `/home/bjoern/.hipfire/models/gemma4-eseries/gemma4-e2b-it-pr439-q8.hfq` is missing, and the exact E2B/E4B fixture directory/files are absent.
 - Unrelated workspace observations remain recorded, not reclassified as Gemma defects: narrow clippy is blocked by the shared pre-existing `hipfire-config/src/rocm.rs` diagnostics, and the full `cargo test` run hit the non-reproducing `hipfire-quantize` `glimmer_self_attn_gate_proj_is_attention_not_mlp_or_router` failure (`155 passed; 1 failed; 4 ignored` in that binary; isolated rerun `1 passed; 159 filtered out`).
+
+## Original Task 7 quality closure (2026-08-29)
+
+This section supersedes the stale blocker list above. The source behavior was not
+changed to preserve the historical malformed MQ4 artifact; that artifact is rejected.
+
+- **Dense batched parity:** the Gemma-only scalar Q8 batch route passes the canonical
+  B=1/2/4/8 sequential-versus-batched argmax and KV checks in the default environment.
+  The B=2 route is parity-safe at a measured +65.7% latency cost versus the former fused
+  route; other architectures retain their existing Q8 batch dispatch.
+- **E-series:** exact generated fixtures
+  `gemma4-e2b-it-pr439-q8.hfq` and `gemma4-e4b-it-pr439-q8.hfq` pass
+  `scripts/reproduce-gemma4-eseries-parity.sh`. E2B and E4B both produce official top-1
+  token `236888`; B=1/2/4 logits/KV checks pass; the dense 12B control produces token
+  `575`.
+- **Independent MoE reference:** official Hugging Face BF16/F32 inference on canonical
+  IDs `[2,9259,236888,575,106]` produces argmax `107`. A full BF16 HFQ control with F32
+  KV matched the HF-F32 logits/top five and sampled layer boundaries, proving the
+  lowered runtime math and isolating compressed KV as invalid for this MoE.
+- **Product MoE KV policy:** lowered Gemma4 MoE now allocates F32 sliding/full KV with
+  checked VRAM preflight. Dense Gemma remains on compressed KV. Public batched prefill
+  falls back to the parity-safe token route when F32 KV is active.
+- **Admitted MoE artifact:** `gemma4-26b-a4b.q8-experts-reference.hfq`, SHA-256
+  `ed82786b8bbde5cfac2b2e785a52f802a853dbc93d09e5d685695d0435b1668f`, size
+  `26,848,688,188` bytes. Astrea census: arch 13, 8,277 tensors, `F16=361`,
+  `Q8F16=7916`, `data_end_matches_file_size=true`, tensor-name MD5
+  `b39ab70ef95d116ac668b86f76966896`.
+- **Canonical MoE oracle:** the admitted artifact under the default carrier-owned
+  lowered route and F32 KV produces token `107`, matching the official HF reference.
+- **User-facing quality:** `serve_harness.py` greedy/thinking-off battery and chain
+  both exit `0`; each covers code, reasoning, factual, prose, and instruction prompts.
+  Both report `empty=0`, `attractor=0`, and `retrieval_miss=0`; decoded prefixes are
+  visibly coherent. All rows intentionally hit the 64-token cap, so no self-termination
+  claim is made. Evidence:
+  `/home/bjoern/hipfire-step005/gemma4/quality-q8/{battery,chain}.json` and matching
+  daemon logs.
+- **Rejected artifact:** `gemma4-26b-a4b.mq4` remains structurally loadable but
+  produces malformed/attractor output even with corrected F32 KV. It is over-quantized
+  for production and is not an accepted Gemma4 MoE fixture.
+
+**Original Task 7 verdict: COMPLETE** for the admitted Q8-expert/F32-KV artifact and
+the exact dense/E-series fixtures. No quality claim is made for the rejected MQ4 MoE
+artifact.
 
 
 ## Out of scope (later tasks)
