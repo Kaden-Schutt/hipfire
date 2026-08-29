@@ -70,7 +70,8 @@ def tensor_at_position(tensor, position):
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     # Resolve in precedence order: CLI, environment, historical default.
     model_path = args.model if args.model is not None else os.environ.get("GEMMA4_26B_MODEL", MODEL)
 
@@ -85,7 +86,7 @@ def main():
     try:
         capture_position = resolve_capture_position(args.position, len(ids))
     except ValueError as error:
-        ap.error(str(error))
+        parser.error(str(error))
 
     # Parse layers to dump
     if args.layers == "all":

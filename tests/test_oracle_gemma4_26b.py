@@ -4,6 +4,8 @@
 import importlib.util
 import json
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,18 @@ def test_parser_accepts_absolute_capture_position_and_boundaries():
     )
     assert args.position == 1
     assert args.boundaries is True
+
+
+def test_cli_rejects_invalid_position_with_argparse_error():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--ids", "2,9259", "--position", "2"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "outside sequence of length 2" in result.stderr
+    assert "NameError" not in result.stderr
 
 
 def test_capture_position_defaults_to_last_and_rejects_out_of_range():
