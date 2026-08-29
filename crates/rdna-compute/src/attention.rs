@@ -5624,6 +5624,131 @@ impl Gpu {
             None,
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    fn attention_mqkv_flash_prefill_wmma_gfx12(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+        bits: i32,
+    ) -> HipResult<()> {
+        let (module, function) = match bits {
+            3 => (
+                "attention_mq3kv_flash_prefill_wmma_gfx12_hd256",
+                "attention_mq3kv_flash_prefill_wmma_gfx12",
+            ),
+            4 => (
+                "attention_mq4kv_flash_prefill_wmma_gfx12_hd256",
+                "attention_mq4kv_flash_prefill_wmma_gfx12",
+            ),
+            _ => unreachable!("MQKV WMMA prefill only supports 3 or 4 bits"),
+        };
+        if !self.functions.contains_key(function) {
+            let stripped = kernels::ATTENTION_MQKV_FLASH_PREFILL_WMMA_GFX12_SRC
+                .replace("#include \"turbo_common.h\"", "");
+            let src = format!(
+                "#define MQ_BITS {bits}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                stripped
+            );
+            self.ensure_kernel(module, &src, function)?;
+        }
+        if !self.functions.contains_key("mqkv_inverse_fwht256_batched") {
+            let stripped = kernels::MQKV_INVERSE_FWHT256_BATCHED_SRC
+                .replace("#include \"turbo_common.h\"", "");
+            let src = format!("{}\n{}", kernels::TURBO_COMMON_H, stripped);
+            self.ensure_kernel(
+                "mqkv_inverse_fwht256_batched",
+                &src,
+                "mqkv_inverse_fwht256_batched",
+            )?;
+        }
+
+        const M_TILE: usize = 16;
+        const S_STRIDE: usize = 18;
+        const V_STRIDE: usize = 18;
+        const HEAD_DIM: usize = 256;
+        let lds =
+            (M_TILE * HEAD_DIM + HEAD_DIM * V_STRIDE + M_TILE * S_STRIDE) * 2 + M_TILE * 3 * 4;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut signs1_ptr = signs1.buf.as_ptr();
+        let mut signs2_ptr = signs2.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut signs1_ptr as *mut _ as *mut c_void,
+            &mut signs2_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            function,
+            [batch_size.div_ceil(M_TILE) as u32, n_heads as u32, 1],
+            [32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_ptr(signs1_ptr);
+                b.push_ptr(signs2_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        )?;
+
+        let mut inverse_params: Vec<*mut c_void> = vec![
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut signs1_ptr as *mut _ as *mut c_void,
+            &mut signs2_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "mqkv_inverse_fwht256_batched",
+            [batch_size as u32, n_heads as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut inverse_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(out_ptr);
+                b.push_ptr(signs1_ptr);
+                b.push_ptr(signs2_ptr);
+                b.push_i32(nh);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
 
     /// Batched flash attention for fwht4 (K FWHT-rotated 4-bit + V Q8_0).
     /// `signs1` and `signs2` occupy the same slots as cos_theta/sin_theta on
@@ -5694,6 +5819,18 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch_caps.has_wmma_w32_gfx12()
+            && head_dim == 256
+            && v_mode_bits == 4
+            && tree_bias.is_none()
+            && block_start == 0
+            && block_cols == 0
+        {
+            return self.attention_mqkv_flash_prefill_wmma_gfx12(
+                q, k_cache, v_cache, out, positions, signs1, signs2, n_heads, n_kv_heads,
+                batch_size, 4,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fwht4_tile_batched",
             kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC,
@@ -6141,6 +6278,18 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch_caps.has_wmma_w32_gfx12()
+            && head_dim == 256
+            && v_mode_bits == 3
+            && tree_bias.is_none()
+            && block_start == 0
+            && block_cols == 0
+        {
+            return self.attention_mqkv_flash_prefill_wmma_gfx12(
+                q, k_cache, v_cache, out, positions, signs1, signs2, n_heads, n_kv_heads,
+                batch_size, 3,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fwht3_tile_batched",
             kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
@@ -8349,7 +8498,10 @@ impl Gpu {
             n_heads > 0 && n_kv_heads > 0,
             "attention_dflash_sliding_f32: n_heads/n_kv_heads must be > 0"
         );
-        assert!(head_dim > 0, "attention_dflash_sliding_f32: head_dim must be > 0");
+        assert!(
+            head_dim > 0,
+            "attention_dflash_sliding_f32: head_dim must be > 0"
+        );
         assert!(
             sliding_window > 0,
             "attention_dflash_sliding_f32: sliding_window must be > 0"
@@ -8474,7 +8626,17 @@ impl Gpu {
         sliding_window: usize,
     ) -> HipResult<()> {
         self.attention_dflash_sliding_f32(
-            q, k, v, out, b, l, n_heads, n_kv_heads, head_dim, ctx_span, sliding_window,
+            q,
+            k,
+            v,
+            out,
+            b,
+            l,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_span,
+            sliding_window,
         )
     }
 

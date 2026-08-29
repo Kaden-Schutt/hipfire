@@ -5347,6 +5347,10 @@ pub const ATTENTION_FLASH_FWHT4_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht4_tile.hip");
 pub const ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht4_tile_batched.hip");
+pub const ATTENTION_MQKV_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_mqkv_flash_prefill_wmma.gfx12.hip");
+pub const MQKV_INVERSE_FWHT256_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/mqkv_inverse_fwht256_batched.hip");
 pub const KV_CACHE_WRITE_ASYM_K_FWHT3_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht3.hip");
 pub const KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC: &str =
