@@ -3214,6 +3214,11 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // unchanged; metadata loads select the dual fp16 header per 128-weight half.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
+/// Candidate K-axis variants of the MQ4V2 MMQ kernel (k2/k4 unroll, ksplit).
+/// Lives in its own TU so production dispatch is untouched — the microbench
+/// example JITs this TU directly. gfx11 only; compile-checks locally.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_KVARIANTS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_kvariants.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
