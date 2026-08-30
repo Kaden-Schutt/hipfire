@@ -21,7 +21,7 @@
 // Partial N lanes and whole tail waves read X batch 0 and discard via out_col<N.
 //
 // Grid:  [ceil(M/16), ceil(N/(16*NW)), 1]
-// Block: [32*NW, 1, 1]. Static LDS 8192 B; dynamic shared_mem=0.
+// Block: [32*NW, 1, 1]. Static LDS 9216 B; dynamic shared_mem=0.
 // Instantiated: mw4/mw8. Production policy (exact gfx1100, non-replay/non-capture):
 // MW4 for N 416..463, MW8 for N>=464.
 // Output: Y += acc with unique owner; gfx11 interleaved C mapping.
@@ -47,8 +47,10 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
         const int safe_batch = (out_col < N) ? out_col : 0;                                    \
         const int groups_per_row = K / 256;                                                    \
                                                                                                \
-        /* Tile-major [kt][row][ki]: 16*16*16 half = 8192 B. */                                \
-        __shared__ __align__(32) _Float16 w_lds[16][16][16];                                    \
+        /* Tile-major [kt][row][ki], ki padded to 18: 16*16*18 half = 9216 B.                  \
+           36 B row stride, gcd(9,32)=1 — bank-conflict-free compute reads                     \
+           (tools/kernels/gfx1100/mb_lds_pad18 screen, 2026-08-30: 1.52x probe). */            \
+        __shared__ __align__(32) _Float16 w_lds[16][16][18];                                    \
                                                                                                \
         float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};                        \
                                                                                                \
