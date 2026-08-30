@@ -6,6 +6,8 @@
 //! (argmax, top-k, top-p, log-sum-exp).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Once;
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
@@ -38,6 +40,53 @@ fn sample_fast_stable_enabled() -> bool {
     })
 }
 
+/// Screening flag: route the parallel sampler's top-K gather through rocPRIM
+/// `device_topk` (largest, unordered) via a runtime-compiled host shim.
+/// Default OFF — production path is byte-identical when unset/0.
+fn sample_rocprim_wanted() -> bool {
+    use std::sync::LazyLock;
+    static EN: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_SAMPLE_ROCPRIM")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    });
+    *EN
+}
+
+type RocprimTopkFn = unsafe extern "C" fn(
+    stream: *mut c_void,
+    d_logits: *const f32,
+    vocab: u32,
+    k: u32,
+    d_out_vals: *mut f32,
+    d_out_idx: *mut u32,
+    d_temp: *mut c_void,
+    temp_bytes: *mut usize,
+) -> i32;
+
+struct RocprimShim {
+    /// Keep the .so mapped for the process lifetime.
+    _lib: libloading::Library,
+    topk: RocprimTopkFn,
+}
+
+
+static ROCPRIM_FALLBACK: AtomicBool = AtomicBool::new(false);
+static ROCPRIM_FALLBACK_LOG: Once = Once::new();
+
+fn rocprim_fallback_tripped() -> bool {
+    ROCPRIM_FALLBACK.load(AtomicOrdering::Relaxed)
+}
+
+fn trip_rocprim_fallback(reason: &str) {
+    ROCPRIM_FALLBACK.store(true, AtomicOrdering::Relaxed);
+    ROCPRIM_FALLBACK_LOG.call_once(|| {
+        eprintln!(
+            "HIPFIRE_SAMPLE_ROCPRIM: {reason}; falling back to production sampler for this process"
+        );
+    });
+}
+
 /// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
 /// TOP_K 20). Shared by runtime ensure_kernel and `precompile_qwen35` so the
 /// cache hash is identical.
@@ -46,15 +95,25 @@ pub(crate) fn sample_top_p_parallel_src() -> String {
 }
 
 /// HIP source for the wide parallel sampler (`sample_top_p_parallel_w64`).
-/// Renames the three entry points; leaves TOP_K at the on-disk default 64.
+/// Renames entry points; leaves TOP_K at the on-disk default 64.
 pub(crate) fn sample_top_p_parallel_w64_src() -> String {
+    // Protect the rocprim finalize name from the generic finalize replace
+    // (which would otherwise turn `…_rocprim` into `…_w64_rocprim`).
     kernels::SAMPLE_TOP_P_PARALLEL_SRC
         .replace(
             "sample_apply_repeat_penalty",
             "sample_apply_repeat_penalty_w64",
         )
         .replace("sample_topk_partial", "sample_topk_partial_w64")
+        .replace(
+            "sample_topk_finalize_rocprim",
+            "___ROCPRIM_FINALIZE_W64___",
+        )
         .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+        .replace(
+            "___ROCPRIM_FINALIZE_W64___",
+            "sample_topk_finalize_rocprim_w64",
+        )
 }
 
 /// HIP source for a fast-stable parallel sampler module.
@@ -68,11 +127,21 @@ pub(crate) fn sample_top_p_parallel_fast_src(top_k_width: usize, suffix: &str) -
     let fn_penalty = format!("sample_apply_repeat_penalty_{suffix}");
     let fn_partial = format!("sample_topk_partial_{suffix}");
     let fn_finalize = format!("sample_topk_finalize_{suffix}");
+    // Park the rocprim entry (unused on the fast path) so the generic
+    // finalize rename cannot mangle it.
     kernels::SAMPLE_TOP_P_PARALLEL_SRC
         .replace("#define TOP_K 64", &top_k_define)
         .replace("sample_apply_repeat_penalty", &fn_penalty)
         .replace("sample_topk_partial", &fn_partial)
+        .replace(
+            "sample_topk_finalize_rocprim",
+            "___ROCPRIM_FINALIZE_UNUSED___",
+        )
         .replace("sample_topk_finalize", &fn_finalize)
+        .replace(
+            "___ROCPRIM_FINALIZE_UNUSED___",
+            &format!("sample_topk_finalize_rocprim_{suffix}"),
+        )
 }
 
 /// All exact parallel-sampler module identities used by `sample_top_p_pf`,
@@ -356,6 +425,15 @@ impl Gpu {
     /// (merge partials → global top-K + the verbatim softmax/sort/top-p/RNG
     /// tail). Byte-identical token to the single-block kernel for distinct
     /// logits.
+    ///
+    /// When `HIPFIRE_SAMPLE_ROCPRIM=1` (default OFF) and the runtime-compiled
+    /// rocPRIM shim loads, the top-K gather is replaced by
+    /// `hipfire_rocprim_topk_f32` + `sample_topk_finalize_rocprim`. The
+    /// finalize tail sorts its K candidates, so the sampled token matches
+    /// production for distinct logits; ties may legitimately differ because
+    /// rocPRIM's unordered top-K does not fix relative order among equals.
+    /// Any shim init/runtime failure trips a process-level fallback to this
+    /// production route (logged once).
     #[allow(clippy::too_many_arguments)]
     fn sample_top_p_parallel_impl(
         &mut self,
@@ -395,12 +473,13 @@ impl Gpu {
         // keyed by function name and skips reload once a name is present (see
         // compile_and_load_kernel), so the wide variant SUFFIXES its entry
         // points to coexist with the default without clobbering it.
-        let (m, fn_penalty, fn_partial, fn_finalize) = if wide {
+        let (m, fn_penalty, fn_partial, fn_finalize, fn_finalize_rocprim) = if wide {
             (
                 "sample_top_p_parallel_w64",
                 "sample_apply_repeat_penalty_w64",
                 "sample_topk_partial_w64",
                 "sample_topk_finalize_w64",
+                "sample_topk_finalize_rocprim_w64",
             )
         } else {
             (
@@ -408,14 +487,18 @@ impl Gpu {
                 "sample_apply_repeat_penalty",
                 "sample_topk_partial",
                 "sample_topk_finalize",
+                "sample_topk_finalize_rocprim",
             )
         };
         // `ensure_kernel` caches compiled functions, but constructing/replacing
         // the full HIP source used to happen before that cache check on every
         // generated token. Only materialize source when a function is missing.
+        let need_rocprim_finalize =
+            sample_rocprim_wanted() && !rocprim_fallback_tripped();
         if !self.functions.contains_key(fn_penalty)
             || !self.functions.contains_key(fn_partial)
             || !self.functions.contains_key(fn_finalize)
+            || (need_rocprim_finalize && !self.functions.contains_key(fn_finalize_rocprim))
         {
             let src: String = if wide {
                 sample_top_p_parallel_w64_src()
@@ -425,6 +508,9 @@ impl Gpu {
             self.ensure_kernel(m, &src, fn_penalty)?;
             self.ensure_kernel(m, &src, fn_partial)?;
             self.ensure_kernel(m, &src, fn_finalize)?;
+            if need_rocprim_finalize {
+                self.ensure_kernel(m, &src, fn_finalize_rocprim)?;
+            }
         }
 
         // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
@@ -461,6 +547,29 @@ impl Gpu {
                     self.stream_ref(),
                     &mut params,
                 )?;
+            }
+        }
+
+        // rocPRIM screening path (HIPFIRE_SAMPLE_ROCPRIM): shim top-K gather +
+        // finalize_rocprim. Penalty already applied. On any failure the helper
+        // trips a process-level fallback and we continue with production.
+        // Determinism: unordered top-K + this finalize tail sorts candidates,
+        // so the token matches production for distinct logits; ties may differ.
+        if sample_rocprim_wanted() && !rocprim_fallback_tripped() {
+            if let Some(result) = self.sample_top_p_rocprim_impl(
+                logits,
+                result_buf,
+                vocab_size,
+                temperature,
+                top_p,
+                rng_state,
+                top_k,
+                top_k_req,
+                min_p_val,
+                block,
+                fn_finalize_rocprim,
+            )? {
+                return Ok(result);
             }
         }
 
@@ -559,6 +668,190 @@ impl Gpu {
         let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
         let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
         Ok((token_id, new_rng))
+    }
+
+    /// rocPRIM top-K gather + `sample_topk_finalize_rocprim`. Returns `None`
+    /// (after tripping process fallback) on any init/runtime failure so the
+    /// caller continues on the production partial/finalize route.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_top_p_rocprim_impl(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        top_k: usize,
+        top_k_req: i32,
+        min_p_val: f32,
+        block: u32,
+        fn_finalize_rocprim: &str,
+    ) -> HipResult<Option<(u32, u32)>> {
+        let Some(topk_fn) = self.ensure_rocprim_topk_fn() else {
+            return Ok(None);
+        };
+
+        // Candidate buffers: [K] f32 vals + [K] u32 idx.
+        let cand_bytes = top_k * 4 * 2;
+        let cand_base = match self
+            .scratch
+            .ensure_sample_rocprim_cand(&self.hip, cand_bytes)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                trip_rocprim_fallback(&format!("cand scratch alloc failed: {e}"));
+                return Ok(None);
+            }
+        };
+        let cand_val = cand_base as *mut f32;
+        let cand_idx = unsafe { (cand_base as *mut u8).add(top_k * 4) as *mut u32 };
+
+        let stream = self
+            .active_stream
+            .as_ref()
+            .map(|s| s.as_raw())
+            .unwrap_or(std::ptr::null_mut());
+        let logits_ptr = logits.buf.as_ptr() as *const f32;
+
+        // Two-phase temp query.
+        let mut temp_bytes: usize = 0;
+        let qerr = unsafe {
+            topk_fn(
+                stream,
+                logits_ptr,
+                vocab_size as u32,
+                top_k as u32,
+                cand_val,
+                cand_idx,
+                std::ptr::null_mut(),
+                &mut temp_bytes,
+            )
+        };
+        if qerr != 0 {
+            trip_rocprim_fallback(&format!("temp-size query failed (hipError={qerr})"));
+            return Ok(None);
+        }
+        let temp_need = temp_bytes.max(4);
+        let d_temp = match self
+            .scratch
+            .ensure_sample_rocprim_temp(&self.hip, temp_need)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                trip_rocprim_fallback(&format!("temp scratch alloc failed: {e}"));
+                return Ok(None);
+            }
+        };
+
+        let mut run_temp_bytes = temp_bytes;
+        let rerr = unsafe {
+            topk_fn(
+                stream,
+                logits_ptr,
+                vocab_size as u32,
+                top_k as u32,
+                cand_val,
+                cand_idx,
+                d_temp,
+                &mut run_temp_bytes,
+            )
+        };
+        if rerr != 0 {
+            trip_rocprim_fallback(&format!("device_topk failed (hipError={rerr})"));
+            return Ok(None);
+        }
+
+        // Finalize over K candidates (no merge). Shared mem unused (tid0-only).
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut ncand = top_k as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut tk = top_k_req;
+        let mut mp = min_p_val;
+        let mut cval = cand_base;
+        let mut cidx = cand_idx as *mut c_void;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut cval as *mut _ as *mut c_void,
+            &mut cidx as *mut _ as *mut c_void,
+            &mut ncand as *mut _ as *mut c_void,
+            &mut result_ptr as *mut _ as *mut c_void,
+            &mut temp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut rng as *mut _ as *mut c_void,
+            &mut tk as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+        ];
+        let func = match self.functions.get(fn_finalize_rocprim) {
+            Some(f) => f,
+            None => {
+                trip_rocprim_fallback(&format!("missing kernel {fn_finalize_rocprim}"));
+                return Ok(None);
+            }
+        };
+        if let Err(e) = (unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }) {
+            trip_rocprim_fallback(&format!("finalize_rocprim launch failed: {e}"));
+            return Ok(None);
+        }
+
+        let mut out = [0u8; 8];
+        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
+        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
+        Ok(Some((token_id, new_rng)))
+    }
+    /// Compile + dlopen the rocPRIM top-K shim once per process. On failure
+    /// trips permanent fallback and returns None.
+    fn ensure_rocprim_topk_fn(&mut self) -> Option<RocprimTopkFn> {
+        use std::sync::OnceLock;
+        static SHIM: OnceLock<Option<RocprimShim>> = OnceLock::new();
+        if let Some(cached) = SHIM.get() {
+            return cached.as_ref().map(|s| s.topk);
+        }
+        let loaded = match Self::load_rocprim_topk_shim(&mut self.compiler) {
+            Ok(shim) => Some(shim),
+            Err(reason) => {
+                trip_rocprim_fallback(&reason);
+                None
+            }
+        };
+        let fn_ptr = loaded.as_ref().map(|s| s.topk);
+        let _ = SHIM.set(loaded);
+        fn_ptr
+    }
+
+    fn load_rocprim_topk_shim(
+        compiler: &mut crate::compiler::KernelCompiler,
+    ) -> Result<RocprimShim, String> {
+        const SHIM_NAME: &str = "hipfire_rocprim_topk";
+        const SHIM_SRC: &str =
+            include_str!("../../../kernels/src/rocprim_topk_shim.cpp");
+        // -DROCPRIM_WITH_TOPK is required (not ENABLE). Include path comes from
+        // compile_host_shim's selected ROCm root.
+        let extra = "-DROCPRIM_WITH_TOPK";
+        let so_path = compiler
+            .compile_host_shim(SHIM_NAME, SHIM_SRC, extra)
+            .map_err(|e| format!("compile_host_shim failed: {e}"))?;
+
+        // Absolute path for dlopen (hipfire convention).
+        let abs = std::fs::canonicalize(&so_path).unwrap_or_else(|_| so_path.clone());
+        let lib = unsafe { libloading::Library::new(&abs) }
+            .map_err(|e| format!("dlopen {} failed: {e}", abs.display()))?;
+        let sym: libloading::Symbol<RocprimTopkFn> =
+            unsafe { lib.get(b"hipfire_rocprim_topk_f32\0") }
+                .map_err(|e| format!("dlsym hipfire_rocprim_topk_f32 failed: {e}"))?;
+        let topk: RocprimTopkFn = *sym;
+        Ok(RocprimShim { _lib: lib, topk })
     }
 
     /// Fast-stable top-k+1 reducer. Selects width 21 for top_k_req<=20 and

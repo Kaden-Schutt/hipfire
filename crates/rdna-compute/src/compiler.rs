@@ -136,6 +136,70 @@ fn publish_pair(
     Ok(())
 }
 
+/// Like [`publish_pair`] but for an arbitrary blob extension (e.g. `"so"` for
+/// host shims). Keeps the `.hsaco` publisher untouched.
+fn publish_pair_ext(
+    dest_dir: &Path,
+    name: &str,
+    ext: &str,
+    src_blob: &Path,
+    src_hash: &str,
+    force: bool,
+) -> Result<(), String> {
+    let dest_blob = dest_dir.join(format!("{name}.{ext}"));
+    let dest_hash = dest_dir.join(format!("{name}.hash"));
+
+    if !force && pair_valid(&dest_blob, &dest_hash, src_hash) {
+        return Ok(());
+    }
+
+    if !nonempty_blob(src_blob) {
+        return Err(format!("{name}: source blob missing or empty"));
+    }
+
+    let token = unique_token();
+    let tmp_blob = dest_dir.join(format!(".{name}.{token}.{ext}.tmp"));
+    let tmp_hash = dest_dir.join(format!(".{name}.{token}.hash.tmp"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&tmp_blob);
+        let _ = std::fs::remove_file(&tmp_hash);
+    };
+
+    let same_blob = same_path(src_blob, &dest_blob);
+
+    if !same_blob {
+        if let Err(e) = std::fs::copy(src_blob, &tmp_blob) {
+            cleanup();
+            return Err(format!("{name}: blob stage failed ({e})"));
+        }
+        if !nonempty_blob(&tmp_blob) {
+            cleanup();
+            return Err(format!("{name}: staged blob empty"));
+        }
+    }
+
+    if let Err(e) = std::fs::write(&tmp_hash, src_hash) {
+        cleanup();
+        return Err(format!("{name}: hash stage failed ({e})"));
+    }
+
+    let _ = std::fs::remove_file(&dest_hash);
+
+    if !same_blob {
+        if let Err(e) = std::fs::rename(&tmp_blob, &dest_blob) {
+            cleanup();
+            return Err(format!("{name}: blob publish failed ({e})"));
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_hash, &dest_hash) {
+        let _ = std::fs::remove_file(&tmp_hash);
+        return Err(format!("{name}: hash publish failed ({e})"));
+    }
+
+    Ok(())
+}
+
 /// Publish only a nonempty blob into `dest_dir`, removing any orphan hash so
 /// it cannot certify the copied content. Used for hashless cold seed fallback.
 fn publish_blob_only(dest_dir: &Path, name: &str, src_blob: &Path) -> Result<(), String> {
@@ -813,6 +877,79 @@ impl KernelCompiler {
         Ok(&self.compiled[name])
     }
 
+    /// Compile a host-side shared library (`.so`) via hipcc for runtime dlopen.
+    /// Same hash-keying as kernel objects (source + arch + flags + toolchain +
+    /// `KERNEL_CACHE_ABI`); artifacts are `{name}.so` + `{name}.hash` in the hot
+    /// cache (and cold writeback when distinct). Does not touch the `.hsaco`
+    /// publish path. Returns `Err` when hipcc is unavailable so callers can fall
+    /// back.
+    pub fn compile_host_shim(
+        &mut self,
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+    ) -> HipResult<PathBuf> {
+        if let Some(path) = self.compiled.get(name) {
+            if path.extension().is_some_and(|e| e == "so") && nonempty_blob(path) {
+                return Ok(path.clone());
+            }
+        }
+
+        let src_hash = Self::hash_parts(
+            source,
+            &self.arch,
+            extra_flags,
+            &[],
+            &self.toolchain_id,
+            SchedulerProfile::Default,
+        );
+
+        let so_path = self.cache_dir.join(format!("{name}.so"));
+        let hash_path = self.cache_dir.join(format!("{name}.hash"));
+        if pair_valid(&so_path, &hash_path, &src_hash) {
+            if let Some(dir) = self.writeback_dir() {
+                if let Err(e) = publish_pair_ext(dir, name, "so", &so_path, &src_hash, false) {
+                    eprintln!(
+                        "  WARNING: {name}: cold .so writeback failed ({e}); \
+                         runtime blob remains valid in the hot cache"
+                    );
+                }
+            }
+            self.compiled.insert(name.to_string(), so_path.clone());
+            return Ok(so_path);
+        }
+
+        if !self.has_hipcc {
+            return Err(self.compiler_unavailable_error(
+                name,
+                "no usable cached host-shim image exists",
+            ));
+        }
+
+        Self::hipcc_compile_publish_so(
+            &self.hipcc_bin,
+            self.rocm_env_root.as_deref(),
+            &self.arch,
+            &self.cache_dir,
+            name,
+            source,
+            &src_hash,
+            extra_flags,
+        )?;
+
+        if let Some(dir) = self.writeback_dir() {
+            if let Err(e) = publish_pair_ext(dir, name, "so", &so_path, &src_hash, false) {
+                eprintln!(
+                    "  WARNING: {name}: cold .so writeback failed ({e}); \
+                     runtime blob remains valid in the hot cache"
+                );
+            }
+        }
+
+        self.compiled.insert(name.to_string(), so_path.clone());
+        Ok(so_path)
+    }
+
     /// Force a fresh hipcc recompile after the driver rejects a loaded image.
     ///
     /// Does **not** pre-delete hot/cold artifacts (safe when hot==cold or the
@@ -1172,6 +1309,106 @@ impl KernelCompiler {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Compile a host shared object (`.so`) via hipcc. Separate from the
+    /// `.hsaco`/`--genco` path: uses `-fPIC -shared` and caller-supplied extra
+    /// flags (e.g. `-DROCPRIM_WITH_TOPK -I…`).
+    fn hipcc_compile_publish_so(
+        hipcc_bin: &Path,
+        rocm_env_root: Option<&Path>,
+        arch: &str,
+        cache_dir: &Path,
+        name: &str,
+        source: &str,
+        src_hash: &str,
+        extra_flags: &str,
+    ) -> HipResult<()> {
+        let src_path = cache_dir.join(format!("{name}.cpp"));
+        let final_so = cache_dir.join(format!("{name}.so"));
+        let token = unique_token();
+        let tmp_obj = cache_dir.join(format!(".{name}.{token}.so.tmp"));
+
+        let cleanup_tmp = || {
+            let _ = std::fs::remove_file(&tmp_obj);
+        };
+
+        std::fs::write(&src_path, source).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("failed to write host-shim source: {e}"))
+        })?;
+
+        // Root-scoped include / --rocm-path flags, then caller extras, then
+        // shared-lib argv. No --genco (that is the device code-object path).
+        let mut args: Vec<String> = Vec::new();
+        let selected_root = hipfire_config::rocm::root();
+        if let Some(root) = selected_root.as_ref() {
+            if hipfire_config::rocm::is_complete_root(root) {
+                args.extend(Self::rocm_root_flags(root));
+            }
+            let candidate = root.join("include");
+            if candidate.join("hip/hip_runtime.h").exists() {
+                let resolved =
+                    Self::win_short_path_if_needed(&candidate.to_string_lossy());
+                args.push(format!("-I{resolved}"));
+            }
+        }
+        args.push("-O3".into());
+        args.push("-fPIC".into());
+        args.push("-shared".into());
+        args.push(format!("--offload-arch={arch}"));
+        for flag in extra_flags.split_whitespace() {
+            args.push(flag.to_string());
+        }
+        args.push("-o".into());
+        args.push(tmp_obj.to_str().unwrap().into());
+        args.push(src_path.to_str().unwrap().into());
+
+        let mut cmd = Command::new(hipcc_bin);
+        cmd.args(&args);
+        if let Some(root) = rocm_env_root {
+            cmd.env("ROCM_PATH", root);
+        }
+        let output = cmd.output().map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("failed to run {}: {e}", hipcc_bin.display()),
+            )
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            cleanup_tmp();
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("hipcc host-shim compilation failed for {name}:\n{stderr}"),
+            ));
+        }
+
+        if !nonempty_blob(&tmp_obj) {
+            cleanup_tmp();
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("hipcc produced empty host shim for {name}"),
+            ));
+        }
+
+        if let Err(e) = publish_pair_ext(cache_dir, name, "so", &tmp_obj, src_hash, true) {
+            cleanup_tmp();
+            let _ = std::fs::remove_file(&tmp_obj);
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("failed to publish host shim {name}: {e}"),
+            ));
+        }
+        cleanup_tmp();
+
+        let final_hash = cache_dir.join(format!("{name}.hash"));
+        if !pair_valid(&final_so, &final_hash, src_hash) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("post-publish host-shim pair invalid for {name}"),
+            ));
+        }
         Ok(())
     }
 

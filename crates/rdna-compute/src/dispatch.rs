@@ -1237,6 +1237,10 @@ impl Gpu {
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,
                 sample_partials_bytes: 0,
+                sample_rocprim_temp: None,
+                sample_rocprim_temp_bytes: 0,
+                sample_rocprim_cand: None,
+                sample_rocprim_cand_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
             #[cfg(feature = "flash-attn-ck")]
