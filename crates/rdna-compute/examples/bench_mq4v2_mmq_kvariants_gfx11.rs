@@ -81,8 +81,8 @@ fn pack_mq4g256v2(w: &[f32], m: usize, k: usize) -> Vec<u8> {
             let z1h = half_from_f32(0.0);
             let hs0 = (z0h as u32) << 16 | s0h as u32;
             let hs1 = (z1h as u32) << 16 | s1h as u32;
-            blob[base + 0..4].copy_from_slice(&hs0.to_le_bytes());
-            blob[base + 4..8].copy_from_slice(&hs1.to_le_bytes());
+            blob[base..base+4].copy_from_slice(&hs0.to_le_bytes());
+            blob[base+4..base+8].copy_from_slice(&hs1.to_le_bytes());
             for t in 0..GROUP {
                 let v = w[r * k + k0 + t];
                 let sc = if t < HALF { sc0 } else { sc1 };
