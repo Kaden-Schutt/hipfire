@@ -66,6 +66,43 @@ Hardware-health discipline on shared hosts: check
 before and after each binary; any increase is a stop condition (see the
 2026-08-29 gfx1100 SMU wedge).
 
+## Counter evidence (optional lane, rocprofv3)
+
+HIP-event timing from a bare binary run is the **authoritative** perf number.
+PMC collection is a separate invocation — never profile the same process you
+time. Profiling inflates kernel medians ~5–7% (measured on gfx1151 MW arms);
+quote bare µs/GiB/s for speed, counters only for path shape.
+
+**Standard set** (normalize per-dispatch; drop warmup / host-ref rows):
+`SQ_WAVES`, `SQ_INSTS_LDS`, `SQ_INSTS_VALU`. Add a bank-conflict or stall
+counter **only if** `rocprofv3 --list-avail` enumerates it **and** it reads
+nonzero on a known-conflicting control. A zero on gfx1100 is
+**unsupported**, never evidence — gfx11xx PMC coverage is still partial in
+ROCm 10.0 (names accept; values stay dead aside from `SQ_WAVES`).
+
+Counters prove **code-path divergence**, not mechanisms. Pad-18 doubling
+`SQ_INSTS_LDS` while getting faster is admissible divergence evidence; citing
+`SQ_INSTS_LDS` alone as bank-conflict proof is not.
+
+When the lane is used, keep under `.codeinsight+research/`:
+1. exact `rocprofv3` command line,
+2. raw output path (counter_collection CSV / `-d` dir),
+3. normalized per-dispatch table,
+4. health check before and after
+   (`dmesg | grep -cE "TransferTableSmu2Dram|MES ring|GPU reset|page fault"`;
+   any increase = stop).
+
+```bash
+# bare timing first (authoritative)
+./mb_qkv_mw_vs_bt --arch gfx1151 --bits 3 --n 512 --samples 5 --warmup 2
+
+# separate PMC pass
+/opt/rocm/core-10.0/bin/rocprofv3 \
+    -d .codeinsight+research/kernels/gfx1151/pmc_qkv_default \
+    --pmc SQ_WAVES,SQ_INSTS_LDS,SQ_INSTS_VALU -- \
+    ./mb_qkv_mw_vs_bt --arch gfx1151 --bits 3 --n 512 --samples 5 --warmup 2
+```
+
 ## Current questions
 
 |File|Question|Production kernel(s)|

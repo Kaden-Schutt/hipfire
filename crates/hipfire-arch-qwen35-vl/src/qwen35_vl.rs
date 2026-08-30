@@ -967,11 +967,13 @@ pub fn vision_forward(
         t0.elapsed().as_secs_f32()
     );
 
-    // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)
+    // Spatial merge free-view: [n, h] → [n_merged, merge_dim]. The 2×2 group
+    // concat is a pure shape change — no rearrange — because `extract_patches`
+    // already emits patches in 2×2-block-major order (same contract as
+    // dots_ocr::vision_forward). `linear_f16` only uses the dimension
+    // parameters, so we reinterpret the LayerNormed buffer in place.
     let sms = config.spatial_merge_size;
-    let merged_h = grid_h / sms;
-    let merged_w = grid_w / sms;
-    let n_merged = merged_h * merged_w;
+    let n_merged = n / (sms * sms);
     let merge_dim = h * sms * sms;
 
     // LayerNorm all patches
@@ -987,37 +989,23 @@ pub fn vision_forward(
     )?;
     gpu.free_tensor(x)?;
 
-    // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
-    let normed_data = gpu.download_f32(&normed)?;
-    gpu.free_tensor(normed)?;
-
-    // Patches in `normed_data` are stored in 2x2-block-grouped order (see
-    // `extract_patches`), so the 4 patches that merge into one output token
-    // are CONSECUTIVE in the buffer: src indices [out_idx*4 .. out_idx*4+4].
-    let mut merged = vec![0.0f32; n_merged * merge_dim];
-    for my in 0..merged_h {
-        for mx in 0..merged_w {
-            let out_idx = my * merged_w + mx;
-            for sub in 0..(sms * sms) {
-                let src = out_idx * (sms * sms) + sub;
-                merged[out_idx * merge_dim + sub * h..out_idx * merge_dim + sub * h + h]
-                    .copy_from_slice(&normed_data[src * h..src * h + h]);
-            }
-        }
+    // Diagnostic: dump free-view buffer under historical merged_pre_mlp name.
+    if let Some(d) = dd {
+        let merged_pre = gpu.download_f32(&normed)?;
+        vl_dump_slice(d, "merged_pre_mlp", &merged_pre, &[n_merged, merge_dim]);
     }
 
-    // Merger MLP on GPU
-    let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
+    // Merger MLP on GPU (free-view dims; no download/CPU pack/reupload)
     let m1 = linear_f16(
         gpu,
         &weights.merger_fc1_w,
-        &merged_gpu,
+        &normed,
         &weights.merger_fc1_b,
         merge_dim,
         merge_dim,
         n_merged,
     )?;
-    gpu.free_tensor(merged_gpu)?;
+    gpu.free_tensor(normed)?;
     gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
 
     let m2 = linear_f16(
@@ -1040,7 +1028,6 @@ pub fn vision_forward(
             &result,
             &[n_merged, config.out_hidden_size],
         );
-        vl_dump_slice(d, "merged_pre_mlp", &merged, &[n_merged, merge_dim]);
     }
 
     eprintln!(

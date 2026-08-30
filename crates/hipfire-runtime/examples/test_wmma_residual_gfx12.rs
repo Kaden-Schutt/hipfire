@@ -91,12 +91,260 @@ fn main() {
         }
     }
 
+    // Dirty-Y overwrite parity: B not necessarily multiple of 16.
+    // Y pre-filled with NaN sentinel; ref = memset+residual; cand = lmhead
+    // overwrite; raw to_bits equality proves every element written once.
+    let overwrite_bs: &[usize] = &[2, 3, 8, 15, 17, 16, 32];
+    let ow_m = 64usize;
+    let ow_k = 512usize;
+    eprintln!("\n--- dirty-Y overwrite parity (M={ow_m} K={ow_k}) ---");
+    for &b in overwrite_bs {
+        let label = format!("overwrite B={b}");
+        match run_one_lmhead_overwrite_parity(&mut gpu, ow_m, ow_k, b) {
+            Ok(()) => {
+                total_pass += 1;
+                eprintln!("  {label:41} OK (to_bits)");
+            }
+            Err(e) => {
+                total_fail += 1;
+                eprintln!("  {label:41} FAIL");
+                eprintln!("{e}");
+            }
+        }
+    }
+
+    // Optional A/B microbench: V=248320 K=5120 B in {8,16}
+    // HIPFIRE_E3_BENCH=1 enables (large alloc ~2.4 GB weights).
+    if std::env::var("HIPFIRE_E3_BENCH").ok().as_deref() == Some("1") {
+        eprintln!("\n--- E3 A/B bench V=248320 K=5120 ---");
+        for &b in &[8usize, 16] {
+            match bench_lmhead_ab(&mut gpu, 248320, 5120, b) {
+                Ok((us_base, us_ow)) => {
+                    let pct = if us_base > 0.0 {
+                        (us_base - us_ow) / us_base * 100.0
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "  B={b}: memset+residual={us_base:.3}us  overwrite={us_ow:.3}us  delta={pct:.2}%"
+                    );
+                }
+                Err(e) => eprintln!("  B={b} bench FAIL: {e}"),
+            }
+        }
+    }
+
     eprintln!("\n--- Summary ---");
     eprintln!("  Passed: {total_pass}");
     eprintln!("  Failed: {total_fail}");
     if total_fail > 0 {
         std::process::exit(1);
     }
+}
+
+/// Dirty-Y overwrite parity: candidate is lmhead overwrite on NaN-filled Y;
+/// reference is memset-zero + residual_wmma_gfx12. Require raw f32::to_bits
+/// equality on every element (proves overwrite wrote every cell once).
+fn run_one_lmhead_overwrite_parity(
+    gpu: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), String> {
+    assert_eq!(m % 16, 0);
+    assert_eq!(
+        k % 256,
+        0,
+        "K must be multiple of 256 (HFQ4G256 group size)"
+    );
+    // N may be any positive size; partial batch tiles are bounds-checked.
+
+    let a_bytes = build_hfq4g256(m, k, 0xB4);
+    let a = gpu
+        .upload_raw(&a_bytes, &[m, k])
+        .map_err(|e| format!("upload a: {e}"))?;
+
+    let x_f32: Vec<f32> = (0..(n * k))
+        .map(|i| {
+            let b = (i / k) as i32;
+            let kk = (i % k) as i32;
+            ((b * 5 + kk * 3) % 37 - 18) as f32 * 0.04
+        })
+        .collect();
+    let x = gpu
+        .upload_f32(&x_f32, &[n, k])
+        .map_err(|e| format!("upload x: {e}"))?;
+
+    // Reference: memset-zero + residual_wmma_gfx12 (production pre-cleanup path).
+    let y_zero = vec![0.0f32; n * m];
+    let y_ref = gpu
+        .upload_f32(&y_zero, &[n, m])
+        .map_err(|e| format!("upload y_ref: {e}"))?;
+    gpu.gemm_hfq4g256_residual_wmma_gfx12(&a, &x, &y_ref, m, k, n)
+        .map_err(|e| format!("residual_wmma_gfx12 ref: {e}"))?;
+    let ref_y = gpu
+        .download_f32(&y_ref)
+        .map_err(|e| format!("download y_ref: {e}"))?;
+
+    // Candidate: NaN sentinel then overwrite kernel — leftover NaN ⇒ missed write.
+    let y_nan: Vec<f32> = (0..(n * m))
+        .map(|i| f32::from_bits(0x7FC0_0000u32 | ((i as u32) & 0x7F)))
+        .collect();
+    let y_cand = gpu
+        .upload_f32(&y_nan, &[n, m])
+        .map_err(|e| format!("upload y_cand nan: {e}"))?;
+    gpu.gemm_hfq4g256_lmhead_wmma_gfx12(&a, &x, &y_cand, m, k, n)
+        .map_err(|e| format!("lmhead_wmma_gfx12: {e}"))?;
+    let cand_y = gpu
+        .download_f32(&y_cand)
+        .map_err(|e| format!("download y_cand: {e}"))?;
+
+    gpu.free_tensor(a).ok();
+    gpu.free_tensor(x).ok();
+    gpu.free_tensor(y_ref).ok();
+    gpu.free_tensor(y_cand).ok();
+
+    compare_to_bits("Y_overwrite", n, m, &cand_y, &ref_y)
+}
+
+fn compare_to_bits(
+    name: &str,
+    n: usize,
+    m: usize,
+    cand: &[f32],
+    refr: &[f32],
+) -> Result<(), String> {
+    assert_eq!(cand.len(), refr.len());
+    assert_eq!(cand.len(), n * m);
+    let mut n_bad = 0usize;
+    let mut n_nan = 0usize;
+    let mut first: Option<(usize, usize, u32, u32)> = None;
+    for batch in 0..n {
+        for row in 0..m {
+            let idx = batch * m + row;
+            let a = cand[idx].to_bits();
+            let b = refr[idx].to_bits();
+            if cand[idx].is_nan() {
+                n_nan += 1;
+            }
+            if a != b {
+                n_bad += 1;
+                if first.is_none() {
+                    first = Some((batch, row, a, b));
+                }
+            }
+        }
+    }
+    if n_bad == 0 && n_nan == 0 {
+        Ok(())
+    } else {
+        let mut report = format!(
+            "    {name}: to_bits_mismatch={n_bad}/{} leftover_nan={n_nan}",
+            n * m
+        );
+        if let Some((b, r, a, rv)) = first {
+            report.push_str(&format!(
+                "\n      first at (batch={b}, row={r}): cand_bits=0x{a:08x} ref_bits=0x{rv:08x}"
+            ));
+        }
+        Err(report)
+    }
+}
+
+/// A/B: memset+residual_wmma_gfx12 vs lmhead overwrite. Event-timed median.
+fn bench_lmhead_ab(
+    gpu: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(f32, f32), String> {
+    let a_bytes = build_hfq4g256(m, k, 0xA5);
+    let a = gpu
+        .upload_raw(&a_bytes, &[m, k])
+        .map_err(|e| format!("upload a: {e}"))?;
+    let x = gpu
+        .upload_f32(&vec![0.01f32; n * k], &[n, k])
+        .map_err(|e| format!("upload x: {e}"))?;
+    let y = gpu
+        .upload_f32(&vec![0.0f32; n * m], &[n, m])
+        .map_err(|e| format!("upload y: {e}"))?;
+
+    let start = gpu.hip.event_create().map_err(|e| format!("event: {e}"))?;
+    let stop = gpu.hip.event_create().map_err(|e| format!("event: {e}"))?;
+    let n_warm = 5usize;
+    let n_iter = 20usize;
+
+    // Warm both paths (also warms fp16_x cache consistently).
+    for _ in 0..n_warm {
+        gpu.hip
+            .memset(&y.buf, 0, n * m * 4)
+            .map_err(|e| format!("memset: {e}"))?;
+        gpu.gemm_hfq4g256_residual_wmma_gfx12(&a, &x, &y, m, k, n)
+            .map_err(|e| format!("warm residual: {e}"))?;
+        gpu.gemm_hfq4g256_lmhead_wmma_gfx12(&a, &x, &y, m, k, n)
+            .map_err(|e| format!("warm overwrite: {e}"))?;
+    }
+
+    // Baseline: memset + residual
+    let mut t_base = Vec::with_capacity(n_iter);
+    for _ in 0..n_iter {
+        gpu.hip
+            .event_record(&start, None)
+            .map_err(|e| format!("record: {e}"))?;
+        gpu.hip
+            .memset(&y.buf, 0, n * m * 4)
+            .map_err(|e| format!("memset: {e}"))?;
+        gpu.gemm_hfq4g256_residual_wmma_gfx12(&a, &x, &y, m, k, n)
+            .map_err(|e| format!("residual: {e}"))?;
+        gpu.hip
+            .event_record(&stop, None)
+            .map_err(|e| format!("record: {e}"))?;
+        gpu.hip
+            .event_synchronize(&stop)
+            .map_err(|e| format!("sync: {e}"))?;
+        let ms = gpu
+            .hip
+            .event_elapsed_ms(&start, &stop)
+            .map_err(|e| format!("elapsed: {e}"))?;
+        t_base.push(ms * 1000.0);
+    }
+
+    // Overwrite path
+    let mut t_ow = Vec::with_capacity(n_iter);
+    for _ in 0..n_iter {
+        gpu.hip
+            .event_record(&start, None)
+            .map_err(|e| format!("record: {e}"))?;
+        gpu.gemm_hfq4g256_lmhead_wmma_gfx12(&a, &x, &y, m, k, n)
+            .map_err(|e| format!("overwrite: {e}"))?;
+        gpu.hip
+            .event_record(&stop, None)
+            .map_err(|e| format!("record: {e}"))?;
+        gpu.hip
+            .event_synchronize(&stop)
+            .map_err(|e| format!("sync: {e}"))?;
+        let ms = gpu
+            .hip
+            .event_elapsed_ms(&start, &stop)
+            .map_err(|e| format!("elapsed: {e}"))?;
+        t_ow.push(ms * 1000.0);
+    }
+
+    gpu.free_tensor(a).ok();
+    gpu.free_tensor(x).ok();
+    gpu.free_tensor(y).ok();
+
+    t_base.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    t_ow.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = |v: &[f32]| {
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        }
+    };
+    Ok((med(&t_base), med(&t_ow)))
 }
 
 fn run_one_lmhead(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {

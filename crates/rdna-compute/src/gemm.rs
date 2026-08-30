@@ -84,8 +84,12 @@ fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
 ///
 /// Same-row MW QKV/QKVZA measured 1.42x vs BT12 on gfx1100 N=512 and
 /// 3.1-3.4x vs BT4 on gfx1151 (tools/kernels microbench screen,
-/// 2026-08-30). gate_up/residual on gfx1151 remain BT pending a pad-18
-/// re-screen; their admission stays gfx1100-only.
+/// 2026-08-30). gfx1151 gate_up/residual flipped to MW after the pad-18
+/// re-screen (mb_gateup_resid_mw_vs_bt, 126 bit-exact runs, 2026-08-30):
+/// gate_up MW 1.25-1.75x over BT12; residual MW 1.09-2.38x over BT4, with
+/// MW4 losing to BT below N=256 at bits 5/6 — the per-bits wave splits
+/// below are measured regions, not taste. gfx1100 gate_up/residual
+/// admission unchanged.
 fn mqv2_mw_waves(
     arch: &str,
     bits: u8,
@@ -94,19 +98,34 @@ fn mqv2_mw_waves(
 ) -> Option<usize> {
     use MqV2PrefillProjection::{GateUp, Qkv, Qkvza, Residual};
 
-    // QKV/QKVZA MW rows per batch contract.
+    // QKV/QKVZA MW rows. gfx1100 Qkv/Qkvza MW was reverted after the E1
+    // model-level gate: microbench 1.42x did not survive to whole-model
+    // (+0.17% overall, ABANDON per .codeinsight+research/ledger-exec/e1/).
     match (arch, bits, projection, batch_size) {
         ("gfx1151", 3 | 5 | 6, Qkv | Qkvza, 384..) => return Some(4),
         ("gfx1151", 3 | 5 | 6, Qkv | Qkvza, 96..=383) => return Some(8),
-        ("gfx1100", 5 | 6, Qkv | Qkvza, 384..) => return Some(4),
         _ => {}
     }
     if matches!(projection, Qkv | Qkvza) {
         return None;
     }
 
-    // GateUp/Residual: byte-for-byte identical admission to the prior
-    // `if arch != "gfx1100" || !matches!(bits, 5 | 6) { return None; }`.
+    // gfx1151 GateUp/Residual: measured best-arm regions per bits
+    // (.codeinsight+research/ledger-exec/e2/report.md).
+    match (arch, bits, projection, batch_size) {
+        ("gfx1151", 3, GateUp, 96..=127) => return Some(8),
+        ("gfx1151", 3, GateUp, 128..) => return Some(4),
+        ("gfx1151", 5 | 6, GateUp, 96..) => return Some(8),
+        ("gfx1151", 3, Residual, 96..=255) => return Some(8),
+        ("gfx1151", 3, Residual, 256..) => return Some(4),
+        ("gfx1151", 5, Residual, 96..=383) => return Some(8),
+        ("gfx1151", 5, Residual, 384..) => return Some(4),
+        ("gfx1151", 6, Residual, 96..) => return Some(8),
+        _ => {}
+    }
+
+    // gfx1100 GateUp/Residual: byte-for-byte identical admission to the
+    // pre-flip `if arch != "gfx1100" || !matches!(bits, 5 | 6)` gate.
     if arch != "gfx1100" || !matches!(bits, 5 | 6) {
         return None;
     }
