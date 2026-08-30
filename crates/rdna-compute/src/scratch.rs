@@ -60,13 +60,6 @@ pub struct ScratchState {
     /// in one allocation; grows-never-shrinks.
     pub sample_partials: Option<DeviceBuffer>,
     pub sample_partials_bytes: usize,
-    /// rocPRIM device_topk temporary storage (two-phase size query).
-    pub sample_rocprim_temp: Option<DeviceBuffer>,
-    pub sample_rocprim_temp_bytes: usize,
-    /// K-candidate (val,idx) pairs from the rocPRIM shim before finalize_rocprim.
-    /// Layout: [TOP_K] f32 vals then [TOP_K] u32/i32 idx; grows-never-shrinks.
-    pub sample_rocprim_cand: Option<DeviceBuffer>,
-    pub sample_rocprim_cand_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -375,36 +368,6 @@ impl ScratchState {
             n_bytes,
         )?;
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
-    }
-
-    /// Ensure rocPRIM top-K temp scratch is at least `n_bytes`.
-    pub fn ensure_sample_rocprim_temp(
-        &mut self,
-        hip: &HipRuntime,
-        n_bytes: usize,
-    ) -> HipResult<*mut c_void> {
-        grow_scratch_buffer(
-            hip,
-            &mut self.sample_rocprim_temp,
-            &mut self.sample_rocprim_temp_bytes,
-            n_bytes,
-        )?;
-        Ok(self.sample_rocprim_temp.as_ref().unwrap().as_ptr())
-    }
-
-    /// Ensure rocPRIM K-candidate (val+idx) scratch is at least `n_bytes`.
-    pub fn ensure_sample_rocprim_cand(
-        &mut self,
-        hip: &HipRuntime,
-        n_bytes: usize,
-    ) -> HipResult<*mut c_void> {
-        grow_scratch_buffer(
-            hip,
-            &mut self.sample_rocprim_cand,
-            &mut self.sample_rocprim_cand_bytes,
-            n_bytes,
-        )?;
-        Ok(self.sample_rocprim_cand.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure the dedicated GEMV-residual temporary can hold at least
