@@ -28376,6 +28376,7 @@ impl Gpu {
     }
 
     /// MQ4 v2 (qt 44) — dedicated v2 source `FUSED_QKVZA_MQ4G256V2_SRC`.
+    /// Module = v1 + `_mq4v2`, func = v2 symbol `fused_qkvza_mq4g256v2`.
     pub fn fused_qkvza_hfq4g256_mq4v2(
         &mut self,
         a_qkv: &GpuTensor,
@@ -28393,99 +28394,10 @@ impl Gpu {
         alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let use_k2048 = self.flags.rdna3_mq4v2_qkvza_k2048
-            && k == 2_048
-            && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201());
-        self.fused_qkvza_hfq4g256_mq4v2_impl(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, use_k2048,
-        )
-    }
-
-    /// Generic MQ4 v2 QKVZA route used as the exact parity reference.
-    pub fn fused_qkvza_hfq4g256_mq4v2_generic_exact(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.fused_qkvza_hfq4g256_mq4v2_impl(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, false,
-        )
-    }
-
-    /// Exact K=2048 MQ4 v2 QKVZA candidate used by the parity oracle.
-    pub fn fused_qkvza_hfq4g256_mq4v2_k2048_exact(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        let use_k2048 = k == 2_048 && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201());
-        self.fused_qkvza_hfq4g256_mq4v2_impl(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, use_k2048,
-        )
-    }
-
-    fn fused_qkvza_hfq4g256_mq4v2_impl(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-        use_k2048: bool,
-    ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, source, func_name, profile_name) = if use_k2048 {
-            (
-                "fused_qkvza_hfq4g256_mq4v2_k2048",
-                kernels::FUSED_QKVZA_MQ4G256V2_K2048_SRC,
-                "fused_qkvza_mq4g256v2_k2048",
-                "fused_qkvza_mq4g256v2_k2048",
-            )
-        } else {
-            (
-                "fused_qkvza_hfq4g256_mq4v2",
-                kernels::FUSED_QKVZA_MQ4G256V2_SRC,
-                "fused_qkvza_mq4g256v2",
-                "fused_qkvza_mq4g256v2",
-            )
-        };
-        self.ensure_kernel(module, source, func_name)?;
+        let module_v2 = "fused_qkvza_hfq4g256_mq4v2";
+        let func_name = "fused_qkvza_mq4g256v2";
+        self.ensure_kernel(module_v2, kernels::FUSED_QKVZA_MQ4G256V2_SRC, func_name)?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
         let ab = a_beta.buf.as_ptr();
@@ -28521,7 +28433,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
-        let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_mq4g256v2", bytes);
         let result =
             self.launch_maybe_blob(func_name, [total, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();

@@ -3997,13 +3997,6 @@ pub const FUSED_QKVZA_MQ4G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
 );
-pub const FUSED_QKVZA_MQ4G256V2_K2048_SRC: &str = concat!(
-    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
-    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_k2048\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
-);
 pub const FUSED_QKVZA_MQ5G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
