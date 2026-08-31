@@ -1033,31 +1033,14 @@ pub fn run_moe_decode(
                 && p.shared_down_w.m == 2_048
                 && p.shared_down_w.k == 512;
             if use_mq4v2_shared_down_fused {
-                // Default-off R2 four-row A/B. Exact `1` only; unset/0/invalid stays R1.
-                static MQ4V2_SHARED_DOWN_R2: LazyLock<bool> = LazyLock::new(|| {
-                    hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_R2")
-                        .map(|value| value == "1")
-                        .unwrap_or(false)
-                });
-                if *MQ4V2_SHARED_DOWN_R2 {
-                    hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2(
-                        &p.shared_down_w.buf,
-                        &x_rot_alias,
-                        out_target,
-                        p.scalar_buf,
-                        p.shared_down_w.m,
-                        p.shared_down_w.k,
-                    ))?;
-                } else {
-                    hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
-                        &p.shared_down_w.buf,
-                        &x_rot_alias,
-                        out_target,
-                        p.scalar_buf,
-                        p.shared_down_w.m,
-                        p.shared_down_w.k,
-                    ))?;
-                }
+                hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
+                    &p.shared_down_w.buf,
+                    &x_rot_alias,
+                    out_target,
+                    p.scalar_buf,
+                    p.shared_down_w.m,
+                    p.shared_down_w.k,
+                ))?;
             } else {
                 #[cfg(feature = "deltanet")]
                 {
@@ -1997,31 +1980,14 @@ fn run_moe_decode_cpu_fallback(
             && p.shared_down_w.m == 2_048
             && p.shared_down_w.k == 512;
         if use_mq4v2_shared_down_fused {
-            // Default-off R2 four-row A/B. Exact `1` only; unset/0/invalid stays R1.
-            static MQ4V2_SHARED_DOWN_R2_FB: LazyLock<bool> = LazyLock::new(|| {
-                hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_R2")
-                    .map(|value| value == "1")
-                    .unwrap_or(false)
-            });
-            if *MQ4V2_SHARED_DOWN_R2_FB {
-                hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2(
-                    &p.shared_down_w.buf,
-                    &x_rot_alias,
-                    p.x_residual,
-                    p.scalar_buf,
-                    p.shared_down_w.m,
-                    p.shared_down_w.k,
-                ))?;
-            } else {
-                hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
-                    &p.shared_down_w.buf,
-                    &x_rot_alias,
-                    p.x_residual,
-                    p.scalar_buf,
-                    p.shared_down_w.m,
-                    p.shared_down_w.k,
-                ))?;
-            }
+            hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
+                &p.shared_down_w.buf,
+                &x_rot_alias,
+                p.x_residual,
+                p.scalar_buf,
+                p.shared_down_w.m,
+                p.shared_down_w.k,
+            ))?;
         } else {
             #[cfg(feature = "deltanet")]
             {

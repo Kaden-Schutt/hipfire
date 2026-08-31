@@ -1680,15 +1680,6 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
-/// Ornith qt44 shared-down R2 A/B: four-row/one-wave K512 residual-sigmoid body.
-/// Same 40 B ABI as R1. Opt-in only via HIPFIRE_MQ4V2_SHARED_DOWN_R2=1.
-pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_R2_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2\n",
-    "#define HIPFIRE_MQ4G256V2_K512 1\n",
-    "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
-    "#define HIPFIRE_MQ4G256V2_SHARED_DOWN_R2 1\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
-);
 
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
