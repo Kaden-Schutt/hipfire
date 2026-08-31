@@ -1217,8 +1217,105 @@ fn main() {
         }
     }
 
+    // Production-shape MQ4V2 ninepath RPB16 vs RPB8 raw-bit/canary comparison.
+    // gfx1100 only; down_m=2048 down_k=512 k_top=8. Exact wrappers bypass the
+    // HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8 env gate so both routes always run.
+    {
+        const M: usize = 2_048;
+        const K: usize = 512;
+        const K_TOP: usize = 8;
+        const N_TABLE: usize = 256;
+        if !gpu.arch_caps.is_gfx1100() {
+            eprintln!(
+                "ninepath_rpb8_vs_rpb16: skip (arch={} not gfx1100)",
+                gpu.arch
+            );
+        } else {
+            let w0 = build_disjoint_halves_salted(M, K, 0xA11E_0A70);
+            let mut w1 = build_disjoint_halves_salted(M, K, 0xA11E_0A71);
+            for v in w1.iter_mut() {
+                *v += 6.0;
+            }
+            let b0 = pack_mq4g256v2(&w0, M, K);
+            let b1 = pack_mq4g256v2(&w1, M, K);
+            let e0 = gpu.upload_raw(&b0, &[b0.len()]).unwrap();
+            let e1 = gpu.upload_raw(&b1, &[b1.len()]).unwrap();
+            let mut ptrs = vec![e0.buf.as_ptr() as u64; N_TABLE];
+            ptrs[0] = e0.buf.as_ptr() as u64;
+            ptrs[1] = e1.buf.as_ptr() as u64;
+            ptrs[255] = e1.buf.as_ptr() as u64;
+            let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let ptr_tab = gpu.upload_raw(&ptr_bytes, &[N_TABLE]).unwrap();
+
+            let topk: Vec<i32> = vec![0, 255, 0, 255, 1, 0, 255, 1];
+            let topk_b: Vec<u8> = topk.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let topk_t = gpu.upload_raw(&topk_b, &[K_TOP]).unwrap();
+            let tw: Vec<f32> = (0..K_TOP).map(|i| 0.05 + 0.1 * (i as f32)).collect();
+            let tw_t = gpu.upload_f32(&tw, &[K_TOP]).unwrap();
+            let act: Vec<f32> = (0..K_TOP * K)
+                .map(|i| prng(i, 0x9A17_0008) * 2.0 - 1.0)
+                .collect();
+            let act_t = gpu.upload_f32(&act, &[K_TOP * K]).unwrap();
+
+            // Residual seed + trailing canary (kernel does out[row] += fold).
+            let mut out_seed = vec![0.0f32; M + 1];
+            for i in 0..M {
+                out_seed[i] = prng(i, 0x3C3C_0008) - 0.5;
+            }
+            out_seed[M] = CANARY_F32;
+
+            let d_ref = gpu.upload_f32(&out_seed, &[M + 1]).unwrap();
+            gpu.gemv_mq4g256v2_moe_ninepath_d4_rpb16_exact(
+                &ptr_tab, &topk_t, &tw_t, &act_t, &d_ref, M, K,
+            )
+            .unwrap_or_else(|e| panic!("ninepath RPB16 exact launch: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+
+            let d_cand = gpu.upload_f32(&out_seed, &[M + 1]).unwrap();
+            gpu.gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100_exact(
+                &ptr_tab, &topk_t, &tw_t, &act_t, &d_cand, M, K,
+            )
+            .unwrap_or_else(|e| panic!("ninepath RPB8 exact launch: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+
+            let ref_all = gpu.download_f32(&d_ref).unwrap();
+            let cand_all = gpu.download_f32(&d_cand).unwrap();
+            let ref_y = &ref_all[..M];
+            let cand_y = &cand_all[..M];
+            let exact = ref_y
+                .iter()
+                .zip(cand_y.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            let canary_ok =
+                (ref_all[M] - CANARY_F32).abs() < 1e-6 && (cand_all[M] - CANARY_F32).abs() < 1e-6;
+            let varied = ref_y.iter().any(|v| v.abs() > 1.0e-6);
+            let want64: Vec<f64> = ref_y.iter().map(|&v| v as f64).collect();
+            let rms = rel_rms(cand_y, &want64);
+            let (worst, wi) = rel_err(cand_y, &want64);
+            let status = if exact && canary_ok && varied {
+                "ok"
+            } else {
+                "FAIL"
+            };
+            eprintln!(
+                "  ninepath_rpb8_vs_rpb16 M={M} K={K} k_top={K_TOP}: exact={exact} rms {rms:.3e} (worst {worst:.3e}@{wi}) canary={canary_ok} varied={varied} {status}"
+            );
+            if !exact {
+                failures.push(format!("ninepath_rpb8_vs_rpb16 bit mismatch rms {rms:.3e}"));
+            }
+            if !canary_ok {
+                failures.push("ninepath_rpb8_vs_rpb16 canary clobbered".into());
+            }
+            if !varied {
+                failures.push("ninepath_rpb8_vs_rpb16 degenerate output".into());
+            }
+            // Keep experts alive through both launches.
+            let _keep = (e0, e1);
+        }
+    }
+
     if failures.is_empty() {
-        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201; K2048 hoist_x32 bit-exact vs generic on gfx1100; K2048 qkv x_buffer bit-exact vs generic on gfx1100");
+        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201; K2048 hoist_x32 bit-exact vs generic on gfx1100; K2048 qkv x_buffer bit-exact vs generic on gfx1100; ninepath_rpb8_vs_rpb16 bit-exact on gfx1100");
     } else {
         eprintln!("\nmq4v2_fused_parity: FAIL — {:?}", failures);
         std::process::exit(1);

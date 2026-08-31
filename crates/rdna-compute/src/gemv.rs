@@ -12442,6 +12442,11 @@ impl Gpu {
     /// MQ4G256V2 (qt=44) sister of [`Self::gemv_hfq4g256_moe_ninepath_d4`].
     /// Same launch contract; the byte estimate reuses the qt13 helper because
     /// both formats are 136 B/group.
+    ///
+    /// Default route remains RPB=16 (`gemv_mq4g256v2_moe_ninepath_d4`, grid
+    /// `down_m/16`). Opt-in gfx1100 higher-parallelism candidate RPB=8 under
+    /// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` at exact down_m=2048, down_k=512
+    /// (grid `down_m/8`). Frozen 48-byte ABI; per-row arithmetic unchanged.
     pub fn gemv_mq4g256v2_moe_ninepath_d4(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -12452,12 +12457,99 @@ impl Gpu {
         down_m: usize,
         down_k: usize,
     ) -> HipResult<()> {
+        let use_rpb8 = self.arch_caps.is_gfx1100()
+            && down_m == 2_048
+            && down_k == 512
+            && hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8").as_deref()
+                == Ok("1");
+        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+            expert_ptrs,
+            topk_indices,
+            topk_weights,
+            rot_batch,
+            out,
+            down_m,
+            down_k,
+            use_rpb8,
+        )
+    }
+
+    /// Force incumbent RPB=16 ninepath (bypasses env candidate selection).
+    #[doc(hidden)]
+    pub fn gemv_mq4g256v2_moe_ninepath_d4_rpb16_exact(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+            expert_ptrs,
+            topk_indices,
+            topk_weights,
+            rot_batch,
+            out,
+            down_m,
+            down_k,
+            false,
+        )
+    }
+
+    /// Force gfx1100 RPB=8 ninepath candidate (bypasses env gate).
+    #[doc(hidden)]
+    pub fn gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100_exact(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+            expert_ptrs,
+            topk_indices,
+            topk_weights,
+            rot_batch,
+            out,
+            down_m,
+            down_k,
+            true,
+        )
+    }
+
+    fn gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+        use_rpb8: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq4g256v2_moe_ninepath_d4",
-            kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC,
-            "gemv_mq4g256v2_moe_ninepath_d4",
-        )?;
+        let (module, src, func, rpb) = if use_rpb8 {
+            (
+                "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
+                kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC,
+                "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
+                8u32,
+            )
+        } else {
+            (
+                "gemv_mq4g256v2_moe_ninepath_d4",
+                kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC,
+                "gemv_mq4g256v2_moe_ninepath_d4",
+                16u32,
+            )
+        };
+        self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
@@ -12476,11 +12568,10 @@ impl Gpu {
         ];
         let bytes =
             8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_moe_ninepath_d4", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func, bytes);
         let result = self.launch_maybe_blob(
-            "gemv_mq4g256v2_moe_ninepath_d4",
-            [(down_m as u32) / 16, 1, 1],
+            func,
+            [(down_m as u32) / rpb, 1, 1],
             [256, 1, 1],
             0,
             &mut params,

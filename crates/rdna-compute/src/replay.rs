@@ -756,7 +756,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     if matches!(
         kernel,
-        "gemv_mq4g256v2_moe_ninepath_d4" | "gemv_mq6g256v2_moe_ninepath_d4"
+        "gemv_mq4g256v2_moe_ninepath_d4"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
+            | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
         return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
@@ -1420,6 +1422,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq4g256v2_moe_ninepath_d4"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         return Some(48);
@@ -6428,8 +6431,10 @@ mod tests {
         }
 
         // Ninepath fused down+combine: 5 ptr + down_m,down_k = 48.
+        // RPB8 gfx1100 candidate shares the frozen 48-byte ABI.
         for symbol in [
             "gemv_mq4g256v2_moe_ninepath_d4",
+            "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
             "gemv_mq6g256v2_moe_ninepath_d4",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(48));

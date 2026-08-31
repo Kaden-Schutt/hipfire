@@ -2406,8 +2406,19 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
 /// group header decode. qt44 previously matched neither `ninepath_hfq4` nor
 /// `ninepath_mq3l`, so it was denied the fused down path despite clearing the
 /// shape gate — which the published Ornith 1.5 artifact does exactly.
+/// Default export: `gemv_mq4g256v2_moe_ninepath_d4`, RPB=16.
 pub const GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip");
+
+/// gfx1100 higher-parallelism MQ4G256V2 ninepath candidate: same TU, RPB=8.
+/// Symbol `gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100`. Frozen 48-byte ABI;
+/// only grid becomes `down_m/8`. Host selects under
+/// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` at exact down_m=2048, down_k=512.
+pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n",
+    "#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip")
+);
 
 /// MQ6G256V2 (qt=47) sister of [`GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC`].
 /// Identical staging / warp-per-krank / LDS fold; only the 200 B dual-half
@@ -7984,7 +7995,19 @@ mod mqv2_moe {
             GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC
                 .contains("void HIPFIRE_MQ4V2_GATE_UP_KERNEL(")
         );
-        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("void gemv_mq4g256v2_moe_ninepath_d4("));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("void HIPFIRE_MQ4V2_NINEPATH_KERNEL("));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC
+            .contains("#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_d4"));
+        assert!(
+            GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("#define HIPFIRE_MQ4V2_NINEPATH_RPB 16")
+        );
+        assert!(!GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC
+            .contains("gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC.starts_with(
+            "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n"
+        ));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC
+            .contains("void HIPFIRE_MQ4V2_NINEPATH_KERNEL("));
         assert!(GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC
             .contains("void gemm_mq4g256v2_moe_grouped_wmma_k2("));
         assert!(GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC
