@@ -976,8 +976,209 @@ fn main() {
         }
     }
 
+    // Exact K=2048 MQ4V2 QKVZA HOIST_X32 / X_BUFFER vs generic device route.
+    // gfx1100 only; independent candidate buffers so unwritten/shared outputs fail.
+    {
+        const K: usize = 2_048;
+        if !gpu.arch_caps.is_gfx1100() {
+            eprintln!(
+                "scalar_fused_qkvza_k2048_hoist/x_buffer: skip (arch={} not gfx1100)",
+                gpu.arch
+            );
+        } else {
+            let ms = [40usize, 24, 16, 8];
+            let salts = [0xA048_0001u32, 0xA048_0002, 0xA048_0003, 0xA048_0004];
+            let parts = ["qkv", "z", "beta", "alpha"];
+            let x: Vec<f32> = (0..K).map(|i| prng(i, 0xC0FF_A048) * 2.0 - 1.0).collect();
+            let d_x = gpu.upload_f32(&x, &[K]).unwrap();
+            let mut d_as = Vec::with_capacity(4);
+            for i in 0..4 {
+                let (_, d_a) = pack_upload_mq4v2(&mut gpu, ms[i], K, salts[i]);
+                d_as.push(d_a);
+            }
+
+            let mut d_refs = Vec::with_capacity(4);
+            let mut y_lens = Vec::with_capacity(4);
+            for &m in &ms {
+                let (d_ref, y_len) = upload_y_canary(&mut gpu, n1, m);
+                d_refs.push(d_ref);
+                y_lens.push(y_len);
+            }
+            gpu.fused_qkvza_hfq4g256_mq4v2_generic_exact(
+                &d_as[0], &d_as[1], &d_as[2], &d_as[3], &d_x, &d_refs[0], &d_refs[1], &d_refs[2],
+                &d_refs[3], ms[0], ms[1], ms[2], ms[3], K,
+            )
+            .unwrap_or_else(|e| panic!("generic scalar fused_qkvza K=2048 launch: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+
+            // ── HOIST_X32 candidate (separate canary buffers) ──
+            {
+                let mut d_cands = Vec::with_capacity(4);
+                for (i, &m) in ms.iter().enumerate() {
+                    let (d_cand, cand_len) = upload_y_canary(&mut gpu, n1, m);
+                    assert_eq!(cand_len, y_lens[i]);
+                    d_cands.push(d_cand);
+                }
+                gpu.fused_qkvza_hfq4g256_mq4v2_k2048_hoist_x32_exact(
+                    &d_as[0],
+                    &d_as[1],
+                    &d_as[2],
+                    &d_as[3],
+                    &d_x,
+                    &d_cands[0],
+                    &d_cands[1],
+                    &d_cands[2],
+                    &d_cands[3],
+                    ms[0],
+                    ms[1],
+                    ms[2],
+                    ms[3],
+                    K,
+                )
+                .unwrap_or_else(|e| panic!("hoist_x32 scalar fused_qkvza K=2048 launch: {e}"));
+                gpu.hip.device_synchronize().unwrap();
+
+                let mut all_exact = true;
+                let mut all_canaries = true;
+                let mut nondegenerate = true;
+                let mut detail = String::new();
+                for i in 0..4 {
+                    let (reference, ref_canary) =
+                        download_y_canary(&gpu, &d_refs[i], y_lens[i], n1, ms[i]);
+                    let (candidate, cand_canary) =
+                        download_y_canary(&gpu, &d_cands[i], y_lens[i], n1, ms[i]);
+                    let exact = reference
+                        .iter()
+                        .zip(&candidate)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    let canary = ref_canary && cand_canary;
+                    let varied = reference.iter().any(|value| value.abs() > 1.0e-6);
+                    let reference_f64: Vec<f64> =
+                        reference.iter().map(|&value| value as f64).collect();
+                    let rms = rel_rms(&candidate, &reference_f64);
+                    all_exact &= exact;
+                    all_canaries &= canary;
+                    nondegenerate &= varied;
+                    detail.push_str(&format!(
+                        " {} exact={exact} rms={rms:.3e} canary={canary} varied={varied}",
+                        parts[i]
+                    ));
+                    if !exact {
+                        failures.push(format!(
+                            "scalar_fused_qkvza_k2048_hoist_x32/{} bit mismatch rms {rms:.3e}",
+                            parts[i]
+                        ));
+                    }
+                    if !canary {
+                        failures.push(format!(
+                            "scalar_fused_qkvza_k2048_hoist_x32/{} canary clobbered",
+                            parts[i]
+                        ));
+                    }
+                    if !varied {
+                        failures.push(format!(
+                            "scalar_fused_qkvza_k2048_hoist_x32/{} degenerate output",
+                            parts[i]
+                        ));
+                    }
+                }
+                let status = if all_exact && all_canaries && nondegenerate {
+                    "ok"
+                } else {
+                    "FAIL"
+                };
+                eprintln!(
+                    "  scalar_fused_qkvza_k2048_hoist_x32 K={K} N={n1} Ms=({},{},{},{}):{detail} {status}",
+                    ms[0], ms[1], ms[2], ms[3]
+                );
+            }
+
+            // ── X_BUFFER candidate (separate canary buffers) ──
+            {
+                let mut d_cands = Vec::with_capacity(4);
+                for (i, &m) in ms.iter().enumerate() {
+                    let (d_cand, cand_len) = upload_y_canary(&mut gpu, n1, m);
+                    assert_eq!(cand_len, y_lens[i]);
+                    d_cands.push(d_cand);
+                }
+                gpu.fused_qkvza_hfq4g256_mq4v2_k2048_x_buffer_exact(
+                    &d_as[0],
+                    &d_as[1],
+                    &d_as[2],
+                    &d_as[3],
+                    &d_x,
+                    &d_cands[0],
+                    &d_cands[1],
+                    &d_cands[2],
+                    &d_cands[3],
+                    ms[0],
+                    ms[1],
+                    ms[2],
+                    ms[3],
+                    K,
+                )
+                .unwrap_or_else(|e| panic!("x_buffer scalar fused_qkvza K=2048 launch: {e}"));
+                gpu.hip.device_synchronize().unwrap();
+
+                let mut all_exact = true;
+                let mut all_canaries = true;
+                let mut nondegenerate = true;
+                let mut detail = String::new();
+                for i in 0..4 {
+                    let (reference, ref_canary) =
+                        download_y_canary(&gpu, &d_refs[i], y_lens[i], n1, ms[i]);
+                    let (candidate, cand_canary) =
+                        download_y_canary(&gpu, &d_cands[i], y_lens[i], n1, ms[i]);
+                    let exact = reference
+                        .iter()
+                        .zip(&candidate)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    let canary = ref_canary && cand_canary;
+                    let varied = reference.iter().any(|value| value.abs() > 1.0e-6);
+                    let reference_f64: Vec<f64> =
+                        reference.iter().map(|&value| value as f64).collect();
+                    let rms = rel_rms(&candidate, &reference_f64);
+                    all_exact &= exact;
+                    all_canaries &= canary;
+                    nondegenerate &= varied;
+                    detail.push_str(&format!(
+                        " {} exact={exact} rms={rms:.3e} canary={canary} varied={varied}",
+                        parts[i]
+                    ));
+                    if !exact {
+                        failures.push(format!(
+                            "scalar_fused_qkvza_k2048_x_buffer/{} bit mismatch rms {rms:.3e}",
+                            parts[i]
+                        ));
+                    }
+                    if !canary {
+                        failures.push(format!(
+                            "scalar_fused_qkvza_k2048_x_buffer/{} canary clobbered",
+                            parts[i]
+                        ));
+                    }
+                    if !varied {
+                        failures.push(format!(
+                            "scalar_fused_qkvza_k2048_x_buffer/{} degenerate output",
+                            parts[i]
+                        ));
+                    }
+                }
+                let status = if all_exact && all_canaries && nondegenerate {
+                    "ok"
+                } else {
+                    "FAIL"
+                };
+                eprintln!(
+                    "  scalar_fused_qkvza_k2048_x_buffer K={K} N={n1} Ms=({},{},{},{}):{detail} {status}",
+                    ms[0], ms[1], ms[2], ms[3]
+                );
+            }
+        }
+    }
+
     if failures.is_empty() {
-        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201");
+        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201; K2048 hoist_x32 + x_buffer bit-exact vs generic on gfx1100");
     } else {
         eprintln!("\nmq4v2_fused_parity: FAIL — {:?}", failures);
         std::process::exit(1);
