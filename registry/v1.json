@@ -348,11 +348,12 @@
       "file": "maple-preview.mq2lloydu",
       "size_gb": 6.5,
       "min_vram_gb": 12,
+      "default_kv_mode": "bf16",
       "sampling": {
         "temperature": 0.6,
         "top_p": 0.95
       },
-      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY \u2014 a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected \u2014 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) \u2014 that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training.",
+      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY \u2014 a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected \u2014 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) \u2014 that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training. KV defaults to BF16: q8 KV costs 39% of the measured divergence from a bf16 reference (mean KL 0.0842 vs 0.0511, top-1 90.8% vs 91.9%), concentrated in the tail \u2014 worst position 10.36 vs 4.21 nats \u2014 for 1.88x KV bytes and ~2% decode. Use --kv-mode q8 to trade that fidelity back for memory.",
       "sha256": "7fb52fe72c1a0a4455d0fe3a8109b0df66fa53782f41d8b257140d3e966645db",
       "size_bytes": 6499340288,
       "arch_id": 15,

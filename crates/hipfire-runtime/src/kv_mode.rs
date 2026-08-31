@@ -148,10 +148,19 @@ pub const QWEN35_PP_POLICY: KvModePolicy = KvModePolicy {
 /// `normalize_full`: no other site can allocate a bf16 cache, so putting it
 /// there would let `HIPFIRE_KV_MODE=bf16` on qwen35 normalize successfully and
 /// then fall to that site's default — a silent downgrade instead of a warning.
+///
+/// **The default is bf16, not q8.** Measured against a bf16 reference on 2048
+/// teacher-forced wikitext tokens, q8 KV costs 39% of the total divergence
+/// (mean KL 0.0842 q8 vs 0.0511 bf16, top-1 90.8% vs 91.9%), and the damage is
+/// in the TAIL rather than as uniform blur — the median moves only 24% but the
+/// worst position goes 10.36 -> 4.21 nats. The price is 1.88x KV bytes
+/// (26,112 -> 49,152 B/token) and about 2% decode, which is inside this box's
+/// run-to-run noise. `--kv-mode q8` restores the old tier for anyone who wants
+/// the memory back.
 fn normalize_maple(raw: &str) -> Option<KvMode> {
     match raw {
-        "q8" | "auto" | "" => Some(Q8),
-        "bf16" => Some(Bf16),
+        "bf16" | "auto" | "" => Some(Bf16),
+        "q8" => Some(Q8),
         _ => None, // every rotated/quantized tier → default (+warn)
     }
 }
@@ -159,7 +168,7 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     site: "maple",
     normalize_alias: normalize_maple,
     accepted: &[Q8, Bf16],
-    default: Q8,
+    default: Bf16,
 };
 
 /// Pure: `&str + &'static policy + usize → ResolveResult`. No GPU, no env read.
@@ -207,14 +216,17 @@ mod tests {
         let p = &MAPLE_POLICY;
         assert_eq!(resolve("bf16", p, 128).mode, KvMode::Bf16);
         assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
-        // Unset and "auto" both mean q8, SILENTLY — this is the shipped
+        // Unset and "auto" both mean BF16, SILENTLY — bf16 is the shipped
         // default and must not print a warning on every load.
-        assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
+        assert_eq!(resolve("", p, 128).mode, KvMode::Bf16);
         assert!(resolve("", p, 128).warning.is_none());
-        assert_eq!(resolve("auto", p, 128).mode, KvMode::Q8);
+        assert_eq!(resolve("auto", p, 128).mode, KvMode::Bf16);
         assert!(resolve("auto", p, 128).warning.is_none());
+        // Asking for q8 explicitly is HONORED and must not warn — it is a
+        // supported tier and an intentional memory saving, not a degradation.
+        assert!(resolve("q8", p, 128).warning.is_none());
 
-        // Every ROTATED / block-quantized tier must be REFUSED to q8 and warn.
+        // Every ROTATED / block-quantized tier must be REFUSED and warn.
         // These have no sliding-window attention kernel, so silently accepting
         // one would make Maple's sliding layers attend the full context and be
         // wrong past 512 tokens rather than merely slower.
@@ -222,11 +234,11 @@ mod tests {
             "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo",
         ] {
             let r = resolve(m, p, 128);
-            assert_eq!(r.mode, KvMode::Q8, "{m} must fall back to q8");
+            assert_eq!(r.mode, KvMode::Bf16, "{m} must fall back to the default");
             assert!(r.warning.is_some(), "{m} must warn, not silently downgrade");
         }
         let garbage = resolve("garbage", p, 128);
-        assert_eq!(garbage.mode, KvMode::Q8);
+        assert_eq!(garbage.mode, KvMode::Bf16);
         assert!(garbage.warning.is_some());
     }
 
