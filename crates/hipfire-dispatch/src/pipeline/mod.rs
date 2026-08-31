@@ -896,7 +896,7 @@ pub fn run_moe_decode(
         && p.batch_size == 1
         && !p.skip_shared
         && p.smi == 512
-        && p.shared_down_w.dtype == DType::MQ4G256
+        && matches!(p.shared_down_w.dtype, DType::MQ4G256 | DType::MQ4G256V2)
         && p.shared_down_w.awq_scale.is_none()
         && *ROUTER_SHARED_FUSE.get_or_init(|| {
             hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1")
