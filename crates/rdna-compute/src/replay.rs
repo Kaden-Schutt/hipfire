@@ -1166,7 +1166,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             write(48),
         ]),
-        "fused_qkv_hfq4g256" | "fused_qkv_mq4g256v2" => Some(vec![
+        "fused_qkv_hfq4g256"
+        | "fused_qkv_mq4g256v2"
+        | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1566,6 +1568,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
+        | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -5504,6 +5507,7 @@ mod tests {
         "fused_qkvza_mq4g256v2",
         "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
         "fused_qkv_mq4g256v2",
+        "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_gate_up_mq4g256v2",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
@@ -6812,7 +6816,6 @@ mod tests {
 
     #[test]
     fn fused_qkv_mq4g256v2_keeps_exact_scalar_replay_contract() {
-        let symbol = "fused_qkv_mq4g256v2";
         let want = [
             read(0),
             read(8),
@@ -6823,13 +6826,26 @@ mod tests {
             write(48),
         ];
 
-        assert_eq!(expected_kernarg_bytes(symbol), Some(80));
-        let got = pointer_effects(symbol).expect("mq4g256v2 qkv pointer contract");
-        assert_eq!(got.len(), want.len());
-        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
-            assert_eq!(got_effect.offset, want_effect.offset);
-            assert_eq!(got_effect.mode, want_effect.mode);
+        // Generic plus gfx1100 K=2048 X_BUFFER share the same 11-arg ABI:
+        // reads@0/8/16/24, writes@32/40/48, pad80.
+        for symbol in [
+            "fused_qkv_mq4g256v2",
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(80));
+            let got = pointer_effects(symbol).expect("mq4g256v2 qkv pointer contract");
+            assert_eq!(got.len(), want.len());
+            for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+                assert_eq!(got_effect.offset, want_effect.offset);
+                assert_eq!(got_effect.mode, want_effect.mode);
+            }
         }
+
+        // Identities stay independent: x_buffer never collapses onto generic.
+        assert_ne!(
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+            "fused_qkv_mq4g256v2"
+        );
 
         // 7 ptr + 4 i32 dimensions = 72 explicit bytes, pad_to(16) → 80.
         let mut blob = hip_bridge::KernargBlob::new();
@@ -6842,7 +6858,12 @@ mod tests {
         assert_eq!(blob.len(), 72, "explicit kernel arguments occupy 72 bytes");
         blob.pad_to(16);
         assert_eq!(blob.len(), 80, "recorded launches pad to 16 bytes");
-        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+        for symbol in [
+            "fused_qkv_mq4g256v2",
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+        }
     }
 
     #[test]

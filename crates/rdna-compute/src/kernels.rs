@@ -4361,6 +4361,14 @@ pub const FUSED_QKV_MQ4G256V2_QWEN2_BIAS_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
 );
+pub const FUSED_QKV_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_QKV_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKV_X_BUFFER 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+);
 pub const FUSED_QKV_MQ5G256V2_QWEN2_BIAS_SRC: &str = concat!(
     "#define HIPFIRE_QKV_WITH_BIAS 1\n",
     "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq5g256v2_qwen2_bias\n",
