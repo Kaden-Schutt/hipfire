@@ -1861,11 +1861,19 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "kv_cache_write_bf16",
-            kernels::KV_CACHE_WRITE_BF16_SRC,
-            "kv_cache_write_bf16",
-        )?;
+        // The decode and batched entry points share ONE translation unit, and
+        // that file `#include`s kv_slot_desc.h for the batched one. The JIT
+        // compiles in a cache dir with no -I to kernels/src, so this wrapper
+        // must strip-and-prepend exactly like the batched wrapper — even
+        // though the decode kernel uses nothing from the header. Omitting it
+        // here still compiles in the batched path and fails only on the first
+        // decode step, which is how it was found.
+        if !self.functions.contains_key("kv_cache_write_bf16") {
+            let stripped =
+                kernels::KV_CACHE_WRITE_BF16_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel("kv_cache_write_bf16", &src, "kv_cache_write_bf16")?;
+        }
         let d = dst.buf.as_ptr();
         let s = src.buf.as_ptr();
         let p = pos_buf.as_ptr();

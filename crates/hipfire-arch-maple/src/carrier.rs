@@ -19,7 +19,19 @@ pub fn load_maple_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<MapleBun
         return Err("maple: pp>1 unsupported via registry".into());
     }
     match src {
-        ModelSource::Hfq(mut hfq) => load_maple_from_hfq(&mut hfq, ctx.gpu, ctx.max_seq),
+        ModelSource::Hfq(mut hfq) => {
+            // Same ladder the other carriers use: an explicit --kv-mode wins,
+            // else the global config value. Resolution against MAPLE_POLICY
+            // happens inside load_maple_from_hfq, where head_dim is known.
+            // Before this, arch 15 hardcoded q8 and --kv-mode was a silent
+            // no-op.
+            let raw = ctx
+                .kv_mode_override
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+            load_maple_from_hfq(&mut hfq, ctx.gpu, ctx.max_seq, &raw)
+        }
         ModelSource::Dir(_) => Err(
             "maple: safetensors-directory loading is unsupported — convert first with \
              `hipfire-quantize --format maple --input <dir> --output <model.hfq>`, which packs \

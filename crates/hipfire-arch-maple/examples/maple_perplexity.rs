@@ -128,7 +128,7 @@ fn main() {
 
     eprintln!("Loading weights from {}...", args.model);
     let t_load = Instant::now();
-    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, args.ctx).expect("load maple bundle");
+    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, args.ctx, "").expect("load maple bundle");
     eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} vocab={}",

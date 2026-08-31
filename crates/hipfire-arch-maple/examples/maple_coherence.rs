@@ -12,7 +12,12 @@
 //! produce a model that loads, runs at full speed, and emits garbage.
 //!
 //! Usage:
-//!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N] [--raw]
+//!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N]
+//!                   [--raw] [--kv-mode q8|bf16]
+//!
+//! `--kv-mode bf16` swaps the Q8_0 KV cache for the flat BF16 tier. Both run
+//! the same sliding-window kernels with the same dim mapping and FMA order, so
+//! a q8-vs-bf16 diff isolates KV storage precision from everything else.
 //!
 //! `HIPFIRE_MAPLE_PER_TOKEN_PREFILL=1` forces the per-token prefill path, so the
 //! batched path can be A/B'd against it from one binary on one machine.
@@ -32,6 +37,7 @@ struct Args {
     prompt: String,
     max_tokens: usize,
     raw: bool,
+    kv_mode: String,
 }
 
 fn parse_args() -> Args {
@@ -40,6 +46,8 @@ fn parse_args() -> Args {
     let mut prompt = "The capital of France is".to_string();
     let mut max_tokens = 64usize;
     let mut raw = false;
+    // "" = MAPLE_POLICY's default (q8). "bf16" selects the flat BF16 KV tier.
+    let mut kv_mode = String::new();
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -61,6 +69,12 @@ fn parse_args() -> Args {
                 raw = true;
                 i += 1;
             }
+            // KV storage tier: "q8" (default) or "bf16". Anything else warns
+            // and falls back to q8 via MAPLE_POLICY.
+            "--kv-mode" => {
+                kv_mode = argv[i + 1].clone();
+                i += 2;
+            }
             other => panic!("unknown arg {other}"),
         }
     }
@@ -69,6 +83,7 @@ fn parse_args() -> Args {
         prompt,
         max_tokens,
         raw,
+        kv_mode,
     }
 }
 
@@ -100,7 +115,8 @@ fn main() {
     let prompt_toks = tokenizer.encode(&text);
 
     let max_seq = prompt_toks.len() + args.max_tokens + 64;
-    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, max_seq).expect("load maple bundle");
+    let mut b =
+        load_maple_from_hfq(&mut hfq, &mut gpu, max_seq, &args.kv_mode).expect("load maple bundle");
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} moe_inter={} vocab={} eos={} max_seq={}",
         b.config.hidden_size,

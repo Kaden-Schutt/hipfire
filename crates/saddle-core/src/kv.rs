@@ -14,6 +14,11 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvMode {
     Q8,
+    /// Flat 2-byte BF16 K/V. NOT part of the quantized ladder: no rotation, no
+    /// per-block scale, and no VMM / adaptive / compaction support. Only a
+    /// site whose `accepted` list names it can ever resolve to it — today that
+    /// is maple alone, so every other site's behaviour is unchanged.
+    Bf16,
     Asym2,
     Asym3,
     Asym4,
@@ -429,6 +434,13 @@ impl KvCache {
                 }
                 Self::checked_vmm_product("q8 K head stride", &[head_dim / 32, 34])
             }
+            // BF16 is contiguous-only. It has no growable-arena constructor, so
+            // refuse here rather than compute a stride for a layout the VMM
+            // path cannot actually allocate.
+            KvMode::Bf16 => Err(hip_bridge::HipError::new(
+                0,
+                "VMM does not support bf16 KV (contiguous backend only)",
+            )),
             KvMode::Asym2 | KvMode::Fwht2 => head_dim
                 .checked_div(4)
                 .and_then(|n| n.checked_add(4))
@@ -508,6 +520,14 @@ impl KvCache {
                         "VMM q8 only supports VMode::Q8 (lloyd-V requires an FWHT K mode)",
                     ));
                 }
+            }
+            // Fail closed: bf16 has no VMM constructor. Callers that want bf16
+            // must use the contiguous backend.
+            KvMode::Bf16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "VMM does not support bf16 KV (contiguous backend only)",
+                ));
             }
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
                 let ok_hd = match mode {
@@ -602,6 +622,10 @@ impl KvCache {
             Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
         let rotation_table_len = match mode {
             KvMode::Q8 => 0,
+            // Unrotated, like Q8. Unreachable in practice — the validate above
+            // rejects bf16 for VMM before this runs — but 0 is the honest
+            // answer for a tier with no rotation table.
+            KvMode::Bf16 => 0,
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
             KvMode::Fwht3 => 256,
             KvMode::Fwht2 | KvMode::Fwht4 => {
@@ -770,6 +794,15 @@ impl KvCache {
             KvMode::Fwht3 => (false, false, true, false, true),
             KvMode::Fwht4 => (false, true, false, false, true),
             KvMode::Asym3Auto => (false, false, false, false, false),
+            // Bf16 is NOT representable in this 5-flag VMM bundle — all-false
+            // here would decode as KTier::F32 and hand a bf16 buffer to the
+            // F32 kernels, which read it at twice the stride. It can never
+            // legitimately arrive: `validate_vmm_mode` rejects bf16 before any
+            // VMM constructor runs. Panic loudly rather than return a lie.
+            KvMode::Bf16 => panic!(
+                "vmm_mode_flags: bf16 has no VMM layout — it is contiguous-only \
+                 and should have been rejected by validate_mode_with_backend"
+            ),
         }
     }
 
@@ -1092,6 +1125,14 @@ impl KvCache {
             (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
             (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
             (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
+            // Bf16 is Flat-only: there is no _filtered constructor because no
+            // hybrid arch (the reason _filtered exists) uses this tier. A
+            // Mask request therefore falls through to the error below rather
+            // than silently allocating every layer.
+            (KvMode::Bf16, Flat(n), Some(cap)) => {
+                Self::new_gpu_bf16_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::Bf16, Flat(n), None) => Self::new_gpu_bf16(gpu, *n, nh, hd, ms),
             // No constructor exists for this combination.
             (m, l, c) => Err(hip_bridge::HipError::new(
                 0,
@@ -4058,6 +4099,7 @@ mod vmm_layout_tests {
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
             KvMode::Asym3Auto => panic!("Asym3Auto is not a layout mode"),
+            KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
         }
     }
 

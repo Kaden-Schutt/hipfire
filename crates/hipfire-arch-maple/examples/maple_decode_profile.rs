@@ -288,7 +288,7 @@ fn main() {
     // from the headline token counts alone silently under-allocates and the
     // first symptom is an illegal-access fault in an unrelated kernel.
     let max_seq = prompt_toks.len() + args.warmup + args.gen + args.profile_gen + 160 + 64;
-    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, max_seq).expect("load maple bundle");
+    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, max_seq, "").expect("load maple bundle");
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} moe_inter={} vocab={} max_seq={}",
         b.config.hidden_size,

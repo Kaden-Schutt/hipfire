@@ -83,14 +83,28 @@ pub fn resolve_eos(tokenizer: &hipfire_runtime::tokenizer::Tokenizer) -> u32 {
 ///
 /// Split out from the carrier so an offline harness (the coherence example)
 /// can build the same bundle without going through the loader registry.
+/// `kv_mode_raw` is the UNRESOLVED request string (`--kv-mode`, `""` for the
+/// default). It is resolved here rather than by the caller because this is the
+/// first point where `config.head_dim` exists, and `resolve` takes it. Modes
+/// outside `MAPLE_POLICY`'s accept set fall back to q8 with a warning.
 pub fn load_maple_from_hfq(
     hfq: &mut HfqFile,
     gpu: &mut Gpu,
     max_seq: usize,
+    kv_mode_raw: &str,
 ) -> Result<MapleBundle, String> {
     let config = MapleConfig::from_hfq(hfq)?;
     let weights = MapleWeights::load(hfq, &config, gpu)?;
-    let state = MapleState::new_with_max_seq(gpu, &config, max_seq)?;
+    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+        hipfire_runtime::kv_mode::resolve(
+            kv_mode_raw,
+            &hipfire_runtime::kv_mode::MAPLE_POLICY,
+            config.head_dim,
+        );
+    if let Some(w) = warning {
+        eprintln!("  KV cache: {w} (site maple)");
+    }
+    let state = MapleState::new_with_max_seq(gpu, &config, max_seq, mode)?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("maple: tokenizer not found: {e}"))?;
     let eos_tok = resolve_eos(&tokenizer);

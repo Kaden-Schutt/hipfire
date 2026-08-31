@@ -24,6 +24,7 @@
 
 use crate::config::MapleConfig;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -671,13 +672,19 @@ pub struct MapleState {
 impl MapleState {
     pub fn new(gpu: &mut Gpu, cfg: &MapleConfig) -> Result<Self, String> {
         let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
-        Self::new_with_max_seq(gpu, cfg, max_seq)
+        Self::new_with_max_seq(gpu, cfg, max_seq, KvMode::Q8)
     }
 
+    /// `kv_mode` must already be resolved through `MAPLE_POLICY` — this is the
+    /// allocation site, not the policy site. Only `Q8` and `Bf16` are
+    /// serviceable; anything else is rejected rather than silently downgraded,
+    /// because the other tiers have no sliding-window attention kernel and
+    /// Maple's 3:1 sliding layers would then attend the full context.
     pub fn new_with_max_seq(
         gpu: &mut Gpu,
         cfg: &MapleConfig,
         max_seq: usize,
+        kv_mode: KvMode,
     ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
@@ -691,13 +698,32 @@ impl MapleState {
         gpu.ensure_mq_signs()
             .map_err(|e| format!("maple: ensure_mq_signs: {e:?}"))?;
 
-        let kv = KvCache::new_gpu_q8(
-            gpu,
-            cfg.num_hidden_layers,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            max_seq,
-        )
+        let kv = match kv_mode {
+            KvMode::Q8 => KvCache::new_gpu_q8(
+                gpu,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                max_seq,
+            ),
+            KvMode::Bf16 => KvCache::new_gpu_bf16(
+                gpu,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                max_seq,
+            ),
+            // Unreachable through the carrier: MAPLE_POLICY accepts only
+            // {Q8, Bf16} and `resolve` falls back to the site default for
+            // everything else. Reject loudly rather than serve a tier whose
+            // windowed kernels do not exist.
+            other => {
+                return Err(format!(
+                    "maple: KV mode {other:?} has no sliding-window attention kernel; \
+                     arch 15 supports q8 and bf16 only"
+                ))
+            }
+        }
         .map_err(|e| format!("maple: kv cache: {e:?}"))?;
         let pos_buf = gpu
             .hip
