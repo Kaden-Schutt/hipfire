@@ -1,5 +1,7 @@
 //! Deterministic CPU-vs-GPU parity for MQ4G256V2 (qt=44) fused prefill
-//! WMMA paths — the gfx11 slice (`gemm_qkv`, `gemm_qkvza`, `gemm_gate_up`).
+//! WMMA paths — the gfx11 slice (`gemm_qkv`, `gemm_qkvza`, `gemm_gate_up`) —
+//! plus N=1 scalar-decode oracles for `fused_qkv_hfq4g256_mq4v2`,
+//! `fused_qkvza_hfq4g256_mq4v2`, and `fused_gate_up_hfq4g256_mq4v2`.
 //!
 //! ## Why this harness exists
 //!
@@ -21,6 +23,12 @@
 //! `gemm_gate_up_hfq4g256_mq4v2` which select `has_wmma_w32_gfx12` (RDNA4) or
 //! `has_wmma_w32` (RDNA3/3.5). Tolerances mirror the residual harness:
 //! rel-RMS <5% against exact-dequant fp32 ref, bug baseline at least 10x worse.
+//!
+//! Scalar N=1 oracles: independently salted qt44 blobs at K=256 with unequal
+//! Ms per family. Reference is standalone `gemv_mq4g256v2` on the same x;
+//! fused outputs must match those GPU refs elementwise (`to_bits()` equality)
+//! and all canaries must survive. Catches V1 single-header decode,
+//! pointer/output swaps, and tail overwrite.
 //! Overall pass requires every independent output comparison and every canary.
 //!
 //! Run: `cargo run --release -p hipfire-runtime --example mq4v2_fused_parity`
@@ -220,6 +228,75 @@ fn download_y_canary(
     );
     let canary_ok = (got_all[y_len - 1] - CANARY_F32).abs() < 1e-6;
     (got_all[..n * m].to_vec(), canary_ok)
+}
+
+/// V1 single-header bug baseline rel-RMS for one N=1 matrix (fixture gate).
+fn v1_header_bug_rel(blob: &[u8], x: &[f32], m: usize, k: usize) -> f64 {
+    let ok = decode_w(blob, m, k);
+    let bug = decode_w_single_header(blob, m, k);
+    let want = ref_gemm_ow(&ok, x, m, k, 1);
+    let bad: Vec<f32> = ref_gemm_ow(&bug, x, m, k, 1)
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    rel_rms(&bad, &want)
+}
+
+/// Pack a salted qt44 blob and upload it.
+fn pack_upload_mq4v2(
+    gpu: &mut Gpu,
+    m: usize,
+    k: usize,
+    salt: u32,
+) -> (Vec<u8>, rdna_compute::GpuTensor) {
+    let w = build_disjoint_halves_salted(m, k, salt);
+    let blob = pack_mq4g256v2(&w, m, k);
+    let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
+    (blob, d_a)
+}
+
+/// Standalone `gemv_mq4g256v2` N=1 reference on the same x / weight blob.
+fn gemv_mq4v2_ref_n1(
+    gpu: &mut Gpu,
+    d_a: &rdna_compute::GpuTensor,
+    d_x: &rdna_compute::GpuTensor,
+    m: usize,
+    k: usize,
+    tag: &str,
+) -> Vec<f32> {
+    let (d_y, _) = upload_y_canary(gpu, 1, m);
+    gpu.gemv_mq4g256v2(d_a, d_x, &d_y, m, k)
+        .unwrap_or_else(|e| panic!("scalar gemv ref {tag}: {e}"));
+    gpu.hip.device_synchronize().unwrap();
+    gpu.download_f32(&d_y).unwrap()[..m].to_vec()
+}
+
+/// Require elementwise `to_bits()` equality and an intact trailing canary.
+fn record_scalar_exact(
+    failures: &mut Vec<String>,
+    family: &str,
+    part: &str,
+    k: usize,
+    got: &[f32],
+    refer: &[f32],
+    canary_ok: bool,
+) -> (bool, f64, f64, usize) {
+    let want: Vec<f64> = refer.iter().map(|&v| v as f64).collect();
+    let exact = got
+        .iter()
+        .zip(refer.iter())
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    let rms = rel_rms(got, &want);
+    let (worst, wi) = rel_err(got, &want);
+    if !exact {
+        failures.push(format!(
+            "scalar_{family}/{part} K={k} N=1 bit mismatch rms {rms:.3e}"
+        ));
+    }
+    if !canary_ok {
+        failures.push(format!("scalar_{family}/{part} K={k} N=1 canary clobbered"));
+    }
+    (exact, rms, worst, wi)
 }
 
 fn main() {
@@ -548,8 +625,244 @@ fn main() {
         }
     }
 
+    // ── scalar N=1 oracles: QKV / QKVZA / GateUp vs standalone gemv_mq4g256v2 ──
+    // Unequal Ms so each gid routing range is non-empty and a swapped y
+    // pointer cannot hide behind equal-length buffers. Exact `to_bits()` only.
+    let n1 = 1usize;
+    let k1 = 256usize;
+
+    // scalar fused_qkvza
+    {
+        let ms = [32usize, 16, 8, 24];
+        let salts = [0x5CA1_0001u32, 0x5CA1_0002, 0x5CA1_0003, 0x5CA1_0004];
+        let parts = ["qkv", "z", "beta", "alpha"];
+        let x: Vec<f32> = (0..n1 * k1)
+            .map(|i| prng(i, 0xC0FF_EE01) * 2.0 - 1.0)
+            .collect();
+        let mut blobs = Vec::with_capacity(4);
+        let mut d_as = Vec::with_capacity(4);
+        for i in 0..4 {
+            let (blob, d_a) = pack_upload_mq4v2(&mut gpu, ms[i], k1, salts[i]);
+            blobs.push(blob);
+            d_as.push(d_a);
+        }
+        let bug_rels: Vec<f64> = (0..4)
+            .map(|i| v1_header_bug_rel(&blobs[i], &x, ms[i], k1))
+            .collect();
+        let bug_rel = bug_rels.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!(
+            "scalar_fused_qkvza K={k1} N={n1} Ms=({},{},{},{}): bug baseline rel {bug_rel:.3e} (qkv {:.3e} z {:.3e} beta {:.3e} alpha {:.3e})",
+            ms[0], ms[1], ms[2], ms[3], bug_rels[0], bug_rels[1], bug_rels[2], bug_rels[3]
+        );
+        assert!(
+            bug_rel > 0.5,
+            "scalar_fused_qkvza fixture not discriminating K={k1} N={n1}: bug {bug_rel:.3e}"
+        );
+        let d_x = gpu.upload_f32(&x, &[n1 * k1]).unwrap();
+        let refs: Vec<Vec<f32>> = (0..4)
+            .map(|i| gemv_mq4v2_ref_n1(&mut gpu, &d_as[i], &d_x, ms[i], k1, parts[i]))
+            .collect();
+        let mut d_ys = Vec::with_capacity(4);
+        let mut y_lens = Vec::with_capacity(4);
+        for &m in &ms {
+            let (d_y, y_len) = upload_y_canary(&mut gpu, n1, m);
+            d_ys.push(d_y);
+            y_lens.push(y_len);
+        }
+        gpu.fused_qkvza_hfq4g256_mq4v2(
+            &d_as[0], &d_as[1], &d_as[2], &d_as[3], &d_x, &d_ys[0], &d_ys[1], &d_ys[2], &d_ys[3],
+            ms[0], ms[1], ms[2], ms[3], k1,
+        )
+        .unwrap_or_else(|e| panic!("scalar fused_qkvza_mq4v2 launch: {e}"));
+        gpu.hip.device_synchronize().unwrap();
+        let mut rms_max = 0.0f64;
+        let mut detail = String::new();
+        let mut canary_ok = true;
+        let mut all_exact = true;
+        for i in 0..4 {
+            let (got, c_ok) = download_y_canary(&gpu, &d_ys[i], y_lens[i], n1, ms[i]);
+            let (exact, rms, worst, wi) = record_scalar_exact(
+                &mut failures,
+                "fused_qkvza",
+                parts[i],
+                k1,
+                &got,
+                &refs[i],
+                c_ok,
+            );
+            rms_max = rms_max.max(rms);
+            all_exact &= exact;
+            canary_ok &= c_ok;
+            detail.push_str(&format!(
+                " {} {rms:.3e} exact={exact} (worst {worst:.3e}@{wi}) canary={c_ok}",
+                parts[i]
+            ));
+        }
+        let status = if all_exact && canary_ok { "ok" } else { "FAIL" };
+        eprintln!(
+            "  scalar_fused_qkvza K={k1} N={n1}: rel-rms {rms_max:.3e}{detail} {status} bug {bug_rel:.3e}"
+        );
+        assert!(
+            rms_max < bug_rel * 0.1,
+            "half1 decoded with half0 at scalar_fused_qkvza K={k1} N={n1}: rms {rms_max:.3e} not below bug {bug_rel:.3e}"
+        );
+    }
+
+    // scalar fused_qkv
+    {
+        let ms = [40usize, 24, 12];
+        let salts = [0x7E4D_0001u32, 0x7E4D_0002, 0x7E4D_0003];
+        let parts = ["q", "k", "v"];
+        let x: Vec<f32> = (0..n1 * k1)
+            .map(|i| prng(i, 0xC0FF_EE02) * 2.0 - 1.0)
+            .collect();
+        let mut blobs = Vec::with_capacity(3);
+        let mut d_as = Vec::with_capacity(3);
+        for i in 0..3 {
+            let (blob, d_a) = pack_upload_mq4v2(&mut gpu, ms[i], k1, salts[i]);
+            blobs.push(blob);
+            d_as.push(d_a);
+        }
+        let bug_rels: Vec<f64> = (0..3)
+            .map(|i| v1_header_bug_rel(&blobs[i], &x, ms[i], k1))
+            .collect();
+        let bug_rel = bug_rels.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!(
+            "scalar_fused_qkv K={k1} N={n1} Ms=({},{},{}): bug baseline rel {bug_rel:.3e} (q {:.3e} k {:.3e} v {:.3e})",
+            ms[0], ms[1], ms[2], bug_rels[0], bug_rels[1], bug_rels[2]
+        );
+        assert!(
+            bug_rel > 0.5,
+            "scalar_fused_qkv fixture not discriminating K={k1} N={n1}: bug {bug_rel:.3e}"
+        );
+        let d_x = gpu.upload_f32(&x, &[n1 * k1]).unwrap();
+        let refs: Vec<Vec<f32>> = (0..3)
+            .map(|i| gemv_mq4v2_ref_n1(&mut gpu, &d_as[i], &d_x, ms[i], k1, parts[i]))
+            .collect();
+        let mut d_ys = Vec::with_capacity(3);
+        let mut y_lens = Vec::with_capacity(3);
+        for &m in &ms {
+            let (d_y, y_len) = upload_y_canary(&mut gpu, n1, m);
+            d_ys.push(d_y);
+            y_lens.push(y_len);
+        }
+        gpu.fused_qkv_hfq4g256_mq4v2(
+            &d_as[0], &d_as[1], &d_as[2], &d_x, &d_ys[0], &d_ys[1], &d_ys[2], ms[0], ms[1], ms[2],
+            k1,
+        )
+        .unwrap_or_else(|e| panic!("scalar fused_qkv_mq4v2 launch: {e}"));
+        gpu.hip.device_synchronize().unwrap();
+        let mut rms_max = 0.0f64;
+        let mut detail = String::new();
+        let mut canary_ok = true;
+        let mut all_exact = true;
+        for i in 0..3 {
+            let (got, c_ok) = download_y_canary(&gpu, &d_ys[i], y_lens[i], n1, ms[i]);
+            let (exact, rms, worst, wi) = record_scalar_exact(
+                &mut failures,
+                "fused_qkv",
+                parts[i],
+                k1,
+                &got,
+                &refs[i],
+                c_ok,
+            );
+            rms_max = rms_max.max(rms);
+            all_exact &= exact;
+            canary_ok &= c_ok;
+            detail.push_str(&format!(
+                " {} {rms:.3e} exact={exact} (worst {worst:.3e}@{wi}) canary={c_ok}",
+                parts[i]
+            ));
+        }
+        let status = if all_exact && canary_ok { "ok" } else { "FAIL" };
+        eprintln!(
+            "  scalar_fused_qkv K={k1} N={n1}: rel-rms {rms_max:.3e}{detail} {status} bug {bug_rel:.3e}"
+        );
+        assert!(
+            rms_max < bug_rel * 0.1,
+            "half1 decoded with half0 at scalar_fused_qkv K={k1} N={n1}: rms {rms_max:.3e} not below bug {bug_rel:.3e}"
+        );
+    }
+
+    // scalar fused_gate_up
+    {
+        let ms = [48usize, 20];
+        let salts = [0x81A0_0001u32, 0x81A0_0002];
+        let parts = ["gate", "up"];
+        let x: Vec<f32> = (0..n1 * k1)
+            .map(|i| prng(i, 0xC0FF_EE03) * 2.0 - 1.0)
+            .collect();
+        let mut blobs = Vec::with_capacity(2);
+        let mut d_as = Vec::with_capacity(2);
+        for i in 0..2 {
+            let (blob, d_a) = pack_upload_mq4v2(&mut gpu, ms[i], k1, salts[i]);
+            blobs.push(blob);
+            d_as.push(d_a);
+        }
+        let bug_rels: Vec<f64> = (0..2)
+            .map(|i| v1_header_bug_rel(&blobs[i], &x, ms[i], k1))
+            .collect();
+        let bug_rel = bug_rels.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!(
+            "scalar_fused_gate_up K={k1} N={n1} Ms=({},{}): bug baseline rel {bug_rel:.3e} (gate {:.3e} up {:.3e})",
+            ms[0], ms[1], bug_rels[0], bug_rels[1]
+        );
+        assert!(
+            bug_rel > 0.5,
+            "scalar_fused_gate_up fixture not discriminating K={k1} N={n1}: bug {bug_rel:.3e}"
+        );
+        let d_x = gpu.upload_f32(&x, &[n1 * k1]).unwrap();
+        let refs: Vec<Vec<f32>> = (0..2)
+            .map(|i| gemv_mq4v2_ref_n1(&mut gpu, &d_as[i], &d_x, ms[i], k1, parts[i]))
+            .collect();
+        let mut d_ys = Vec::with_capacity(2);
+        let mut y_lens = Vec::with_capacity(2);
+        for &m in &ms {
+            let (d_y, y_len) = upload_y_canary(&mut gpu, n1, m);
+            d_ys.push(d_y);
+            y_lens.push(y_len);
+        }
+        gpu.fused_gate_up_hfq4g256_mq4v2(
+            &d_as[0], &d_as[1], &d_x, &d_ys[0], &d_ys[1], ms[0], ms[1], k1,
+        )
+        .unwrap_or_else(|e| panic!("scalar fused_gate_up_mq4v2 launch: {e}"));
+        gpu.hip.device_synchronize().unwrap();
+        let mut rms_max = 0.0f64;
+        let mut detail = String::new();
+        let mut canary_ok = true;
+        let mut all_exact = true;
+        for i in 0..2 {
+            let (got, c_ok) = download_y_canary(&gpu, &d_ys[i], y_lens[i], n1, ms[i]);
+            let (exact, rms, worst, wi) = record_scalar_exact(
+                &mut failures,
+                "fused_gate_up",
+                parts[i],
+                k1,
+                &got,
+                &refs[i],
+                c_ok,
+            );
+            rms_max = rms_max.max(rms);
+            all_exact &= exact;
+            canary_ok &= c_ok;
+            detail.push_str(&format!(
+                " {} {rms:.3e} exact={exact} (worst {worst:.3e}@{wi}) canary={c_ok}",
+                parts[i]
+            ));
+        }
+        let status = if all_exact && canary_ok { "ok" } else { "FAIL" };
+        eprintln!(
+            "  scalar_fused_gate_up K={k1} N={n1}: rel-rms {rms_max:.3e}{detail} {status} bug {bug_rel:.3e}"
+        );
+        assert!(
+            rms_max < bug_rel * 0.1,
+            "half1 decoded with half0 at scalar_fused_gate_up K={k1} N={n1}: rms {rms_max:.3e} not below bug {bug_rel:.3e}"
+        );
+    }
+
     if failures.is_empty() {
-        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64");
+        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2");
     } else {
         eprintln!("\nmq4v2_fused_parity: FAIL — {:?}", failures);
         std::process::exit(1);
