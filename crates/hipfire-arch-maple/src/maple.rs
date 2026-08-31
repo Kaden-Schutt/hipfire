@@ -151,6 +151,13 @@ fn wt_from_raw(
         // `pack_maple_head` quantized against; if the two ever diverge the
         // result is not an error but silently wrong logits.
         30 => DType::MQ4G256Lloyd,
+        // qt=44 arrives only from `--head-quant mq4v2`. Same FWHT-rotated
+        // contract as qt=30 above — it resolves to GemvMq4G256V2Prerotated, so
+        // weight_gemv rotates x with the same ensure_mq_signs seeds (42/1042)
+        // that pack_maple_head quantized against. It differs from qt=30 only in
+        // the 8 header bytes: a separate fp16 scale/zero per 128-weight half
+        // rather than one pair per 256, at 4.25 bpw instead of 5.0.
+        44 => DType::MQ4G256V2,
         51 => DType::MQ2G256LloydU,
         other => return Err(format!("unsupported quant_type {other}")),
     };
