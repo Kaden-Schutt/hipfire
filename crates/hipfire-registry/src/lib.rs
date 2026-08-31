@@ -722,6 +722,20 @@ mod tests {
             model.sha256.as_deref(),
             Some("4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428")
         );
+
+        let (tag, model) = registry.model("ornith-1.5:35b-a3b-mq4r").unwrap();
+        assert_eq!(tag, "ornith-1.5:35b-a3b-mq4r");
+        assert_eq!(model.file, "ornith-1.5-35b-a3b.mq4r");
+        assert_eq!(model.quant.as_deref(), Some("mq4r"));
+        assert_eq!(model.size_bytes, Some(18_700_570_368));
+        assert_eq!(
+            model.quant_recipe.as_deref(),
+            Some("mq4v2-uniform-no-q8-router@10fbf86f")
+        );
+        assert_eq!(
+            model.sha256.as_deref(),
+            Some("84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6")
+        );
     }
 
     /// Pins Muse Glimmer's sampling contract to its model card's "Best Practices"

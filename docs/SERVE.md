@@ -244,6 +244,35 @@ Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
 LCP can hit. Other arches reset every request (stateless OpenAI shape).
 
+### Client notes (Zed / OpenAI-compatible agents)
+
+Live-GPU endpoint validation on gfx1100 and gfx1201 exercised Zed-shaped
+streamed requests against the canonical Qwen3.6 35B-A3B MQ4R artifact. The
+matrix covered automatic and required tool calls, multiple calls in one turn,
+multi-turn `reasoning_content` replay, `tool_choice: "none"`, usage chunks, and
+strict UTF-8 SSE/JSON decoding. This validates the OpenAI-compatible endpoint,
+not the Zed application UI itself.
+
+Inbound assistant `tool_calls[].function.arguments` strings are parsed into
+JSON objects for Qwen template replay; outbound OpenAI arguments remain JSON
+strings. Tool-call deltas are emitted in bulk at the terminal chunk,
+`finish_reason=tool_calls` is produced, and disconnect cancels in-flight
+generation.
+
+Current caveats for agent clients:
+
+- **Multi-turn reasoning replay:** Qwen3.5/3.6-family arches replay assistant
+  `reasoning_content` into the next turn (alongside `muse_glimmer`).
+- **Tool-argument streaming:** progressive per-token argument deltas are not
+  emitted; arguments arrive bulk-at-terminal with the tool-call chunk.
+- **`parallel_tool_calls`:** the explicit request field is ignored.
+- **Zed temperature:** Zed defaults sampling temperature to **1.0** unless the
+  agent profile overrides it.
+
+For Qwen3.5/3.6 agent use, prefer temperature **0.2–0.6** in the profile, and
+enable interleaved reasoning on Zed’s OpenAI-compatible capability when the
+client exposes that toggle.
+
 ## Auto-routing from `hipfire run`
 
 ```bash

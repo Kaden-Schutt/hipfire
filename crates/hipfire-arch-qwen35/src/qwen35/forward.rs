@@ -217,28 +217,33 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
             .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
 }
 
-/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
-/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
-/// applicable even on a graded file: the MQ4 router routes on the rotated x via
-/// the fused gate kernel (MoeResolution::gate_fusable), and the routed experts
-/// (any FwhtG256 MQ-family) consume the same single rotated activation — saving
-/// the un-fused rmsnorm + the per-component rotates the else-branch incurs.
-/// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
-/// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
+/// GATE-SIDE exact-uniform MQ4G256 V1 quartet (router + shared expert
+/// gate/up), independent of the routed experts. When true, the fused
+/// rmsnorm+FWHT path may hand only the rotated activation to the V1 four-weight
+/// gate kernel. MQ4G256V2 deliberately stays on the normalized generic path:
+/// dispatch reuses its single rotated activation through exact V2 prerotated
+/// GEMVs, whose implementation is correct across every admitted wave32 arch.
+///
+/// Keeping this predicate aligned with `MoeResolution::gate_fusable` is a
+/// correctness invariant. If Qwen pre-rotates while dispatch declines the
+/// fused route, generic `run_auto` receives the raw residual in its `x_norm`
+/// slot and silently rotates an unnormalized activation.
 pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)
-        && matches!(
-            ffn.shared_expert_gate.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
-        && matches!(
-            ffn.shared_expert.gate.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
-        && matches!(
-            ffn.shared_expert.up.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
+    gate_side_mq4_uniform_from_dtypes([
+        ffn.router.gpu_dtype,
+        ffn.shared_expert_gate.gpu_dtype,
+        ffn.shared_expert.gate.gpu_dtype,
+        ffn.shared_expert.up.gpu_dtype,
+    ])
+}
+
+/// Pure core of [`ffn_gate_side_mq4_for_moe`] for unit tests (no live weights).
+pub(crate) fn gate_side_mq4_uniform_from_dtypes(
+    [router, shared_expert_gate, shared_gate, shared_up]: [DType; 4],
+) -> bool {
+    [router, shared_expert_gate, shared_gate, shared_up]
+        .into_iter()
+        .all(|dt| dt == DType::MQ4G256)
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -6125,19 +6130,27 @@ mod tests {
     }
 
     #[test]
-    fn mq4_family_gate_side_match_keeps_v1_and_v2() {
-        // Mirrors ffn_gate_side_mq4_for_moe / experts_all_gate_up_mq4 arms:
-        // both V1 and V2 are MQ4-family for prerotate admission; neither is MQ6.
-        let is_mq4 = |dt: DType| matches!(dt, DType::MQ4G256 | DType::MQ4G256V2);
-        let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256 | DType::MQ6G256V2);
-        assert!(is_mq4(DType::MQ4G256));
-        assert!(is_mq4(DType::MQ4G256V2));
-        assert!(!is_mq4(DType::MQ6G256));
-        assert!(!is_mq4(DType::MQ6G256V2));
-        assert!(is_mq6(DType::MQ6G256));
-        assert!(is_mq6(DType::MQ6G256V2));
-        assert!(!is_mq6(DType::MQ4G256));
-        assert!(!is_mq6(DType::MQ4G256V2));
+    fn mq4v2_gate_side_uses_normalized_generic_path() {
+        let v1 = DType::MQ4G256;
+        let v2 = DType::MQ4G256V2;
+        assert!(gate_side_mq4_uniform_from_dtypes([v1, v1, v1, v1]));
+        assert!(
+            !gate_side_mq4_uniform_from_dtypes([v2, v2, v2, v2]),
+            "V2 gate quartet must preserve normalized x for prerotated GEMVs"
+        );
+        assert!(!gate_side_mq4_uniform_from_dtypes([v2, v1, v1, v1]));
+        assert!(!gate_side_mq4_uniform_from_dtypes([
+            DType::Q8_0,
+            v1,
+            v1,
+            v1
+        ]));
+        assert!(!gate_side_mq4_uniform_from_dtypes([
+            DType::MQ6G256,
+            v1,
+            v1,
+            v1
+        ]));
     }
 
     #[test]

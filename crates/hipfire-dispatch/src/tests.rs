@@ -1113,6 +1113,61 @@ fn moe_res_mq4v2_routed_indexable() {
 }
 
 #[test]
+fn moe_res_all_mq4v2_gate_quartet_uses_prerotated_gemvs() {
+    // The V2 structural quartet must stay off the fused V1 gate route. Routed
+    // V2 remains indexable and requests one rotated activation, which the
+    // generic gate path reuses through exact V2 prerotated GEMVs.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::MQ4G256V2;
+    d.shared_gate = DType::MQ4G256V2;
+    d.shared_expert_gate = DType::MQ4G256V2;
+    d.shared_expert_up = DType::MQ4G256V2;
+    d.shared_expert_down = DType::MQ4G256V2;
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = true;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        !r.gate_fusable,
+        "V2 gate quartet must not use the V1 fused route"
+    );
+    assert!(!r.gate_side_mq4);
+    assert!(
+        r.needs_x_rot_local,
+        "V2 gate and routed weights reuse rotated x"
+    );
+    assert!(r.routed_indexable_mq4v2);
+    assert!(r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
+    // Mixed V1/V2 gate-side is never fusable: V1 f32 header vs V2 dual-f16
+    // header share stride; wrong launcher is silent garbage. Routed V2
+    // indexability is independent and stays on.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::MQ4G256V2; // V2 router, rest V1
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_fusable, "mixed V1/V2 gate quartet must not fuse");
+    assert!(!r.gate_side_mq4);
+    assert!(
+        r.routed_indexable_mq4v2,
+        "routed V2 indexability unchanged by gate mix"
+    );
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local);
+
+    // V1 router + one V2 shared half
+    let mut d = dtypes_all_mq4();
+    d.shared_expert_up = DType::MQ4G256V2;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_fusable, "single V2 shared-up disqualifies fuse");
+}
+
+#[test]
 fn moe_res_shipped_ornith15_takes_the_indexed_path() {
     // The dtype combination of the PUBLISHED artifact
     // hipfire-models/ornith1.5-35b-a3b (read from its HFQ index: 20,651 of

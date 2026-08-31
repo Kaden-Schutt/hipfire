@@ -1531,10 +1531,23 @@ pub(crate) struct RequestContract {
     pub forwarded_tools: Option<serde_json::Value>,
 }
 
-/// `muse_glimmer` is the only arch that surfaces reasoning content in messages.
+/// Architectures that surface reasoning content in multi-turn message history
+/// (`muse_glimmer` and Qwen3.5/3.6-family arches).
 /// Single source of truth for daemon request projection.
 pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
-    arch == Some("muse_glimmer")
+    let Some(arch) = arch else {
+        return false;
+    };
+    if arch == "muse_glimmer" {
+        return true;
+    }
+    let lower = arch.to_ascii_lowercase();
+    lower == "qwen35"
+        || lower == "qwen35-vl"
+        || lower.starts_with("qwen35")
+        || lower.starts_with("qwen36")
+        || lower.contains("qwen3.5")
+        || lower.contains("qwen3.6")
 }
 
 pub(crate) fn project_request_contract(

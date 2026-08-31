@@ -263,6 +263,17 @@ context on limited VRAM:
 2. Set `cask_sidecar` to that exact path. Enable `cask` separately only when m-folding is intended.
 3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash. `cask_auto_attach` remains `false` unless explicitly opted in.
 
+### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
+
+On 24GB GPUs, Q8 KV is about 10,880 B/token across 10 full-attention layers,
+plus O(N) flash partials (~2,064 B/token), ~25 MiB DeltaNet state, and multi-GiB
+fixed HIP/graph overhead. **50K Q8 is tight but physically feasible**; **200K Q8
+is not a 24GB-class configuration** — it needs >32GB-class VRAM or CASK/compressed
+KV. Some historical 131K sidecar benches clamped physical capacity to ~2432
+tokens and should not be read as full-context Q8 support. Long-context decode
+slowdown is expected O(N) full-attention bandwidth, not by itself an admission
+regression.
+
 ## If something fails
 
 | Symptom | What to try |

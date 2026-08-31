@@ -6024,8 +6024,8 @@ fn registry_source(source: RegistrySource) -> &'static str {
 mod tests {
     use super::*;
     use crate::serve::complete::{
-        forward_think_fragments, inject_default_system_message, normalize_openai_messages,
-        Completion, ThinkFragment,
+        forward_think_fragments, include_reasoning_content, inject_default_system_message,
+        normalize_openai_messages, Completion, ThinkFragment,
     };
 
     use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
@@ -7737,6 +7737,44 @@ mod tests {
         assert_eq!(on3[0]["tool_plan"], "inline think");
         assert_eq!(on3[0]["reasoning_content"], "inline think");
         assert_eq!(on3[0]["reasoning_content"], on3[0]["tool_plan"]);
+    }
+
+    #[test]
+    fn include_reasoning_content_arch_predicate() {
+        assert!(include_reasoning_content(Some("muse_glimmer")));
+        assert!(include_reasoning_content(Some("qwen35")));
+        assert!(include_reasoning_content(Some("qwen35-vl")));
+        assert!(include_reasoning_content(Some("qwen36")));
+        assert!(include_reasoning_content(Some("Qwen3.6-A3B")));
+        assert!(include_reasoning_content(Some("qwen3.5")));
+        assert!(!include_reasoning_content(Some("llama")));
+        assert!(!include_reasoning_content(Some("gemma4")));
+        assert!(!include_reasoning_content(Some("qwen2")));
+        assert!(!include_reasoning_content(None));
+    }
+
+    #[test]
+    fn normalize_reasoning_emitted_for_qwen_include_flag() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "visible",
+                "reasoning_content": "qwen chain of thought"
+            }]
+        });
+        let include = include_reasoning_content(Some("qwen35"));
+        assert!(include);
+        let on = normalize_openai_messages(body.get("messages"), include);
+        assert_eq!(on[0]["reasoning_content"], "qwen chain of thought");
+        assert_eq!(on[0]["tool_plan"], "qwen chain of thought");
+        assert_eq!(on[0]["content"], "visible");
+
+        let off = normalize_openai_messages(
+            body.get("messages"),
+            include_reasoning_content(Some("llama")),
+        );
+        assert!(off[0].get("reasoning_content").is_none());
+        assert_eq!(off[0]["tool_plan"], "qwen chain of thought");
     }
 
     #[test]

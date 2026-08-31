@@ -112,9 +112,11 @@ impl MoeDtypes {
 #[derive(Clone, Copy, Debug)]
 pub struct MoeResolution {
     pub gate_side_mq4: bool,
-    /// Router + shared expert are MQ4 (fused gate path applicable, independent
-    /// of routed-expert dtype). True for uniform MQ4 AND graded files whose
-    /// gate-side is MQ4 (e.g. the redline mq4r).
+    /// Router + shared expert gate/up are an exact-uniform MQ4G256 V1
+    /// quartet. The fused gate path is independent of routed-expert dtype.
+    /// MQ4G256V2 deliberately stays on the normalized generic path and reuses
+    /// the rotated activation through exact V2 GEMVs; its fused quartet
+    /// launcher is not correct on every admitted wave32 architecture.
     pub gate_fusable: bool,
     pub routed_indexable_mq4: bool,
     pub routed_indexable_mq4v2: bool,
@@ -194,10 +196,13 @@ impl MoeResolution {
 
     pub fn resolve_arch(d: &MoeDtypes, k: usize, arch_has_e8_wmma: bool) -> Self {
         use DType::*;
-        // Gate-side weights (router + shared expert) all MQ4 → the fused gate
-        // kernel (fused_qkvza_hfq4g256 on one rotated xr) is applicable. This is
-        // INDEPENDENT of the routed-expert dtype (all MQ-family share the same
-        // FwhtG256 rotation), so it can fire on graded files too (redline mq4r).
+        // The fused four-weight gate kernel is admitted only for the exact
+        // MQ4G256 V1 quartet. MQ4G256V2 uses the normalized generic path and
+        // reuses its already-rotated activation through the dedicated V2
+        // prerotated GEMVs. The V2 fused launcher is not correct on every
+        // admitted wave32 architecture, so it cannot own a cross-arch route.
+        // This is independent of routed-expert dtype: all rotated MQ families
+        // consume the same FwhtG256 activation.
         let gate_fusable = d.router == MQ4G256
             && d.shared_gate == MQ4G256
             && d.shared_expert_gate == MQ4G256
