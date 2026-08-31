@@ -4027,31 +4027,6 @@ pub const FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
 );
-// Eight exact row waves share one bank-conflict-free LDS activation tile.
-// Exact gfx1100/K=2048 MQ4V2 experiment; host routing is opt-in only.
-pub const FUSED_QKVZA_MQ4G256V2_K2048_LDSX8_GFX1100_SRC: &str = concat!(
-    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
-    "#define HIPFIRE_RDNA3_QKVZA_LDSX8 1\n",
-    "#define HIPFIRE_QKVZA_WAVES_PER_BLOCK 8\n",
-    "#define HIPFIRE_QKVZA_BLOCK_SIZE 256\n",
-    "#define HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU 2\n",
-    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
-);
-/// gfx1100 selective QKVZA activation lowering: keep HFQ weights on global
-/// loads and issue only the shared K=2048 activation as aligned temporal B128
-/// buffer loads. Same 32-lane geometry and FMA order as HOIST_X32.
-pub const FUSED_QKVZA_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC: &str = concat!(
-    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
-    "#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n",
-    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
-);
-
 pub const FUSED_QKVZA_MQ5G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -8062,60 +8037,6 @@ mod mqv2_moe {
         assert_eq!(n12, "gemm_mq4g256v2_moe_grouped_wmma_gfx12");
         assert!(s11.contains("void gemm_mq4g256v2_moe_grouped_wmma_k2("));
         assert!(s12.contains("void gemm_mq4g256v2_moe_grouped_wmma_gfx12("));
-    }
-
-    #[test]
-    fn mq4v2_qkvza_k2048_ldsx8_gfx1100_source_contract() {
-        let src = FUSED_QKVZA_MQ4G256V2_K2048_LDSX8_GFX1100_SRC;
-        assert!(src.contains("#define HIPFIRE_RDNA3_QKVZA_K2048 1\n"));
-        assert!(src.contains("#define HIPFIRE_RDNA3_QKVZA_LDSX8 1\n"));
-        assert!(src.contains("#define HIPFIRE_QKVZA_WAVES_PER_BLOCK 8\n"));
-        assert!(src.contains("#define HIPFIRE_QKVZA_BLOCK_SIZE 256\n"));
-        assert!(src.contains("#define HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU 2\n"));
-        assert!(src.contains(
-            "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100\n"
-        ));
-        assert!(!src.contains("HIPFIRE_RDNA3_QKVZA_HOIST_X32"));
-        assert_ne!(
-            FUSED_QKVZA_MQ4G256V2_K2048_LDSX8_GFX1100_SRC,
-            FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC
-        );
-        assert_ne!(
-            "fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100",
-            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
-        );
-        assert_ne!(
-            "fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100",
-            "fused_qkvza_mq4g256v2"
-        );
-    }
-
-    #[test]
-    fn mq4v2_qkvza_k2048_x_buffer_gfx1100_source_contract() {
-        let src = FUSED_QKVZA_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC;
-        assert!(src.contains("#define HIPFIRE_RDNA3_QKVZA_K2048 1\n"));
-        assert!(src.contains("#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n"));
-        assert!(src.contains(
-            "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100\n"
-        ));
-        assert!(!src.contains("HIPFIRE_RDNA3_QKVZA_HOIST_X32"));
-        assert!(!src.contains("HIPFIRE_RDNA3_QKVZA_LDSX8"));
-        assert_ne!(
-            FUSED_QKVZA_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC,
-            FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC
-        );
-        assert_ne!(
-            FUSED_QKVZA_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC,
-            FUSED_QKVZA_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC
-        );
-        assert_ne!(
-            "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
-            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
-        );
-        assert_ne!(
-            "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
-            "fused_qkvza_mq4g256v2"
-        );
     }
 
     #[test]
