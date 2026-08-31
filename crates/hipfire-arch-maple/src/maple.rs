@@ -129,14 +129,16 @@ fn load_wt(
 /// quant_type → DType. **qt=51 (`MQ2G256LloydU`) is the whole point of this
 /// arch**: it is the unrotated MQ2-Lloyd sibling that carries Maple's native
 /// ternary weights losslessly, and the dispatcher must NOT rotate x for it.
-fn wt_from_raw(
-    gpu: &mut Gpu,
-    qt: u8,
-    data: &[u8],
-    m: usize,
-    k: usize,
-) -> Result<WeightTensor, String> {
-    let dtype = match qt {
+/// quant_type -> DType for every carrier a Maple `.hfq` can hold. Pure, so the
+/// READER contract is testable without a GPU.
+///
+/// This map is append-only in practice: it is what lets an already-converted
+/// model load, so an entry may not be removed just because the CONVERTER stops
+/// producing that carrier. qt=30 is exactly that case — `--head-quant mq4` is
+/// deprecated and no longer selectable, but every qt=30 `.hfq` already on disk
+/// must keep loading.
+pub(crate) fn maple_dtype_for_quant_type(qt: u8) -> Result<DType, String> {
+    Ok(match qt {
         1 => DType::F16,
         2 => DType::F32,
         16 => DType::BF16,
@@ -160,7 +162,17 @@ fn wt_from_raw(
         44 => DType::MQ4G256V2,
         51 => DType::MQ2G256LloydU,
         other => return Err(format!("unsupported quant_type {other}")),
-    };
+    })
+}
+
+fn wt_from_raw(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let dtype = maple_dtype_for_quant_type(qt)?;
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("upload_raw: {e:?}"))?;
@@ -1052,5 +1064,55 @@ mod tests {
         assert_eq!(bf16_to_f32(0xBF80), -1.0);
         assert_eq!(bf16_to_f32(0x0000), 0.0);
         assert_eq!(bf16_to_f32(0x4049), f32::from_bits(0x40490000));
+    }
+}
+
+#[cfg(test)]
+mod head_carrier_tests {
+    use super::*;
+
+    /// Deprecating a CONVERTER option must never stop an existing model from
+    /// loading. `--head-quant mq4` is gone, but qt=30 heads are on disk and
+    /// must still resolve — this is the guard that keeps the reader and the
+    /// producer decoupled.
+    #[test]
+    fn deprecated_qt30_head_still_loads() {
+        assert_eq!(
+            maple_dtype_for_quant_type(30).unwrap(),
+            DType::MQ4G256Lloyd,
+            "qt=30 is deprecated as a CONVERTER option, not as a readable carrier"
+        );
+    }
+
+    #[test]
+    fn mq4v2_head_carrier_resolves() {
+        assert_eq!(
+            maple_dtype_for_quant_type(44).unwrap(),
+            DType::MQ4G256V2,
+            "qt=44 is the replacement fast head; without this arm it fails at \
+             load with 'unsupported quant_type 44'"
+        );
+    }
+
+    /// The three carriers the converter can still emit, plus the body tier.
+    #[test]
+    fn shipped_carriers_resolve() {
+        assert_eq!(maple_dtype_for_quant_type(16).unwrap(), DType::BF16);
+        assert_eq!(maple_dtype_for_quant_type(3).unwrap(), DType::Q8_0);
+        assert_eq!(maple_dtype_for_quant_type(44).unwrap(), DType::MQ4G256V2);
+        // qt=51 is the whole point of arch 15: the unrotated ternary body.
+        assert_eq!(
+            maple_dtype_for_quant_type(51).unwrap(),
+            DType::MQ2G256LloydU
+        );
+    }
+
+    /// An unknown carrier must FAIL rather than silently pick something —
+    /// these tiers differ in rotation, and a wrong guess yields plausible but
+    /// wrong logits with no error.
+    #[test]
+    fn unknown_quant_type_is_rejected() {
+        let e = maple_dtype_for_quant_type(200).unwrap_err();
+        assert!(e.contains("unsupported quant_type 200"), "got {e}");
     }
 }

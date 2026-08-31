@@ -56,6 +56,13 @@ pub(crate) enum MapleHeadQuant {
     /// **FWHT-rotated**: the weights are encoded against FWHT-256-rotated
     /// blocks, so the runtime MUST rotate `x` to match. See
     /// `pack_maple_head` for why the seeds are not free parameters.
+    ///
+    /// **DEPRECATED — use `Mq4V2`.** Measured on gfx1151 (KV bf16, 2048
+    /// teacher-forced tokens): qt=44 is better on EVERY axis — mean KL 0.0744
+    /// vs 0.0772, decode 165.8 vs 161.8 tok/s, and 4.25 vs 5.0 bpw. There is
+    /// no workload where qt=30 is the right choice. Kept only so the packer
+    /// arm and its FWHT-seed contract stay documented next to qt=44's; the
+    /// CLI no longer offers it.
     Mq4,
     /// MQ4-G256 **v2** (qt=44), 136 B per 256 weights = 4.25 bpw.
     /// **FWHT-rotated**, same as `Mq4`, and the same nibble payload — but the

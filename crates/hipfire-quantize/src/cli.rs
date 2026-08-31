@@ -70,8 +70,13 @@ pub(crate) struct QuantizeArgs {
     /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
     /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
     /// the same swap buys 49% rather than 10%.
+    ///
+    /// `mq4` (qt=30) is DEPRECATED and no longer selectable: mq4v2 (qt=44)
+    /// beats it on every axis -- lower KL (0.0744 vs 0.0772), faster (165.8 vs
+    /// 161.8 tok/s) and 15% smaller (4.25 vs 5.0 bpw). Existing .hfq files with
+    /// a qt=30 head still LOAD; only producing new ones is removed.
     #[arg(long, value_name = "MODE", default_value = "q8",
-          value_parser = ["bf16", "q8", "mq4", "mq4v2"])]
+          value_parser = ["bf16", "q8", "mq4v2"])]
     pub head_quant: String,
 
     /// Override the architecture ID stamped into the HFQ header.
