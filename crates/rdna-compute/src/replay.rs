@@ -634,6 +634,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_gate_up_hfq4g256_setprio_gfx1100"
             | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
+            | "fused_gate_up_mq4g256v2"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -1032,7 +1033,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
-        | "fused_qkvza_hfq4g256_reduce_chain" => Some(vec![
+        | "fused_qkvza_hfq4g256_reduce_chain"
+        | "fused_qkvza_mq4g256v2" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1161,7 +1163,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             write(48),
         ]),
-        "fused_qkv_hfq4g256" => Some(vec![
+        "fused_qkv_hfq4g256" | "fused_qkv_mq4g256v2" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1299,6 +1301,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_gate_up_hfq4g256_setprio_gfx1100"
             | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
+            | "fused_gate_up_mq4g256v2"
     ) {
         return Some(64);
     }
@@ -1557,6 +1560,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
+        | "fused_qkv_mq4g256v2"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -1566,6 +1570,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
+        | "fused_qkvza_mq4g256v2"
         | "gated_delta_net_q8_fast" => Some(96),
         "gated_delta_net_f32" => Some(80),
         _ => None,
@@ -5442,6 +5447,9 @@ mod tests {
         "fused_qkvza_hfq4g256_wavepack4",
         "fused_qkvza_hfq4g256_ldsx8",
         "fused_qkvza_hfq4g256_reduce_chain",
+        "fused_qkvza_mq4g256v2",
+        "fused_qkv_mq4g256v2",
+        "fused_gate_up_mq4g256v2",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
@@ -6623,6 +6631,105 @@ mod tests {
         assert_ne!("gemm_mq4g256v2_residual_wmma", "gemm_mq4g256_residual_wmma");
         assert!(pointer_effects("gemv_mq4g256v2").is_some());
         assert!(pointer_effects("gemv_mq6g256v2").is_some());
+    }
+
+    #[test]
+    fn fused_qkvza_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let symbol = "fused_qkvza_mq4g256v2";
+        let want = [
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ];
+
+        assert_eq!(expected_kernarg_bytes(symbol), Some(96));
+        let got = pointer_effects(symbol).expect("mq4g256v2 qkvza pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // 9 ptr + 5 i32 dimensions = 92 explicit bytes, pad_to(16) → 96.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..9 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..5 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 92, "explicit kernel arguments occupy 92 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 96, "recorded launches pad to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+    }
+
+    #[test]
+    fn fused_qkv_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let symbol = "fused_qkv_mq4g256v2";
+        let want = [
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ];
+
+        assert_eq!(expected_kernarg_bytes(symbol), Some(80));
+        let got = pointer_effects(symbol).expect("mq4g256v2 qkv pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // 7 ptr + 4 i32 dimensions = 72 explicit bytes, pad_to(16) → 80.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 72, "explicit kernel arguments occupy 72 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 80, "recorded launches pad to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+    }
+
+    #[test]
+    fn fused_gate_up_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let symbol = "fused_gate_up_mq4g256v2";
+        let want = [read(0), read(8), read(16), write(24), write(32)];
+
+        assert_eq!(expected_kernarg_bytes(symbol), Some(64));
+        let got = pointer_effects(symbol).expect("mq4g256v2 gate_up pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // 5 ptr + 3 i32 dimensions = 52 explicit bytes, pad_to(16) → 64.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..3 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 52, "explicit kernel arguments occupy 52 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 64, "recorded launches pad to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
     }
 
     #[test]

@@ -1113,10 +1113,9 @@ fn moe_res_mq4v2_routed_indexable() {
 }
 
 #[test]
-fn moe_res_all_mq4v2_gate_quartet_uses_prerotated_gemvs() {
-    // The V2 structural quartet must stay off the fused V1 gate route. Routed
-    // V2 remains indexable and requests one rotated activation, which the
-    // generic gate path reuses through exact V2 prerotated GEMVs.
+fn moe_res_all_mq4v2_gate_quartet_is_fusable_mq4v2() {
+    // Exact-uniform V2 gate-side quartet admits the V2 fused route (one launch),
+    // never the V1 fused route. Still needs the rotated activation.
     let mut d = dtypes_all_mq4();
     d.router = DType::MQ4G256V2;
     d.shared_gate = DType::MQ4G256V2;
@@ -1128,30 +1127,35 @@ fn moe_res_all_mq4v2_gate_quartet_uses_prerotated_gemvs() {
     d.experts_all_gate_up_mq4 = true;
     let r = MoeResolution::resolve(&d, 8);
     assert!(
+        r.gate_fusable_mq4v2,
+        "uniform all-gate-side V2 must admit gate_fusable_mq4v2"
+    );
+    assert!(
         !r.gate_fusable,
-        "V2 gate quartet must not use the V1 fused route"
+        "V2 gate quartet must not claim the V1 fused route"
     );
     assert!(!r.gate_side_mq4);
-    assert!(
-        r.needs_x_rot_local,
-        "V2 gate and routed weights reuse rotated x"
-    );
+    assert!(r.needs_x_rot_local, "V2 fused gate requires rotated x");
     assert!(r.routed_indexable_mq4v2);
     assert!(r.use_gpu_topk);
 }
 
 #[test]
 fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
-    // Mixed V1/V2 gate-side is never fusable: V1 f32 header vs V2 dual-f16
-    // header share stride; wrong launcher is silent garbage. Routed V2
-    // indexability is independent and stays on.
+    // Mixed V1/V2 gate-side is never fusable on either predicate: V1 f32 header
+    // vs V2 dual-f16 header share stride; wrong launcher is silent garbage.
+    // Routed V2 indexability is independent and stays on.
     let mut d = dtypes_all_mq4();
     d.router = DType::MQ4G256V2; // V2 router, rest V1
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = false;
     let r = MoeResolution::resolve(&d, 8);
-    assert!(!r.gate_fusable, "mixed V1/V2 gate quartet must not fuse");
+    assert!(!r.gate_fusable, "mixed V1/V2 gate quartet must not fuse V1");
+    assert!(
+        !r.gate_fusable_mq4v2,
+        "mixed V1/V2 gate quartet must not fuse V2"
+    );
     assert!(!r.gate_side_mq4);
     assert!(
         r.routed_indexable_mq4v2,
@@ -1164,7 +1168,11 @@ fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
     let mut d = dtypes_all_mq4();
     d.shared_expert_up = DType::MQ4G256V2;
     let r = MoeResolution::resolve(&d, 8);
-    assert!(!r.gate_fusable, "single V2 shared-up disqualifies fuse");
+    assert!(!r.gate_fusable, "single V2 shared-up disqualifies V1 fuse");
+    assert!(
+        !r.gate_fusable_mq4v2,
+        "single V2 shared-up disqualifies V2 fuse"
+    );
 }
 
 #[test]
@@ -1722,8 +1730,9 @@ fn match_prefix_guard_receives_correct_window() {
 
 use crate::pipeline::steps::{
     guard_gate_up_hfq4g256, guard_gate_up_hfq6g256, guard_gate_up_mq3g256lloyd,
-    guard_gate_up_mq4g256lloyd, guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq3g256lloyd,
-    guard_qkv_mq4g256lloyd,
+    guard_gate_up_mq4g256lloyd, guard_gate_up_mq4g256v2, guard_qkv_hfq4g256, guard_qkv_hfq6g256,
+    guard_qkv_mq3g256lloyd, guard_qkv_mq4g256lloyd, guard_qkv_mq4g256v2, guard_qkvza_mq4g256v2,
+    match_fused_prefix,
 };
 
 fn make_qkv3_steps<'a>(
@@ -1984,6 +1993,186 @@ fn guard_gate_up_mq4g256lloyd_fires() {
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn match_fused_prefix_admits_exact_mq4g256v2_qkv() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_qkv_mq4g256v2(&steps, &ctx_rdna3()));
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx_rdna3()),
+        Some((KernelKey::FusedQkvMq4G256V2, 4))
+    );
+}
+
+#[test]
+fn match_fused_prefix_admits_exact_mq4g256v2_qkvza() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    // QKVZA = QKV3 window + one extra Gemv (reuse builder, no new abstraction).
+    let mut steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    steps.push(Step::Gemv {
+        w: &wr,
+        input: GemvInput::Prerotated(&dummy),
+        out: &dummy,
+    });
+    assert!(guard_qkvza_mq4g256v2(&steps, &ctx_rdna3()));
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx_rdna3()),
+        Some((KernelKey::FusedQkvzaMq4G256V2, 5))
+    );
+}
+
+#[test]
+fn match_fused_prefix_admits_exact_mq4g256v2_gate_up() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_gate_up_mq4g256v2(&steps, &ctx_rdna3()));
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx_rdna3()),
+        Some((KernelKey::FusedGateUpMq4G256V2, 3))
+    );
+}
+
+#[test]
+fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
+    // Mixed V1/V2 must not admit any exact V2 fused key (clean exact-dtype only).
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr_v2 = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let wr_v1 = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let steps = vec![
+        Step::RmsnormAutomatic {
+            x: &dummy,
+            norm_weight: &dummy,
+            x_plain: &dummy,
+            out: &dummy,
+            awq_scale: None,
+            k: 4096,
+            eps: 1e-6,
+            rotation: RotationPlan::FwhtG256,
+        },
+        Step::Gemv {
+            w: &wr_v2,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+        Step::Gemv {
+            w: &wr_v1,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+        Step::Gemv {
+            w: &wr_v2,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+    ];
+    assert!(!guard_qkv_mq4g256v2(&steps, &ctx_rdna3()));
+    let got = match_fused_prefix(&steps, &ctx_rdna3());
+    assert!(
+        !matches!(
+            got,
+            Some((
+                KernelKey::FusedQkvMq4G256V2
+                    | KernelKey::FusedQkvzaMq4G256V2
+                    | KernelKey::FusedGateUpMq4G256V2,
+                _
+            ))
+        ),
+        "mixed V1/V2 must not admit V2 fused key, got {got:?}"
+    );
+}
+
+#[test]
+fn match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch() {
+    // Exact V2 windows must not admit scalar V2 fusion off gfx1100/gfx1201.
+    // gfx1200 is a near-miss RDNA4 sibling — still fail-closed.
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let ctx = ctx_rdna4(); // gfx1200 — not gfx1201
+    let qkv = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(!guard_qkv_mq4g256v2(&qkv, &ctx));
+    assert!(
+        !matches!(
+            match_fused_prefix(&qkv, &ctx),
+            Some((KernelKey::FusedQkvMq4G256V2, _))
+        ),
+        "unsupported arch must not admit FusedQkvMq4G256V2"
+    );
+    let mut qkvza = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    qkvza.push(Step::Gemv {
+        w: &wr,
+        input: GemvInput::Prerotated(&dummy),
+        out: &dummy,
+    });
+    assert!(!guard_qkvza_mq4g256v2(&qkvza, &ctx));
+    assert!(
+        !matches!(
+            match_fused_prefix(&qkvza, &ctx),
+            Some((KernelKey::FusedQkvzaMq4G256V2, _))
+        ),
+        "unsupported arch must not admit FusedQkvzaMq4G256V2"
+    );
+    let gate_up = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(!guard_gate_up_mq4g256v2(&gate_up, &ctx));
+    assert!(
+        !matches!(
+            match_fused_prefix(&gate_up, &ctx),
+            Some((KernelKey::FusedGateUpMq4G256V2, _))
+        ),
+        "unsupported arch must not admit FusedGateUpMq4G256V2"
+    );
 }
 
 // ── MoePrefillResolution cells (Ship 4.2) ─────────────────────────

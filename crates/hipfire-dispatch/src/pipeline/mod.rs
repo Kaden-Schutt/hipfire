@@ -681,10 +681,44 @@ pub fn run_moe_decode(
     let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
     if res.gate_fusable {
         let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
-        // Resolver admits only an exact-uniform V1 gate quartet. V2 structural
-        // weights deliberately use the normalized generic branch below and its
-        // exact prerotated V2 GEMVs.
+        // Exact-uniform V1 MQ4G256 gate quartet → one fused launch.
         hip!(gpu.fused_qkvza_hfq4g256(
+            &p.router.buf,
+            &p.shared_expert_gate.buf,
+            &p.shared_gate_w.buf,
+            &p.shared_up_w.buf,
+            xr,
+            p.router_logits,
+            p.scalar_buf,
+            &shared_gate,
+            &shared_up,
+            p.router.m,
+            p.shared_expert_gate.m,
+            p.shared_gate_w.m,
+            p.shared_up_w.m,
+            p.router.k,
+        ))?;
+    } else if res.gate_fusable_mq4v2
+        && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+        && p.batch_size == 1
+        && p.router.awq_scale.is_none()
+        && p.shared_expert_gate.awq_scale.is_none()
+        && p.shared_gate_w.awq_scale.is_none()
+        && p.shared_up_w.awq_scale.is_none()
+        && p.router.k == 2048
+        && p.shared_expert_gate.k == 2048
+        && p.shared_gate_w.k == 2048
+        && p.shared_up_w.k == 2048
+        && p.router.m == 256
+        && p.shared_expert_gate.m == 1
+        && p.shared_gate_w.m == 512
+        && p.shared_up_w.m == 512
+    {
+        let xr = x_rot_local.expect("gate_fusable_mq4v2 implies x_rot_local (needs_x_rot_local)");
+        // Exact official Ornith qt44 gate quartet on gfx1100/gfx1201 only →
+        // one V2 fused launch. Any miss (arch/AWQ/shape/batch) falls through
+        // to the generic four-GEMV branch below — never errors.
+        hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
             &p.router.buf,
             &p.shared_expert_gate.buf,
             &p.shared_gate_w.buf,
@@ -704,8 +738,8 @@ pub fn run_moe_decode(
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
         // Reuse the single normalized FWHT activation for structural MQ
-        // router/scalar weights. This is the cross-arch MQ4V2 path: it avoids
-        // both the broken fused V2 quartet and two redundant rotations.
+        // router/scalar weights when the fused quartet is not admitted
+        // (mixed dtype, non-MQ4 gate side, AWQ, etc.).
         let router_prerot = x_rot_local.is_some()
             && p.router.awq_scale.is_none()
             && p.shared_expert_gate.awq_scale.is_none()

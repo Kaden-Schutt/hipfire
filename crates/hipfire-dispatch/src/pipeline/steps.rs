@@ -150,6 +150,21 @@ pub(crate) fn guard_qkv_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool 
     steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
+/// Exact MQ4G256V2 scalar fusion is fail-closed to gfx1100 + gfx1201 only.
+/// Keep `force_unfused` first so the global kill-switch still wins.
+fn mq4g256v2_scalar_fusion_ok(ctx: &DispatchCtx) -> bool {
+    !ctx.flags.force_unfused && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+}
+
+/// Exact MQ4G256V2 (qt44) QKV decode fusion. Official Ornith is all-qt44;
+/// never admit mixed V1/V2 or AWQ windows onto the V2 fused kernel.
+/// Unsupported arches fall through to exact per-projection V2 GEMVs.
+pub(crate) fn guard_qkv_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx)
+        && steps.len() == 4
+        && gemv_steps_uniform(steps, DType::MQ4G256V2, true)
+}
+
 pub(crate) fn guard_qkv_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if ctx.flags.force_unfused {
         return false;
@@ -200,6 +215,14 @@ pub(crate) fn guard_qkvza_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> boo
     steps.len() == 5 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
+/// Exact MQ4G256V2 (qt44) QKVZA decode fusion.
+/// Fail-closed to gfx1100/gfx1201; other arches keep per-projection V2 GEMVs.
+pub(crate) fn guard_qkvza_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx)
+        && steps.len() == 5
+        && gemv_steps_uniform(steps, DType::MQ4G256V2, true)
+}
+
 pub(crate) fn guard_qkvza_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if ctx.flags.force_unfused {
         return false;
@@ -247,6 +270,14 @@ pub(crate) fn guard_gate_up_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> b
         return false;
     }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
+}
+
+/// Exact MQ4G256V2 (qt44) gate+up decode fusion.
+/// Fail-closed to gfx1100/gfx1201; other arches keep per-projection V2 GEMVs.
+pub(crate) fn guard_gate_up_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx)
+        && steps.len() == 3
+        && gemv_steps_uniform(steps, DType::MQ4G256V2, true)
 }
 
 pub(crate) fn guard_gate_up_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -484,6 +515,12 @@ const FUSED_TABLE: &[FusedPattern] = &[
         key: KernelKey::FusedQkvMq3G256Lloyd,
         guard: guard_qkv_mq3g256lloyd,
     },
+    // Exact MQ4G256V2 before broad HFQ4/MQ4 V1 neighbor.
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvMq4G256V2,
+        guard: guard_qkv_mq4g256v2,
+    },
     FusedPattern {
         ops: QKV3,
         key: KernelKey::FusedQkvHfq4G256,
@@ -504,6 +541,12 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq3G256Lloyd,
         guard: guard_qkvza_mq3g256lloyd,
+    },
+    // Exact MQ4G256V2 before broad HFQ4/MQ4 V1 neighbor.
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq4G256V2,
+        guard: guard_qkvza_mq4g256v2,
     },
     FusedPattern {
         ops: QKVZA4,
@@ -531,6 +574,12 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpMq3G256Lloyd,
         guard: guard_gate_up_mq3g256lloyd,
+    },
+    // Exact MQ4G256V2 before broad HFQ4/MQ4 V1 neighbor.
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq4G256V2,
+        guard: guard_gate_up_mq4g256v2,
     },
     FusedPattern {
         ops: GATE_UP2,
@@ -986,6 +1035,7 @@ fn launch_fused(
 
     match key {
         KernelKey::FusedQkvMq4G256Lloyd
+        | KernelKey::FusedQkvMq4G256V2
         | KernelKey::FusedQkvMq3G256Lloyd
         | KernelKey::FusedQkvHfq4G256
         | KernelKey::FusedQkvHfq6G256
@@ -1010,6 +1060,7 @@ fn launch_fused(
             )
         }
         KernelKey::FusedGateUpMq4G256Lloyd
+        | KernelKey::FusedGateUpMq4G256V2
         | KernelKey::FusedGateUpMq3G256Lloyd
         | KernelKey::FusedGateUpHfq4G256
         | KernelKey::FusedGateUpHfq6G256
@@ -1037,6 +1088,7 @@ fn launch_fused(
         KernelKey::FusedQkvzaHfq4G256
         | KernelKey::FusedQkvzaMq3G256Lloyd
         | KernelKey::FusedQkvzaMq4G256Lloyd
+        | KernelKey::FusedQkvzaMq4G256V2
         | KernelKey::FusedQkvzaHfq6G256
         | KernelKey::FusedQkvzaMfp4G32E8
         | KernelKey::FusedQkvzaQ8_0 => {
