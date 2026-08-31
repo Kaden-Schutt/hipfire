@@ -58,11 +58,7 @@
 #define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed
 #endif
 
-#if defined(HIPFIRE_MQ4V2_GATE_UP_NOLDS)
-__launch_bounds__(32, 8)
-#else
 __launch_bounds__(32, 16)
-#endif
 extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
     const int* __restrict__ topk_indices,                // [k_top]
