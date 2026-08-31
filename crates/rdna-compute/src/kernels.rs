@@ -7101,6 +7101,87 @@ pub const CALIB_REDUCE_SRC: &str = include_str!("../../../kernels/src/calib_redu
 /// sufficient: every produced coordinate and block scale must have identical
 /// bits to the generic implementation.
 #[cfg(test)]
+mod moe_topk_renorm_barriers {
+    use super::MOE_TOPK_RENORM_K8_SRC;
+
+    /// Strip `//` and `/* */` comments and macro line-continuations, then
+    /// collapse whitespace, so the structural check below is not defeated by
+    /// reformatting or by a comment that happens to contain the tokens.
+    fn normalize(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let b = src.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if b[i] == b'\\' {
+                i += 1; // macro line-continuation
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every winner-invalidation must be followed by a barrier BEFORE the next
+    /// round restages `warp_v[warp_id]` / `warp_i[warp_id]`.
+    ///
+    /// The hazard this pins: `warp_i[0]` is dual-purpose in this kernel — it is
+    /// both warp 0's per-warp staging slot AND the slot through which a round's
+    /// winner is published to every thread. Without a barrier after the winner
+    /// is consumed, warp 0 races into the next round and overwrites `warp_i[0]`
+    /// while a slower warp is still reading it as the winner. That warp then
+    /// fails to invalidate the expert just picked, so the SAME expert is
+    /// selected again — the top-8 comes back with a duplicate and a distinct
+    /// expert missing.
+    ///
+    /// Not hypothetical: measured at ~1 occurrence per 46k router calls on Maple
+    /// (arch 15) from bit-identical input logits. It is a silent quality fault —
+    /// the duplicated expert is double-weighted and a legitimately selected one
+    /// never runs. The sibling kernels (`moe_softmax_topk_k8`, both `_batched`
+    /// variants) are immune because they mask through a separate
+    /// `smem_v`/`picked_idx` instead of aliasing the staging array.
+    #[test]
+    fn invalidation_is_closed_by_a_barrier_before_the_next_restage() {
+        let norm = normalize(MOE_TOPK_RENORM_K8_SRC);
+        let sites: Vec<usize> = norm.match_indices("cur_i = -1;").map(|(i, _)| i).collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two winner-invalidation sites (the exact-256 fast \
+             path and the n_exp<=BLOCK_SIZE path); found {}. If the kernel was \
+             restructured, re-derive this invariant rather than deleting it.",
+            sites.len()
+        );
+        for site in sites {
+            let rest = &norm[site..];
+            let barrier = rest
+                .find("__syncthreads();")
+                .expect("no barrier at all follows a winner-invalidation");
+            if let Some(restage) = rest.find("warp_v[warp_id] =") {
+                assert!(
+                    barrier < restage,
+                    "winner-invalidation is not barrier-closed: the next \
+                     `warp_v[warp_id] =` restage is reachable before any \
+                     `__syncthreads()`. warp 0 can clobber `warp_i[0]` while \
+                     another warp still reads it as this round's winner, which \
+                     yields a DUPLICATED expert in the top-8."
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod gfx1201_e8_decode_identity {
     fn generic_cvt_e4m3(b: u8) -> f32 {
         let exp = ((b >> 3) & 0xF) as i32;
