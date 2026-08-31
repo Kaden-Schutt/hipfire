@@ -2412,23 +2412,11 @@ pub const GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC: &str =
 
 /// gfx1100 higher-parallelism MQ4G256V2 ninepath candidate: same TU, RPB=8.
 /// Symbol `gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100`. Frozen 48-byte ABI;
-/// only grid becomes `down_m/8`. Host selects via
-/// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB=8` (or legacy
-/// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` when the new env is unset) at
-/// exact down_m=2048, down_k=512.
+/// only grid becomes `down_m/8`. Host selects under
+/// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` at exact down_m=2048, down_k=512.
 pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n",
     "#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip")
-);
-
-/// gfx1100 higher-parallelism MQ4G256V2 ninepath candidate: same TU, RPB=4.
-/// Symbol `gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100`. Frozen 48-byte ABI;
-/// grid `down_m/4`. Host selects via `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB=4`
-/// at exact down_m=2048, down_k=512.
-pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB4_GFX1100_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100\n",
-    "#define HIPFIRE_MQ4V2_NINEPATH_RPB 4\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip")
 );
 
@@ -8015,17 +8003,10 @@ mod mqv2_moe {
         );
         assert!(!GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC
             .contains("gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"));
-        assert!(!GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC
-            .contains("gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100"));
         assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC.starts_with(
             "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n"
         ));
         assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC
-            .contains("void HIPFIRE_MQ4V2_NINEPATH_KERNEL("));
-        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB4_GFX1100_SRC.starts_with(
-            "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100\n#define HIPFIRE_MQ4V2_NINEPATH_RPB 4\n"
-        ));
-        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB4_GFX1100_SRC
             .contains("void HIPFIRE_MQ4V2_NINEPATH_KERNEL("));
         assert!(GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC
             .contains("void gemm_mq4g256v2_moe_grouped_wmma_k2("));

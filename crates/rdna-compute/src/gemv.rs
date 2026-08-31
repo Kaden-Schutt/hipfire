@@ -15,30 +15,6 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
         == Some("1")
 }
 
-/// gfx1100 MQ4V2 ninepath RPB selector. Default 16. At exact down_m=2048 /
-/// down_k=512 on gfx1100: `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB` may be `8` or
-/// `4`. Legacy `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` maps to RPB8 only when
-/// the new env is unset.
-fn mq4v2_ninepath_rpb_select(is_gfx1100: bool, down_m: usize, down_k: usize) -> u32 {
-    if !is_gfx1100 || down_m != 2_048 || down_k != 512 {
-        return 16;
-    }
-    match hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB").as_deref() {
-        Ok("8") => 8,
-        Ok("4") => 4,
-        Ok(_) => 16,
-        Err(_) => {
-            if hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8").as_deref()
-                == Ok("1")
-            {
-                8
-            } else {
-                16
-            }
-        }
-    }
-}
-
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
     let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
     let signs2 = crate::dispatch::gen_fwht_signs(1042, 256);
@@ -12468,13 +12444,9 @@ impl Gpu {
     /// both formats are 136 B/group.
     ///
     /// Default route remains RPB=16 (`gemv_mq4g256v2_moe_ninepath_d4`, grid
-    /// `down_m/16`). Opt-in gfx1100 higher-parallelism candidates at exact
-    /// down_m=2048, down_k=512:
-    /// - `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB=8` → RPB8 grid `down_m/8`
-    /// - `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB=4` → RPB4 grid `down_m/4`
-    /// - legacy `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` → RPB8 only when the
-    ///   new env is unset.
-    /// Frozen 48-byte ABI; per-row arithmetic unchanged.
+    /// `down_m/16`). Opt-in gfx1100 higher-parallelism candidate RPB=8 under
+    /// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` at exact down_m=2048, down_k=512
+    /// (grid `down_m/8`). Frozen 48-byte ABI; per-row arithmetic unchanged.
     pub fn gemv_mq4g256v2_moe_ninepath_d4(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -12485,7 +12457,11 @@ impl Gpu {
         down_m: usize,
         down_k: usize,
     ) -> HipResult<()> {
-        let rpb = mq4v2_ninepath_rpb_select(self.arch_caps.is_gfx1100(), down_m, down_k);
+        let use_rpb8 = self.arch_caps.is_gfx1100()
+            && down_m == 2_048
+            && down_k == 512
+            && hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8").as_deref()
+                == Ok("1");
         self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
             expert_ptrs,
             topk_indices,
@@ -12494,7 +12470,7 @@ impl Gpu {
             out,
             down_m,
             down_k,
-            rpb,
+            use_rpb8,
         )
     }
 
@@ -12518,7 +12494,7 @@ impl Gpu {
             out,
             down_m,
             down_k,
-            16,
+            false,
         )
     }
 
@@ -12542,31 +12518,7 @@ impl Gpu {
             out,
             down_m,
             down_k,
-            8,
-        )
-    }
-
-    /// Force gfx1100 RPB=4 ninepath candidate (bypasses env gate).
-    #[doc(hidden)]
-    pub fn gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100_exact(
-        &mut self,
-        expert_ptrs: &GpuTensor,
-        topk_indices: &GpuTensor,
-        topk_weights: &GpuTensor,
-        rot_batch: &GpuTensor,
-        out: &GpuTensor,
-        down_m: usize,
-        down_k: usize,
-    ) -> HipResult<()> {
-        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
-            expert_ptrs,
-            topk_indices,
-            topk_weights,
-            rot_batch,
-            out,
-            down_m,
-            down_k,
-            4,
+            true,
         )
     }
 
@@ -12579,28 +12531,23 @@ impl Gpu {
         out: &GpuTensor,
         down_m: usize,
         down_k: usize,
-        rpb: u32,
+        use_rpb8: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, src, func, rpb) = match rpb {
-            8 => (
+        let (module, src, func, rpb) = if use_rpb8 {
+            (
                 "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
                 kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC,
                 "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
                 8u32,
-            ),
-            4 => (
-                "gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100",
-                kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB4_GFX1100_SRC,
-                "gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100",
-                4u32,
-            ),
-            _ => (
+            )
+        } else {
+            (
                 "gemv_mq4g256v2_moe_ninepath_d4",
                 kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC,
                 "gemv_mq4g256v2_moe_ninepath_d4",
                 16u32,
-            ),
+            )
         };
         self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();

@@ -758,7 +758,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
-            | "gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
@@ -1424,7 +1423,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
-            | "gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         return Some(48);
@@ -6437,7 +6435,6 @@ mod tests {
         for symbol in [
             "gemv_mq4g256v2_moe_ninepath_d4",
             "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
-            "gemv_mq4g256v2_moe_ninepath_rpb4_gfx1100",
             "gemv_mq6g256v2_moe_ninepath_d4",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(48));
