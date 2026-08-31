@@ -11729,29 +11729,11 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Opt-in gfx1100 exact-shape candidate: removes dead workgroups, LDS
-        // staging, and the barrier while preserving one-wave/row arithmetic
-        // exactly. Default env-off route remains incumbent pending measurement.
-        // Frozen 48-byte ABI: expert_ptrs@0, topk_indices@8, x@16,
-        // y_gate@24, y_up@32, M i32@40, K i32@44.
-        let use_nolds = self.arch_caps.is_gfx1100()
-            && m == 1024
-            && k == 2048
-            && hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_GATE_UP_NOLDS").as_deref()
-                == Ok("1");
-        if use_nolds {
-            self.ensure_kernel(
-                "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
-                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC,
-                "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
-            )?;
-        } else {
-            self.ensure_kernel(
-                "gemv_mq4g256v2_moe_gate_up_k8_indexed",
-                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
-                "gemv_mq4g256v2_moe_gate_up_k8_indexed",
-            )?;
-        }
+        self.ensure_kernel(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+        )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -11770,12 +11752,12 @@ impl Gpu {
         ];
         // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let func_name = if use_nolds {
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
-        } else {
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed"
-        };
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            bytes,
+        );
         // Launch contraction. The kernel maps blockIdx.x to one row in each of
         // the two M/2 outputs and returns for `row >= mi`, so m/2 workgroups
         // cover M — the other half were launched only to exit at the guard.
@@ -11792,25 +11774,15 @@ impl Gpu {
         //
         // Opt-in elsewhere: the contraction is semantically target-neutral,
         // but specialisations ship only on measured architectures.
-        let grid_x = if use_nolds {
-            // Candidate exact shape: M=1024 => [512,8,1], block [32,1,1], LDS 0.
-            (m as u32) >> 1
-        } else {
-            let tight = match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID")
-                .as_deref()
-            {
+        let tight =
+            match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID").as_deref() {
                 Ok("1") => true,
                 Ok("0") => false,
                 _ => self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201(),
             };
-            if tight {
-                (m as u32) >> 1
-            } else {
-                m as u32
-            }
-        };
+        let grid_x = if tight { (m as u32) >> 1 } else { m as u32 };
         let result = self.launch_maybe_blob(
-            func_name,
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
             [grid_x, 8, 1],
             [32u32, 1, 1],
             0,
