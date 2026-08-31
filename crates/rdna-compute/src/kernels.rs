@@ -2355,6 +2355,17 @@ pub const GEMV_MQ6G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat
 pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip");
 
+/// Exact-shape gfx1100 MQ4G256V2 MoE gate_up candidate: drop LDS x staging and
+/// the dead-workgroup barrier while keeping one-wave/row arithmetic identical
+/// to [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC`]. Symbol
+/// `gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100`. Opt-in only
+/// (`HIPFIRE_GFX1100_MQ4V2_GATE_UP_NOLDS=1`); default route stays the incumbent.
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100\n",
+    "#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip")
+);
+
 /// MQ6G256V2 (qt=47) sister of [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC`].
 /// Same grid/ABI/output split; only group stride (200 B) and 6-bit payload
 /// decode change. V1 f32 header must not collapse into this dual-half path.
@@ -7948,8 +7959,23 @@ mod mqv2_moe {
 
     #[test]
     fn existing_mq4v2_moe_sources_untouched() {
+        assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC.contains(
+            "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed"
+        ));
         assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC
-            .contains("void gemv_mq4g256v2_moe_gate_up_k8_indexed("));
+            .contains("void HIPFIRE_MQ4V2_GATE_UP_KERNEL("));
+        assert!(!GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC.contains("HIPFIRE_MQ4V2_GATE_UP_NOLDS"));
+        assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC.contains(
+            "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
+        ));
+        assert!(
+            GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC
+                .contains("#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1")
+        );
+        assert!(
+            GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC
+                .contains("void HIPFIRE_MQ4V2_GATE_UP_KERNEL(")
+        );
         assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("void gemv_mq4g256v2_moe_ninepath_d4("));
         assert!(GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC
             .contains("void gemm_mq4g256v2_moe_grouped_wmma_k2("));
