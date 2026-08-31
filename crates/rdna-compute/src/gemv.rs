@@ -7467,13 +7467,17 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Opt-in one-row residual candidate for Ornith attention out_proj:
-        // exact gfx1100, M=2048, K=4096. Reuses the plain V2 body with a
-        // residual epilogue and fixed K4096; zero LDS. Unset/0 keeps the
-        // dual-row residual route byte-identical for every architecture.
+        // Default-on one-row residual specialization for the exact Ornith
+        // attention out_proj shape: gfx1100, M=2048, K=4096. It reuses the
+        // plain V2 body with a residual epilogue and fixed K4096, requires no
+        // private scratch, and is bit-identical to the legacy generic route
+        // with nonzero residuals. `=0` (or an invalid value) is the kill switch;
+        // every architecture/shape miss keeps the generic route.
         use std::sync::LazyLock;
         static MQ4V2_RESIDUAL_R1: LazyLock<bool> = LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_MQ4V2_RESIDUAL_R1").as_deref() == Ok("1")
+            hipfire_config::developer_var("HIPFIRE_MQ4V2_RESIDUAL_R1")
+                .map(|value| value == "1")
+                .unwrap_or(true)
         });
         let use_r1_noscratch =
             self.arch_caps.is_gfx1100() && m == 2_048 && k == 4_096 && *MQ4V2_RESIDUAL_R1;
@@ -7497,8 +7501,7 @@ impl Gpu {
                 &k_val as *const _ as *mut c_void,
             ];
             let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
-            let timer =
-                crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_residual", bytes);
+            let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
             let result =
                 self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
                     let mut b = hip_bridge::KernargBlob::new();

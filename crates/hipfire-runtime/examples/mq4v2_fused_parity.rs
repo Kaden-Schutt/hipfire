@@ -907,7 +907,7 @@ fn main() {
             let d_c = gpu.upload_f32(&c_host, &[1]).unwrap();
 
             // Reference route.
-            let d_y_ref = gpu.upload_f32(&y_seed, &[M + N_CANARY]).unwrap();
+            let d_y_ref = gpu.upload_f32(&y_seed[..M], &[M]).unwrap();
             let d_tmp = gpu.upload_f32(&vec![0.0f32; M], &[M]).unwrap();
             let d_c_ref = gpu.upload_f32(&c_host, &[1]).unwrap();
             gpu.sigmoid_f32(&d_c_ref)
@@ -932,9 +932,12 @@ fn main() {
                 .iter()
                 .zip(cand_y.iter())
                 .all(|(a, b)| a.to_bits() == b.to_bits());
+            // Only the candidate receives padded output. The production
+            // reference scaled-add sizes its grid from y, so padding that y
+            // would deliberately make it read beyond the M-element temp.
             let canary_ok = (0..N_CANARY).all(|i| {
                 let want = CANARY_F32 + i as f32 * 0.001;
-                (cand_all[M + i] - want).abs() < 1e-6 && (ref_all[M + i] - want).abs() < 1e-6
+                (cand_all[M + i] - want).abs() < 1e-6
             });
             // Scalar must be intact on the fused path (not mutated).
             let c_after = gpu.download_f32(&d_c).unwrap();
