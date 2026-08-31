@@ -2355,11 +2355,11 @@ pub const GEMV_MQ6G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat
 pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip");
 
-/// Exact-shape gfx1100 MQ4G256V2 MoE gate_up candidate: drop LDS x staging and
-/// the dead-workgroup barrier while keeping one-wave/row arithmetic identical
-/// to [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC`]. Symbol
-/// `gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100`. Opt-in only
-/// (`HIPFIRE_GFX1100_MQ4V2_GATE_UP_NOLDS=1`); default route stays the incumbent.
+/// Exact-shape gfx1100 MQ4G256V2 MoE gate_up specialization: drop LDS x
+/// staging and the dead-workgroup barrier while keeping one-wave/row
+/// arithmetic identical to [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC`].
+/// Symbol `gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100`;
+/// the host selects it by architecture and exact M=1024, K=2048 shape.
 pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100\n",
     "#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1\n",

@@ -11729,16 +11729,15 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Opt-in gfx1100 exact-shape candidate: removes dead workgroups, LDS
+        // Default gfx1100 exact-shape route: removes dead workgroups, LDS
         // staging, and the barrier while preserving one-wave/row arithmetic
-        // exactly. Default env-off route remains incumbent pending measurement.
-        // Frozen 48-byte ABI: expert_ptrs@0, topk_indices@8, x@16,
-        // y_gate@24, y_up@32, M i32@40, K i32@44.
-        let use_nolds = self.arch_caps.is_gfx1100()
-            && m == 1024
-            && k == 2048
-            && hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_GATE_UP_NOLDS").as_deref()
-                == Ok("1");
+        // exactly. The generic kernel remains the fallback for other shapes
+        // and architectures. Frozen 48-byte ABI: expert_ptrs@0,
+        // topk_indices@8, x@16, y_gate@24, y_up@32, M i32@40, K i32@44.
+        //
+        // Measured on Ornith 1.5 with Q8 EF and retained PM4 replay: the
+        // complete admitted gfx1100 stack improved 241.002 -> 246.167 tok/s.
+        let use_nolds = self.arch_caps.is_gfx1100() && m == 1024 && k == 2048;
         if use_nolds {
             self.ensure_kernel(
                 "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
