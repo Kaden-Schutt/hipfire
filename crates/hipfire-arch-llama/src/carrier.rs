@@ -14,6 +14,8 @@ use hipfire_runtime::llama::{
     LlamaConfig, LlamaWeights, WeightTensor,
 };
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::model_source::ModelSource as ModelSourceTrait;
+use hipfire_runtime::weight_manifest::{plan_manifest, ManifestPlan, WeightEntry};
 use hipfire_runtime::weight_backend::hfq_weight_dtype;
 use hipfire_runtime::weight_store::{
     TakenWeight, WeightHandle, WeightLoadTransaction, WeightOrigin, WeightStoreAssembly,
@@ -27,6 +29,8 @@ pub struct LlamaBundle {
     pub weights: LlamaWeights,
     pub scratch: ForwardScratch,
     pub kv: KvCache,
+    /// The admitted mesh that owns this plan and the attached store origin.
+    pub(crate) mesh: DeviceMesh,
     /// Pure declaration/placement plan captured at load time. The plan has no
     /// GPU handles and is immutable after publication.
     pub manifest_plan: ManifestPlan,
