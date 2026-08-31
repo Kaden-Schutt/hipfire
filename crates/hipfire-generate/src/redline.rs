@@ -2070,11 +2070,15 @@ pub fn handle_redline_dspark_shadow_pm4(
 
 const DFLASH_SHADOW_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
 
-/// Unconditional Q8 byte parity is not a correctness oracle: Q8 DeltaNet
-/// uses stochastic rounding keyed on the GDN frame. Every arm resets the
-/// same frame checkpoint; tokens/argmax/indices stay bit-exact, and
-/// dequantized recurrent/hidden/logit regions are claim-scoped max-abs/rel.
+/// Legacy stochastic Q8 (no error-feedback residual) is not a byte-parity
+/// oracle: GDN requant uses stochastic rounding keyed on the frame. Retained
+/// only when `StateQuant::Q8` runs without EF. Deterministic Q8+EF and non-Q8
+/// state claim bit-exact recurrent bytes instead.
 const DFLASH_Q8_BYTE_PARITY_INVALID: &str = "unconditional Q8 recurrent-state byte parity is not a correctness oracle (stochastic GDN rounding); arms share a GDN frame checkpoint and compare tokens/argmax/indices bit-exact plus claim-scoped max-abs/rel on dequantized regions";
+
+/// Deterministic recurrent state (Q8+EF residual or non-Q8) may claim
+/// bit-exact DeltaNet bytes across arms, including the EF residual itself.
+const DFLASH_DETERMINISTIC_BYTE_PARITY: &str = "deterministic DeltaNet state (Q8 error-feedback residual or non-Q8) admits bit-exact recurrent-state byte parity across arms; tokens/argmax/indices stay bit-exact and claim-scoped max-abs/rel cover dequantized regions";
 
 struct RedlineDflashFixtures {
     hidden_rb: HiddenStateRingBuffer,
@@ -2105,9 +2109,11 @@ struct RedlineDflashWindowSnap {
     dn_s_after_forward: Vec<u8>,
     dn_scales_after_forward: Vec<u8>,
     dn_conv_after_forward: Vec<u8>,
+    dn_ef_after_forward: Vec<u8>,
     dn_s_after_rollback: Vec<u8>,
     dn_scales_after_rollback: Vec<u8>,
     dn_conv_after_rollback: Vec<u8>,
+    dn_ef_after_rollback: Vec<u8>,
     kv_active_hash: u64,
     kv_guard: Vec<u8>,
     hidden_staging: Vec<u8>,
@@ -2300,7 +2306,7 @@ fn redline_dflash_zero_fixtures(
 fn redline_append_dn_parts(
     gpu: &rdna_compute::Gpu,
     slot: &ModelSlot,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
     let mut s = Vec::new();
     for tensor in &slot.dn_state.s_matrices {
         redline_append_buffer(gpu, &mut s, &tensor.buf)?;
@@ -2313,7 +2319,11 @@ fn redline_append_dn_parts(
     for tensor in &slot.dn_state.conv_states {
         redline_append_buffer(gpu, &mut conv, &tensor.buf)?;
     }
-    Ok((s, scales, conv))
+    let mut ef = Vec::new();
+    for tensor in &slot.dn_state.s_ef_residual {
+        redline_append_buffer(gpu, &mut ef, &tensor.buf)?;
+    }
+    Ok((s, scales, conv, ef))
 }
 
 fn redline_dflash_kv_regions(
@@ -2374,8 +2384,8 @@ fn redline_dflash_snapshot_window(
     position: usize,
     tokens: Vec<u32>,
     argmax: Vec<u32>,
-    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>),
-    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>),
+    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
 ) -> Result<RedlineDflashWindowSnap, String> {
     let batch = tokens.len();
     let dim = fixtures.verify_scratch.dim;
@@ -2454,9 +2464,11 @@ fn redline_dflash_snapshot_window(
         dn_s_after_forward: after_forward.0,
         dn_scales_after_forward: after_forward.1,
         dn_conv_after_forward: after_forward.2,
+        dn_ef_after_forward: after_forward.3,
         dn_s_after_rollback: after_rollback.0,
         dn_scales_after_rollback: after_rollback.1,
         dn_conv_after_rollback: after_rollback.2,
+        dn_ef_after_rollback: after_rollback.3,
         kv_active_hash,
         kv_guard,
         hidden_staging,
@@ -2641,9 +2653,11 @@ fn redline_dflash_compare_window(
         "dn_s_after_forward": err(&reference.dn_s_after_forward, &other.dn_s_after_forward),
         "dn_scales_after_forward": err(&reference.dn_scales_after_forward, &other.dn_scales_after_forward),
         "dn_conv_after_forward": err(&reference.dn_conv_after_forward, &other.dn_conv_after_forward),
+        "dn_ef_after_forward_equal": bit(&reference.dn_ef_after_forward, &other.dn_ef_after_forward),
         "dn_s_after_rollback": err(&reference.dn_s_after_rollback, &other.dn_s_after_rollback),
         "dn_scales_after_rollback": err(&reference.dn_scales_after_rollback, &other.dn_scales_after_rollback),
         "dn_conv_after_rollback": err(&reference.dn_conv_after_rollback, &other.dn_conv_after_rollback),
+        "dn_ef_after_rollback_equal": bit(&reference.dn_ef_after_rollback, &other.dn_ef_after_rollback),
     })
 }
 
@@ -3044,6 +3058,18 @@ pub fn redline_shadow_dflash_verify_pm4(
             .as_ref()
             .and_then(|s| s.verify_pm4_report());
 
+        // Q8+EF (default-on) and non-Q8 state are deterministic byte-parity
+        // oracles. Only legacy stochastic Q8 without an EF residual keeps the
+        // invalid-parity warning — decide from StateQuant, not vector emptiness.
+        let is_q8 = matches!(slot.dn_state.quant, qwen35::StateQuant::Q8);
+        let q8_error_feedback_enabled = is_q8 && !slot.dn_state.s_ef_residual.is_empty();
+        let q8_byte_parity_invalid = is_q8 && !q8_error_feedback_enabled;
+        let oracle = if q8_byte_parity_invalid {
+            DFLASH_Q8_BYTE_PARITY_INVALID
+        } else {
+            DFLASH_DETERMINISTIC_BYTE_PARITY
+        };
+
         Ok(serde_json::json!({
             "type": "redline_dflash_shadow_result",
             "backend": "pm4_ib",
@@ -3056,7 +3082,7 @@ pub fn redline_shadow_dflash_verify_pm4(
             "arch_id": loaded.arch_id,
             "physical_cap": loaded.physical_cap,
             "model": redline_artifact_fingerprint(&loaded.model_path),
-            "oracle": DFLASH_Q8_BYTE_PARITY_INVALID,
+            "oracle": oracle,
             "arms": {
                 "hip_auto": redline_dflash_arm_json(&hip_auto),
                 "direct_capture_safe": redline_dflash_arm_json(&direct_capture_safe),
@@ -3064,7 +3090,8 @@ pub fn redline_shadow_dflash_verify_pm4(
                 "pm4": redline_dflash_arm_json(&pm4),
             },
             "parity": {
-                "q8_byte_parity_invalid": true,
+                "q8_error_feedback_enabled": q8_error_feedback_enabled,
+                "q8_byte_parity_invalid": q8_byte_parity_invalid,
                 "windows": parity_windows,
             },
             "capture": {

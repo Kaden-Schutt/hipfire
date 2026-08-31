@@ -113,14 +113,13 @@ DFLASH_EXACT_FIELDS = (
     "kv_guard_equal",
     "pbs_guard_equal",
     "gdn_frame_equal",
+    "dn_ef_after_forward_equal",
+    "dn_ef_after_rollback_equal",
 )
 
-# Arms judged against the `direct_capture_safe` reference. `hip_auto` is the
-# shipping HipGraph path, which replays a frozen Q8 GatedDeltaNet
-# stochastic-rounding frame; its comparison is reported as
-# `direct_capture_safe_vs_hip_auto` for documentation but is NOT a verdict,
-# because the retained route reproduces live frame consumption and the graph
-# does not.
+# Arms judged against the `direct_capture_safe` reference. `hip_auto` remains
+# diagnostic rather than verdict-bearing: this harness certifies the retained
+# recorded-HIP/PM4 routes, not the separate HipGraph route.
 DFLASH_COMPARED_ARMS = ("recorded_hip", "pm4")
 
 
@@ -160,7 +159,12 @@ def dflash_shadow_failures(shadow):
             f"prepared route is not single-queue/single-phase: {identity!r}"
         )
 
-    windows = ((shadow.get("parity") or {}).get("windows")) or []
+    parity = shadow.get("parity") or {}
+    if "q8_byte_parity_invalid" not in parity:
+        failures.append("parity.q8_byte_parity_invalid missing")
+    elif parity.get("q8_byte_parity_invalid"):
+        failures.append("parity.q8_byte_parity_invalid is true (production Q8 EF evidence required)")
+    windows = parity.get("windows") or []
     if not windows:
         failures.append("parity table has no windows")
     for window in windows:
@@ -171,7 +175,9 @@ def dflash_shadow_failures(shadow):
                 failures.append(f"position {position}: arm {arm} missing from parity")
                 continue
             for field in DFLASH_EXACT_FIELDS:
-                if field in row and not row[field]:
+                if field not in row:
+                    failures.append(f"position {position}: {arm}.{field} missing")
+                elif not row[field]:
                     failures.append(f"position {position}: {arm}.{field} is false")
             for field, value in row.items():
                 if isinstance(value, dict) and "max_abs" in value:
