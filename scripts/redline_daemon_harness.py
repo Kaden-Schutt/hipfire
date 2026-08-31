@@ -218,11 +218,11 @@ def main():
         "--state-quant",
         choices=("q8", "fp32", "q4"),
         help=(
-            "DeltaNet state precision for the run. Pass fp32 for any BYTE-PARITY "
-            "claim: Q8 state uses stochastic rounding, which makes a bit-exact "
-            "PM4/HIP path report exact=False and misattributes the failure to the "
-            "lowering (see CLAUDE.md 'Byte-parity validation is meaningless under "
-            "stochastic state'). Omit to keep the daemon default (q8)."
+            "DeltaNet state precision for the run. Omit to validate the production "
+            "default: Q8 with default-on deterministic error feedback (q8_ef). "
+            "Pass fp32 only when explicitly testing the FP32 state route. If "
+            "HIPFIRE_DN_STATE_EF=0 selects legacy stochastic Q8, byte parity is "
+            "meaningless; re-enable EF or use fp32 plus HIPFIRE_DETERMINISTIC=1."
         ),
     )
     parser.add_argument("--max-seq", type=int, default=2048)
@@ -333,6 +333,8 @@ def main():
             "kv_mode": args.kv_mode,
             "dflash_mode": "on" if args.dflash_verify_shadow else "off",
             "dspark_mode": "on" if args.dspark_verify_shadow else "off",
+            "mtp_mode": "off",
+            "ngram_draft": False,
         }
         # DeepSeek4 discovers `<stem>-dspark.<ext>` itself. Passing the same file
         # through params.draft would incorrectly enter the Qwen DFlash lm_head
