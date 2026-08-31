@@ -196,7 +196,11 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
+#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
+    if (tid == 0) y[row] += acc;
+#else
     if (tid == 0) y[row] = acc;
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────

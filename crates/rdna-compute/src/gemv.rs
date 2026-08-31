@@ -7467,6 +7467,54 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Opt-in one-row residual candidate: exact gfx1100 + M=K=2048 only.
+        // Reuses plain V2 body with residual epilogue and fixed K2048; zero LDS.
+        // Unset/0 keeps the dual-row residual route byte-identical for all arches.
+        use std::sync::OnceLock;
+        static MQ4V2_RESIDUAL_R1: OnceLock<bool> = OnceLock::new();
+        let use_r1_noscratch = self.arch_caps.is_gfx1100()
+            && m == 2_048
+            && k == 2_048
+            && *MQ4V2_RESIDUAL_R1.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_MQ4V2_RESIDUAL_R1").as_deref() == Ok("1")
+            });
+        if use_r1_noscratch {
+            const FUNC: &str = "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch";
+            self.ensure_kernel(
+                FUNC,
+                kernels::GEMV_MQ4G256V2_RESIDUAL_R1_K2048_GFX1100_NOSCRATCH_SRC,
+                FUNC,
+            )?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+            let timer =
+                crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_residual", bytes);
+            let result =
+                self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                });
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         // Preserve arch-dependent row selection identical to v1.
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
         let rows = if rdna3 {

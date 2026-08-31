@@ -1659,6 +1659,16 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
 );
+/// gfx1100-only one-row residual candidate from the plain V2 body: fixed K=2048
+/// groups, residual store (`y[row] += acc`), unique symbol. Zero private segment
+/// target for retained-PM4 qualification. Launcher-gated; default residual path
+/// stays on dual-row `GEMV_MQ4G256V2_RESIDUAL_SRC`.
+pub const GEMV_MQ4G256V2_RESIDUAL_R1_K2048_GFX1100_NOSCRATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch\n",
+    "#define HIPFIRE_MQ4G256V2_K2048 1\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

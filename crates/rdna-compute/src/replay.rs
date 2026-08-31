@@ -811,6 +811,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
+            | "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -1437,6 +1438,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
+            | "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -5469,6 +5471,7 @@ mod tests {
         "gemv_hfq4g256_residual_cpol_rt_low",
         "gemv_hfq4g256_residual_cpol_slc",
         "gemv_hfq4g256_residual_k2048",
+        "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch",
         "gemv_hfq4g256_residual_rt_low_gfx1151",
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",
@@ -6552,6 +6555,7 @@ mod tests {
         for symbol in [
             "gemv_mq4g256v2",
             "gemv_mq4g256v2_residual",
+            "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch",
             "gemv_mq6g256v2",
             "gemv_mq6g256v2_residual",
             "gemv_mq4g256v2_multirow_r2",
@@ -6631,6 +6635,39 @@ mod tests {
         assert_ne!("gemm_mq4g256v2_residual_wmma", "gemm_mq4g256_residual_wmma");
         assert!(pointer_effects("gemv_mq4g256v2").is_some());
         assert!(pointer_effects("gemv_mq6g256v2").is_some());
+    }
+
+    #[test]
+    fn mq4g256v2_residual_r1_k2048_gfx1100_noscratch_keeps_exact_residual_contract() {
+        // gfx1100-only residual R1 K=2048 noscratch candidate: same 32-B plain V2
+        // residual ABI (A@0, x@8, y@16 RMW/write; M@24, K@28). Distinct symbol —
+        // never collapses onto generic residual or unknown names.
+        let symbol = "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch";
+        let want = [read(0), read(8), write(16)];
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..3 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 32, "{symbol} explicit args occupy 32 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 32, "{symbol} recorded launches pad to 16");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+
+        let got = pointer_effects(symbol).expect("noscratch residual pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // Fail-closed: unknown / mismatched residual names stay unrecognized.
+        assert!(pointer_effects("gemv_mq4g256v2_residual_r1_k2048_gfx1100").is_none());
+        assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_r1_k2048_gfx1100").is_none());
+        assert_ne!(symbol, "gemv_mq4g256v2_residual");
+        assert_ne!(symbol, "gemv_hfq4g256_residual_k2048");
     }
 
     #[test]
