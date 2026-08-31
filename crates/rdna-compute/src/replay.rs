@@ -807,15 +807,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     // Dense shared-expert V2 (qt44 qt47). Plain GEMV / residual / multirow share the same
     // 3-pointer ABI: a_raw, x (read); y (write/RMW). Same padded size as HFQ4 dense.
-    // The gfx1100 lm_head x-buffer candidate is the ornith M=248320 K=2048
-    // specialization of the plain decode; its replay contract is identical to
-    // generic gemv_mq4g256v2 (A@0 read, x@8 read, y@16 write, M@24, K@28, 32B).
     if matches!(
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
-            | "gemv_mq4g256v2_gfx1100_lm_head_x_buffer"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -1447,7 +1443,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
-            | "gemv_mq4g256v2_gfx1100_lm_head_x_buffer"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -6615,15 +6610,10 @@ mod tests {
         let dense_gemm_effects = vec![read(0), read(8), write(16)];
 
         // Dense GEMV: 3 ptr + M,K = 32 (already 16-aligned). Plain, residual, multirow.
-        // The gfx1100 lm_head x-buffer candidate lives here: same 32B plain V2
-        // contract (candidate pointer effects read@0,@8,write@16) so A3B replay
-        // inventory treats it as the same dense family and fails closed with
-        // identical resource effects.
         for symbol in [
             "gemv_mq4g256v2",
             "gemv_mq4g256v2_residual",
             "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
-            "gemv_mq4g256v2_gfx1100_lm_head_x_buffer",
             "gemv_mq6g256v2",
             "gemv_mq6g256v2_residual",
             "gemv_mq4g256v2_multirow_r2",
@@ -6736,58 +6726,6 @@ mod tests {
         assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_r1_k4096_gfx1100").is_none());
         assert_ne!(symbol, "gemv_mq4g256v2_residual");
         assert_ne!(symbol, "gemv_hfq4g256_residual_k2048");
-    }
-
-    #[test]
-    fn mq4g256v2_gfx1100_lm_head_x_buffer_keeps_exact_32b_abi() {
-        // Ornith lm_head specialization: frozen plain V2 ABI (A@0 read, x@8
-        // read, y@16 write; M@24, K@28 → 32B). Same as generic decode; one
-        // wave/row, no multirow/tiling/precision/cache-policy changes. The
-        // candidate must be indistinguishable from generic in the resource
-        // model and must fail closed on any distinct name.
-        let symbol = "gemv_mq4g256v2_gfx1100_lm_head_x_buffer";
-        let want = [read(0), read(8), write(16)];
-
-        let mut blob = hip_bridge::KernargBlob::new();
-        for _ in 0..3 {
-            blob.push_ptr(std::ptr::null());
-        }
-        blob.push_i32(0);
-        blob.push_i32(0);
-        assert_eq!(blob.len(), 32, "{symbol} explicit args occupy 32 bytes");
-        blob.pad_to(16);
-        assert_eq!(blob.len(), 32, "{symbol} recorded launches pad to 16");
-        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
-
-        let got = pointer_effects(symbol).expect("lm_head x_buffer pointer contract");
-        assert_eq!(got.len(), want.len());
-        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
-            assert_eq!(got_effect.offset, want_effect.offset);
-            assert_eq!(got_effect.mode, want_effect.mode);
-        }
-        // Identical resource effects to the generic plain GEMV — A3B replay
-        // inventory treats them as the same family (no extra acquire).
-        let generic = pointer_effects("gemv_mq4g256v2").expect("generic pointer contract");
-        assert_eq!(got.len(), generic.len());
-        for (g, w) in got.iter().zip(generic.iter()) {
-            assert_eq!(g.offset, w.offset);
-            assert_eq!(g.mode, w.mode);
-        }
-        assert_eq!(
-            expected_kernarg_bytes(symbol),
-            expected_kernarg_bytes("gemv_mq4g256v2")
-        );
-
-        // Distinct frozen symbol — never collapses onto generic or unknown.
-        assert_ne!(symbol, "gemv_mq4g256v2");
-        assert_ne!(symbol, "gemv_mq4g256v2_residual");
-        assert!(pointer_effects("gemv_mq4g256v2_gfx1100_lm_head_x_buffer_unknown").is_none());
-        assert!(
-            expected_kernarg_bytes("gemv_mq4g256v2_gfx1100_lm_head_x_buffer_unknown").is_none()
-        );
-        // Gate typo must fail closed: missing _x_buffer suffix.
-        assert!(pointer_effects("gemv_mq4g256v2_gfx1100_lm_head").is_none());
-        assert!(expected_kernarg_bytes("gemv_mq4g256v2_gfx1100_lm_head").is_none());
     }
 
     #[test]

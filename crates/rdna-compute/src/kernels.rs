@@ -1680,16 +1680,6 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
-/// gfx1100 Ornith lm_head exact candidate: fixed K=2048, one wave/row, and
-/// aligned raw b128 activation loads in the quad loop only. Shared TU with
-/// the generic V2 body; default stays on `GEMV_MQ4G256V2_SRC`. Env-gated
-/// host path: `HIPFIRE_GFX1100_MQ4G256V2_LM_HEAD_X_BUFFER=1`.
-pub const GEMV_MQ4G256V2_GFX1100_LM_HEAD_X_BUFFER_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_gfx1100_lm_head_x_buffer\n",
-    "#define HIPFIRE_MQ4G256V2_K2048 1\n",
-    "#define HIPFIRE_GFX1100_LM_HEAD_X_BUFFER 1\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
-);
 
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",

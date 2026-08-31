@@ -5,11 +5,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#if defined(HIPFIRE_GFX1100_LM_HEAD_X_BUFFER)
-using hipfire_lm_i32x4 = int __attribute__((ext_vector_type(4)));
-using hipfire_lm_f32x4 = float __attribute__((ext_vector_type(4)));
-#endif
-
 #ifndef HIPFIRE_MQ4G256V2_KERNEL
 #define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2
 #endif
@@ -89,10 +84,6 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(ptr))
     #define LOAD_WEIGHT_PACKED(ptr, offset) (*(const unsigned int*)(ptr))
 #endif
-#if defined(HIPFIRE_GFX1100_LM_HEAD_X_BUFFER)
-    const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
-#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
@@ -134,48 +125,6 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
 
         int base = g * 256 + tid * 8;
 
-#if defined(HIPFIRE_GFX1100_LM_HEAD_X_BUFFER)
-        // Two aligned raw b128 loads per group replace eight scalar x[] reads.
-        // Values feed the same DOG association as the generic path.
-        const hipfire_lm_f32x4 xv0a = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 0) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv0b = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 4) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv1a = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 256) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv1b = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 260) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv2a = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 512) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv2b = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 516) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv3a = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 768) * 4, 0, 0));
-        const hipfire_lm_f32x4 xv3b = __builtin_bit_cast(
-            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
-                x_rsrc, (base + 772) * 4, 0, 0));
-        #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
-            (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7)
-        DOG_V(pk0, sc0, zp0, acc0, xv0a.x,xv0a.y,xv0a.z,xv0a.w,xv0b.x,xv0b.y,xv0b.z,xv0b.w);
-        DOG_V(pk1, sc1, zp1, acc1, xv1a.x,xv1a.y,xv1a.z,xv1a.w,xv1b.x,xv1b.y,xv1b.z,xv1b.w);
-        DOG_V(pk2, sc2, zp2, acc2, xv2a.x,xv2a.y,xv2a.z,xv2a.w,xv2b.x,xv2b.y,xv2b.z,xv2b.w);
-        DOG_V(pk3, sc3, zp3, acc3, xv3a.x,xv3a.y,xv3a.z,xv3a.w,xv3b.x,xv3b.y,xv3b.z,xv3b.w);
-        #undef DOG_V
-#else
         #define DOG(pk, sc, zp, b, a) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -191,7 +140,6 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         DOG(pk2, sc2, zp2, base + 512, acc2);
         DOG(pk3, sc3, zp3, base + 768, acc3);
         #undef DOG
-#endif
     }
 
     // Tail handling: groups_per_row may not be a multiple of 4. Each tail
