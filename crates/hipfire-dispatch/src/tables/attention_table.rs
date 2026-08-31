@@ -43,6 +43,11 @@ pub fn populate(registry: &mut KernelRegistry) {
             Some(ShapePredicate::BatchEq(1)),
         ),
         (
+            KernelKey::KvWriteBf16,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
             KernelKey::KvWriteF32,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
@@ -117,6 +122,11 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),
+        (
+            KernelKey::KvWriteBf16Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in kv_write_batched {
         registry.register(KernelVariant {
@@ -168,6 +178,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         ),
         (
             KernelKey::AttnFlashQ8_0Windowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashBf16Windowed,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
         ),
@@ -316,6 +331,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         ),
         (
             KernelKey::AttnQ8_0KvBatchedMaskedWindowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::AttnBf16KvBatchedMaskedWindowed,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),

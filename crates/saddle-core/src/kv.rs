@@ -311,6 +311,11 @@ pub struct KvCache {
     /// True when the rotation primitive is signed-FWHT (matches Fwht{2,3,4}
     /// KvMode values). False when Givens (matches Asym{2,3,4}).
     pub quant_fwht: bool,
+    /// True when K and V are stored as flat 2-byte BF16 (no scales, no
+    /// blocks) instead of a quantized block layout. Mutually exclusive with
+    /// every `quant_*` tier flag above; `quantized` is also set so the legacy
+    /// llama/qwen35 `!quantized` branches never mistake it for plain F32.
+    pub quant_bf16: bool,
     /// V-cache quantization mode (independent of the K mode). Defaults to Q8.
     pub v_mode: VMode,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
@@ -974,6 +979,7 @@ impl KvCache {
             givens_cos: None,
             givens_sin: None,
             quant_fwht: false,
+            quant_bf16: false,
             v_mode: VMode::Q8,
             layer_is_boundary: self.layer_is_boundary.clone(),
             compact_offset: 0,
@@ -1100,7 +1106,6 @@ impl KvCache {
             )),
         }
     }
-
 }
 
 impl KvCache {
@@ -1137,6 +1142,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1185,6 +1191,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1256,11 +1263,106 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create a flat BF16 KV cache. 2 bytes per element — 1.88x the Q8_0
+    /// layout (34 B per 32 elements) but with no per-block scale and no
+    /// quantization error: bf16 carries the same 8 exponent bits as f32 and
+    /// truncates only the mantissa.
+    ///
+    /// Layout is deliberately the simplest thing that can work: element
+    /// `(t, kv_h, d)` lives at `t * kv_dim + kv_h * head_dim + d`, one bf16
+    /// each. No blocks, no scales, no padding. That is what lets the tile
+    /// kernel drop the entire Q8 block-index computation.
+    ///
+    /// Sized by `physical_cap` like `new_gpu_q8_capped`, so eviction-bounded
+    /// callers get the buffer they asked for.
+    ///
+    /// This exists so Maple's Q8 KV can be compared against a near-reference
+    /// KV at long context. It is NOT the default for any model.
+    pub fn new_gpu_bf16(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_bf16_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Same as [`KvCache::new_gpu_bf16`] with an explicit physical_cap.
+    pub fn new_gpu_bf16_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        // 2 bytes per element, rounded up to whole F32 elements because the
+        // allocator is typed F32 everywhere else in this file. kv_dim is even
+        // for every real model so the round-up is a no-op, but the ceil keeps
+        // a hypothetical odd kv_dim from under-allocating.
+        let cache_bytes = physical_cap * kv_dim * 2;
+        let cache_elems = cache_bytes.div_ceil(4);
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            // `quantized` is TRUE even though bf16 is not a quantized tier:
+            // the legacy llama/qwen35 paths branch on `!quantized` to mean
+            // "plain F32 layout", and a bf16 buffer read as F32 is garbage.
+            // Setting this keeps those paths out of their F32 arm. Only Maple
+            // can allocate this cache today.
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: true,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            // V is bf16 too. `VMode::Q8` is the struct's default and is never
+            // read on this path — the tier decode reaches `KTier::Bf16` before
+            // any v_mode branch.
             v_mode: VMode::Q8,
         })
     }
@@ -2356,6 +2458,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -2451,6 +2554,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2567,6 +2671,7 @@ impl KvCache {
             quant_asym3,
             quant_asym2,
             quant_fwht,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos,
             givens_sin,
@@ -2661,6 +2766,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2707,6 +2813,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2755,6 +2862,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2805,6 +2913,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2903,6 +3012,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -2974,6 +3084,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3046,6 +3157,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3145,6 +3257,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3271,6 +3384,7 @@ impl KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3453,6 +3567,7 @@ impl KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3480,7 +3595,12 @@ impl KvCache {
             "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3500,7 +3620,12 @@ impl KvCache {
             "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3559,6 +3684,7 @@ impl KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3642,6 +3768,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3731,6 +3858,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3803,6 +3931,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3908,7 +4037,6 @@ impl KvCache {
     // The KvCache.givens_cos / .givens_sin fields stay `None` in multi mode
     // — Stage 6 forward dispatch reads from the per-device replicas in
     // `Gpus` instead.
-
 }
 
 /// KV VMM-layout and adaptive-reset contract tests.
@@ -3962,6 +4090,7 @@ mod vmm_layout_tests {
             quant_asym3: a3,
             quant_asym2: a2,
             quant_fwht: fwht,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3985,7 +4114,6 @@ mod vmm_layout_tests {
             physical_cap: Some(physical_cap),
         }
     }
-
 
     #[test]
     fn fwht3_vmm_layout_matches_asym3_byte_geometry() {
