@@ -220,7 +220,7 @@ fn check_gfx1100_residual_r1_exact(gpu: &mut Gpu) {
     // Starting Y at +0 makes residual addition bit-identical to the plain V2
     // store, so every output bit is a direct oracle for unchanged decode and
     // accumulation order. The padded tail catches an over-wide row grid.
-    let (m, k) = (2_048usize, 2_048usize);
+    let (m, k) = (2_048usize, 4_096usize);
     let w = build_disjoint_halves(m, k);
     let blob = pack_mq4g256v2(&w, m, k);
     let x: Vec<f32> = (0..k).map(|i| prng(i, 0x51D3_0001) * 2.0 - 1.0).collect();
@@ -256,7 +256,7 @@ fn check_gfx1100_residual_r1_exact(gpu: &mut Gpu) {
         "gfx1100 residual R1 wrote past M={m}"
     );
     eprintln!(
-        "gfx1100 residual R1 K2048: PASS — {m} outputs bit-exact vs plain V2; canaries intact"
+        "gfx1100 residual R1 K4096: PASS — {m} outputs bit-exact vs plain V2; canaries intact"
     );
 }
 

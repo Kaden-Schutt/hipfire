@@ -7467,22 +7467,21 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Opt-in one-row residual candidate: exact gfx1100 + M=K=2048 only.
-        // Reuses plain V2 body with residual epilogue and fixed K2048; zero LDS.
-        // Unset/0 keeps the dual-row residual route byte-identical for all arches.
-        use std::sync::OnceLock;
-        static MQ4V2_RESIDUAL_R1: OnceLock<bool> = OnceLock::new();
-        let use_r1_noscratch = self.arch_caps.is_gfx1100()
-            && m == 2_048
-            && k == 2_048
-            && *MQ4V2_RESIDUAL_R1.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_MQ4V2_RESIDUAL_R1").as_deref() == Ok("1")
-            });
+        // Opt-in one-row residual candidate for Ornith attention out_proj:
+        // exact gfx1100, M=2048, K=4096. Reuses the plain V2 body with a
+        // residual epilogue and fixed K4096; zero LDS. Unset/0 keeps the
+        // dual-row residual route byte-identical for every architecture.
+        use std::sync::LazyLock;
+        static MQ4V2_RESIDUAL_R1: LazyLock<bool> = LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_MQ4V2_RESIDUAL_R1").as_deref() == Ok("1")
+        });
+        let use_r1_noscratch =
+            self.arch_caps.is_gfx1100() && m == 2_048 && k == 4_096 && *MQ4V2_RESIDUAL_R1;
         if use_r1_noscratch {
-            const FUNC: &str = "gemv_mq4g256v2_residual_r1_k2048_gfx1100_noscratch";
+            const FUNC: &str = "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch";
             self.ensure_kernel(
                 FUNC,
-                kernels::GEMV_MQ4G256V2_RESIDUAL_R1_K2048_GFX1100_NOSCRATCH_SRC,
+                kernels::GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC,
                 FUNC,
             )?;
             let a_ptr = a_raw.buf.as_ptr();

@@ -56,6 +56,8 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
 
 #if defined(HIPFIRE_MQ4G256V2_K2048)
     const int groups_per_row = 8;
+#elif defined(HIPFIRE_MQ4G256V2_K4096)
+    const int groups_per_row = 16;
 #else
     const int groups_per_row = K / 256;
 #endif
