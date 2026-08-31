@@ -71,6 +71,11 @@ pub struct FeatureFlags {
     /// Compile MQ4G256V2 QKVZA with the exact K=2048 group count.
     /// Default off until cross-architecture product A/B promotes it.
     pub rdna3_mq4v2_qkvza_k2048: bool,
+    /// MQ4G256V2 K=2048 R4 streaming QKVZA candidate — four rows per wave.
+    /// Admitted only on exact arch/shape (gfx1100|gfx1201, K=2048,
+    /// qkv_m=8192, z_m=4096, beta_m=32, alpha_m=32). Default off; opt in with
+    /// `HIPFIRE_MQ4V2_QKVZA_K2048_R4_STREAM=1` until product A/B promotes it.
+    pub mq4v2_qkvza_k2048_r4_stream: bool,
     /// Stage one residual GEMV row's 32 activation values ahead of the
     /// independent packed-weight loads. Certified default on exact gfx1100;
     /// other RDNA3 targets remain explicit opt-in until separately measured.
@@ -413,6 +418,8 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_mq4v2_qkvza_k2048: parse_bool("HIPFIRE_MQ4V2_QKVZA_K2048").unwrap_or(false),
+            mq4v2_qkvza_k2048_r4_stream: parse_bool("HIPFIRE_MQ4V2_QKVZA_K2048_R4_STREAM")
+                .unwrap_or(false),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_residual_k2048: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048").as_deref()
@@ -692,6 +699,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_qkvza_k2048: false,
             rdna3_mq4v2_qkvza_k2048: false,
+            mq4v2_qkvza_k2048_r4_stream: false,
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_residual_k2048: false,
             rdna3_hfq4_sigmoid_tight_grid: false,
