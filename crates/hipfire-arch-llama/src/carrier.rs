@@ -4,17 +4,30 @@
 
 use crate::dspark_body::Qwen3DrafterAssets;
 use crate::Llama;
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::dspark_core::DsparkWeights;
-use hipfire_runtime::llama::{ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{
+    ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
+};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::weight_manifest::{plan_manifest, ManifestPlan};
+use hipfire_runtime::weight_store::WeightStore;
 
 pub struct LlamaBundle {
     pub config: LlamaConfig,
     pub weights: LlamaWeights,
     pub scratch: ForwardScratch,
     pub kv: KvCache,
+    /// Pure declaration/placement plan captured at load time. The plan has no
+    /// GPU handles and is immutable after publication.
+    pub manifest_plan: ManifestPlan,
+    /// A pilot store is attached only after its handles are assembled under
+    /// this bundle. It is crate-visible so callers cannot create an independent
+    /// unload owner; `ArchModel::free_gpu` is the sole release path.
+    pub(crate) weight_store: Option<WeightStore>,
+    pub(crate) mesh: DeviceMesh,
     /// Decoder-layer indices whose residual hidden states a hidden-conditioned
     /// drafter (DFlash / EAGLE) wants captured, ascending order. Empty = no
     /// capture (the `SpecTarget::dflash_extract_layers` default of `None`). The
@@ -25,26 +38,34 @@ pub struct LlamaBundle {
     /// was found or speculation was disabled. Task-10 wires the speculator build.
     pub dspark_weights: Option<DsparkWeights>,
     /// Loaded DSpark drafter body assets (5-layer dense-GQA transformer +
-    /// block-only KvCache/scratch).  `None` when `dspark_weights` is `None`.
+    /// block-only KvCache/scratch). `None` when `dspark_weights` is `None`.
     pub dspark_assets: Option<Qwen3DrafterAssets>,
 }
 
 /// Build the LLaMA GPU bundle from an HFQ or safetensors-directory source.
 ///
-/// Verbatim relocation of the carrier's `(config, weights, kv, scratch)`
-/// seam: HFQ via `Architecture` trait, Dir via ParoQuant loaders. Error
-/// strings are byte-identical to the prior inline carrier block.
+/// The source/config path remains architecture-owned. Once it resolves, the
+/// carrier publishes a pure Single manifest plan. Every fallible GPU stage
+/// explicitly releases earlier allocations before returning an error; no
+/// implicit GPU-buffer destructor is introduced.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
     let (config, weights, kv, scratch) = match src {
         ModelSource::Hfq(mut hfq) => {
-            let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+            let config =
+                <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
             let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-            // Size scratch (flash-attention partials) for the runtime KV cap so the
-            // asym/flash attends, which index partials by ceil(physical_cap/128), don't
-            // overflow it (the trait `new_state` only knows the model's declared max).
-            let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-                .map_err(|e| format!("llama: ForwardScratch::new_with_max_seq failed: {e:?}"))?;
+            // The plain LLaMA path has no independent cap resolver. PR #661's
+            // physical-cap behavior is owned by the existing upstream KV plan.
+            let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    weights.free_gpu(ctx.gpu);
+                    return Err(format!(
+                        "llama: ForwardScratch::new_with_max_seq failed: {error:?}"
+                    ));
+                }
+            };
             let dims = KvDims {
                 layers: KvLayers::Flat(config.n_layers),
                 n_kv_heads: config.n_kv_heads,
@@ -52,7 +73,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 max_seq: ctx.max_seq,
                 physical_cap: None,
             };
-            let kv = <KvCache as KvCacheExt>::from_mode(
+            let kv = match <KvCache as KvCacheExt>::from_mode(
                 hipfire_runtime::kv_mode::resolve(
                     ctx.kv_mode_override.unwrap_or(""),
                     &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
@@ -61,8 +82,16 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 .mode,
                 KvTarget::Single(ctx.gpu),
                 &dims,
-            )
-            .map_err(|e| format!("llama: <KvCache as KvCacheExt>::from_mode failed: {e}"))?;
+            ) {
+                Ok(kv) => kv,
+                Err(error) => {
+                    scratch.free_gpu(ctx.gpu);
+                    weights.free_gpu(ctx.gpu);
+                    return Err(format!(
+                        "llama: <KvCache as KvCacheExt>::from_mode failed: {error}"
+                    ));
+                }
+            };
             (config, weights, kv, scratch)
         }
         ModelSource::Dir(source) => {
@@ -74,7 +103,6 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                     .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-            // Replicate carriers.rs `resolve_kv_mode` warning path verbatim.
             let kv_mode_str = ctx
                 .kv_mode_override
                 .filter(|s| !s.is_empty())
@@ -86,7 +114,10 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 config.head_dim,
             );
             if let Some(w) = rr.warning {
-                eprintln!("  KV cache: {w} (site {})", hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site);
+                eprintln!(
+                    "  KV cache: {w} (site {})",
+                    hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
+                );
             }
             let dims = KvDims {
                 layers: KvLayers::Flat(config.n_layers),
@@ -95,22 +126,47 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 max_seq: ctx.max_seq,
                 physical_cap: Some(ctx.max_seq),
             };
-            let kv = <KvCache as KvCacheExt>::from_mode(
+            let kv = match <KvCache as KvCacheExt>::from_mode(
                 rr.mode,
                 KvTarget::Single(ctx.gpu),
                 &dims,
-            )
-            .map_err(|e| format!("KvCache: {e}"))?;
-            let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-                .map_err(|e| format!("ForwardScratch::new_with_max_seq: {e:?}"))?;
+            ) {
+                Ok(kv) => kv,
+                Err(error) => {
+                    weights.free_gpu(ctx.gpu);
+                    return Err(format!("KvCache: {error}"));
+                }
+            };
+            let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    let _ = kv.free_gpu(ctx.gpu);
+                    weights.free_gpu(ctx.gpu);
+                    return Err(format!(
+                        "ForwardScratch::new_with_max_seq: {error:?}"
+                    ));
+                }
+            };
             (config, weights, kv, scratch)
         }
     };
+
+    // Pure plan publication happens after source/config resolution and before
+    // the bundle becomes visible to the loader. It performs no GPU or file IO.
+    let mesh = DeviceMesh::single();
+    let manifest = Llama::weight_manifest(&config);
+    let state = Llama::state_manifest(&config);
+    let manifest_plan = plan_manifest(&manifest, &state, &mesh, config.n_layers)
+        .map_err(|e| format!("llama: manifest planning failed: {e}"))?;
+
     Ok(LlamaBundle {
         config,
         weights,
         scratch,
         kv,
+        manifest_plan,
+        weight_store: None,
+        mesh,
         dflash_extract_layers: Vec::new(),
         dspark_weights: None,
         dspark_assets: None,
@@ -121,6 +177,42 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
 pub use load_bundle as load_llama_bundle;
 
 impl LlamaBundle {
+    /// Attach a store whose resident handles have been assembled for this
+    /// bundle. The target mesh epoch is checked before publication; teardown
+    /// remains exclusively in `ArchModel::free_gpu`. On rejection the store is
+    /// returned unchanged so the caller can retry against the right owner.
+    pub fn attach_weight_store(
+        &mut self,
+        store: WeightStore,
+    ) -> Result<(), (WeightStore, String)> {
+        if self.weight_store.is_some() {
+            return Err((store, "llama: weight store already attached".into()));
+        }
+        let Some(origin) = store.origin() else {
+            return Err((store, "llama: weight store has no origin".into()));
+        };
+        if origin.mesh_epoch() != self.mesh.epoch() {
+            return Err((
+                store,
+                format!(
+                    "llama: weight store origin epoch {:?} does not match bundle epoch {:?}",
+                    origin.mesh_epoch(),
+                    self.mesh.epoch()
+                ),
+            ));
+        }
+        self.weight_store = Some(store);
+        Ok(())
+    }
+
+    /// The immutable mesh identity used by this bundle's manifest plan.
+    /// Callers that run the Single pilot must pass this exact mesh to
+    /// `fulfill_manifest`; constructing a fresh `DeviceMesh::single()` would
+    /// intentionally fail the origin check.
+    pub fn manifest_mesh(&self) -> &DeviceMesh {
+        &self.mesh
+    }
+
     /// Set the decoder-layer indices whose residual hidden states the
     /// hidden-conditioned drafter wants captured (ascending order). The
     /// speculator calls this with `dflash::DflashConfig::target_layer_ids`.

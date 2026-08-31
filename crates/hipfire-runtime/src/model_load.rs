@@ -6,6 +6,7 @@
 //! per-tensor dequant), which `WeightSource::read_layer` calls internally.
 
 use crate::llama::{EmbeddingFormat, WeightTensor};
+use hipfire_hardware::{DeviceMesh, DimKind};
 use hip_bridge::HipResult;
 use hipfire_hardware::Gpus;
 use rdna_compute::{Gpu, GpuTensor};
@@ -30,6 +31,58 @@ impl Layout {
             layer_to_device: (0..n_layers).map(|i| g.device_for_layer(i)).collect(),
         }
     }
+
+    /// Build the canonical stage/rank-0 view from an admitted mesh. The
+    /// manifest planner owns the full stage grid; this legacy loader view
+    /// selects rank zero for each layer so existing orchestrators continue to
+    /// have one deterministic device index until their typed mesh path lands.
+    pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> Self {
+        let mut output_coord = mesh.coord_of(0);
+        if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
+            output_coord[index] = mesh.size_of(DimKind::Pp).saturating_sub(1);
+        }
+        let layer_to_device = (0..n_layers)
+            .map(|layer| {
+                let mut coord = mesh.coord_of(0);
+                if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
+                    coord[index] = mesh.stage_for_layer(layer, n_layers);
+                }
+                mesh.device_of(&coord)
+            })
+            .collect();
+        Self {
+            output_device: mesh.device_of(&output_coord),
+            layer_to_device,
+        }
+    }
+
+    /// Validate the pure layout before any source preparation or GPU upload.
+    pub fn validate(&self, n_devices: usize, n_layers: usize) -> Result<(), String> {
+        if self.output_device >= n_devices {
+            return Err(format!(
+                "layout output device {} outside device count {}",
+                self.output_device, n_devices
+            ));
+        }
+        if self.layer_to_device.len() != n_layers {
+            return Err(format!(
+                "layout has {} layer assignments, expected {n_layers}",
+                self.layer_to_device.len()
+            ));
+        }
+        if let Some((layer, &device)) = self
+            .layer_to_device
+            .iter()
+            .enumerate()
+            .find(|(_, &device)| device >= n_devices)
+        {
+            return Err(format!(
+                "layout layer {layer} device {device} outside device count {n_devices}"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn device_for_layer(&self, i: usize) -> usize {
         self.layer_to_device[i]
     }
@@ -80,6 +133,15 @@ pub fn load_weights<S: WeightSource>(
     devices: &mut [Gpu],
     layout: &Layout,
 ) -> HipResult<LoadedWeights<S::Layer>> {
+    if devices.is_empty() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "load_weights: at least one device is required",
+        ));
+    }
+    layout
+        .validate(devices.len(), source.n_layers())
+        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
     source.prepare(devices.len())?;
     let out_dev = layout.output_device();
     let can_alias = devices.len() == 1;
@@ -113,5 +175,26 @@ mod tests {
         for i in 0..5 {
             assert_eq!(l.device_for_layer(i), 0);
         }
+    }
+
+    #[test]
+    fn mesh_layout_selects_stage_rank_zero_without_io() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]);
+        let layout = Layout::from_mesh(&mesh, 4);
+        assert_eq!(layout.output_device(), 2);
+        assert_eq!(
+            (0..4)
+                .map(|layer| layout.device_for_layer(layer))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 2, 2]
+        );
+        assert!(layout.validate(mesh.n_devices(), 4).is_ok());
+    }
+
+    #[test]
+    fn invalid_layout_is_rejected_before_source_work() {
+        let layout = Layout::single(2);
+        assert!(layout.validate(0, 2).is_err());
+        assert!(layout.validate(1, 3).is_err());
     }
 }
