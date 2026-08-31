@@ -782,6 +782,7 @@ fn validate_expert_sources(
                     "{context}: duplicate {label} source '{name}' at index {index}"
                 ));
             }
+            let entry = manifest_entry(spec, manifest, &format!("{label}[{index}]"), name)?;
             source_shape_matches(spec, label, per_expert, entry)?;
             if per_expert {
                 if let Some(previous) = &shape {
