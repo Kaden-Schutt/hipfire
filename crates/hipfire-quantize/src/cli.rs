@@ -62,8 +62,16 @@ pub(crate) struct QuantizeArgs {
     /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
     /// per token — a RAM question, not a bandwidth one), the ternary expert
     /// path, or the router.
-    #[arg(long, value_name = "MODE", default_value = "bf16",
-          value_parser = ["bf16", "q8", "mq4"])]
+    /// Default is q8, not bf16. Measured on gfx1151 against a bf16 reference
+    /// (2048 teacher-forced tokens): q8 and bf16 heads give the IDENTICAL mean
+    /// KL of 0.0511, but q8 decodes 23% faster (144.6 vs 117.6 tok/s). A bf16
+    /// head is therefore strictly dominated -- it costs throughput and buys
+    /// exactly zero accuracy. mq4 (qt=30 Lloyd, 5.0 bpw) is +10.4% decode over
+    /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
+    /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
+    /// the same swap buys 49% rather than 10%.
+    #[arg(long, value_name = "MODE", default_value = "q8",
+          value_parser = ["bf16", "q8", "mq4", "mq4v2"])]
     pub head_quant: String,
 
     /// Override the architecture ID stamped into the HFQ header.

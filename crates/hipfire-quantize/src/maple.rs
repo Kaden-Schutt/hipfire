@@ -57,6 +57,13 @@ pub(crate) enum MapleHeadQuant {
     /// blocks, so the runtime MUST rotate `x` to match. See
     /// `pack_maple_head` for why the seeds are not free parameters.
     Mq4,
+    /// MQ4-G256 **v2** (qt=44), 136 B per 256 weights = 4.25 bpw.
+    /// **FWHT-rotated**, same as `Mq4`, and the same nibble payload — but the
+    /// 8 header bytes carry a SEPARATE fp16 scale/zero per 128-weight half
+    /// instead of one pair governing all 256. Strictly finer quantization at a
+    /// SMALLER footprint than qt=30 (4.25 vs 5.0 bpw), so it is the natural
+    /// candidate if the mq4 head's accuracy cost is what rules it out.
+    Mq4V2,
 }
 
 impl std::str::FromStr for MapleHeadQuant {
@@ -66,8 +73,9 @@ impl std::str::FromStr for MapleHeadQuant {
             "bf16" | "none" => Ok(Self::Bf16),
             "q8" | "q8_0" | "q8f16" => Ok(Self::Q8),
             "mq4" | "mq4-lloyd" | "mq4g256lloyd" => Ok(Self::Mq4),
+            "mq4v2" | "mq4-v2" | "mq4g256v2" => Ok(Self::Mq4V2),
             other => Err(format!(
-                "unknown --head-quant {other:?} (expected bf16, q8 or mq4)"
+                "unknown --head-quant {other:?} (expected bf16, q8, mq4 or mq4v2)"
             )),
         }
     }
@@ -80,6 +88,7 @@ impl MapleHeadQuant {
             Self::Bf16 => "bf16",
             Self::Q8 => "q8",
             Self::Mq4 => "mq4",
+            Self::Mq4V2 => "mq4v2",
         }
     }
 }
@@ -162,6 +171,25 @@ pub(crate) fn pack_maple_head(
             Ok((
                 crate::quant_mq::quantize_mq4g256_lloyd(vals, &signs1, &signs2),
                 QuantType::MQ4G256Lloyd,
+                256,
+            ))
+        }
+        MapleHeadQuant::Mq4V2 => {
+            if k % 256 != 0 {
+                return Err(format!(
+                    "lm_head K={k} is not a multiple of 256 (MQ4-G256 block)"
+                ));
+            }
+            // Same FWHT seeds as the qt=30 arm above. They are NOT free
+            // parameters: the runtime rotates `x` with signs derived from the
+            // same seeds, so a mismatch here silently produces garbage logits
+            // rather than a load error.
+            let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+            let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+            let m = vals.len() / k;
+            Ok((
+                crate::quant_fwht::quantize_mq4g256v2(vals, m, k, &signs1, &signs2),
+                QuantType::MQ4G256V2,
                 256,
             ))
         }
