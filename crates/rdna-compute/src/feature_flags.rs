@@ -68,6 +68,9 @@ pub struct FeatureFlags {
     /// Certified default on gfx1100; set
     /// `HIPFIRE_RDNA3_HFQ4_QKVZA_K2048=0` to restore the general kernel.
     pub rdna3_hfq4_qkvza_k2048: bool,
+    /// Compile MQ4G256V2 QKVZA with the exact K=2048 group count.
+    /// Default off until cross-architecture product A/B promotes it.
+    pub rdna3_mq4v2_qkvza_k2048: bool,
     /// Stage one residual GEMV row's 32 activation values ahead of the
     /// independent packed-weight loads. Certified default on exact gfx1100;
     /// other RDNA3 targets remain explicit opt-in until separately measured.
@@ -409,6 +412,7 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
                 .unwrap_or(arch == "gfx1100"),
+            rdna3_mq4v2_qkvza_k2048: parse_bool("HIPFIRE_MQ4V2_QKVZA_K2048").unwrap_or(false),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_residual_k2048: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048").as_deref()
@@ -687,6 +691,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_reduce_chain: false,
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_qkvza_k2048: false,
+            rdna3_mq4v2_qkvza_k2048: false,
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_residual_k2048: false,
             rdna3_hfq4_sigmoid_tight_grid: false,
