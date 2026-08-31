@@ -36,9 +36,7 @@ thread_local! {
 /// [`clear_faults`] after it so a failed test cannot poison a later one.
 #[doc(hidden)]
 pub mod test_support {
-    use super::{
-        FAIL_AFTER_UPLOAD, RESIDENT_ALLOCATIONS, RESIDENT_RELEASES,
-    };
+    use super::{FAIL_AFTER_UPLOAD, RESIDENT_ALLOCATIONS, RESIDENT_RELEASES};
 
     pub fn reset() {
         RESIDENT_ALLOCATIONS.with(|count| count.set(0));
@@ -125,7 +123,12 @@ pub struct WeightProjection {
     pub dtype: DType,
 }
 
-fn projection_for(entry: &WeightEntry, rank: usize, world_size: usize, dtype: DType) -> WeightProjection {
+fn projection_for(
+    entry: &WeightEntry,
+    rank: usize,
+    world_size: usize,
+    dtype: DType,
+) -> WeightProjection {
     let (kind, axis) = match &entry.policy {
         ShardPolicy::ColumnShard { axis } => (WeightProjectionKind::ColumnShard, Some(*axis)),
         ShardPolicy::RowShard { axis } => (WeightProjectionKind::RowShard, Some(*axis)),
@@ -307,12 +310,7 @@ impl WeightLoadTransaction {
             .is_some_and(|store| store.contains(name, layer, device))
     }
 
-    pub fn get(
-        &self,
-        name: &str,
-        layer: Option<usize>,
-        device: usize,
-    ) -> Option<&WeightHandle> {
+    pub fn get(&self, name: &str, layer: Option<usize>, device: usize) -> Option<&WeightHandle> {
         self.store
             .as_ref()
             .and_then(|store| store.get(name, layer, device))
@@ -338,14 +336,12 @@ impl WeightLoadTransaction {
     /// Compare the unpublished transaction's captured target with an admitted
     /// owner identity. This read-only check is used before the carrier wraps
     /// the transaction in its private attached owner.
-    pub fn validate_origin_value(
-        &self,
-        expected: WeightOrigin,
-    ) -> Result<(), WeightStoreError> {
-        self.store.as_ref().map_or(
-            Err(WeightStoreError::UnboundOrigin),
-            |store| store.validate_origin_value(expected),
-        )
+    pub fn validate_origin_value(&self, expected: WeightOrigin) -> Result<(), WeightStoreError> {
+        self.store
+            .as_ref()
+            .map_or(Err(WeightStoreError::UnboundOrigin), |store| {
+                store.validate_origin_value(expected)
+            })
     }
 
     /// Start typed assembly while this load is still unpublished.
@@ -459,12 +455,7 @@ impl WeightStore {
     /// Move a handle out of the store. This is private to the assembly
     /// capability so arbitrary store holders cannot independently tear down a
     /// resident allocation.
-    fn take(
-        &mut self,
-        name: &str,
-        layer: Option<usize>,
-        device: usize,
-    ) -> Option<WeightHandle> {
+    fn take(&mut self, name: &str, layer: Option<usize>, device: usize) -> Option<WeightHandle> {
         let key = WeightPlacementKey::new(name, layer, device);
         self.projections.remove(&key);
         self.placements.remove(&key)
@@ -492,10 +483,7 @@ impl WeightStore {
 
     /// Compare a store's captured origin with an already-resolved target
     /// identity. This read-only seam cannot release or extract any handle.
-    pub fn validate_origin_value(
-        &self,
-        expected: WeightOrigin,
-    ) -> Result<(), WeightStoreError> {
+    pub fn validate_origin_value(&self, expected: WeightOrigin) -> Result<(), WeightStoreError> {
         let actual = self.origin.ok_or(WeightStoreError::UnboundOrigin)?;
         if actual != expected {
             return Err(WeightStoreError::OriginMismatch { expected, actual });
@@ -505,11 +493,7 @@ impl WeightStore {
 
     /// Verify that this store is still being handled by the same mesh/device
     /// target. No GPU calls occur on mismatch.
-    pub fn validate_origin(
-        &self,
-        mesh: &DeviceMesh,
-        gpu: &Gpu,
-    ) -> Result<(), WeightStoreError> {
+    pub fn validate_origin(&self, mesh: &DeviceMesh, gpu: &Gpu) -> Result<(), WeightStoreError> {
         self.validate_origin_value(WeightOrigin::for_single(mesh, gpu))
     }
 
@@ -558,12 +542,7 @@ pub struct WeightStoreAssembly<'a> {
 }
 
 impl<'a> WeightStoreAssembly<'a> {
-    pub fn take(
-        &mut self,
-        name: &str,
-        layer: Option<usize>,
-        device: usize,
-    ) -> Option<usize> {
+    pub fn take(&mut self, name: &str, layer: Option<usize>, device: usize) -> Option<usize> {
         let key = WeightPlacementKey::new(name, layer, device);
         let (handle, projection) = self.store.take_with_projection(name, layer, device)?;
         let slot = self.taken.len();
@@ -586,9 +565,7 @@ impl Drop for WeightStoreAssembly<'_> {
             return;
         }
         for taken in self.taken.drain(..) {
-            let _ = self
-                .store
-                .insert(taken.key, taken.handle, taken.projection);
+            let _ = self.store.insert(taken.key, taken.handle, taken.projection);
         }
     }
 }
@@ -628,11 +605,7 @@ fn target_error(mesh: &DeviceMesh) -> Option<FulfillError> {
         ),
     })
 }
-fn rollback_fulfill_error(
-    store: WeightStore,
-    gpu: &Gpu,
-    mut error: FulfillError,
-) -> FulfillError {
+fn rollback_fulfill_error(store: WeightStore, gpu: &Gpu, mut error: FulfillError) -> FulfillError {
     if let Err(release_error) = store.rollback(gpu) {
         error
             .reason
@@ -680,15 +653,15 @@ where
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: devices.first().copied().unwrap_or(0),
-                reason: format!(
-                    "Single placement resolved to {:?}, expected [0]",
-                    devices
-                ),
+                reason: format!("Single placement resolved to {:?}, expected [0]", devices),
             };
             return Err(rollback_fulfill_error(store, gpu, error));
         }
         let key = WeightPlacementKey::new(&entry.name, entry.layer, 0);
-        if let ShardPolicy::Tied { source: source_name } = &entry.policy {
+        if let ShardPolicy::Tied {
+            source: source_name,
+        } = &entry.policy
+        {
             let source_dtype = match store.get(source_name, entry.layer, 0) {
                 Some(WeightHandle::Resident(tensor)) => Some(tensor.dtype),
                 Some(WeightHandle::Alias(_)) | None => None,
@@ -717,11 +690,9 @@ where
                 return Err(rollback_fulfill_error(store, gpu, error));
             }
             let projection = projection_for(entry, 0, 1, actual_dtype);
-            if let Err(reason) = store.insert(
-                key,
-                WeightHandle::Alias(source_name.clone()),
-                projection,
-            ) {
+            if let Err(reason) =
+                store.insert(key, WeightHandle::Alias(source_name.clone()), projection)
+            {
                 let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
@@ -926,7 +897,9 @@ mod tests {
             .stage_alias("x", None, 0, "source-b", projection(DType::F32))
             .unwrap_err();
         assert!(matches!(error, WeightStoreError::DuplicatePlacement(_)));
-        assert!(matches!(store.get("x", None, 0), Some(WeightHandle::Alias(source)) if source == "source-a"));
+        assert!(
+            matches!(store.get("x", None, 0), Some(WeightHandle::Alias(source)) if source == "source-a")
+        );
         assert_eq!(store.projection("x", None, 0).unwrap().dtype, DType::F16);
     }
 
@@ -969,13 +942,9 @@ mod tests {
                 source: "source".into(),
             },
         );
-        let transaction = fulfill_manifest_single(
-            &[source, alias],
-            &mesh,
-            1,
-            &gpu,
-            |_| Ok((vec![0; 4], DType::F32)),
-        )
+        let transaction = fulfill_manifest_single(&[source, alias], &mesh, 1, &gpu, |_| {
+            Ok((vec![0; 4], DType::F32))
+        })
         .unwrap();
         assert_eq!(
             transaction.projection("alias", None, 0).unwrap().dtype,
@@ -997,10 +966,9 @@ mod tests {
         };
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
-        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
-            Ok((vec![0; 4], DType::F32))
-        })
-        .unwrap();
+        let transaction =
+            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| Ok((vec![0; 4], DType::F32)))
+                .unwrap();
         assert_eq!(transaction.len(), 1);
         assert!(matches!(
             transaction.get("resident", None, 0),
@@ -1041,10 +1009,9 @@ mod tests {
         RESIDENT_RELEASES.with(|count| count.set(0));
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
-        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
-            Ok((vec![0; 4], DType::F32))
-        })
-        .unwrap();
+        let transaction =
+            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| Ok((vec![0; 4], DType::F32)))
+                .unwrap();
         let expected = WeightOrigin::from_parts(mesh.epoch(), 1, gpu.device_id);
         let error = transaction.validate_origin_value(expected).unwrap_err();
         assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
@@ -1060,7 +1027,6 @@ mod tests {
         assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
     }
 
-
     #[test]
     fn rollback_reports_free_failure_without_counting_release() {
         let Ok(gpu) = Gpu::init() else {
@@ -1073,10 +1039,7 @@ mod tests {
         let mut store = WeightStore::with_origin(origin);
         let borrowed = GpuTensor {
             buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(
-                    std::ptr::null_mut::<std::ffi::c_void>(),
-                    0,
-                )
+                hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0)
             },
             shape: vec![0],
             dtype: DType::F32,

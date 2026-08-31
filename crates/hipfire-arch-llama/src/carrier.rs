@@ -15,8 +15,8 @@ use hipfire_runtime::llama::{
 };
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as ModelSourceTrait;
-use hipfire_runtime::weight_manifest::{plan_manifest, ManifestPlan, WeightEntry};
 use hipfire_runtime::weight_backend::hfq_weight_dtype;
+use hipfire_runtime::weight_manifest::{plan_manifest, ManifestPlan, WeightEntry};
 use hipfire_runtime::weight_store::{
     TakenWeight, WeightHandle, WeightLoadTransaction, WeightOrigin, WeightStoreAssembly,
     WeightStoreAssemblyGuard, WeightStoreError,
@@ -82,10 +82,7 @@ impl AttachedWeightStore {
     }
 }
 
-fn with_weight_rollback_error(
-    reason: String,
-    rollback: hip_bridge::HipResult<()>,
-) -> String {
+fn with_weight_rollback_error(reason: String, rollback: hip_bridge::HipResult<()>) -> String {
     match rollback {
         Ok(()) => reason,
         Err(error) => format!("{reason}; resident rollback failed: {error}"),
@@ -213,10 +210,8 @@ fn f32_bytes_from_hfq(quant_type: u8, data: &[u8], name: &str) -> Result<Vec<u8>
             }
             for chunk in chunks {
                 bytes.extend_from_slice(
-                    &f32::from_bits(
-                        u16::from_le_bytes([chunk[0], chunk[1]]) as u32 * (1 << 16),
-                    )
-                    .to_le_bytes(),
+                    &f32::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]) as u32 * (1 << 16))
+                        .to_le_bytes(),
                 );
             }
         }
@@ -244,12 +239,11 @@ fn hfq_source(hfq: &HfqFile, entry: &WeightEntry) -> Result<(Vec<u8>, DType), St
             )),
         };
     }
-    if matches!(entry.name.as_str(), "output_norm" | "attn_norm" | "ffn_norm" | "q_norm" | "k_norm")
-    {
-        return Ok((
-            f32_bytes_from_hfq(quant_type, &data, &name)?,
-            DType::F32,
-        ));
+    if matches!(
+        entry.name.as_str(),
+        "output_norm" | "attn_norm" | "ffn_norm" | "q_norm" | "k_norm"
+    ) {
+        return Ok((f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32));
     }
     match quant_type {
         1 | 2 | 16 => Ok((f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32)),
@@ -367,9 +361,8 @@ fn assemble_llama_weights(
 ) -> Result<LlamaWeights, String> {
     let mut assembly = transaction.begin_assembly();
     let mut slots = HashMap::new();
-    let mut take = |name: &str, layer: Option<usize>| {
-        take_slot(&mut assembly, &mut slots, name, layer)
-    };
+    let mut take =
+        |name: &str, layer: Option<usize>| take_slot(&mut assembly, &mut slots, name, layer);
 
     take("token_embd", None)?;
     take("output_norm", None)?;
@@ -431,13 +424,7 @@ fn assemble_llama_weights(
             config.dim,
         )
     } else {
-        resident_weight(
-            &mut cells,
-            "lm_head",
-            None,
-            config.vocab_size,
-            config.dim,
-        )
+        resident_weight(&mut cells, "lm_head", None, config.vocab_size, config.dim)
     };
     let mut layers = Vec::with_capacity(config.n_layers);
     for layer in 0..config.n_layers {
@@ -544,174 +531,159 @@ fn classify_hfq_route(hfq: &HfqFile) -> HfqLoadRoute {
 }
 
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
-    let (config, weights, kv, scratch, manifest_plan, weight_store, mesh, weight_origin) =
-        match src {
-            ModelSource::Hfq(hfq) => {
-                let config =
-                    <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-                // Admission and route classification are pure source checks.
-                // They must run before any manifest fulfillment or GPU upload.
-                hipfire_runtime::hfq::validate_llama_hfq_admission(&hfq)
-                    .map_err(|e| e.to_string())?;
-                let has_separate_lm_head =
-                    hfq.find_tensor_info("lm_head.weight").is_some();
-                let route = classify_hfq_route(&hfq);
-                eprintln!("llama: HFQ source route = {route:?}");
-                let (mesh, manifest_plan) = plan_single(&config, has_separate_lm_head)?;
-                let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
-                let (weights, mut weight_store) = match route {
-                    HfqLoadRoute::LegacyAwq => {
-                        let weights =
-                            hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, ctx.gpu)
-                                .map_err(|e| format!("llama: load_weights_hfq failed: {e:?}"))?;
-                        (weights, None)
-                    }
-                    HfqLoadRoute::ManifestPlainLlama => {
-                        let manifest =
-                            Llama::weight_manifest_for_hfq(&config, has_separate_lm_head);
-                        let mut transaction = hipfire_runtime::weight_store::fulfill_manifest(
-                            &manifest,
-                            &mesh,
-                            config.n_layers,
-                            ctx.gpu,
-                            |entry| hfq_source(&hfq, entry),
-                        )
-                        .map_err(|e| format!("llama: {e}"))?;
-                        let weights = match assemble_llama_weights(&config, &mut transaction) {
-                            Ok(weights) => weights,
-                            Err(error) => {
-                                return Err(with_weight_rollback_error(
-                                    error,
-                                    transaction.rollback(ctx.gpu),
-                                ));
-                            }
-                        };
-                        (weights, Some(transaction))
-                    }
-                };
-                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-                // The plain LLaMA path has no independent cap resolver. PR
-                // #661's physical-cap behavior is owned by the existing
-                // upstream KV plan.
-                let scratch =
-                    match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
-                        Ok(scratch) => scratch,
+    let (config, weights, kv, scratch, manifest_plan, weight_store, mesh, weight_origin) = match src
+    {
+        ModelSource::Hfq(hfq) => {
+            let config =
+                <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+            // Admission and route classification are pure source checks.
+            // They must run before any manifest fulfillment or GPU upload.
+            hipfire_runtime::hfq::validate_llama_hfq_admission(&hfq).map_err(|e| e.to_string())?;
+            let has_separate_lm_head = hfq.find_tensor_info("lm_head.weight").is_some();
+            let route = classify_hfq_route(&hfq);
+            eprintln!("llama: HFQ source route = {route:?}");
+            let (mesh, manifest_plan) = plan_single(&config, has_separate_lm_head)?;
+            let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
+            let (weights, mut weight_store) = match route {
+                HfqLoadRoute::LegacyAwq => {
+                    let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, ctx.gpu)
+                        .map_err(|e| format!("llama: load_weights_hfq failed: {e:?}"))?;
+                    (weights, None)
+                }
+                HfqLoadRoute::ManifestPlainLlama => {
+                    let manifest = Llama::weight_manifest_for_hfq(&config, has_separate_lm_head);
+                    let mut transaction = hipfire_runtime::weight_store::fulfill_manifest(
+                        &manifest,
+                        &mesh,
+                        config.n_layers,
+                        ctx.gpu,
+                        |entry| hfq_source(&hfq, entry),
+                    )
+                    .map_err(|e| format!("llama: {e}"))?;
+                    let weights = match assemble_llama_weights(&config, &mut transaction) {
+                        Ok(weights) => weights,
                         Err(error) => {
-                            let rollback = if let Some(transaction) = weight_store.take() {
-                                transaction.rollback(ctx.gpu)
-                            } else {
-                                Ok(())
-                            };
-                            weights.free_gpu(ctx.gpu);
                             return Err(with_weight_rollback_error(
-                                format!(
-                                    "llama: ForwardScratch::new_with_max_seq failed: {error:?}"
-                                ),
-                                rollback,
+                                error,
+                                transaction.rollback(ctx.gpu),
                             ));
                         }
                     };
-                let dims = llama_kv_dims(&config, ctx.max_seq, None);
-                let kv = match <KvCache as KvCacheExt>::from_mode(
-                    hipfire_runtime::kv_mode::resolve(
-                        ctx.kv_mode_override.unwrap_or(""),
-                        &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
-                        config.head_dim,
-                    )
-                    .mode,
-                    KvTarget::Single(ctx.gpu),
-                    &dims,
-                ) {
-                    Ok(kv) => kv,
-                    Err(error) => {
-                        scratch.free_gpu(ctx.gpu);
-                        let rollback = if let Some(transaction) = weight_store.take() {
-                            transaction.rollback(ctx.gpu)
-                        } else {
-                            Ok(())
-                        };
-                        weights.free_gpu(ctx.gpu);
-                        return Err(with_weight_rollback_error(
-                            format!(
-                                "llama: <KvCache as KvCacheExt>::from_mode failed: {error}"
-                            ),
-                            rollback,
-                        ));
-                    }
-                };
-                (
-                    config,
-                    weights,
-                    kv,
-                    scratch,
-                    manifest_plan,
-                    weight_store,
-                    mesh,
-                    weight_origin,
-                )
-            }
-            ModelSource::Dir(source) => {
-                let config =
-                    hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
-                        format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
-                    })?;
-                let (mesh, manifest_plan) =
-                    plan_single(&config, source.tensor_info("lm_head.weight").is_some())?;
-                let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
-                let weights =
-                    hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                        .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-                let kv_mode_str = ctx
-                    .kv_mode_override
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
-                let rr = hipfire_runtime::kv_mode::resolve(
-                    &kv_mode_str,
-                    &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
-                    config.head_dim,
-                );
-                if let Some(w) = rr.warning {
-                    eprintln!(
-                        "  KV cache: {w} (site {})",
-                        hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
-                    );
+                    (weights, Some(transaction))
                 }
-                let dims = llama_kv_dims(&config, ctx.max_seq, Some(ctx.max_seq));
-                let kv = match <KvCache as KvCacheExt>::from_mode(
-                    rr.mode,
-                    KvTarget::Single(ctx.gpu),
-                    &dims,
-                ) {
+            };
+            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+            // The plain LLaMA path has no independent cap resolver. PR
+            // #661's physical-cap behavior is owned by the existing
+            // upstream KV plan.
+            let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    let rollback = if let Some(transaction) = weight_store.take() {
+                        transaction.rollback(ctx.gpu)
+                    } else {
+                        Ok(())
+                    };
+                    weights.free_gpu(ctx.gpu);
+                    return Err(with_weight_rollback_error(
+                        format!("llama: ForwardScratch::new_with_max_seq failed: {error:?}"),
+                        rollback,
+                    ));
+                }
+            };
+            let dims = llama_kv_dims(&config, ctx.max_seq, None);
+            let kv = match <KvCache as KvCacheExt>::from_mode(
+                hipfire_runtime::kv_mode::resolve(
+                    ctx.kv_mode_override.unwrap_or(""),
+                    &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
+                    config.head_dim,
+                )
+                .mode,
+                KvTarget::Single(ctx.gpu),
+                &dims,
+            ) {
+                Ok(kv) => kv,
+                Err(error) => {
+                    scratch.free_gpu(ctx.gpu);
+                    let rollback = if let Some(transaction) = weight_store.take() {
+                        transaction.rollback(ctx.gpu)
+                    } else {
+                        Ok(())
+                    };
+                    weights.free_gpu(ctx.gpu);
+                    return Err(with_weight_rollback_error(
+                        format!("llama: <KvCache as KvCacheExt>::from_mode failed: {error}"),
+                        rollback,
+                    ));
+                }
+            };
+            (
+                config,
+                weights,
+                kv,
+                scratch,
+                manifest_plan,
+                weight_store,
+                mesh,
+                weight_origin,
+            )
+        }
+        ModelSource::Dir(source) => {
+            let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
+                .map_err(|e| format!("failed to parse LLaMA/Qwen3 config from config.json: {e}"))?;
+            let (mesh, manifest_plan) =
+                plan_single(&config, source.tensor_info("lm_head.weight").is_some())?;
+            let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
+            let weights =
+                hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
+                    .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+            let kv_mode_str = ctx
+                .kv_mode_override
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+            let rr = hipfire_runtime::kv_mode::resolve(
+                &kv_mode_str,
+                &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
+                config.head_dim,
+            );
+            if let Some(w) = rr.warning {
+                eprintln!(
+                    "  KV cache: {w} (site {})",
+                    hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
+                );
+            }
+            let dims = llama_kv_dims(&config, ctx.max_seq, Some(ctx.max_seq));
+            let kv =
+                match <KvCache as KvCacheExt>::from_mode(rr.mode, KvTarget::Single(ctx.gpu), &dims)
+                {
                     Ok(kv) => kv,
                     Err(error) => {
                         weights.free_gpu(ctx.gpu);
                         return Err(format!("KvCache: {error}"));
                     }
                 };
-                let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
-                    Ok(scratch) => scratch,
-                    Err(error) => {
-                        let _ = kv.free_gpu(ctx.gpu);
-                        weights.free_gpu(ctx.gpu);
-                        return Err(format!(
-                            "ForwardScratch::new_with_max_seq: {error:?}"
-                        ));
-                    }
-                };
-                (
-                    config,
-                    weights,
-                    kv,
-                    scratch,
-                    manifest_plan,
-                    None,
-                    mesh,
-                    weight_origin,
-                )
-            }
-        };
+            let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    let _ = kv.free_gpu(ctx.gpu);
+                    weights.free_gpu(ctx.gpu);
+                    return Err(format!("ForwardScratch::new_with_max_seq: {error:?}"));
+                }
+            };
+            (
+                config,
+                weights,
+                kv,
+                scratch,
+                manifest_plan,
+                None,
+                mesh,
+                weight_origin,
+            )
+        }
+    };
 
     let mut bundle = LlamaBundle {
         config,
@@ -756,15 +728,10 @@ impl LlamaBundle {
         transaction: WeightLoadTransaction,
     ) -> Result<(), (WeightLoadTransaction, String)> {
         if self.weight_store.is_some() {
-            return Err((
-                transaction,
-                "llama: weight store already attached".into(),
-            ));
+            return Err((transaction, "llama: weight store already attached".into()));
         }
-        let attached = match AttachedWeightStore::from_transaction(
-            transaction,
-            self.weight_origin,
-        ) {
+        let attached = match AttachedWeightStore::from_transaction(transaction, self.weight_origin)
+        {
             Ok(attached) => attached,
             Err((transaction, error)) => {
                 return Err((
@@ -800,20 +767,18 @@ impl LlamaBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_runtime::llama::ModelArch;
     use hipfire_runtime::arch_model::ArchModel;
-    use hipfire_runtime::hfq::{
-        write_hfqm_package_mem, HfqFile, HfqMemTensor,
-    };
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
     use hipfire_runtime::kv_backend::KvBackend;
     use hipfire_runtime::kv_mode::KvMode;
-    use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+    use hipfire_runtime::llama::ModelArch;
     use hipfire_runtime::llama::{
         forward_scratch_compute, forward_scratch_embed, KvCache, KvCacheExt, KvDims, KvLayers,
         KvTarget,
     };
-    use hipfire_runtime::weight_store::test_support;
+    use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
     use hipfire_runtime::weight_manifest::ShardPolicy;
+    use hipfire_runtime::weight_store::test_support;
     use hipfire_runtime::weight_store::{
         WeightLoadTransaction, WeightOrigin, WeightProjection, WeightProjectionKind, WeightStore,
     };
@@ -863,7 +828,6 @@ mod tests {
         }
     }
 
-
     fn fixture_hfq(
         with_awq_sidecar: bool,
         with_q_proj_bias: bool,
@@ -880,11 +844,7 @@ mod tests {
             f16_hfq_tensor("model.layers.0.mlp.gate_proj.weight", &[64, 32]),
             f16_hfq_tensor("model.layers.0.mlp.up_proj.weight", &[64, 32]),
             f16_hfq_tensor("model.layers.0.mlp.down_proj.weight", &[32, 64]),
-            f32_hfq_tensor(
-                "model.layers.0.input_layernorm.weight",
-                &[32],
-                false,
-            ),
+            f32_hfq_tensor("model.layers.0.input_layernorm.weight", &[32], false),
             f32_hfq_tensor(
                 "model.layers.0.post_attention_layernorm.weight",
                 &[32],
@@ -932,10 +892,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hipfire-g3-{}-{nonce}.hfq",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("hipfire-g3-{}-{nonce}.hfq", std::process::id()));
         write_hfqm_package_mem(&path, 0, metadata, &tensors).expect("write HFQ fixture");
         let hfq = HfqFile::open(&path).expect("open HFQ fixture");
         (path, hfq)
@@ -1002,7 +960,10 @@ mod tests {
         assert_eq!(mesh.n_devices(), 1);
         assert_eq!(plan.weights.len(), 12);
         assert_eq!(plan.state.len(), 1);
-        assert!(plan.collective_schedule.iter().any(|entry| entry.name == "wo"));
+        assert!(plan
+            .collective_schedule
+            .iter()
+            .any(|entry| entry.name == "wo"));
         assert!(manifest[0].dtype_constraint.accepts(DType::HFQ4G256));
         assert!(manifest[1].dtype_constraint.accepts(DType::MQ4G256));
         assert!(manifest[9].dtype_constraint.accepts(DType::F32));
@@ -1035,7 +996,6 @@ mod tests {
         assert!(transaction.contains("token_embd", None, 0));
         assert!(transaction.projection("lm_head", None, 0).is_some());
     }
-
 
     #[test]
     fn hfq_float_widening_matches_legacy_f32_representation() {
@@ -1192,12 +1152,9 @@ mod tests {
         let scratch = ForwardScratch::new_with_max_seq(&mut gpu, &config, 8)
             .expect("allocate legacy forward scratch");
         let dims = llama_kv_dims(&config, 8, None);
-        let mut kv = <KvCache as KvCacheExt>::from_mode(
-            KvMode::Q8,
-            KvTarget::Single(&mut gpu),
-            &dims,
-        )
-        .expect("allocate legacy KV cache");
+        let mut kv =
+            <KvCache as KvCacheExt>::from_mode(KvMode::Q8, KvTarget::Single(&mut gpu), &dims)
+                .expect("allocate legacy KV cache");
         forward_scratch_embed(&mut gpu, &legacy, &config, 1, 0, &scratch)
             .expect("legacy embedding forward");
         forward_scratch_compute(&mut gpu, &legacy, &config, 0, &mut kv, &scratch)
@@ -1210,9 +1167,7 @@ mod tests {
         legacy.free_gpu(&mut gpu);
 
         assert_eq!(manifest_logits.len(), legacy_logits.len());
-        for (index, (manifest, legacy)) in
-            manifest_logits.iter().zip(&legacy_logits).enumerate()
-        {
+        for (index, (manifest, legacy)) in manifest_logits.iter().zip(&legacy_logits).enumerate() {
             assert!(
                 (manifest - legacy).abs() <= 1e-5,
                 "logit mismatch at index {index}: manifest={manifest} legacy={legacy}"
@@ -1220,7 +1175,6 @@ mod tests {
         }
         std::fs::remove_file(path).expect("remove HFQ fixture");
     }
-
 
     #[test]
     fn physical_cap_is_honored_by_upstream_kv_constructor() {
@@ -1234,12 +1188,9 @@ mod tests {
             max_seq: 8,
             physical_cap: Some(4),
         };
-        let cache = <KvCache as KvCacheExt>::from_mode(
-            KvMode::Q8,
-            KvTarget::Single(&mut gpu),
-            &dims,
-        )
-        .expect("upstream Q8 constructor");
+        let cache =
+            <KvCache as KvCacheExt>::from_mode(KvMode::Q8, KvTarget::Single(&mut gpu), &dims)
+                .expect("upstream Q8 constructor");
         assert_eq!(cache.max_seq, 8);
         assert_eq!(cache.physical_cap, 4);
         let _ = cache.free_gpu(&mut gpu);

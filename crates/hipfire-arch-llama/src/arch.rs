@@ -17,8 +17,8 @@
 use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::weight_manifest::{
     DTypeConstraint, FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
 };
@@ -293,7 +293,14 @@ impl Llama {
     /// Pure state declaration for the full-attention LLaMA family.
     pub fn state_manifest(cfg: &LlamaConfig) -> Vec<StateEntry> {
         (0..cfg.n_layers)
-            .map(|layer| StateEntry::new(StateKind::Kv { quant: String::new() }, layer))
+            .map(|layer| {
+                StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    layer,
+                )
+            })
             .collect()
     }
 }

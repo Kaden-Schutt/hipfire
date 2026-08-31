@@ -30,9 +30,7 @@ use std::collections::HashSet;
 pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
     match policy {
         ShardPolicy::RowShard { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Tp }),
-        ShardPolicy::ExpertSharded { .. } => {
-            Some(CollectiveHint::AllReduce { kind: DimKind::Ep })
-        }
+        ShardPolicy::ExpertSharded { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Ep }),
         ShardPolicy::ExpertTensorSharded { inner, .. } => collective_for_policy(inner),
         _ => None,
     }
@@ -422,9 +420,10 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
             ShardPolicy::ColumnShard { axis }
             | ShardPolicy::RowShard { axis }
             | ShardPolicy::VocabShard { axis } => {
-                let dim = entry.logical_shape.get(*axis).ok_or_else(|| {
-                    format!("{context}: shard axis {axis} outside logical shape")
-                })?;
+                let dim = entry
+                    .logical_shape
+                    .get(*axis)
+                    .ok_or_else(|| format!("{context}: shard axis {axis} outside logical shape"))?;
                 if tp > 1 && dim % tp != 0 {
                     return Err(format!(
                         "{context}: shard dim {dim} (axis {axis}) not divisible by Tp={tp}"
@@ -511,11 +510,14 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                     ));
                 }
                 let axis = match inner.as_ref() {
-                    ShardPolicy::ColumnShard { axis: 1 }
-                    | ShardPolicy::RowShard { axis: 2 } => match inner.as_ref() {
-                        ShardPolicy::ColumnShard { axis } | ShardPolicy::RowShard { axis } => *axis,
-                        _ => unreachable!(),
-                    },
+                    ShardPolicy::ColumnShard { axis: 1 } | ShardPolicy::RowShard { axis: 2 } => {
+                        match inner.as_ref() {
+                            ShardPolicy::ColumnShard { axis } | ShardPolicy::RowShard { axis } => {
+                                *axis
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                     ShardPolicy::ColumnShard { axis } | ShardPolicy::RowShard { axis } => {
                         return Err(format!(
                             "{context}: ExpertTensorSharded inner axis {axis} is incompatible with [expert, projection, hidden]"
@@ -591,7 +593,10 @@ pub fn plan_manifest(
         })
         .collect();
     let band_xfers = (0..n_layers)
-        .filter_map(|layer| mesh.band_xfer_after(layer, n_layers).map(|hint| (layer, hint)))
+        .filter_map(|layer| {
+            mesh.band_xfer_after(layer, n_layers)
+                .map(|hint| (layer, hint))
+        })
         .collect();
     Ok(ManifestPlan {
         weights: weight_placements,
@@ -728,23 +733,14 @@ fn manifest_entry<'a>(
         .ok_or_else(|| format!("{context}: {label} reference '{name}' not found"))
 }
 
-fn source_policy_matches(
-    spec: &ExpertGroupSpec,
-    label: &str,
-    policy: &ShardPolicy,
-) -> bool {
+fn source_policy_matches(spec: &ExpertGroupSpec, label: &str, policy: &ShardPolicy) -> bool {
     match spec.parallelism {
         ExpertParallelism::Single => matches!(
             policy,
-            ShardPolicy::Replicate
-                | ShardPolicy::Pin(_)
-                | ShardPolicy::Tied { .. }
+            ShardPolicy::Replicate | ShardPolicy::Pin(_) | ShardPolicy::Tied { .. }
         ),
         ExpertParallelism::TensorParallel => match (label, policy) {
-            (
-                "gate_up" | "gate" | "up",
-                ShardPolicy::ExpertTensorSharded { n_experts, inner },
-            ) => {
+            ("gate_up" | "gate" | "up", ShardPolicy::ExpertTensorSharded { n_experts, inner }) => {
                 *n_experts == spec.n_experts
                     && matches!(inner.as_ref(), ShardPolicy::ColumnShard { axis: 1 })
             }
@@ -794,10 +790,7 @@ fn source_shape_matches(
     Ok(())
 }
 
-fn validate_expert_sources(
-    spec: &ExpertGroupSpec,
-    manifest: &[WeightEntry],
-) -> Result<(), String> {
+fn validate_expert_sources(spec: &ExpertGroupSpec, manifest: &[WeightEntry]) -> Result<(), String> {
     let context = expert_context(spec);
     let router = manifest_entry(spec, manifest, "router", &spec.router)?;
     if !matches!(router.logical_shape.len(), 1 | 2)
@@ -884,13 +877,19 @@ pub fn validate_expert_group_specs(
     for spec in specs {
         let context = expert_context(spec);
         if spec.group.is_empty() || spec.router.is_empty() || spec.execution.is_empty() {
-            return Err(format!("{context}: group/router/execution identities must be non-empty"));
+            return Err(format!(
+                "{context}: group/router/execution identities must be non-empty"
+            ));
         }
         if spec.n_experts == 0 || spec.resources.bytes_per_expert == 0 {
-            return Err(format!("{context}: n_experts and bytes_per_expert must be non-zero"));
+            return Err(format!(
+                "{context}: n_experts and bytes_per_expert must be non-zero"
+            ));
         }
         if spec.resources.alignment == 0 || !spec.resources.alignment.is_power_of_two() {
-            return Err(format!("{context}: alignment must be a non-zero power of two"));
+            return Err(format!(
+                "{context}: alignment must be a non-zero power of two"
+            ));
         }
         if !groups.insert((&spec.group, spec.layer)) {
             return Err(format!("{context}: duplicate group/layer identity"));
@@ -1002,13 +1001,7 @@ mod tests {
     #[test]
     fn expert_source_identity_and_shape_are_checked() {
         let manifest = vec![
-            WeightEntry::layer(
-                "router",
-                0,
-                vec![8, 4],
-                DType::F16,
-                ShardPolicy::Replicate,
-            ),
+            WeightEntry::layer("router", 0, vec![8, 4], DType::F16, ShardPolicy::Replicate),
             WeightEntry::layer(
                 "gate_up",
                 0,
@@ -1089,12 +1082,7 @@ mod tests {
 
     #[test]
     fn tied_entries_require_matching_representation_and_no_tied_chain() {
-        let source = WeightEntry::model(
-            "source",
-            vec![8, 8],
-            DType::F16,
-            ShardPolicy::Replicate,
-        );
+        let source = WeightEntry::model("source", vec![8, 8], DType::F16, ShardPolicy::Replicate);
         let shape_mismatch = WeightEntry::model(
             "shape_mismatch",
             vec![8, 4],
@@ -1161,16 +1149,15 @@ mod tests {
                 source: "cycle_a".into(),
             },
         );
-        assert!(validate_manifest(&[cycle_a, cycle_b], &DeviceMesh::single().expect("single-device mesh construction cannot overflow")).is_err());
+        assert!(validate_manifest(
+            &[cycle_a, cycle_b],
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
+        )
+        .is_err());
     }
     #[test]
     fn tied_entries_reject_different_source_sets_with_equal_logical_dtype() {
-        let source = WeightEntry::model(
-            "source",
-            vec![8, 8],
-            DType::F16,
-            ShardPolicy::Replicate,
-        );
+        let source = WeightEntry::model("source", vec![8, 8], DType::F16, ShardPolicy::Replicate);
         let tied = WeightEntry::model_with_dtype_constraint(
             "tied",
             vec![8, 8],
@@ -1182,7 +1169,7 @@ mod tests {
         );
         let error = validate_manifest(
             &[source, tied],
-            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow"),
         )
         .unwrap_err();
         assert!(error.contains("source dtype contract"));

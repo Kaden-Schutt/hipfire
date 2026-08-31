@@ -62,4 +62,3 @@ impl ArchModel for LlamaBundle {
         let _ = kv.free_gpu(gpu);
     }
 }
-
