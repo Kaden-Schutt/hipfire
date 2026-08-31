@@ -7983,7 +7983,8 @@ mod mqv2_moe {
         ));
         assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC
             .contains("void HIPFIRE_MQ4V2_GATE_UP_KERNEL("));
-        assert!(!GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC.contains("HIPFIRE_MQ4V2_GATE_UP_NOLDS"));
+        assert!(!GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC
+            .contains("#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1"));
         assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC.contains(
             "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
         ));
