@@ -54,7 +54,9 @@ impl ArchModel for LlamaBundle {
             // Attachment already checked the complete origin and created this
             // owner capability. There is no mismatch branch to leak the model:
             // an attached store can only be drained by this consuming owner.
-            store.drain(gpu);
+            if let Err(error) = store.drain(gpu) {
+                eprintln!("llama: failed to release attached weight store: {error}");
+            }
         }
         weights.free_gpu(gpu);
         let _ = kv.free_gpu(gpu);

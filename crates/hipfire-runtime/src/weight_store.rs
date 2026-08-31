@@ -358,10 +358,13 @@ impl WeightLoadTransaction {
 
     /// Consume this transaction and release every resident handle it owns.
     /// This is intentionally the only rollback operation exposed by the
-    /// lifecycle API.
-    pub fn rollback(mut self, gpu: &Gpu) {
+    /// lifecycle API. Successful frees are reflected in the resident-release
+    /// accounting; any failed HIP free is returned to the caller.
+    pub fn rollback(mut self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
         if let Some(store) = self.store.take() {
-            store.rollback(gpu);
+            store.rollback(gpu)
+        } else {
+            Ok(())
         }
     }
 }
@@ -512,19 +515,29 @@ impl WeightStore {
 
     /// Explicit rollback for a failed transaction. It consumes the partial
     /// store and frees every resident buffer on the single owning GPU.
-    fn rollback(self, gpu: &Gpu) {
-        self.release_unchecked(gpu);
+    fn rollback(self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
+        self.release_unchecked(gpu)
     }
 
-    fn release_unchecked(self, gpu: &Gpu) {
+    fn release_unchecked(self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
+        let mut first_error = None;
         for handle in self.placements.into_values() {
             if let WeightHandle::Resident(tensor) = handle {
-                // Rollback is deliberately direct and best-effort, matching
-                // the existing loader's explicit owner teardown. The store
-                // never relies on a destructor to release GPU memory.
-                let _ = gpu.hip.free(tensor.buf);
-                RESIDENT_RELEASES.with(|count| count.set(count.get() + 1));
+                match gpu.hip.free(tensor.buf) {
+                    Ok(()) => {
+                        RESIDENT_RELEASES.with(|count| count.set(count.get() + 1));
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
             }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -615,6 +628,18 @@ fn target_error(mesh: &DeviceMesh) -> Option<FulfillError> {
         ),
     })
 }
+fn rollback_fulfill_error(
+    store: WeightStore,
+    gpu: &Gpu,
+    mut error: FulfillError,
+) -> FulfillError {
+    if let Err(release_error) = store.rollback(gpu) {
+        error
+            .reason
+            .push_str(&format!("; resident rollback failed: {release_error}"));
+    }
+    error
+}
 
 /// Fulfill a manifest for a plain LLaMA Single target.
 ///
@@ -660,8 +685,7 @@ where
                     devices
                 ),
             };
-            store.rollback(gpu);
-            return Err(error);
+            return Err(rollback_fulfill_error(store, gpu, error));
         }
         let key = WeightPlacementKey::new(&entry.name, entry.layer, 0);
         if let ShardPolicy::Tied { source: source_name } = &entry.policy {
@@ -670,19 +694,18 @@ where
                 Some(WeightHandle::Alias(_)) | None => None,
             };
             let Some(actual_dtype) = source_dtype else {
-                store.rollback(gpu);
-                return Err(FulfillError {
+                let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
                     reason: format!(
                         "tied source '{source_name}' is unresolved or has no actual resident dtype"
                     ),
-                });
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
             };
             if !entry.dtype_constraint.accepts(actual_dtype) {
-                store.rollback(gpu);
-                return Err(FulfillError {
+                let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
@@ -690,7 +713,8 @@ where
                         "tied source '{source_name}' actual dtype {actual_dtype:?} is excluded by constraint {:?}",
                         entry.dtype_constraint
                     ),
-                });
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
             }
             let projection = projection_for(entry, 0, 1, actual_dtype);
             if let Err(reason) = store.insert(
@@ -698,13 +722,13 @@ where
                 WeightHandle::Alias(source_name.clone()),
                 projection,
             ) {
-                store.rollback(gpu);
-                return Err(FulfillError {
+                let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
                     reason: reason.to_string(),
-                });
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
             }
             continue;
         }
@@ -712,18 +736,17 @@ where
         let (bytes, dtype) = match source(entry) {
             Ok(value) => value,
             Err(reason) => {
-                store.rollback(gpu);
-                return Err(FulfillError {
+                let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
                     reason: format!("source read failed: {reason}"),
-                });
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
             }
         };
         if !entry.dtype_constraint.accepts(dtype) {
-            store.rollback(gpu);
-            return Err(FulfillError {
+            let error = FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: 0,
@@ -731,7 +754,8 @@ where
                     "source dtype {dtype:?} violates constraint {:?}",
                     entry.dtype_constraint
                 ),
-            });
+            };
+            return Err(rollback_fulfill_error(store, gpu, error));
         }
         if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
             let expected_bytes = entry
@@ -740,8 +764,7 @@ where
                 .try_fold(1usize, |count, &dim| count.checked_mul(dim))
                 .and_then(|elements| elements.checked_mul(dtype.size()));
             if expected_bytes != Some(bytes.len()) {
-                store.rollback(gpu);
-                return Err(FulfillError {
+                let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
@@ -751,40 +774,41 @@ where
                         expected_bytes,
                         entry.logical_shape
                     ),
-                });
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
             }
         }
         let mut tensor = match gpu.upload_raw(&bytes, &entry.logical_shape) {
             Ok(tensor) => tensor,
             Err(error) => {
-                store.rollback(gpu);
-                return Err(FulfillError {
+                let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
                     reason: format!("upload_raw failed: {error}"),
-                });
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
             }
         };
         tensor.dtype = dtype;
         let projection = projection_for(entry, 0, 1, dtype);
         if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
-            store.rollback(gpu);
-            return Err(FulfillError {
+            let error = FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: 0,
                 reason: reason.to_string(),
-            });
+            };
+            return Err(rollback_fulfill_error(store, gpu, error));
         }
         if test_support::record_resident_upload() {
-            store.rollback(gpu);
-            return Err(FulfillError {
+            let error = FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: 0,
                 reason: "test fault injected after resident upload".into(),
-            });
+            };
+            return Err(rollback_fulfill_error(store, gpu, error));
         }
     }
     Ok(WeightLoadTransaction::new(store))
@@ -825,8 +849,8 @@ mod tests {
 
     #[test]
     fn origin_mismatch_is_detected_before_gpu_release() {
-        let first = DeviceMesh::single();
-        let second = DeviceMesh::single();
+        let first = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let second = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let actual = WeightOrigin::from_parts(first.epoch(), 0, 0);
         let expected = WeightOrigin::from_parts(second.epoch(), 0, 0);
         let store = WeightStore::with_origin(actual);
@@ -842,7 +866,7 @@ mod tests {
 
     #[test]
     fn staged_rollback_removes_handles_and_projection_together() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let origin = WeightOrigin::from_parts(mesh.epoch(), 0, 0);
         let mut store = WeightStore::with_origin(origin);
         store
@@ -863,7 +887,7 @@ mod tests {
 
     #[test]
     fn assembly_drop_restores_staged_handles() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let mut store = WeightStore::with_origin(WeightOrigin::from_parts(mesh.epoch(), 0, 0));
         store
             .stage_alias("x", None, 0, "source", projection(DType::F16))
@@ -871,7 +895,8 @@ mod tests {
         {
             let mut assembly = store.begin_assembly();
             assert_eq!(assembly.take("x", None, 0), Some(0));
-            assert!(assembly.get(0).is_some());
+            let guard = assembly.commit();
+            assert!(guard.get(0).is_some());
         }
         assert!(store.contains("x", None, 0));
         assert!(store.projection("x", None, 0).is_some());
@@ -879,7 +904,7 @@ mod tests {
 
     #[test]
     fn repeated_unload_lookup_cannot_reclaim_a_transferred_cell() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let mut store = WeightStore::with_origin(WeightOrigin::from_parts(mesh.epoch(), 0, 0));
         store
             .stage_alias("x", None, 0, "source", projection(DType::F16))
@@ -892,7 +917,7 @@ mod tests {
 
     #[test]
     fn duplicate_projection_is_rejected_without_replacing_identity() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let mut store = WeightStore::with_origin(WeightOrigin::from_parts(mesh.epoch(), 0, 0));
         store
             .stage_alias("x", None, 0, "source-a", projection(DType::F16))
@@ -907,7 +932,8 @@ mod tests {
 
     #[test]
     fn single_target_refuses_multi_device_before_source_or_gpu_work() {
-        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)])
+            .expect("small test mesh construction cannot overflow");
         let entry = WeightEntry::model(
             "embed",
             vec![2, 2],
@@ -925,7 +951,7 @@ mod tests {
         let Ok(gpu) = Gpu::init() else {
             return;
         };
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let constraint = DTypeConstraint::source_from_sources(vec![DType::F16, DType::F32]);
         let source = WeightEntry::model_with_dtype_constraint(
             "source",
@@ -959,7 +985,9 @@ mod tests {
             transaction.get("alias", None, 0),
             Some(WeightHandle::Alias(source)) if source == "source"
         ));
-        transaction.rollback(&gpu);
+        transaction
+            .rollback(&gpu)
+            .expect("resident transaction rollback must free its HIP allocation");
     }
 
     #[test]
@@ -967,7 +995,7 @@ mod tests {
         let Ok(gpu) = Gpu::init() else {
             return;
         };
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
         let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
             Ok((vec![0; 4], DType::F32))
@@ -982,13 +1010,15 @@ mod tests {
             transaction.projection("resident", None, 0).unwrap().dtype,
             DType::F32
         );
-        transaction.rollback(&gpu);
+        transaction
+            .rollback(&gpu)
+            .expect("resident transaction rollback must free its HIP allocation");
     }
 
     #[test]
     fn full_origin_mismatch_leaves_unpublished_transaction_unchanged() {
-        let first = DeviceMesh::single();
-        let second = DeviceMesh::single();
+        let first = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let second = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let actual = WeightOrigin::from_parts(first.epoch(), 3, 11);
         let expected = WeightOrigin::from_parts(second.epoch(), 4, 12);
         let mut store = WeightStore::with_origin(actual);
@@ -1009,7 +1039,7 @@ mod tests {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
         let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
             Ok((vec![0; 4], DType::F32))
@@ -1024,10 +1054,48 @@ mod tests {
             0,
             "origin rejection must not free resident buffers"
         );
-        transaction.rollback(&gpu);
+        transaction
+            .rollback(&gpu)
+            .expect("resident transaction rollback must free its HIP allocation");
         assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
     }
 
+
+    #[test]
+    fn rollback_reports_free_failure_without_counting_release() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        test_support::reset();
+        RESIDENT_ALLOCATIONS.with(|count| count.set(1));
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let origin = WeightOrigin::from_parts(mesh.epoch(), 0, gpu.device_id);
+        let mut store = WeightStore::with_origin(origin);
+        let borrowed = GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    std::ptr::null_mut::<std::ffi::c_void>(),
+                    0,
+                )
+            },
+            shape: vec![0],
+            dtype: DType::F32,
+        };
+        store
+            .insert(
+                WeightPlacementKey::new("borrowed", None, 0),
+                WeightHandle::Resident(borrowed),
+                projection(DType::F32),
+            )
+            .expect("insert borrowed resident test handle");
+        let error = WeightLoadTransaction::new(store)
+            .rollback(&gpu)
+            .expect_err("rollback must surface a failed HIP free");
+        assert!(error.message.contains("borrowed"));
+        assert_eq!(test_support::resident_allocations(), 1);
+        assert_eq!(test_support::resident_releases(), 0);
+        test_support::reset();
+    }
 
     #[test]
     fn source_failure_after_resident_upload_rolls_back_everything() {
@@ -1035,7 +1103,7 @@ mod tests {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entries = vec![
             WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
@@ -1063,7 +1131,7 @@ mod tests {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let constraint = DTypeConstraint::source_exact(DType::F32);
         let entries = vec![
             WeightEntry::model_with_dtype_constraint(
@@ -1104,7 +1172,7 @@ mod tests {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entries = vec![
             WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),

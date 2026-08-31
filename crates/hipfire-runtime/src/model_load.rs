@@ -112,10 +112,13 @@ pub trait WeightSource {
     fn n_layers(&self) -> usize;
     /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1; llama no-op.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)>;
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor>;
     /// `can_alias` is true iff embed and output share a device (n==1); the
     /// implementation decides whether to use it (single-device LLaMA and
     /// qwen35 alias tied embeddings; multi-device routes re-materialize).
     fn read_output(
+        &mut self,
         gpu: &mut Gpu,
         embd: &GpuTensor,
         embd_fmt: EmbeddingFormat,
@@ -177,7 +180,8 @@ mod tests {
 
     #[test]
     fn mesh_layout_selects_stage_rank_zero_without_io() {
-        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]);
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)])
+            .expect("small test mesh construction cannot overflow");
         let layout = Layout::from_mesh(&mesh, 4);
         assert_eq!(layout.output_device(), 2);
         assert_eq!(

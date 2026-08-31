@@ -912,7 +912,8 @@ mod tests {
 
     #[test]
     fn placement_and_boundaries_use_named_mesh() {
-        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]);
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)])
+            .expect("small test mesh construction cannot overflow");
         let embed = WeightEntry::model(
             "token_embd",
             vec![32, 8],
@@ -955,7 +956,8 @@ mod tests {
 
     #[test]
     fn validation_covers_divisibility_ties_and_expert_shape() {
-        let tp3 = DeviceMesh::rect(&[(DimKind::Tp, 3)]);
+        let tp3 = DeviceMesh::rect(&[(DimKind::Tp, 3)])
+            .expect("small test mesh construction cannot overflow");
         assert!(validate_manifest(
             &[layer_entry("wo", 0, ShardPolicy::RowShard { axis: 1 })],
             &tp3
@@ -977,7 +979,11 @@ mod tests {
                 },
             ),
         ];
-        assert!(validate_manifest(&tied, &DeviceMesh::single()).is_ok());
+        assert!(validate_manifest(
+            &tied,
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
+        )
+        .is_ok());
         let bad_expert = WeightEntry::layer(
             "experts",
             0,
@@ -988,7 +994,11 @@ mod tests {
                 assign: ExpertAssign::Stride,
             },
         );
-        assert!(validate_manifest(&[bad_expert], &DeviceMesh::single()).is_err());
+        assert!(validate_manifest(
+            &[bad_expert],
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1071,7 +1081,7 @@ mod tests {
 
     #[test]
     fn planning_rejects_weight_layer_at_n_layers_and_accepts_last_layer() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let valid = layer_entry("w", 2, ShardPolicy::Replicate);
         assert!(plan_manifest(&[valid], &[], &mesh, 3).is_ok());
         let out_of_range = layer_entry("w", 3, ShardPolicy::Replicate);
@@ -1097,7 +1107,7 @@ mod tests {
         );
         assert!(validate_manifest(
             &[source.clone(), shape_mismatch],
-            &DeviceMesh::single()
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
         )
         .is_err());
 
@@ -1111,7 +1121,7 @@ mod tests {
         );
         assert!(validate_manifest(
             &[source.clone(), dtype_mismatch],
-            &DeviceMesh::single()
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
         )
         .is_err());
 
@@ -1133,7 +1143,7 @@ mod tests {
         );
         assert!(validate_manifest(
             &[source, chained_source, chain],
-            &DeviceMesh::single()
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
         )
         .is_err());
 
@@ -1153,7 +1163,7 @@ mod tests {
                 source: "cycle_a".into(),
             },
         );
-        assert!(validate_manifest(&[cycle_a, cycle_b], &DeviceMesh::single()).is_err());
+        assert!(validate_manifest(&[cycle_a, cycle_b], &DeviceMesh::single().expect("single-device mesh construction cannot overflow")).is_err());
     }
     #[test]
     fn tied_entries_reject_different_source_sets_with_equal_logical_dtype() {
@@ -1172,7 +1182,11 @@ mod tests {
                 source: "source".into(),
             },
         );
-        let error = validate_manifest(&[source, tied], &DeviceMesh::single()).unwrap_err();
+        let error = validate_manifest(
+            &[source, tied],
+            &DeviceMesh::single().expect("single-device mesh construction cannot overflow")
+        )
+        .unwrap_err();
         assert!(error.contains("source dtype contract"));
     }
 }

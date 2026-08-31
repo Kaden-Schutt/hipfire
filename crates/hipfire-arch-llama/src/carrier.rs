@@ -73,8 +73,18 @@ impl AttachedWeightStore {
         Ok(Self { transaction })
     }
 
-    pub(crate) fn drain(self, gpu: &mut rdna_compute::Gpu) {
-        self.transaction.rollback(gpu);
+    pub(crate) fn drain(self, gpu: &mut rdna_compute::Gpu) -> hip_bridge::HipResult<()> {
+        self.transaction.rollback(gpu)
+    }
+}
+
+fn with_weight_rollback_error(
+    reason: String,
+    rollback: hip_bridge::HipResult<()>,
+) -> String {
+    match rollback {
+        Ok(()) => reason,
+        Err(error) => format!("{reason}; resident rollback failed: {error}"),
     }
 }
 
@@ -82,7 +92,7 @@ fn plan_single(
     config: &LlamaConfig,
     has_separate_lm_head: bool,
 ) -> Result<(DeviceMesh, ManifestPlan), String> {
-    let mesh = DeviceMesh::single();
+    let mesh = DeviceMesh::single().map_err(|error| format!("llama: device mesh: {error}"))?;
     let manifest = Llama::weight_manifest_for_hfq(config, has_separate_lm_head);
     let state = Llama::state_manifest(config);
     let plan = plan_manifest(&manifest, &state, &mesh, config.n_layers)
@@ -566,8 +576,10 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                         let weights = match assemble_llama_weights(&config, &mut transaction) {
                             Ok(weights) => weights,
                             Err(error) => {
-                                transaction.rollback(ctx.gpu);
-                                return Err(error);
+                                return Err(with_weight_rollback_error(
+                                    error,
+                                    transaction.rollback(ctx.gpu),
+                                ));
                             }
                         };
                         (weights, Some(transaction))
@@ -581,12 +593,17 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                     match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
                         Ok(scratch) => scratch,
                         Err(error) => {
-                            if let Some(transaction) = weight_store.take() {
-                                transaction.rollback(ctx.gpu);
-                            }
+                            let rollback = if let Some(transaction) = weight_store.take() {
+                                transaction.rollback(ctx.gpu)
+                            } else {
+                                Ok(())
+                            };
                             weights.free_gpu(ctx.gpu);
-                            return Err(format!(
-                                "llama: ForwardScratch::new_with_max_seq failed: {error:?}"
+                            return Err(with_weight_rollback_error(
+                                format!(
+                                    "llama: ForwardScratch::new_with_max_seq failed: {error:?}"
+                                ),
+                                rollback,
                             ));
                         }
                     };
@@ -604,12 +621,17 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                     Ok(kv) => kv,
                     Err(error) => {
                         scratch.free_gpu(ctx.gpu);
-                        if let Some(transaction) = weight_store.take() {
-                            transaction.rollback(ctx.gpu);
-                        }
+                        let rollback = if let Some(transaction) = weight_store.take() {
+                            transaction.rollback(ctx.gpu)
+                        } else {
+                            Ok(())
+                        };
                         weights.free_gpu(ctx.gpu);
-                        return Err(format!(
-                            "llama: <KvCache as KvCacheExt>::from_mode failed: {error}"
+                        return Err(with_weight_rollback_error(
+                            format!(
+                                "llama: <KvCache as KvCacheExt>::from_mode failed: {error}"
+                            ),
+                            rollback,
                         ));
                     }
                 };
@@ -708,11 +730,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 kv,
                 ..
             } = bundle;
-            transaction.rollback(ctx.gpu);
+            let rollback = transaction.rollback(ctx.gpu);
             scratch.free_gpu(ctx.gpu);
             weights.free_gpu(ctx.gpu);
             let _ = kv.free_gpu(ctx.gpu);
-            return Err(error);
+            return Err(with_weight_rollback_error(error, rollback));
         }
     }
     Ok(bundle)
@@ -783,7 +805,8 @@ mod tests {
     use hipfire_runtime::kv_mode::KvMode;
     use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
     use hipfire_runtime::llama::{
-        weight_gemv, KvCache, KvCacheExt, KvDims, KvLayers, KvTarget,
+        forward_scratch_compute, forward_scratch_embed, KvCache, KvCacheExt, KvDims, KvLayers,
+        KvTarget,
     };
     use hipfire_runtime::weight_store::test_support;
     use hipfire_runtime::weight_store::{
@@ -951,23 +974,6 @@ mod tests {
         }
     }
 
-    fn output_for(
-        gpu: &mut rdna_compute::Gpu,
-        weights: &LlamaWeights,
-        hidden: &[f32],
-    ) -> Vec<f32> {
-        let input = gpu
-            .upload_f32(hidden, &[hidden.len()])
-            .expect("upload deterministic output input");
-        let output = gpu
-            .alloc_tensor(&[weights.output.m], DType::F32)
-            .expect("allocate deterministic output");
-        weight_gemv(gpu, &weights.output, &input, &output).expect("run output projection");
-        let values = gpu.download_f32(&output).expect("download output projection");
-        let _ = gpu.free_tensor(output);
-        let _ = gpu.free_tensor(input);
-        values
-    }
     #[test]
     fn single_plan_covers_every_typed_llama_handle() {
         let (mesh, plan) = plan_single(&config(), true).unwrap();
@@ -984,7 +990,7 @@ mod tests {
 
     #[test]
     fn typed_assembly_rolls_back_when_a_cell_is_not_resident() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let origin = WeightOrigin::from_parts(mesh.epoch(), 0, 0);
         let mut store = WeightStore::with_origin(origin);
         for name in ["token_embd", "output_norm", "lm_head"] {
@@ -1133,42 +1139,77 @@ mod tests {
     }
 
     #[test]
-    fn production_manifest_matches_legacy_numerical_output() {
+    fn production_manifest_matches_legacy_forward_logits() {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
         let (path, hfq) = fixture_hfq(false, false, false, false);
         let cask = CaskConfig::default();
         let mut ctx = load_ctx(&path, &mut gpu, &cask);
-        let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
-            .expect("load plain HFQ fixture through manifest path");
+        let mut bundle =
+            load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load plain HFQ fixture");
         drop(ctx);
-        assert!(bundle.weights.lm_head_aliases_embd);
-        let hidden: Vec<f32> = (0..bundle.config.dim)
-            .map(|index| (index as f32 + 1.0) / 17.0)
-            .collect();
-        let manifest_output = output_for(&mut gpu, &bundle.weights, &hidden);
+
+        let manifest_logits = {
+            forward_scratch_embed(
+                &mut gpu,
+                &bundle.weights,
+                &bundle.config,
+                1,
+                0,
+                &bundle.scratch,
+            )
+            .expect("manifest embedding forward");
+            forward_scratch_compute(
+                &mut gpu,
+                &bundle.weights,
+                &bundle.config,
+                0,
+                &mut bundle.kv,
+                &bundle.scratch,
+            )
+            .expect("manifest model forward");
+            gpu.download_f32(&bundle.scratch.logits)
+                .expect("download manifest logits")
+        };
         Box::new(bundle).free_gpu(&mut gpu);
 
         let hfq = HfqFile::open(&path).expect("reopen HFQ fixture");
         let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("fixture config");
         let legacy = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
             .expect("load legacy HFQ fixture");
-        assert!(legacy.lm_head_aliases_embd);
-        assert_eq!(legacy.embd_format, EmbeddingFormat::F32);
-        let legacy_output = output_for(&mut gpu, &legacy, &hidden);
+        let scratch = ForwardScratch::new_with_max_seq(&mut gpu, &config, 8)
+            .expect("allocate legacy forward scratch");
+        let dims = llama_kv_dims(&config, 8, None);
+        let mut kv = <KvCache as KvCacheExt>::from_mode(
+            KvMode::Q8,
+            KvTarget::Single(&mut gpu),
+            &dims,
+        )
+        .expect("allocate legacy KV cache");
+        forward_scratch_embed(&mut gpu, &legacy, &config, 1, 0, &scratch)
+            .expect("legacy embedding forward");
+        forward_scratch_compute(&mut gpu, &legacy, &config, 0, &mut kv, &scratch)
+            .expect("legacy model forward");
+        let legacy_logits = gpu
+            .download_f32(&scratch.logits)
+            .expect("download legacy logits");
+        scratch.free_gpu(&mut gpu);
+        let _ = kv.free_gpu(&mut gpu);
         legacy.free_gpu(&mut gpu);
 
-        assert_eq!(
-            manifest_output, legacy_output,
-            "manifest and legacy output projections must agree for the same input"
-        );
-        assert!(
-            manifest_output.iter().any(|value| *value != 0.0),
-            "parity assertion must observe a non-zero numerical output"
-        );
+        assert_eq!(manifest_logits.len(), legacy_logits.len());
+        for (index, (manifest, legacy)) in
+            manifest_logits.iter().zip(&legacy_logits).enumerate()
+        {
+            assert!(
+                (manifest - legacy).abs() <= 1e-5,
+                "logit mismatch at index {index}: manifest={manifest} legacy={legacy}"
+            );
+        }
         std::fs::remove_file(path).expect("remove HFQ fixture");
     }
+
 
     #[test]
     fn physical_cap_is_honored_by_upstream_kv_constructor() {
