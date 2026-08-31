@@ -70,29 +70,6 @@ enum MqV2PrefillProjection {
     GateUp,
     Residual,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mq4v2QkvzaRoute {
-    Generic,
-    K2048,
-    R4Gfx1100,
-    R4Gfx1201,
-}
-
-fn is_mq4v2_qkvza_k2048_r4_admitted(
-    arch: &str,
-    qkv_m: usize,
-    z_m: usize,
-    beta_m: usize,
-    alpha_m: usize,
-    k: usize,
-) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201")
-        && k == 2048
-        && qkv_m == 8192
-        && z_m == 4096
-        && beta_m == 32
-        && alpha_m == 32
-}
 
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
@@ -28416,26 +28393,12 @@ impl Gpu {
         alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let arch = self.arch_caps.arch();
-        let is_r4_admitted = self.flags.mq4v2_qkvza_k2048_r4_stream
-            && is_mq4v2_qkvza_k2048_r4_admitted(arch, qkv_m, z_m, beta_m, alpha_m, k);
-        let route = if is_r4_admitted {
-            match arch {
-                "gfx1100" => Mq4v2QkvzaRoute::R4Gfx1100,
-                "gfx1201" => Mq4v2QkvzaRoute::R4Gfx1201,
-                _ => unreachable!("R4 admitted only on gfx1100|gfx1201"),
-            }
-        } else if self.flags.rdna3_mq4v2_qkvza_k2048
+        let use_k2048 = self.flags.rdna3_mq4v2_qkvza_k2048
             && k == 2_048
-            && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201())
-        {
-            Mq4v2QkvzaRoute::K2048
-        } else {
-            Mq4v2QkvzaRoute::Generic
-        };
+            && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201());
         self.fused_qkvza_hfq4g256_mq4v2_impl(
             a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, route,
+            alpha_m, k, use_k2048,
         )
     }
 
@@ -28458,21 +28421,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.fused_qkvza_hfq4g256_mq4v2_impl(
-            a_qkv,
-            a_z,
-            a_beta,
-            a_alpha,
-            x,
-            y_qkv,
-            y_z,
-            y_beta,
-            y_alpha,
-            qkv_m,
-            z_m,
-            beta_m,
-            alpha_m,
-            k,
-            Mq4v2QkvzaRoute::Generic,
+            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+            alpha_m, k, false,
         )
     }
 
@@ -28494,52 +28444,10 @@ impl Gpu {
         alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let route = if k == 2_048 && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) {
-            Mq4v2QkvzaRoute::K2048
-        } else {
-            Mq4v2QkvzaRoute::Generic
-        };
+        let use_k2048 = k == 2_048 && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201());
         self.fused_qkvza_hfq4g256_mq4v2_impl(
             a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, route,
-        )
-    }
-
-    /// Exact K=2048 R4 streaming MQ4 v2 QKVZA candidate (four rows per wave).
-    /// Admitted only on exact shape/arch (gfx1100|gfx1201, K=2048,
-    /// qkv_m=8192, z_m=4096, beta_m=32, alpha_m=32); falls back to generic
-    /// without duplicating argument packing. Direct oracle for
-    /// `fused_qkvza_mq4g256v2_k2048_r4_stream_*` (grid 3088, block 32, LDS 0).
-    pub fn fused_qkvza_hfq4g256_mq4v2_k2048_r4_stream_exact(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        let arch = self.arch_caps.arch();
-        let route = if is_mq4v2_qkvza_k2048_r4_admitted(arch, qkv_m, z_m, beta_m, alpha_m, k) {
-            match arch {
-                "gfx1100" => Mq4v2QkvzaRoute::R4Gfx1100,
-                "gfx1201" => Mq4v2QkvzaRoute::R4Gfx1201,
-                _ => Mq4v2QkvzaRoute::Generic,
-            }
-        } else {
-            Mq4v2QkvzaRoute::Generic
-        };
-        self.fused_qkvza_hfq4g256_mq4v2_impl(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, route,
+            alpha_m, k, use_k2048,
         )
     }
 
@@ -28559,38 +28467,23 @@ impl Gpu {
         beta_m: usize,
         alpha_m: usize,
         k: usize,
-        route: Mq4v2QkvzaRoute,
+        use_k2048: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, source, func_name, profile_name, grid_div) = match route {
-            Mq4v2QkvzaRoute::Generic => (
-                "fused_qkvza_hfq4g256_mq4v2",
-                kernels::FUSED_QKVZA_MQ4G256V2_SRC,
-                "fused_qkvza_mq4g256v2",
-                "fused_qkvza_mq4g256v2",
-                1u32,
-            ),
-            Mq4v2QkvzaRoute::K2048 => (
+        let (module, source, func_name, profile_name) = if use_k2048 {
+            (
                 "fused_qkvza_hfq4g256_mq4v2_k2048",
                 kernels::FUSED_QKVZA_MQ4G256V2_K2048_SRC,
                 "fused_qkvza_mq4g256v2_k2048",
                 "fused_qkvza_mq4g256v2_k2048",
-                1u32,
-            ),
-            Mq4v2QkvzaRoute::R4Gfx1100 => (
-                "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100",
-                kernels::FUSED_QKVZA_MQ4G256V2_K2048_R4_STREAM_GFX1100_SRC,
-                "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100",
-                "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100",
-                4u32,
-            ),
-            Mq4v2QkvzaRoute::R4Gfx1201 => (
-                "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201",
-                kernels::FUSED_QKVZA_MQ4G256V2_K2048_R4_STREAM_GFX1201_SRC,
-                "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201",
-                "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201",
-                4u32,
-            ),
+            )
+        } else {
+            (
+                "fused_qkvza_hfq4g256_mq4v2",
+                kernels::FUSED_QKVZA_MQ4G256V2_SRC,
+                "fused_qkvza_mq4g256v2",
+                "fused_qkvza_mq4g256v2",
+            )
         };
         self.ensure_kernel(module, source, func_name)?;
         let aq = a_qkv.buf.as_ptr();
@@ -28608,7 +28501,6 @@ impl Gpu {
         let a_m_i = alpha_m as i32;
         let k_i = k as i32;
         let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        let grid = total / grid_div;
         let mut params: Vec<*mut c_void> = vec![
             &aq as *const _ as *mut c_void,
             &az as *const _ as *mut c_void,
@@ -28631,7 +28523,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result =
-            self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+            self.launch_maybe_blob(func_name, [total, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq);
                 b.push_ptr(az);

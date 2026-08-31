@@ -714,7 +714,7 @@ fn main() {
         let arch_ok = gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201();
         if !arch_ok {
             eprintln!(
-                "scalar_fused_qkvza_k2048(+r4_stream): skip (arch={} not gfx1100|gfx1201)",
+                "scalar_fused_qkvza_k2048: skip (arch={} not gfx1100|gfx1201)",
                 gpu.arch
             );
         } else {
@@ -813,112 +813,6 @@ fn main() {
                 "FAIL"
             };
             eprintln!("  scalar_fused_qkvza_k2048 K={K} N={n1}:{detail} {status}");
-        }
-
-        // Exact K=2048 R4 stream MQ4V2 QKVZA vs generic on the official shape.
-        // Device generic-vs-R4 only — no CPU f64 GEMM reference work.
-        if arch_ok {
-            const K: usize = 2_048;
-            // Official routing boundaries (all divisible by 4).
-            let ms = [8192usize, 4096, 32, 32];
-            let salts = [0xF4A0_0001u32, 0xF4A0_0002, 0xF4A0_0003, 0xF4A0_0004];
-            let parts = ["qkv", "z", "beta", "alpha"];
-            let x: Vec<f32> = (0..K).map(|i| prng(i, 0xC0FF_F4A0) * 2.0 - 1.0).collect();
-            let d_x = gpu.upload_f32(&x, &[K]).unwrap();
-            let mut d_as = Vec::with_capacity(4);
-            for i in 0..4 {
-                // Drop host blob immediately after upload to bound fixture memory.
-                let (_, d_a) = pack_upload_mq4v2(&mut gpu, ms[i], K, salts[i]);
-                d_as.push(d_a);
-            }
-            let mut d_refs = Vec::with_capacity(4);
-            let mut d_candidates = Vec::with_capacity(4);
-            let mut y_lens = Vec::with_capacity(4);
-            for &m in &ms {
-                let (d_ref, y_len) = upload_y_canary(&mut gpu, n1, m);
-                let (d_candidate, candidate_len) = upload_y_canary(&mut gpu, n1, m);
-                assert_eq!(candidate_len, y_len);
-                d_refs.push(d_ref);
-                d_candidates.push(d_candidate);
-                y_lens.push(y_len);
-            }
-            gpu.fused_qkvza_hfq4g256_mq4v2_generic_exact(
-                &d_as[0], &d_as[1], &d_as[2], &d_as[3], &d_x, &d_refs[0], &d_refs[1], &d_refs[2],
-                &d_refs[3], ms[0], ms[1], ms[2], ms[3], K,
-            )
-            .unwrap_or_else(|e| panic!("generic scalar fused_qkvza K=2048 R4-shape launch: {e}"));
-            gpu.hip.device_synchronize().unwrap();
-            gpu.fused_qkvza_hfq4g256_mq4v2_k2048_r4_stream_exact(
-                &d_as[0],
-                &d_as[1],
-                &d_as[2],
-                &d_as[3],
-                &d_x,
-                &d_candidates[0],
-                &d_candidates[1],
-                &d_candidates[2],
-                &d_candidates[3],
-                ms[0],
-                ms[1],
-                ms[2],
-                ms[3],
-                K,
-            )
-            .unwrap_or_else(|e| {
-                panic!("candidate scalar fused_qkvza K=2048 R4 stream launch: {e}")
-            });
-            gpu.hip.device_synchronize().unwrap();
-
-            let mut all_exact = true;
-            let mut all_canaries = true;
-            let mut nondegenerate = true;
-            let mut detail = String::new();
-            for i in 0..4 {
-                let (reference, ref_canary) =
-                    download_y_canary(&gpu, &d_refs[i], y_lens[i], n1, ms[i]);
-                let (candidate, candidate_canary) =
-                    download_y_canary(&gpu, &d_candidates[i], y_lens[i], n1, ms[i]);
-                let exact = reference
-                    .iter()
-                    .zip(&candidate)
-                    .all(|(a, b)| a.to_bits() == b.to_bits());
-                let canary = ref_canary && candidate_canary;
-                let varied = reference.iter().any(|value| value.abs() > 1.0e-6);
-                all_exact &= exact;
-                all_canaries &= canary;
-                nondegenerate &= varied;
-                detail.push_str(&format!(
-                    " {} exact={exact} canary={canary} varied={varied}",
-                    parts[i]
-                ));
-                if !exact {
-                    failures.push(format!(
-                        "scalar_fused_qkvza_k2048_r4_stream/{} bit mismatch",
-                        parts[i]
-                    ));
-                }
-                if !canary {
-                    failures.push(format!(
-                        "scalar_fused_qkvza_k2048_r4_stream/{} canary clobbered",
-                        parts[i]
-                    ));
-                }
-                if !varied {
-                    failures.push(format!(
-                        "scalar_fused_qkvza_k2048_r4_stream/{} degenerate output",
-                        parts[i]
-                    ));
-                }
-            }
-            let status = if all_exact && all_canaries && nondegenerate {
-                "ok"
-            } else {
-                "FAIL"
-            };
-            eprintln!(
-                "  scalar_fused_qkvza_k2048_r4_stream K={K} N={n1} Ms=({},{},{},{}):{detail} {status}",
-                ms[0], ms[1], ms[2], ms[3]
-            );
         }
     }
 
@@ -1191,7 +1085,7 @@ fn main() {
     }
 
     if failures.is_empty() {
-        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; K2048 one-row + R4-stream official-shape bit-exact vs generic on gfx1100|gfx1201; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201");
+        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201");
     } else {
         eprintln!("\nmq4v2_fused_parity: FAIL — {:?}", failures);
         std::process::exit(1);

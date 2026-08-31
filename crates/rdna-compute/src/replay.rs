@@ -1035,9 +1035,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
-        | "fused_qkvza_mq4g256v2"
-        | "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100"
-        | "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201" => Some(vec![
+        | "fused_qkvza_mq4g256v2" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1577,8 +1575,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "fused_qkvza_mq4g256v2"
-        | "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100"
-        | "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201"
         | "gated_delta_net_q8_fast" => Some(96),
         "gated_delta_net_f32" => Some(80),
         _ => None,
@@ -5504,8 +5500,6 @@ mod tests {
         "fused_qkvza_hfq4g256_ldsx8",
         "fused_qkvza_hfq4g256_reduce_chain",
         "fused_qkvza_mq4g256v2",
-        "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100",
-        "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201",
         "fused_qkv_mq4g256v2",
         "fused_gate_up_mq4g256v2",
         "fused_sigmoid_alpha_gate_f32",
@@ -6761,6 +6755,7 @@ mod tests {
 
     #[test]
     fn fused_qkvza_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let symbol = "fused_qkvza_mq4g256v2";
         let want = [
             read(0),
             read(8),
@@ -6772,16 +6767,14 @@ mod tests {
             write(56),
             write(64),
         ];
-        // Architecture-unique R4 identities keep the generic QKVZA ABI independently;
-        // never alias either symbol onto generic/one-row/the other arch.
-        let symbols = [
-            "fused_qkvza_mq4g256v2",
-            "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1100",
-            "fused_qkvza_mq4g256v2_k2048_r4_stream_gfx1201",
-        ];
-        assert_ne!(symbols[0], symbols[1]);
-        assert_ne!(symbols[0], symbols[2]);
-        assert_ne!(symbols[1], symbols[2]);
+
+        assert_eq!(expected_kernarg_bytes(symbol), Some(96));
+        let got = pointer_effects(symbol).expect("mq4g256v2 qkvza pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
 
         // 9 ptr + 5 i32 dimensions = 92 explicit bytes, pad_to(16) → 96.
         let mut blob = hip_bridge::KernargBlob::new();
@@ -6794,21 +6787,7 @@ mod tests {
         assert_eq!(blob.len(), 92, "explicit kernel arguments occupy 92 bytes");
         blob.pad_to(16);
         assert_eq!(blob.len(), 96, "recorded launches pad to 16 bytes");
-
-        for symbol in symbols {
-            assert_eq!(expected_kernarg_bytes(symbol), Some(96));
-            let got = pointer_effects(symbol).expect("mq4g256v2 qkvza pointer contract");
-            assert_eq!(got.len(), want.len());
-            for (got_effect, want_effect) in got.iter().zip(want.iter()) {
-                assert_eq!(got_effect.offset, want_effect.offset);
-                assert_eq!(got_effect.mode, want_effect.mode);
-            }
-            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
-            assert!(
-                A3B_REPLAY_KERNELS.contains(&symbol),
-                "{symbol} missing from A3B replay kernel catalog"
-            );
-        }
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
     }
 
     #[test]
