@@ -10,7 +10,7 @@ use crate::dispatch::{
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 /// Batch ceilings for the LDS-staged HFQ4-G256 GEMMs (`HIPFIRE_HFQ4G256_LDSSTAGE=1`).
 /// The staged kernels win while the grid is small and lose once the added LDS
@@ -74,7 +74,6 @@ enum MqV2PrefillProjection {
 enum Mq4v2QkvzaVariant {
     Generic,
     HoistX32,
-    K2048LdsX8Gfx1100,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28406,22 +28405,9 @@ impl Gpu {
         alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // Measured gfx1100 K=2048 hoist specialization is the default production
-        // route (generic ~18 us/call → hoist ~10.38 us/call). Opt-in LDSX8
-        // eight-wave activation sharing is gated on exact production dims.
-        static GFX1100_MQ4V2_QKVZA_LDSX8: LazyLock<bool> = LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_QKVZA_LDSX8").as_deref() == Ok("1")
-        });
-        let ldsx8 = self.arch == "gfx1100"
-            && k == 2048
-            && qkv_m == 256
-            && z_m == 1
-            && beta_m == 512
-            && alpha_m == 512
-            && *GFX1100_MQ4V2_QKVZA_LDSX8;
-        let variant = if ldsx8 {
-            Mq4v2QkvzaVariant::K2048LdsX8Gfx1100
-        } else if self.arch == "gfx1100" && k == 2048 {
+        // Measured gfx1100 K=2048 hoist specialization is the only production
+        // route (generic ~18 us/call → hoist ~10.38 us/call).
+        let variant = if self.arch == "gfx1100" && k == 2048 {
             Mq4v2QkvzaVariant::HoistX32
         } else {
             Mq4v2QkvzaVariant::Generic
@@ -28498,43 +28484,6 @@ impl Gpu {
         )
     }
 
-    #[doc(hidden)]
-    pub fn fused_qkvza_hfq4g256_mq4v2_k2048_ldsx8_gfx1100_exact(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.fused_qkvza_hfq4g256_mq4v2_dispatch(
-            a_qkv,
-            a_z,
-            a_beta,
-            a_alpha,
-            x,
-            y_qkv,
-            y_z,
-            y_beta,
-            y_alpha,
-            qkv_m,
-            z_m,
-            beta_m,
-            alpha_m,
-            k,
-            Mq4v2QkvzaVariant::K2048LdsX8Gfx1100,
-        )
-    }
-
     fn fused_qkvza_hfq4g256_mq4v2_dispatch(
         &mut self,
         a_qkv: &GpuTensor,
@@ -28554,30 +28503,18 @@ impl Gpu {
         variant: Mq4v2QkvzaVariant,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, src, func_name, profile_name, block, grid_x) = match variant {
+        let (module, src, func_name, profile_name) = match variant {
             Mq4v2QkvzaVariant::Generic => (
                 "fused_qkvza_hfq4g256_mq4v2",
                 kernels::FUSED_QKVZA_MQ4G256V2_SRC,
                 "fused_qkvza_mq4g256v2",
                 "fused_qkvza_mq4g256v2",
-                [32u32, 1, 1],
-                (qkv_m + z_m + beta_m + alpha_m) as u32,
             ),
             Mq4v2QkvzaVariant::HoistX32 => (
                 "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
                 kernels::FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC,
                 "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
                 "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
-                [32u32, 1, 1],
-                (qkv_m + z_m + beta_m + alpha_m) as u32,
-            ),
-            Mq4v2QkvzaVariant::K2048LdsX8Gfx1100 => (
-                "fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100",
-                kernels::FUSED_QKVZA_MQ4G256V2_K2048_LDSX8_GFX1100_SRC,
-                "fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100",
-                "fused_qkvza_mq4g256v2_k2048_ldsx8_gfx1100",
-                [256u32, 1, 1],
-                ((qkv_m + z_m + beta_m + alpha_m) as u32).div_ceil(8),
             ),
         };
         self.ensure_kernel(module, src, func_name)?;
@@ -28595,6 +28532,7 @@ impl Gpu {
         let b_m_i = beta_m as i32;
         let a_m_i = alpha_m as i32;
         let k_i = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
         let mut params: Vec<*mut c_void> = vec![
             &aq as *const _ as *mut c_void,
             &az as *const _ as *mut c_void,
@@ -28617,7 +28555,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result =
-            self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
+            self.launch_maybe_blob(func_name, [total, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq);
                 b.push_ptr(az);
