@@ -3314,7 +3314,7 @@ pub fn handle_redline_shadow(
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
-            gpu.replay_recorded_hip_prefix(prepared.0)
+            gpu.replay_recorded_hip_prefix_at(prepared.0, context + i)
                 .map_err(|error| error.to_string())?;
         }
         gpu.hip

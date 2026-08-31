@@ -1016,14 +1016,15 @@ pub fn run_moe_decode(
             } else if !router_shared_fuse {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
-            // Opt-in one-launch fuse for exact Ornith qt44 shared-down shape.
-            // The scalar has no later read in this executor. `ffn_out` is dead
-            // here on the indexed path; on the generic fallback its next access
-            // is an overwrite by routed-expert down. Unset/0 and every non-exact
-            // case keep sigmoid + plain V2 GEMV + scaled_add.
+            // Default-on one-launch fuse for the exact Ornith qt44 shared-down
+            // shape. The scalar has no later read in this executor. `ffn_out`
+            // is dead here on the indexed path; on the generic fallback its
+            // next access is an overwrite by routed-expert down. `0` or an
+            // invalid override keeps sigmoid + plain V2 GEMV + scaled_add.
             static MQ4V2_SHARED_DOWN_FUSED: LazyLock<bool> = LazyLock::new(|| {
-                hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED").as_deref()
-                    == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED")
+                    .map(|value| value == "1")
+                    .unwrap_or(true)
             });
             let use_mq4v2_shared_down_fused = *MQ4V2_SHARED_DOWN_FUSED
                 && p.shared_down_w.dtype == DType::MQ4G256V2
@@ -1964,10 +1965,13 @@ fn run_moe_decode_cpu_fallback(
             hip!(gpu.fused_silu_mul_rotate_mq(shared_gate, shared_up, &x_rot_alias, p.smi))?;
         }
         // `scalar_buf` has no later read; `ffn_out` is overwritten by the first
-        // routed-expert down before being consumed. The fused arm may therefore
-        // leave both scratch buffers untouched.
+        // routed-expert down before being consumed. The exact product shape
+        // therefore defaults to the fused arm; `0` or an invalid override
+        // retains the generic three-launch route.
         static MQ4V2_SHARED_DOWN_FUSED_FB: LazyLock<bool> = LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED").as_deref() == Ok("1")
+            hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED")
+                .map(|value| value == "1")
+                .unwrap_or(true)
         });
         let use_mq4v2_shared_down_fused = *MQ4V2_SHARED_DOWN_FUSED_FB
             && p.shared_down_w.dtype == DType::MQ4G256V2
