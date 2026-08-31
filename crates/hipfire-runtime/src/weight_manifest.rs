@@ -364,6 +364,23 @@ fn validate_shape(entry: &WeightEntry) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_weight_layers(
+    manifest: &[WeightEntry],
+    n_layers: usize,
+) -> Result<(), String> {
+    for entry in manifest {
+        if let Some(layer) = entry.layer {
+            if layer >= n_layers {
+                return Err(format!(
+                    "{} layer {} outside n_layers={n_layers}",
+                    entry.name, layer
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate logical shard math and tied source identity before fulfillment.
 pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<(), String> {
     let mut identities = HashSet::new();
@@ -431,6 +448,30 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                 if source_entry.identity() == entry.identity() {
                     return Err(format!("{context}: an entry cannot tie to itself"));
                 }
+                if source_entry.logical_shape != entry.logical_shape {
+                    return Err(format!(
+                        "{context}: tied source '{source}' shape {:?} does not match {:?}",
+                        source_entry.logical_shape, entry.logical_shape
+                    ));
+                }
+                if source_entry.dtype != entry.dtype {
+                    return Err(format!(
+                        "{context}: tied source '{source}' dtype {:?} does not match {:?}",
+                        source_entry.dtype, entry.dtype
+                    ));
+                }
+                if !entry.dtype_constraint.accepts(source_entry.dtype)
+                    || !source_entry.dtype_constraint.accepts(entry.dtype)
+                {
+                    return Err(format!(
+                        "{context}: tied source '{source}' violates the source dtype contract"
+                    ));
+                }
+                if matches!(&source_entry.policy, ShardPolicy::Tied { .. }) {
+                    return Err(format!(
+                        "{context}: tied source '{source}' is itself tied; chains and cycles are unsupported"
+                    ));
+                }
             }
             ShardPolicy::ExpertSharded { n_experts, .. } => {
                 if *n_experts == 0 || entry.logical_shape.first() != Some(n_experts) {
@@ -486,6 +527,7 @@ pub fn plan_manifest(
     mesh: &DeviceMesh,
     n_layers: usize,
 ) -> Result<ManifestPlan, String> {
+    validate_weight_layers(weights, n_layers)?;
     validate_manifest(weights, mesh)?;
     let mut state_ids = HashSet::new();
     for entry in state {
@@ -1001,5 +1043,92 @@ mod tests {
             }
         };
         assert!(validate_expert_group_specs(&[bad], &manifest).is_err());
+    }
+
+    #[test]
+    fn planning_rejects_weight_layer_at_n_layers_and_accepts_last_layer() {
+        let mesh = DeviceMesh::single();
+        let valid = layer_entry("w", 2, ShardPolicy::Replicate);
+        assert!(plan_manifest(&[valid], &[], &mesh, 3).is_ok());
+        let out_of_range = layer_entry("w", 3, ShardPolicy::Replicate);
+        let error = plan_manifest(&[out_of_range], &[], &mesh, 3).unwrap_err();
+        assert!(error.contains("outside n_layers=3"));
+    }
+
+    #[test]
+    fn tied_entries_require_matching_representation_and_no_tied_chain() {
+        let source = WeightEntry::model(
+            "source",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Replicate,
+        );
+        let shape_mismatch = WeightEntry::model(
+            "shape_mismatch",
+            vec![8, 4],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "source".into(),
+            },
+        );
+        assert!(validate_manifest(
+            &[source.clone(), shape_mismatch],
+            &DeviceMesh::single()
+        )
+        .is_err());
+
+        let dtype_mismatch = WeightEntry::model(
+            "dtype_mismatch",
+            vec![8, 8],
+            DType::F32,
+            ShardPolicy::Tied {
+                source: "source".into(),
+            },
+        );
+        assert!(validate_manifest(
+            &[source.clone(), dtype_mismatch],
+            &DeviceMesh::single()
+        )
+        .is_err());
+
+        let chained_source = WeightEntry::model(
+            "chained_source",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "source".into(),
+            },
+        );
+        let chain = WeightEntry::model(
+            "chain",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "chained_source".into(),
+            },
+        );
+        assert!(validate_manifest(
+            &[source, chained_source, chain],
+            &DeviceMesh::single()
+        )
+        .is_err());
+
+        let cycle_a = WeightEntry::model(
+            "cycle_a",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "cycle_b".into(),
+            },
+        );
+        let cycle_b = WeightEntry::model(
+            "cycle_b",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "cycle_a".into(),
+            },
+        );
+        assert!(validate_manifest(&[cycle_a, cycle_b], &DeviceMesh::single()).is_err());
     }
 }

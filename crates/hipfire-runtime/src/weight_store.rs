@@ -11,15 +11,20 @@
 //!
 //! The store is not a model owner. It has no `Drop` implementation and never
 //! frees GPU buffers implicitly. A carrier may move a committed store into its
-//! existing `ArchModel` owner; that owner must call [`WeightStore::release_on_owner`]
-//! during its existing teardown path. `take` transfers a resident handle to the
-//! owner that is assembling typed weights, and therefore removes the cell from
-//! the store's cleanup set.
+//! existing `ArchModel` owner; that owner must transfer its resident handles
+//! through [`WeightStore::take_all`] during the existing teardown path.
+//! `take` transfers a resident handle to the owner that is assembling typed
+//! weights, and therefore removes the cell from the store's cleanup set.
 
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
 use hipfire_hardware::{DeviceMesh, MeshEpoch};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
+
+#[cfg(test)]
+thread_local! {
+    static RESIDENT_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Stable logical placement identity. Layer is part of the key because a
 /// per-layer name such as `wq` appears once for every decoder block.
@@ -199,8 +204,8 @@ impl std::error::Error for FulfillError {}
 /// `(name, layer, device)` and captures the target origin once.
 ///
 /// There is intentionally no `Drop` implementation. A `WeightStore` that is
-/// abandoned without explicit rollback/release leaks rather than guessing a
-/// GPU owner; production callers keep it beneath `ArchModel`.
+/// abandoned without explicit rollback or owner transfer leaks rather than
+/// guessing a GPU owner; production callers keep it beneath `ArchModel`.
 #[derive(Default)]
 pub struct WeightStore {
     placements: HashMap<WeightPlacementKey, WeightHandle>,
@@ -355,21 +360,25 @@ impl WeightStore {
         self.validate_origin_value(WeightOrigin::for_single(mesh, gpu))
     }
 
-    /// Explicit owner teardown. This method is intentionally consuming and has
-    /// no implicit/drop fallback; `ArchModel::free_gpu` is the production call
-    /// site. Callers must validate the target first with [`validate_origin`].
-    /// On mismatch the original store is returned unchanged for retry by the
-    /// owner; no GPU call occurs.
-    pub fn release_on_owner(
+    /// Roll back a fulfilled store before it is published beneath a model
+    /// owner. This is the only public consuming GPU-free operation: callers
+    /// may use it while a load transaction is still unpublished, but an
+    /// attached store can only be drained by the model owner via `take_all`.
+    pub fn rollback_unpublished(self, gpu: &Gpu) {
+        self.release_unchecked(gpu);
+    }
+
+    /// Transfer every resident/alias handle to the model owner after checking
+    /// the complete captured origin. On mismatch, the original store is
+    /// returned unchanged so the owner can retry against the correct target.
+    pub fn take_all(
         self,
-        mesh: &DeviceMesh,
-        gpu: &mut Gpu,
-    ) -> Result<(), (Self, WeightStoreError)> {
-        if let Err(error) = self.validate_origin(mesh, gpu) {
+        expected: WeightOrigin,
+    ) -> Result<Vec<WeightHandle>, (Self, WeightStoreError)> {
+        if let Err(error) = self.validate_origin_value(expected) {
             return Err((self, error));
         }
-        self.release_unchecked(gpu);
-        Ok(())
+        Ok(self.placements.into_values().collect())
     }
 
     /// Explicit rollback for a failed transaction. It consumes the partial
@@ -385,6 +394,8 @@ impl WeightStore {
                 // the existing loader's explicit owner teardown. The store
                 // never relies on a destructor to release GPU memory.
                 let _ = gpu.hip.free(tensor.buf);
+                #[cfg(test)]
+                RESIDENT_RELEASES.with(|count| count.set(count.get() + 1));
             }
         }
     }
@@ -496,7 +507,9 @@ where
     if let Some(error) = target_error(mesh) {
         return Err(error);
     }
-    if let Err(reason) = crate::weight_manifest::validate_manifest(weights, mesh) {
+    if let Err(reason) = crate::weight_manifest::validate_weight_layers(weights, n_layers)
+        .and_then(|_| crate::weight_manifest::validate_manifest(weights, mesh))
+    {
         return Err(FulfillError {
             name: "<manifest>".to_string(),
             layer: None,
@@ -564,6 +577,27 @@ where
                     entry.dtype_constraint
                 ),
             });
+        }
+        if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            let expected_bytes = entry
+                .logical_shape
+                .iter()
+                .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+                .and_then(|elements| elements.checked_mul(dtype.size()));
+            if expected_bytes != Some(bytes.len()) {
+                store.rollback(gpu);
+                return Err(FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: 0,
+                    reason: format!(
+                        "source payload has {} bytes, expected {:?} for {dtype:?} {:?}",
+                        bytes.len(),
+                        expected_bytes,
+                        entry.logical_shape
+                    ),
+                });
+            }
         }
         let mut tensor = match gpu.upload_raw(&bytes, &entry.logical_shape) {
             Ok(tensor) => tensor,
@@ -720,5 +754,187 @@ mod tests {
         // Gpu; the closure would be unreachable on this path.
         assert!(target_error(&mesh).is_some());
         assert_eq!(placement_devices(&entry, &mesh, 1), vec![0]);
+    }
+
+    #[test]
+    fn successful_single_fulfillment_commits_resident_projection() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        let mesh = DeviceMesh::single();
+        let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
+        let store = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
+            Ok((vec![0; 4], DType::F32))
+        })
+        .unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(matches!(
+            store.get("resident", None, 0),
+            Some(WeightHandle::Resident(tensor)) if tensor.dtype == DType::F32
+        ));
+        assert_eq!(
+            store.projection("resident", None, 0).unwrap().dtype,
+            DType::F32
+        );
+        store.rollback_unpublished(&gpu);
+    }
+
+    #[test]
+    fn full_origin_mismatch_returns_resident_store_unchanged() {
+        let first = DeviceMesh::single();
+        let second = DeviceMesh::single();
+        let actual = WeightOrigin::from_parts(first.epoch(), 3, 11);
+        let expected = WeightOrigin::from_parts(second.epoch(), 4, 12);
+        let mut store = WeightStore::with_origin(actual);
+        store
+            .stage_alias("resident", None, 0, "source", projection(DType::F16))
+            .unwrap();
+        let (store, error) = match store.take_all(expected) {
+            Ok(_) => panic!("origin mismatch unexpectedly succeeded"),
+            Err(value) => value,
+        };
+        assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
+        assert_eq!(store.origin(), Some(actual));
+        assert!(store.contains("resident", None, 0));
+        assert!(store.projection("resident", None, 0).is_some());
+    }
+
+    #[test]
+    fn full_origin_mismatch_does_not_free_a_resident_store() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        RESIDENT_RELEASES.with(|count| count.set(0));
+        let mesh = DeviceMesh::single();
+        let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
+        let store = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
+            Ok((vec![0; 4], DType::F32))
+        })
+        .unwrap();
+        let expected = WeightOrigin::from_parts(mesh.epoch(), 1, gpu.device_id);
+        let (store, error) = match store.take_all(expected) {
+            Ok(_) => panic!("origin mismatch unexpectedly succeeded"),
+            Err(value) => value,
+        };
+        assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            RESIDENT_RELEASES.with(std::cell::Cell::get),
+            0,
+            "origin rejection must not free resident buffers"
+        );
+        store.rollback_unpublished(&gpu);
+        assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn owner_transfer_is_consuming_and_empty_transfer_is_idempotent() {
+        let mesh = DeviceMesh::single();
+        let origin = WeightOrigin::from_parts(mesh.epoch(), 0, 0);
+        let mut store = WeightStore::with_origin(origin);
+        store
+            .stage_alias("owned", None, 0, "source", projection(DType::F16))
+            .unwrap();
+        let handles = store.take_all(origin).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert!(matches!(
+            handles.into_iter().next(),
+            Some(WeightHandle::Alias(_))
+        ));
+        let second = WeightStore::with_origin(origin).take_all(origin).unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn source_failure_after_resident_upload_rolls_back_everything() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        RESIDENT_RELEASES.with(|count| count.set(0));
+        let mesh = DeviceMesh::single();
+        let entries = vec![
+            WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
+            WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
+        ];
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, |entry| {
+            if entry.name == "first" {
+                Ok((vec![0; 4], DType::F32))
+            } else {
+                Err("injected source failure".into())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.name, "second");
+        assert!(error.reason.contains("source read failed"));
+        assert_eq!(
+            RESIDENT_RELEASES.with(std::cell::Cell::get),
+            1,
+            "the first resident allocation must be explicitly freed"
+        );
+    }
+
+    #[test]
+    fn dtype_failure_after_resident_upload_rolls_back_everything() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        RESIDENT_RELEASES.with(|count| count.set(0));
+        let mesh = DeviceMesh::single();
+        let constraint = DTypeConstraint::source_exact(DType::F32);
+        let entries = vec![
+            WeightEntry::model_with_dtype_constraint(
+                "first",
+                vec![1],
+                DType::F32,
+                constraint.clone(),
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::model_with_dtype_constraint(
+                "second",
+                vec![1],
+                DType::F32,
+                constraint,
+                ShardPolicy::Replicate,
+            ),
+        ];
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, |entry| {
+            if entry.name == "first" {
+                Ok((vec![0; 4], DType::F32))
+            } else {
+                Ok((vec![0; 2], DType::F16))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.name, "second");
+        assert!(error.reason.contains("violates constraint"));
+        assert_eq!(
+            RESIDENT_RELEASES.with(std::cell::Cell::get),
+            1,
+            "the first resident allocation must be explicitly freed"
+        );
+    }
+
+    #[test]
+    fn malformed_upload_payload_after_resident_allocation_rolls_back() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        RESIDENT_RELEASES.with(|count| count.set(0));
+        let mesh = DeviceMesh::single();
+        let entries = vec![
+            WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
+            WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
+        ];
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, |entry| {
+            if entry.name == "first" {
+                Ok((vec![0; 4], DType::F32))
+            } else {
+                Ok((vec![0; 1], DType::F32))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.name, "second");
+        assert!(error.reason.contains("payload"));
+        assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
     }
 }

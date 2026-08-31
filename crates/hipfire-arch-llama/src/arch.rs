@@ -20,7 +20,7 @@ use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::weight_manifest::{
-    FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+    DTypeConstraint, FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
 };
 use rdna_compute::{DType, Gpu};
 
@@ -38,6 +38,58 @@ use hipfire_runtime::llama::{attention_family, AttnParams, KvTierInputs, KvTierP
 /// MoE / Qwen3MoE (`arch_id = 6`) are NOT covered by this marker —
 /// see [`hipfire_arch_qwen35::Qwen35`] for those.
 pub struct Llama;
+
+fn linear_source_constraint() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![
+        DType::F32,
+        DType::Q4F16G64,
+        DType::Q8_0,
+        DType::Q4K,
+        DType::Q8HFQ,
+        DType::HFQ4G256,
+        DType::HFQ4G128,
+        DType::HFQ6G256,
+        DType::HFQ2G256,
+        DType::HFQ2G128,
+        DType::HFQ3G256,
+        DType::HFQ3G128,
+        DType::MQ4G256,
+        DType::MQ8G256,
+        DType::MQ6G256,
+        DType::MQ3G256,
+        DType::MQ2G256,
+        DType::MQ2G256Lloyd,
+        DType::MQ2G256LloydU,
+        DType::MQ3G256Lloyd,
+        DType::HFP4G32,
+        DType::MFP4G32,
+        DType::MQ4G256Lloyd,
+        DType::MQ2G256GL,
+        DType::MQ3G256GL,
+        DType::TQ2G128,
+        DType::BQ1G128,
+        DType::MQ4G256V2,
+        DType::MQ4CG256,
+        DType::MQ6G256V2,
+        DType::MQ5G256V2,
+        DType::MQ3G256V2,
+        DType::MQ2G256V2,
+    ])
+}
+
+fn embedding_source_constraint() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![
+        DType::F32,
+        DType::Q8_0,
+        DType::Q4K,
+        DType::HFQ4G256,
+        DType::HFQ4G128,
+    ])
+}
+
+fn norm_source_constraint() -> DTypeConstraint {
+    DTypeConstraint::source_exact(DType::F32)
+}
 
 impl Architecture for Llama {
     type Weights = LlamaWeights;
@@ -85,19 +137,24 @@ impl Llama {
         use ShardPolicy::*;
         let (dim, hidden, head_dim) = (cfg.dim, cfg.hidden_dim, cfg.head_dim);
         let (heads, kv_heads) = (cfg.n_heads, cfg.n_kv_heads);
+        let linear = linear_source_constraint();
+        let embedding = embedding_source_constraint();
+        let norm = norm_source_constraint();
         let mut manifest = Vec::with_capacity(cfg.n_layers * 11 + 3);
-        manifest.push(WeightEntry::model(
+        manifest.push(WeightEntry::model_with_dtype_constraint(
             "token_embd",
             vec![cfg.vocab_size, dim],
             DType::F16,
+            embedding,
             Pin(PinTarget::Embed),
         ));
         for layer in 0..cfg.n_layers {
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "wq",
                 layer,
                 vec![heads * head_dim, dim],
                 DType::F16,
+                linear.clone(),
                 FusedQkv {
                     q_heads: heads,
                     kv_heads,
@@ -105,89 +162,101 @@ impl Llama {
                     layout: FusedQkvLayout::Qkv,
                 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "wk",
                 layer,
                 vec![kv_heads * head_dim, dim],
                 DType::F16,
+                linear.clone(),
                 ColumnShard { axis: 0 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "wv",
                 layer,
                 vec![kv_heads * head_dim, dim],
                 DType::F16,
+                linear.clone(),
                 ColumnShard { axis: 0 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "wo",
                 layer,
                 vec![dim, heads * head_dim],
                 DType::F16,
+                linear.clone(),
                 RowShard { axis: 1 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "ffn_gate",
                 layer,
                 vec![hidden, dim],
                 DType::F16,
+                linear.clone(),
                 ColumnShard { axis: 0 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "ffn_up",
                 layer,
                 vec![hidden, dim],
                 DType::F16,
+                linear.clone(),
                 ColumnShard { axis: 0 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "ffn_down",
                 layer,
                 vec![dim, hidden],
                 DType::F16,
+                linear.clone(),
                 RowShard { axis: 1 },
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "attn_norm",
                 layer,
                 vec![dim],
                 DType::F32,
+                norm.clone(),
                 Replicate,
             ));
-            manifest.push(WeightEntry::layer(
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
                 "ffn_norm",
                 layer,
                 vec![dim],
                 DType::F32,
+                norm.clone(),
                 Replicate,
             ));
             if cfg.has_qk_norm {
-                manifest.push(WeightEntry::layer(
+                manifest.push(WeightEntry::layer_with_dtype_constraint(
                     "q_norm",
                     layer,
                     vec![head_dim],
                     DType::F32,
+                    norm.clone(),
                     Replicate,
                 ));
-                manifest.push(WeightEntry::layer(
+                manifest.push(WeightEntry::layer_with_dtype_constraint(
                     "k_norm",
                     layer,
                     vec![head_dim],
                     DType::F32,
+                    norm.clone(),
                     Replicate,
                 ));
             }
         }
-        manifest.push(WeightEntry::model(
+        manifest.push(WeightEntry::model_with_dtype_constraint(
             "output_norm",
             vec![dim],
             DType::F32,
+            norm,
             Replicate,
         ));
-        manifest.push(WeightEntry::model(
+        manifest.push(WeightEntry::model_with_dtype_constraint(
             "lm_head",
             vec![cfg.vocab_size, dim],
             DType::F16,
+            linear,
             Pin(PinTarget::Output),
         ));
         manifest
