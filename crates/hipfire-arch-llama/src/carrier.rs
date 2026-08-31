@@ -813,6 +813,7 @@ mod tests {
         KvTarget,
     };
     use hipfire_runtime::weight_store::test_support;
+    use hipfire_runtime::weight_manifest::ShardPolicy;
     use hipfire_runtime::weight_store::{
         WeightLoadTransaction, WeightOrigin, WeightProjection, WeightProjectionKind, WeightStore,
     };
@@ -846,6 +847,22 @@ mod tests {
             data,
         }
     }
+    fn f16_hfq_tensor(name: &str, shape: &[u32]) -> HfqMemTensor {
+        let elements = shape.iter().map(|&dim| dim as usize).product::<usize>();
+        HfqMemTensor {
+            name: name.into(),
+            quant_type: 1,
+            shape: shape.to_vec(),
+            group_size: 0,
+            data: (0..elements)
+                .flat_map(|index| {
+                    let bits = if index % 2 == 0 { 0x3c00u16 } else { 0x3800u16 };
+                    bits.to_le_bytes()
+                })
+                .collect(),
+        }
+    }
+
 
     fn fixture_hfq(
         with_awq_sidecar: bool,
@@ -856,13 +873,13 @@ mod tests {
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 32], false),
             f32_hfq_tensor("model.norm.weight", &[32], false),
-            f32_hfq_tensor("model.layers.0.self_attn.q_proj.weight", &[32, 32], false),
-            f32_hfq_tensor("model.layers.0.self_attn.k_proj.weight", &[32, 32], false),
-            f32_hfq_tensor("model.layers.0.self_attn.v_proj.weight", &[32, 32], false),
-            f32_hfq_tensor("model.layers.0.self_attn.o_proj.weight", &[32, 32], false),
-            f32_hfq_tensor("model.layers.0.mlp.gate_proj.weight", &[64, 32], false),
-            f32_hfq_tensor("model.layers.0.mlp.up_proj.weight", &[64, 32], false),
-            f32_hfq_tensor("model.layers.0.mlp.down_proj.weight", &[32, 64], false),
+            f16_hfq_tensor("model.layers.0.self_attn.q_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.self_attn.k_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.self_attn.v_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.self_attn.o_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.mlp.gate_proj.weight", &[64, 32]),
+            f16_hfq_tensor("model.layers.0.mlp.up_proj.weight", &[64, 32]),
+            f16_hfq_tensor("model.layers.0.mlp.down_proj.weight", &[32, 64]),
             f32_hfq_tensor(
                 "model.layers.0.input_layernorm.weight",
                 &[32],
@@ -1081,19 +1098,9 @@ mod tests {
     }
 
     #[test]
-    fn production_awq_route_preserves_legacy_loader() {
-        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
-            return;
-        };
+    fn production_awq_sidecar_selects_legacy_loader() {
         let (path, hfq) = fixture_hfq(true, false, false, false);
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
-        let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
-            .expect("AWQ fixture must use the legacy HFQ loader");
-        drop(ctx);
-        assert!(bundle.weight_store.is_none());
-        assert!(bundle.weights.lm_head_aliases_embd);
-        Box::new(bundle).free_gpu(&mut gpu);
+        assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
         std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 

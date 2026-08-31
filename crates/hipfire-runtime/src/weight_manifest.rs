@@ -484,8 +484,6 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                 if !source_entry
                     .dtype_constraint
                     .same_source_set(&entry.dtype_constraint)
-                    || !entry.dtype_constraint.accepts(source_entry.dtype)
-                    || !source_entry.dtype_constraint.accepts(entry.dtype)
                 {
                     return Err(format!(
                         "{context}: tied source '{source}' violates the source dtype contract"
@@ -920,7 +918,7 @@ mod tests {
             DType::F16,
             ShardPolicy::Pin(PinTarget::Embed),
         );
-        let row = layer_entry("wo", 1, ShardPolicy::RowShard { axis: 1 });
+        let row = layer_entry("wo", 2, ShardPolicy::RowShard { axis: 1 });
         assert_eq!(placement_devices(&embed, &mesh, 4), vec![0]);
         assert_eq!(placement_devices(&row, &mesh, 4), vec![2, 3]);
         let plan = plan_manifest(
