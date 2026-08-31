@@ -61,32 +61,3 @@ impl ArchModel for LlamaBundle {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hipfire_hardware::DeviceMesh;
-    use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
-    use hipfire_runtime::weight_store::{
-        fulfill_manifest_single, WeightLoadTransaction, WeightOrigin, WeightStore,
-    };
-
-    #[test]
-    fn attached_owner_drain_is_consuming_and_empty_drain_is_safe() {
-        let Ok(gpu) = Gpu::init() else {
-            return;
-        };
-        let mesh = DeviceMesh::single();
-        let origin = WeightOrigin::for_single(&mesh, &gpu);
-        let entry =
-            WeightEntry::model("owned", vec![1], rdna_compute::DType::F32, ShardPolicy::Replicate);
-        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
-            Ok((vec![0; 4], rdna_compute::DType::F32))
-        })
-        .unwrap();
-        transaction.publish(origin).unwrap().drain(&gpu);
-        WeightLoadTransaction::new(WeightStore::with_origin(origin))
-            .publish(origin)
-            .unwrap()
-            .drain(&gpu);
-    }
-}

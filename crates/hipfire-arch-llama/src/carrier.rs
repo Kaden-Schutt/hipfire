@@ -16,8 +16,8 @@ use hipfire_runtime::llama::{
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::weight_backend::hfq_weight_dtype;
 use hipfire_runtime::weight_store::{
-    AttachedWeightStore, TakenWeight, WeightHandle, WeightLoadTransaction,
-    WeightStoreAssembly, WeightStoreAssemblyGuard, WeightOrigin,
+    TakenWeight, WeightHandle, WeightLoadTransaction, WeightOrigin, WeightStoreAssembly,
+    WeightStoreAssemblyGuard, WeightStoreError,
 };
 use rdna_compute::{DType, GpuTensor};
 use std::collections::HashMap;
@@ -52,6 +52,32 @@ pub struct LlamaBundle {
     /// block-only KvCache/scratch). `None` when `dspark_weights` is `None`.
     pub dspark_assets: Option<Qwen3DrafterAssets>,
 }
+
+/// Crate-private attached owner for the manifest transaction.
+///
+/// The runtime transaction stays public only long enough for the load carrier
+/// to assemble or roll it back. Once wrapped here, the only consuming path is
+/// the crate's [`hipfire_runtime::arch_model::ArchModel::free_gpu`] implementation.
+pub(crate) struct AttachedWeightStore {
+    transaction: WeightLoadTransaction,
+}
+
+impl AttachedWeightStore {
+    fn from_transaction(
+        transaction: WeightLoadTransaction,
+        expected: WeightOrigin,
+    ) -> Result<Self, (WeightLoadTransaction, WeightStoreError)> {
+        if let Err(error) = transaction.validate_origin_value(expected) {
+            return Err((transaction, error));
+        }
+        Ok(Self { transaction })
+    }
+
+    pub(crate) fn drain(self, gpu: &mut rdna_compute::Gpu) {
+        self.transaction.rollback(gpu);
+    }
+}
+
 fn plan_single(
     config: &LlamaConfig,
     has_separate_lm_head: bool,
@@ -697,9 +723,9 @@ pub use load_bundle as load_llama_bundle;
 
 impl LlamaBundle {
     /// Attach an unpublished load transaction after validating the complete
-    /// target identity. Publication creates the sole resident-store drain
-    /// capability; a rejected transaction is returned unchanged.
-    pub fn attach_weight_store(
+    /// target identity. The resulting owner is crate-private and can only be
+    /// consumed by `ArchModel::free_gpu`.
+    fn attach_weight_store(
         &mut self,
         transaction: WeightLoadTransaction,
     ) -> Result<(), (WeightLoadTransaction, String)> {
@@ -709,10 +735,16 @@ impl LlamaBundle {
                 "llama: weight store already attached".into(),
             ));
         }
-        let attached = match transaction.publish(self.weight_origin) {
+        let attached = match AttachedWeightStore::from_transaction(
+            transaction,
+            self.weight_origin,
+        ) {
             Ok(attached) => attached,
             Err((transaction, error)) => {
-                return Err((transaction, format!("llama: weight store origin rejected: {error}")));
+                return Err((
+                    transaction,
+                    format!("llama: weight store origin rejected: {error}"),
+                ));
             }
         };
         self.weight_store = Some(attached);
@@ -750,7 +782,10 @@ mod tests {
     use hipfire_runtime::kv_backend::KvBackend;
     use hipfire_runtime::kv_mode::KvMode;
     use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
-    use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
+    use hipfire_runtime::llama::{
+        weight_gemv, KvCache, KvCacheExt, KvDims, KvLayers, KvTarget,
+    };
+    use hipfire_runtime::weight_store::test_support;
     use hipfire_runtime::weight_store::{
         WeightLoadTransaction, WeightOrigin, WeightProjection, WeightProjectionKind, WeightStore,
     };
@@ -769,7 +804,20 @@ mod tests {
 
     fn f32_hfq_tensor(name: &str, shape: &[u32], malformed: bool) -> HfqMemTensor {
         let elements = shape.iter().map(|&dim| dim as usize).product::<usize>();
-        hfq_tensor(name, shape, 2, if malformed { 4 } else { elements * 4 })
+        let data = if malformed {
+            vec![0; 4]
+        } else {
+            (0..elements)
+                .flat_map(|value| ((value as f32) + 1.0).to_le_bytes())
+                .collect()
+        };
+        HfqMemTensor {
+            name: name.into(),
+            quant_type: 2,
+            shape: shape.to_vec(),
+            group_size: 0,
+            data,
+        }
     }
 
     fn fixture_hfq(
@@ -901,6 +949,24 @@ mod tests {
             logical_shape: vec![1],
             dtype: DType::F32,
         }
+    }
+
+    fn output_for(
+        gpu: &mut rdna_compute::Gpu,
+        weights: &LlamaWeights,
+        hidden: &[f32],
+    ) -> Vec<f32> {
+        let input = gpu
+            .upload_f32(hidden, &[hidden.len()])
+            .expect("upload deterministic output input");
+        let output = gpu
+            .alloc_tensor(&[weights.output.m], DType::F32)
+            .expect("allocate deterministic output");
+        weight_gemv(gpu, &weights.output, &input, &output).expect("run output projection");
+        let values = gpu.download_f32(&output).expect("download output projection");
+        let _ = gpu.free_tensor(output);
+        let _ = gpu.free_tensor(input);
+        values
     }
     #[test]
     fn single_plan_covers_every_typed_llama_handle() {
@@ -1040,42 +1106,67 @@ mod tests {
     }
 
     #[test]
-    fn production_post_resident_failure_returns_clean_load_error() {
+    fn production_post_resident_failure_reclaims_every_uploaded_allocation() {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_hfq(false, false, true, false);
+        let (path, hfq) = fixture_hfq(false, false, false, false);
+        test_support::reset();
+        test_support::arm_fail_after_upload(1);
         let cask = CaskConfig::default();
         let mut ctx = load_ctx(&path, &mut gpu, &cask);
         let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
-            Ok(_) => panic!("malformed output norm unexpectedly loaded"),
+            Ok(_) => panic!("post-upload fault unexpectedly succeeded"),
             Err(error) => error,
         };
         drop(ctx);
-        assert!(error.contains("source payload") || error.contains("output_norm"));
+        test_support::clear_faults();
+        assert!(error.contains("test fault injected after resident upload"));
+        let allocations = test_support::resident_allocations();
+        assert!(allocations > 0, "fault must follow a resident upload");
+        assert_eq!(
+            allocations,
+            test_support::resident_releases(),
+            "every resident allocation must be reclaimed on load failure"
+        );
         std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
     #[test]
-    fn production_manifest_matches_legacy_alias_contract() {
+    fn production_manifest_matches_legacy_numerical_output() {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
         let (path, hfq) = fixture_hfq(false, false, false, false);
         let cask = CaskConfig::default();
         let mut ctx = load_ctx(&path, &mut gpu, &cask);
-        let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load plain HFQ fixture");
-        let manifest_alias = bundle.weights.lm_head_aliases_embd;
+        let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
+            .expect("load plain HFQ fixture through manifest path");
         drop(ctx);
+        assert!(bundle.weights.lm_head_aliases_embd);
+        let hidden: Vec<f32> = (0..bundle.config.dim)
+            .map(|index| (index as f32 + 1.0) / 17.0)
+            .collect();
+        let manifest_output = output_for(&mut gpu, &bundle.weights, &hidden);
         Box::new(bundle).free_gpu(&mut gpu);
 
         let hfq = HfqFile::open(&path).expect("reopen HFQ fixture");
         let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("fixture config");
         let legacy = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
-            .expect("legacy loader fixture");
-        assert_eq!(manifest_alias, legacy.lm_head_aliases_embd);
+            .expect("load legacy HFQ fixture");
+        assert!(legacy.lm_head_aliases_embd);
         assert_eq!(legacy.embd_format, EmbeddingFormat::F32);
+        let legacy_output = output_for(&mut gpu, &legacy, &hidden);
         legacy.free_gpu(&mut gpu);
+
+        assert_eq!(
+            manifest_output, legacy_output,
+            "manifest and legacy output projections must agree for the same input"
+        );
+        assert!(
+            manifest_output.iter().any(|value| *value != 0.0),
+            "parity assertion must observe a non-zero numerical output"
+        );
         std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
