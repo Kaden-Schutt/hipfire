@@ -262,6 +262,34 @@ impl Llama {
         manifest
     }
 
+    /// Build the manifest for an HFQ source after source classification.
+    ///
+    /// A separate `lm_head.weight` is a resident output projection. When the
+    /// source omits it, the declaration is a true tie to `token_embd`; the
+    /// output placement remains pinned to the final stage while the source
+    /// representation contract is copied from the embedding entry.
+    pub fn weight_manifest_for_hfq(
+        cfg: &LlamaConfig,
+        has_separate_lm_head: bool,
+    ) -> Vec<WeightEntry> {
+        let mut manifest = Self::weight_manifest(cfg);
+        if !has_separate_lm_head {
+            let embedding_constraint = manifest
+                .first()
+                .expect("LLaMA manifest always contains token_embd")
+                .dtype_constraint
+                .clone();
+            let output = manifest
+                .last_mut()
+                .expect("LLaMA manifest always contains lm_head");
+            output.dtype_constraint = embedding_constraint;
+            output.policy = ShardPolicy::Tied {
+                source: "token_embd".into(),
+            };
+        }
+        manifest
+    }
+
     /// Pure state declaration for the full-attention LLaMA family.
     pub fn state_manifest(cfg: &LlamaConfig) -> Vec<StateEntry> {
         (0..cfg.n_layers)

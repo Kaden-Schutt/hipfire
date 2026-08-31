@@ -92,15 +92,15 @@ impl Layout {
 }
 
 /// Neutral result of the orchestrator. Each arch assembles its own weights
-/// struct from this (qwen35 adds `pager`; llama drops `lm_head_aliases_embd`).
+/// struct from this (qwen35 adds `pager`).
 pub struct LoadedWeights<L> {
     pub token_embd: GpuTensor,
     pub embd_format: EmbeddingFormat,
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<L>,
-    /// True iff the tied lm_head aliases the embedding buffer (qwen35 single-GPU);
-    /// llama always returns `false` (it reuploads).
+    /// True iff the tied lm_head aliases the embedding buffer on this
+    /// single-device route; false means a separate output allocation exists.
     pub lm_head_aliases_embd: bool,
 }
 
@@ -112,12 +112,10 @@ pub trait WeightSource {
     fn n_layers(&self) -> usize;
     /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1; llama no-op.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
-    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)>;
-    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor>;
-    /// `can_alias` is true iff embed and output share a device (n==1); the impl
-    /// decides whether to use it (qwen35 aliases; llama ignores it and reuploads).
+    /// `can_alias` is true iff embed and output share a device (n==1); the
+    /// implementation decides whether to use it (single-device LLaMA and
+    /// qwen35 alias tied embeddings; multi-device routes re-materialize).
     fn read_output(
-        &mut self,
         gpu: &mut Gpu,
         embd: &GpuTensor,
         embd_fmt: EmbeddingFormat,

@@ -10,12 +10,12 @@
 //! them, and the first failure explicitly rolls back every resident buffer.
 //!
 //! The store is not a model owner. It has no `Drop` implementation and never
-//! frees GPU buffers implicitly. A carrier may move a committed store into its
-//! existing `ArchModel` owner; that owner must transfer its resident handles
-//! through [`WeightStore::take_all`] during the existing teardown path.
-//! `take` transfers a resident handle to the owner that is assembling typed
-//! weights, and therefore removes the cell from the store's cleanup set.
-
+//! frees GPU buffers implicitly. A carrier moves a committed transaction into
+//! its existing `ArchModel` owner; that owner consumes the private drain
+//! capability during the existing teardown path.
+//! `WeightStoreAssembly::take` transfers a resident handle to the owner that is
+//! assembling typed weights, and therefore removes the cell from the store's
+//! cleanup set.
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
 use hipfire_hardware::{DeviceMesh, MeshEpoch};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -201,16 +201,153 @@ impl std::fmt::Display for FulfillError {
 impl std::error::Error for FulfillError {}
 
 /// Load-side placement container. It records one immutable projection per
-/// `(name, layer, device)` and captures the target origin once.
-///
-/// There is intentionally no `Drop` implementation. A `WeightStore` that is
-/// abandoned without explicit rollback or owner transfer leaks rather than
-/// guessing a GPU owner; production callers keep it beneath `ArchModel`.
+/// `(name, layer, device)` and captures the target origin once. The container
+/// itself has no consuming teardown API: lifecycle transitions are represented
+/// by [`WeightLoadTransaction`] and [`AttachedWeightStore`].
 #[derive(Default)]
 pub struct WeightStore {
     placements: HashMap<WeightPlacementKey, WeightHandle>,
     projections: HashMap<WeightPlacementKey, WeightProjection>,
     origin: Option<WeightOrigin>,
+}
+
+/// The only owner that may roll back resident allocations before publication.
+///
+/// A transaction owns the store until [`Self::publish`] transfers it into the
+/// attached owner held by the architecture bundle. It deliberately has no
+/// implicit `Drop` cleanup because the GPU is not available to a destructor.
+pub struct WeightLoadTransaction {
+    store: Option<WeightStore>,
+}
+
+impl std::fmt::Debug for WeightLoadTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeightLoadTransaction")
+            .field("origin", &self.origin())
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// The resident-store capability returned by a committed load transaction.
+///
+/// The backing store and its drain capability are private. Architecture
+/// owners receive this value during attachment and consume it exactly once
+/// during unload; no public `WeightStore` method can drain an attached store.
+pub struct AttachedWeightStore {
+    store: WeightStore,
+    capability: WeightStoreDrainCapability,
+}
+
+struct WeightStoreDrainCapability {
+    origin: WeightOrigin,
+}
+
+impl WeightLoadTransaction {
+    pub fn new(store: WeightStore) -> Self {
+        Self { store: Some(store) }
+    }
+
+    pub fn origin(&self) -> Option<WeightOrigin> {
+        self.store.as_ref().and_then(WeightStore::origin)
+    }
+
+    pub fn len(&self) -> usize {
+        self.store.as_ref().map_or(0, WeightStore::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.store.as_ref().map_or(true, WeightStore::is_empty)
+    }
+
+    pub fn contains(&self, name: &str, layer: Option<usize>, device: usize) -> bool {
+        self.store
+            .as_ref()
+            .is_some_and(|store| store.contains(name, layer, device))
+    }
+
+    pub fn get(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+    ) -> Option<&WeightHandle> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.get(name, layer, device))
+    }
+
+    pub fn projection(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+    ) -> Option<&WeightProjection> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.projection(name, layer, device))
+    }
+
+    pub fn devices_for(&self, name: &str, layer: Option<usize>) -> Vec<usize> {
+        self.store
+            .as_ref()
+            .map_or_else(Vec::new, |store| store.devices_for(name, layer))
+    }
+
+    /// Start typed assembly while this load is still unpublished.
+    pub fn begin_assembly(&mut self) -> WeightStoreAssembly<'_> {
+        self.store
+            .as_mut()
+            .expect("weight load transaction was already consumed")
+            .begin_assembly()
+    }
+
+    /// Consume this transaction and release every resident handle it owns.
+    /// This is intentionally the only rollback operation exposed by the
+    /// lifecycle API.
+    pub fn rollback(mut self, gpu: &Gpu) {
+        if let Some(store) = self.store.take() {
+            store.rollback(gpu);
+        }
+    }
+
+    /// Publish the store beneath an architecture owner after checking the
+    /// complete immutable target identity. A mismatch returns this
+    /// transaction unchanged so the caller can retry or roll it back.
+    pub fn publish(
+        mut self,
+        expected: WeightOrigin,
+    ) -> Result<AttachedWeightStore, (Self, WeightStoreError)> {
+        let store = self
+            .store
+            .take()
+            .expect("weight load transaction was already consumed");
+        if let Err(error) = store.validate_origin_value(expected) {
+            self.store = Some(store);
+            return Err((self, error));
+        }
+        Ok(AttachedWeightStore {
+            store,
+            capability: WeightStoreDrainCapability { origin: expected },
+        })
+    }
+}
+
+impl AttachedWeightStore {
+    /// Drain resident handles through the private owner capability. The
+    /// capability is established only by `WeightLoadTransaction::publish`, so
+    /// origin mismatch is impossible after attachment.
+    pub fn drain(self, gpu: &Gpu) {
+        let Self { store, capability } = self;
+        capability.drain(store, gpu);
+    }
+}
+
+impl WeightStoreDrainCapability {
+    fn drain(self, store: WeightStore, gpu: &Gpu) {
+        debug_assert_eq!(store.origin, Some(self.origin));
+        store.release_unchecked(gpu);
+    }
 }
 
 impl WeightStore {
@@ -300,9 +437,10 @@ impl WeightStore {
         )
     }
 
-    /// Move a handle out of the store. The projection is removed with it so no
-    /// stale metadata can describe a cell that the store no longer owns.
-    pub fn take(
+    /// Move a handle out of the store. This is private to the assembly
+    /// capability so arbitrary store holders cannot independently tear down a
+    /// resident allocation.
+    fn take(
         &mut self,
         name: &str,
         layer: Option<usize>,
@@ -313,7 +451,7 @@ impl WeightStore {
         self.placements.remove(&key)
     }
 
-    pub fn take_with_projection(
+    fn take_with_projection(
         &mut self,
         name: &str,
         layer: Option<usize>,
@@ -325,10 +463,7 @@ impl WeightStore {
         Some((handle, projection))
     }
 
-    /// Start a typed assembly transaction. Handles moved through the
-    /// transaction are restored to this store if the transaction is dropped
-    /// before `finalize`; no GPU free or second owner is introduced.
-    pub fn begin_assembly(&mut self) -> WeightStoreAssembly<'_> {
+    fn begin_assembly(&mut self) -> WeightStoreAssembly<'_> {
         WeightStoreAssembly {
             store: self,
             taken: Vec::new(),
@@ -337,8 +472,7 @@ impl WeightStore {
     }
 
     /// Compare a store's captured origin with an already-resolved target
-    /// identity. This pure seam is used by fault-path tests and by owner
-    /// teardown after target resolution.
+    /// identity. This read-only seam cannot release or extract any handle.
     pub fn validate_origin_value(
         &self,
         expected: WeightOrigin,
@@ -358,27 +492,6 @@ impl WeightStore {
         gpu: &Gpu,
     ) -> Result<(), WeightStoreError> {
         self.validate_origin_value(WeightOrigin::for_single(mesh, gpu))
-    }
-
-    /// Roll back a fulfilled store before it is published beneath a model
-    /// owner. This is the only public consuming GPU-free operation: callers
-    /// may use it while a load transaction is still unpublished, but an
-    /// attached store can only be drained by the model owner via `take_all`.
-    pub fn rollback_unpublished(self, gpu: &Gpu) {
-        self.release_unchecked(gpu);
-    }
-
-    /// Transfer every resident/alias handle to the model owner after checking
-    /// the complete captured origin. On mismatch, the original store is
-    /// returned unchanged so the owner can retry against the correct target.
-    pub fn take_all(
-        self,
-        expected: WeightOrigin,
-    ) -> Result<Vec<WeightHandle>, (Self, WeightStoreError)> {
-        if let Err(error) = self.validate_origin_value(expected) {
-            return Err((self, error));
-        }
-        Ok(self.placements.into_values().collect())
     }
 
     /// Explicit rollback for a failed transaction. It consumes the partial
@@ -500,7 +613,7 @@ pub fn fulfill_manifest_single<F>(
     n_layers: usize,
     gpu: &Gpu,
     source: F,
-) -> Result<WeightStore, FulfillError>
+) -> Result<WeightLoadTransaction, FulfillError>
 where
     F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
@@ -623,7 +736,7 @@ where
             });
         }
     }
-    Ok(store)
+    Ok(WeightLoadTransaction::new(store))
 }
 
 /// Canonical name used by the manifest fulfillment seam. The target is
@@ -635,7 +748,7 @@ pub fn fulfill_manifest<F>(
     n_layers: usize,
     gpu: &Gpu,
     source: F,
-) -> Result<WeightStore, FulfillError>
+) -> Result<WeightLoadTransaction, FulfillError>
 where
     F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
@@ -763,24 +876,24 @@ mod tests {
         };
         let mesh = DeviceMesh::single();
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
-        let store = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
+        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
             Ok((vec![0; 4], DType::F32))
         })
         .unwrap();
-        assert_eq!(store.len(), 1);
+        assert_eq!(transaction.len(), 1);
         assert!(matches!(
-            store.get("resident", None, 0),
+            transaction.get("resident", None, 0),
             Some(WeightHandle::Resident(tensor)) if tensor.dtype == DType::F32
         ));
         assert_eq!(
-            store.projection("resident", None, 0).unwrap().dtype,
+            transaction.projection("resident", None, 0).unwrap().dtype,
             DType::F32
         );
-        store.rollback_unpublished(&gpu);
+        transaction.rollback(&gpu);
     }
 
     #[test]
-    fn full_origin_mismatch_returns_resident_store_unchanged() {
+    fn full_origin_mismatch_returns_unpublished_transaction_unchanged() {
         let first = DeviceMesh::single();
         let second = DeviceMesh::single();
         let actual = WeightOrigin::from_parts(first.epoch(), 3, 11);
@@ -789,60 +902,63 @@ mod tests {
         store
             .stage_alias("resident", None, 0, "source", projection(DType::F16))
             .unwrap();
-        let (store, error) = match store.take_all(expected) {
+        let transaction = WeightLoadTransaction::new(store);
+        let (transaction, error) = match transaction.publish(expected) {
             Ok(_) => panic!("origin mismatch unexpectedly succeeded"),
             Err(value) => value,
         };
         assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
-        assert_eq!(store.origin(), Some(actual));
-        assert!(store.contains("resident", None, 0));
-        assert!(store.projection("resident", None, 0).is_some());
+        assert_eq!(transaction.origin(), Some(actual));
+        assert!(transaction.contains("resident", None, 0));
+        assert!(transaction.projection("resident", None, 0).is_some());
     }
 
     #[test]
-    fn full_origin_mismatch_does_not_free_a_resident_store() {
+    fn full_origin_mismatch_does_not_free_a_resident_transaction() {
         let Ok(gpu) = Gpu::init() else {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
         let mesh = DeviceMesh::single();
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
-        let store = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
+        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| {
             Ok((vec![0; 4], DType::F32))
         })
         .unwrap();
         let expected = WeightOrigin::from_parts(mesh.epoch(), 1, gpu.device_id);
-        let (store, error) = match store.take_all(expected) {
+        let (transaction, error) = match transaction.publish(expected) {
             Ok(_) => panic!("origin mismatch unexpectedly succeeded"),
             Err(value) => value,
         };
         assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
-        assert_eq!(store.len(), 1);
+        assert_eq!(transaction.len(), 1);
         assert_eq!(
             RESIDENT_RELEASES.with(std::cell::Cell::get),
             0,
             "origin rejection must not free resident buffers"
         );
-        store.rollback_unpublished(&gpu);
+        transaction.rollback(&gpu);
         assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
     }
 
     #[test]
-    fn owner_transfer_is_consuming_and_empty_transfer_is_idempotent() {
+    fn attached_owner_transfer_is_consuming_and_empty_transfer_is_safe() {
         let mesh = DeviceMesh::single();
         let origin = WeightOrigin::from_parts(mesh.epoch(), 0, 0);
         let mut store = WeightStore::with_origin(origin);
         store
             .stage_alias("owned", None, 0, "source", projection(DType::F16))
             .unwrap();
-        let handles = store.take_all(origin).unwrap();
-        assert_eq!(handles.len(), 1);
-        assert!(matches!(
-            handles.into_iter().next(),
-            Some(WeightHandle::Alias(_))
-        ));
-        let second = WeightStore::with_origin(origin).take_all(origin).unwrap();
-        assert!(second.is_empty());
+        let transaction = WeightLoadTransaction::new(store);
+        let attached = transaction.publish(origin).unwrap();
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        attached.drain(&gpu);
+        let empty = WeightLoadTransaction::new(WeightStore::with_origin(origin))
+            .publish(origin)
+            .unwrap();
+        empty.drain(&gpu);
     }
 
     #[test]

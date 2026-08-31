@@ -100,6 +100,27 @@ impl DTypeConstraint {
             SourceDType::OneOf(allowed) => allowed.contains(&dtype),
         }
     }
+
+    /// Whether two source constraints admit exactly the same representation
+    /// set. Variant spelling is not part of the contract: `Exact(F16)` and
+    /// `OneOf([F16])` are equivalent, while `Any` is never equivalent to a
+    /// finite list.
+    pub fn same_source_set(&self, other: &Self) -> bool {
+        fn finite_equal(left: &[DType], right: &[DType]) -> bool {
+            left.iter().all(|dtype| right.contains(dtype))
+                && right.iter().all(|dtype| left.contains(dtype))
+        }
+        match (&self.source, &other.source) {
+            (SourceDType::Any, SourceDType::Any) => true,
+            (SourceDType::Any, _) | (_, SourceDType::Any) => false,
+            (SourceDType::Exact(left), SourceDType::Exact(right)) => left == right,
+            (SourceDType::Exact(dtype), SourceDType::OneOf(values))
+            | (SourceDType::OneOf(values), SourceDType::Exact(dtype)) => {
+                values.iter().all(|value| value == dtype)
+            }
+            (SourceDType::OneOf(left), SourceDType::OneOf(right)) => finite_equal(left, right),
+        }
+    }
 }
 
 /// The block ordering of a fused projection.
@@ -460,7 +481,10 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                         source_entry.dtype, entry.dtype
                     ));
                 }
-                if !entry.dtype_constraint.accepts(source_entry.dtype)
+                if !source_entry
+                    .dtype_constraint
+                    .same_source_set(&entry.dtype_constraint)
+                    || !entry.dtype_constraint.accepts(source_entry.dtype)
                     || !source_entry.dtype_constraint.accepts(entry.dtype)
                 {
                     return Err(format!(
@@ -1130,5 +1154,25 @@ mod tests {
             },
         );
         assert!(validate_manifest(&[cycle_a, cycle_b], &DeviceMesh::single()).is_err());
+    }
+    #[test]
+    fn tied_entries_reject_different_source_sets_with_equal_logical_dtype() {
+        let source = WeightEntry::model(
+            "source",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Replicate,
+        );
+        let tied = WeightEntry::model_with_dtype_constraint(
+            "tied",
+            vec![8, 8],
+            DType::F16,
+            DTypeConstraint::source_exact(DType::F16),
+            ShardPolicy::Tied {
+                source: "source".into(),
+            },
+        );
+        let error = validate_manifest(&[source, tied], &DeviceMesh::single()).unwrap_err();
+        assert!(error.contains("source dtype contract"));
     }
 }
