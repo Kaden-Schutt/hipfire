@@ -533,10 +533,25 @@ def main():
                     "iterations": args.shadow_iterations,
                 }
             )
-            shadow_pass = report["aql_shadow"]["bit_exact"]
+            shadow = report["aql_shadow"]
+            frame_values = [
+                shadow.get(arm, {}).get("gdn_frame")
+                for arm in ("hip", "aql", "blob")
+            ]
+            frame_present = any(frame is not None for frame in frame_values)
+            frame_exact = not frame_present or (
+                all(frame is not None for frame in frame_values)
+                and frame_values[0] == frame_values[1] == frame_values[2]
+            )
+            shadow["gdn_frame_exact"] = frame_exact
+            shadow_pass = (
+                bool(shadow["bit_exact"])
+                and bool(shadow["blob_bit_exact"])
+                and frame_exact
+            )
             print(
                 f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
-                f"exact={shadow_pass} "
+                f"exact={shadow_pass} gdn_frame_exact={frame_exact} "
                 f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
                 f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
                 flush=True,

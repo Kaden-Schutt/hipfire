@@ -861,8 +861,120 @@ fn main() {
         );
     }
 
+    // ── Ornith qt44 shared-down fuse: M=2048 K=512 residual_sigmoid_scaled ──
+    // Reference: sigmoid_f32 → plain gemv_mq4g256v2 into temp → scaled_add.
+    // Candidate: gemv_mq4g256v2_residual_sigmoid_scaled_k512 (one launch).
+    // Exact gfx1100|gfx1201 only; skip elsewhere. 16 tail canaries.
+    {
+        let arch_ok = gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201();
+        if !arch_ok {
+            eprintln!(
+                "shared_down_fused residual_sigmoid_scaled_k512: skip (arch={} not gfx1100|gfx1201)",
+                gpu.arch
+            );
+        } else {
+            const M: usize = 2048;
+            const K: usize = 512;
+            const N_CANARY: usize = 16;
+            let w = build_disjoint_halves_salted(M, K, 0x51C0_D0F1);
+            let blob = pack_mq4g256v2(&w, M, K);
+            let bug_rel = {
+                let x_probe: Vec<f32> = (0..K).map(|i| prng(i, 0xC0FF_EE51) * 2.0 - 1.0).collect();
+                v1_header_bug_rel(&blob, &x_probe, M, K)
+            };
+            eprintln!(
+                "shared_down_fused residual_sigmoid_scaled_k512 M={M} K={K}: V1-header bug baseline rel {bug_rel:.3e}"
+            );
+            assert!(
+                bug_rel > 0.5,
+                "shared_down_fused fixture not discriminating: bug {bug_rel:.3e}"
+            );
+
+            let x: Vec<f32> = (0..K).map(|i| prng(i, 0xC0FF_EE52) * 2.0 - 1.0).collect();
+            // Nontrivial pre-sigmoid scalar (not 0 → gate≠0.5).
+            let c_host = [1.25f32];
+            // Nonzero residual seed.
+            let mut y_seed = vec![0.0f32; M + N_CANARY];
+            for i in 0..M {
+                y_seed[i] = prng(i, 0x5E51_D00D) * 0.5 + 0.25;
+            }
+            for i in 0..N_CANARY {
+                y_seed[M + i] = CANARY_F32 + i as f32 * 0.001;
+            }
+
+            let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
+            let d_x = gpu.upload_f32(&x, &[K]).unwrap();
+            let d_c = gpu.upload_f32(&c_host, &[1]).unwrap();
+
+            // Reference route.
+            let d_y_ref = gpu.upload_f32(&y_seed, &[M + N_CANARY]).unwrap();
+            let d_tmp = gpu.upload_f32(&vec![0.0f32; M], &[M]).unwrap();
+            let d_c_ref = gpu.upload_f32(&c_host, &[1]).unwrap();
+            gpu.sigmoid_f32(&d_c_ref)
+                .unwrap_or_else(|e| panic!("ref sigmoid_f32: {e}"));
+            gpu.gemv_mq4g256v2(&d_a, &d_x, &d_tmp, M, K)
+                .unwrap_or_else(|e| panic!("ref gemv_mq4g256v2: {e}"));
+            gpu.scaled_add_inplace_gpu_scalar_f32(&d_y_ref, &d_tmp, &d_c_ref)
+                .unwrap_or_else(|e| panic!("ref scaled_add: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+            let ref_all = gpu.download_f32(&d_y_ref).unwrap();
+
+            // Candidate fused route (does not mutate c).
+            let d_y_cand = gpu.upload_f32(&y_seed, &[M + N_CANARY]).unwrap();
+            gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(&d_a, &d_x, &d_y_cand, &d_c, M, K)
+                .unwrap_or_else(|e| panic!("candidate fused launch: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+            let cand_all = gpu.download_f32(&d_y_cand).unwrap();
+
+            let ref_y = &ref_all[..M];
+            let cand_y = &cand_all[..M];
+            let exact = ref_y
+                .iter()
+                .zip(cand_y.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            let canary_ok = (0..N_CANARY).all(|i| {
+                let want = CANARY_F32 + i as f32 * 0.001;
+                (cand_all[M + i] - want).abs() < 1e-6 && (ref_all[M + i] - want).abs() < 1e-6
+            });
+            // Scalar must be intact on the fused path (not mutated).
+            let c_after = gpu.download_f32(&d_c).unwrap();
+            let c_intact = (c_after[0] - c_host[0]).abs() < 1e-6;
+
+            let want64: Vec<f64> = ref_y.iter().map(|&v| v as f64).collect();
+            let rms = rel_rms(cand_y, &want64);
+            let (worst, wi) = rel_err(cand_y, &want64);
+            let status = if exact && canary_ok && c_intact {
+                "ok"
+            } else {
+                "FAIL"
+            };
+            eprintln!(
+                "  shared_down_fused residual_sigmoid_scaled_k512: exact={exact} rms {rms:.3e} (worst {worst:.3e}@{wi}) canary={canary_ok} c_intact={c_intact} {status} bug {bug_rel:.3e}"
+            );
+            if !exact {
+                failures.push(format!(
+                    "shared_down_fused residual_sigmoid_scaled_k512 bit mismatch rms {rms:.3e}"
+                ));
+            }
+            if !canary_ok {
+                failures
+                    .push("shared_down_fused residual_sigmoid_scaled_k512 canary clobbered".into());
+            }
+            if !c_intact {
+                failures.push(
+                    "shared_down_fused residual_sigmoid_scaled_k512 mutated pre-sigmoid scalar"
+                        .into(),
+                );
+            }
+            assert!(
+                rms < bug_rel * 0.1,
+                "half1 decoded with half0 at shared_down_fused: rms {rms:.3e} not below bug {bug_rel:.3e}"
+            );
+        }
+    }
+
     if failures.is_empty() {
-        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2");
+        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201");
     } else {
         eprintln!("\nmq4v2_fused_parity: FAIL — {:?}", failures);
         std::process::exit(1);

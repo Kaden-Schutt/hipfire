@@ -1125,7 +1125,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
-        "gemv_hfq4g256_residual_sigmoid_scaled_gpu" => {
+        "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
@@ -1538,6 +1539,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
@@ -2736,6 +2738,54 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
             )
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
             )
     )
@@ -5483,6 +5533,7 @@ mod tests {
         "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate",
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+        "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
@@ -6671,6 +6722,38 @@ mod tests {
     }
 
     #[test]
+    fn mq4g256v2_residual_sigmoid_scaled_k512_keeps_exact_40b_abi() {
+        // Ornith qt44 shared-down fuse: A@0, x@8, y@16 RMW/write, c_buf@24 read;
+        // M@32, K@36 → 40 explicit bytes, pad_to(16) → 48. Four pointer offsets.
+        let symbol = "gemv_mq4g256v2_residual_sigmoid_scaled_k512";
+        let want = [read(0), read(8), write(16), read(24)];
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..4 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 40, "{symbol} explicit args occupy 40 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+
+        let got = pointer_effects(symbol).expect("sigmoid residual pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // Distinct from V1 residual_sigmoid and plain V2 residual; fail-closed on typos.
+        assert_ne!(symbol, "gemv_hfq4g256_residual_sigmoid_scaled_gpu");
+        assert_ne!(symbol, "gemv_mq4g256v2_residual");
+        assert!(pointer_effects("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
+        assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
+    }
+
+    #[test]
     fn fused_qkvza_mq4g256v2_keeps_exact_scalar_replay_contract() {
         let symbol = "fused_qkvza_mq4g256v2";
         let want = [
@@ -6780,7 +6863,15 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
         ));
         assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        ));
+        assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+        ));
+        assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         ));
         assert!(independent_sibling(
@@ -6788,11 +6879,23 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
         ));
         assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+        ));
+        assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         ));
         assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
+        ));
+        assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
+        ));
+        assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
         ));
         for kernel in [
@@ -6802,6 +6905,10 @@ mod tests {
         ] {
             assert!(independent_sibling(
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                kernel,
+            ));
+            assert!(independent_sibling(
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
                 kernel,
             ));
         }

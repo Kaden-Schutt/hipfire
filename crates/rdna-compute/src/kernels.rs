@@ -1670,6 +1670,17 @@ pub const GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC: &str = concat!
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
+/// Ornith qt44 shared-expert down fuse: fixed K=512 dual-half MQ4G256V2 body with
+/// lane-0 `sigmoid(c_buf[0]) * acc` residual store. ABI is 40 B (A/x/y/c_buf/M/K).
+/// Launcher-gated to exact gfx1100|gfx1201 / M=2048 / K=512; default shared-down
+/// stays on sigmoid_f32 + plain V2 GEMV + scaled_add.
+pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_sigmoid_scaled_k512\n",
+    "#define HIPFIRE_MQ4G256V2_K512 1\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

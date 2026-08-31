@@ -48,6 +48,9 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
+#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE)
+    const float* __restrict__ c_buf,
+#endif
     int M, int K
 ) {
     const int row = blockIdx.x;
@@ -58,6 +61,8 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     const int groups_per_row = 8;
 #elif defined(HIPFIRE_MQ4G256V2_K4096)
     const int groups_per_row = 16;
+#elif defined(HIPFIRE_MQ4G256V2_K512)
+    const int groups_per_row = 2;
 #else
     const int groups_per_row = K / 256;
 #endif
@@ -198,7 +203,12 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
-#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
+#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE)
+    if (tid == 0) {
+        float gate = 1.0f / (1.0f + expf(-c_buf[0]));
+        y[row] += gate * acc;
+    }
+#elif defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
     if (tid == 0) y[row] += acc;
 #else
     if (tid == 0) y[row] = acc;
