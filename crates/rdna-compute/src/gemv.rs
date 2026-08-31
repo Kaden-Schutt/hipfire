@@ -167,6 +167,14 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
             .unwrap_or(false)
     })
 }
+fn gfx1100_mq4g256v2_lm_head_x_buffer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4G256V2_LM_HEAD_X_BUFFER").as_deref()
+            == Ok("1")
+    })
+}
 
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
@@ -7697,6 +7705,97 @@ impl Gpu {
         }
         result
     }
+    /// Exact generic wrapper for oracle: launches the baseline `gemv_mq4g256v2`
+    /// at frozen 32B ABI (A@0 read, x@8 read, y@16 write, M@24, K@28),
+    /// grid [M,1,1], block [32,1,1], LDS 0. No arch/shape gating beyond what
+    /// the kernel source itself encodes; this is the default generic decode.
+    pub fn gemv_mq4g256v2_generic_exact(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_mq4g256v2";
+        // Preserve existing arch dispatch for the generic source so the
+        // generic exact remains bit-identical to the production default
+        // when the candidate gate is off. Only the candidate bypasses this.
+        let (v2_src, v2_module) =
+            kernels::gemv_mq4g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+        let module_v2 = format!("{}_mq4v2", v2_module);
+        self.ensure_kernel(&module_v2, v2_src, FUNC)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // Frozen ABI 32B via KernargBlob, grid M, block 32, LDS 0.
+        self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+
+    /// Exact candidate wrapper for oracle and for the gfx1100 lm_head x-buffer
+    /// opt-in. Frozen: module/symbol `gemv_mq4g256v2_gfx1100_lm_head_x_buffer`,
+    /// source `GEMV_MQ4G256V2_GFX1100_LM_HEAD_X_BUFFER_SRC` which defines
+    /// `HIPFIRE_GFX1100_LM_HEAD_X_BUFFER` + `HIPFIRE_HFQ4G256_K2048` in the
+    /// shared `gemv_mq4g256v2.hip` TU. Same frozen 32B ABI, grid [M,1,1],
+    /// block32, LDS0 as generic. K must be 2048 (the specialized shape);
+    /// M may be a smaller representative for oracle memory control while still
+    /// forcing the identical K2048 kernel.
+    pub fn gemv_mq4g256v2_gfx1100_lm_head_x_buffer_exact(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_mq4g256v2_gfx1100_lm_head_x_buffer";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMV_MQ4G256V2_GFX1100_LM_HEAD_X_BUFFER_SRC,
+            FUNC,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+
     /// MQ4 v2 (qt=44) — plain GEMV. Faithful port of `gemv_hfq4g256` for the
     /// dual-scale format. Same arch gating, rows/R selection, grid/block
     /// geometry and kernarg order; only SRC, module (`_mq4v2` suffix) and
@@ -7710,6 +7809,19 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Opt-in exact gfx1100 Ornith lm_head specialization.
+        // Only exact gfx1100, M=248320, K=2048, env == "1" selects the frozen
+        // candidate. All other arches/shapes/default remain generic.
+        // Frozen candidate: one wave/row, no multirow/tiling/precision/
+        // weight-cache policy/compiler changes; header decode, 4-accum
+        // ownership, FMA association, final combine+shuffle preserved exactly.
+        if self.arch_caps.is_gfx1100()
+            && m == 248_320
+            && k == 2_048
+            && gfx1100_mq4g256v2_lm_head_x_buffer_enabled()
+        {
+            return self.gemv_mq4g256v2_gfx1100_lm_head_x_buffer_exact(a_raw, x, y, m, k);
+        }
         use std::sync::OnceLock;
         static GFX1151_LM_HEAD_DOT2: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_dot2 = self.arch_caps.is_gfx1151()

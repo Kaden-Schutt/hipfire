@@ -1217,8 +1217,75 @@ fn main() {
         }
     }
 
+    // Exact K=2048 plain MQ4V2 LM-head X_BUFFER vs generic device route.
+    // gfx1100 only; practical M>=257 non-multiple (row body independent of
+    // production M=248320). Independent canary buffers so unwritten/shared
+    // outputs fail. Candidate forces K2048 kernel via frozen exact wrapper.
+    {
+        const K: usize = 2_048;
+        // 257: ≥256+1 boundary, not a wave/tile multiple.
+        const M: usize = 257;
+        if !gpu.arch_caps.is_gfx1100() {
+            eprintln!(
+                "scalar_gemv_mq4g256v2_k2048_lm_head_x_buffer: skip (arch={} not gfx1100)",
+                gpu.arch
+            );
+        } else {
+            let x: Vec<f32> = (0..K).map(|i| prng(i, 0xD048_C0FF) * 2.0 - 1.0).collect();
+            let d_x = gpu.upload_f32(&x, &[K]).unwrap();
+            let (_, d_a) = pack_upload_mq4v2(&mut gpu, M, K, 0xD048_A001);
+
+            let (d_ref, y_len) = upload_y_canary(&mut gpu, n1, M);
+            gpu.gemv_mq4g256v2_generic_exact(&d_a, &d_x, &d_ref, M, K)
+                .unwrap_or_else(|e| panic!("generic plain gemv K=2048 launch: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+
+            let (d_cand, cand_len) = upload_y_canary(&mut gpu, n1, M);
+            assert_eq!(cand_len, y_len);
+            gpu.gemv_mq4g256v2_gfx1100_lm_head_x_buffer_exact(&d_a, &d_x, &d_cand, M, K)
+                .unwrap_or_else(|e| panic!("lm_head_x_buffer plain gemv K=2048 launch: {e}"));
+            gpu.hip.device_synchronize().unwrap();
+
+            let (reference, ref_canary) = download_y_canary(&gpu, &d_ref, y_len, n1, M);
+            let (candidate, cand_canary) = download_y_canary(&gpu, &d_cand, y_len, n1, M);
+            let exact = reference
+                .iter()
+                .zip(&candidate)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            let canary = ref_canary && cand_canary;
+            let first = reference.first().copied().unwrap_or(0.0);
+            let varied = reference.iter().any(|value| value.abs() > 1.0e-6)
+                && reference
+                    .iter()
+                    .any(|value| value.to_bits() != first.to_bits());
+            let reference_f64: Vec<f64> = reference.iter().map(|&value| value as f64).collect();
+            let rms = rel_rms(&candidate, &reference_f64);
+            if !exact {
+                failures.push(format!(
+                    "scalar_gemv_mq4g256v2_k2048_lm_head_x_buffer bit mismatch rms {rms:.3e}"
+                ));
+            }
+            if !canary {
+                failures
+                    .push("scalar_gemv_mq4g256v2_k2048_lm_head_x_buffer canary clobbered".into());
+            }
+            if !varied {
+                failures
+                    .push("scalar_gemv_mq4g256v2_k2048_lm_head_x_buffer degenerate output".into());
+            }
+            let status = if exact && canary && varied {
+                "ok"
+            } else {
+                "FAIL"
+            };
+            eprintln!(
+                "  scalar_gemv_mq4g256v2_k2048_lm_head_x_buffer K={K} M={M} N={n1} exact={exact} rms={rms:.3e} canary={canary} varied={varied} {status}"
+            );
+        }
+    }
+
     if failures.is_empty() {
-        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201; K2048 hoist_x32 bit-exact vs generic on gfx1100; K2048 qkv x_buffer bit-exact vs generic on gfx1100");
+        eprintln!("\nmq4v2_fused_parity: PASS — all fused families half-select/pointer-swap/canary correct at K=256/512, N=16/64; scalar fused_qkv / fused_qkvza / fused_gate_up N=1 match standalone gemv_mq4g256v2; residual_sigmoid_scaled_k512 bit-exact vs reference on gfx1100|gfx1201; K2048 hoist_x32 bit-exact vs generic on gfx1100; K2048 qkv x_buffer bit-exact vs generic on gfx1100; K2048 plain gemv lm_head_x_buffer bit-exact vs generic on gfx1100");
     } else {
         eprintln!("\nmq4v2_fused_parity: FAIL — {:?}", failures);
         std::process::exit(1);
