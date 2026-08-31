@@ -1039,7 +1039,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "fused_qkvza_mq4g256v2"
-        | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100" => Some(vec![
+        | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
+        | "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1585,6 +1586,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "fused_qkvza_mq4g256v2"
         | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
+        | "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100"
         | "gated_delta_net_q8_fast" => Some(96),
         "gated_delta_net_f32" => Some(80),
         _ => None,
@@ -5511,6 +5513,7 @@ mod tests {
         "fused_qkvza_hfq4g256_reduce_chain",
         "fused_qkvza_mq4g256v2",
         "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+        "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_qkv_mq4g256v2",
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_gate_up_mq4g256v2",
@@ -6785,11 +6788,12 @@ mod tests {
             write(64),
         ];
 
-        // Generic plus gfx1100 K=2048 HOIST_X32 share the same 14-arg ABI:
+        // Generic plus gfx1100 K=2048 HOIST_X32 / X_BUFFER share the same 14-arg ABI:
         // reads@0/8/16/24/32, writes@40/48/56/64, pad96.
         for symbol in [
             "fused_qkvza_mq4g256v2",
             "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+            "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(96));
             let got = pointer_effects(symbol).expect("mq4g256v2 qkvza pointer contract");
@@ -6800,10 +6804,18 @@ mod tests {
             }
         }
 
-        // Identities stay independent: hoist never collapses onto generic.
+        // Identities stay independent: specialized routes never collapse onto generic.
         assert_ne!(
             "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
             "fused_qkvza_mq4g256v2"
+        );
+        assert_ne!(
+            "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
+            "fused_qkvza_mq4g256v2"
+        );
+        assert_ne!(
+            "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
+            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
         );
 
         // 9 ptr + 5 i32 dimensions = 92 explicit bytes, pad_to(16) → 96.
@@ -6820,6 +6832,7 @@ mod tests {
         for symbol in [
             "fused_qkvza_mq4g256v2",
             "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+            "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
         }
