@@ -74,7 +74,6 @@ enum MqV2PrefillProjection {
 enum Mq4v2QkvzaVariant {
     Generic,
     HoistX32,
-    XBuffer,
 }
 
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
@@ -28400,12 +28399,10 @@ impl Gpu {
         alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Measured gfx1100 K=2048 hoist specialization is the only production
+        // route (generic ~18 us/call → hoist ~10.38 us/call).
         let variant = if self.arch == "gfx1100" && k == 2048 {
-            match self.flags.mq4v2_qkvza_variant.as_deref() {
-                Some("hoist") => Mq4v2QkvzaVariant::HoistX32,
-                Some("x_buffer") => Mq4v2QkvzaVariant::XBuffer,
-                _ => Mq4v2QkvzaVariant::Generic,
-            }
+            Mq4v2QkvzaVariant::HoistX32
         } else {
             Mq4v2QkvzaVariant::Generic
         };
@@ -28481,35 +28478,6 @@ impl Gpu {
         )
     }
 
-    #[doc(hidden)]
-    pub fn fused_qkvza_hfq4g256_mq4v2_k2048_x_buffer_exact(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        let variant = if self.arch == "gfx1100" && k == 2048 {
-            Mq4v2QkvzaVariant::XBuffer
-        } else {
-            Mq4v2QkvzaVariant::Generic
-        };
-        self.fused_qkvza_hfq4g256_mq4v2_dispatch(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
-            alpha_m, k, variant,
-        )
-    }
-
     fn fused_qkvza_hfq4g256_mq4v2_dispatch(
         &mut self,
         a_qkv: &GpuTensor,
@@ -28541,12 +28509,6 @@ impl Gpu {
                 kernels::FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC,
                 "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
                 "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
-            ),
-            Mq4v2QkvzaVariant::XBuffer => (
-                "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
-                kernels::FUSED_QKVZA_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC,
-                "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
-                "fused_qkvza_mq4g256v2_k2048_x_buffer_gfx1100",
             ),
         };
         self.ensure_kernel(module, src, func_name)?;

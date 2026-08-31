@@ -234,12 +234,6 @@ pub struct FeatureFlags {
     pub lloyd_force_baseline: bool,
     pub rdna2_variant: Option<u32>,
 
-    // ── MQ4V2 QKVZA K2048 candidate ───────────────────────────────
-    /// Activation-load schedule for the exact gfx1100 K=2048 QKVZA path.
-    /// `None` = generic (default). `Some("hoist")` / `Some("x_buffer")` select the
-    /// arithmetic-identical candidate kernels. Env: `HIPFIRE_MQ4V2_QKVZA_VARIANT`.
-    pub mq4v2_qkvza_variant: Option<String>,
-
     // ── Compiler.rs env reads ──────────────────────────────────────
     pub hipcc_extra_flags: String,
 
@@ -552,13 +546,6 @@ impl FeatureFlags {
             rdna2_variant: value("HIPFIRE_RDNA2_VARIANT")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok()),
-            mq4v2_qkvza_variant: value("HIPFIRE_MQ4V2_QKVZA_VARIANT")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .and_then(|v| match v.as_str() {
-                    "hoist" | "x_buffer" => Some(v),
-                    _ => None,
-                }),
 
             // Compiler.rs
             hipcc_extra_flags,
@@ -778,7 +765,6 @@ impl FeatureFlags {
             slot_trace: false,
             lloyd_force_baseline: false,
             rdna2_variant: None,
-            mq4v2_qkvza_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
             dflash_tree: true,
