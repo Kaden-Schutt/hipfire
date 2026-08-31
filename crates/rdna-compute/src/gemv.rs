@@ -12443,10 +12443,11 @@ impl Gpu {
     /// Same launch contract; the byte estimate reuses the qt13 helper because
     /// both formats are 136 B/group.
     ///
-    /// Default route remains RPB=16 (`gemv_mq4g256v2_moe_ninepath_d4`, grid
-    /// `down_m/16`). Opt-in gfx1100 higher-parallelism candidate RPB=8 under
-    /// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` at exact down_m=2048, down_k=512
-    /// (grid `down_m/8`). Frozen 48-byte ABI; per-row arithmetic unchanged.
+    /// gfx1100 uses the higher-parallelism RPB=8 specialization by default at
+    /// exact down_m=2048, down_k=512 (grid `down_m/8`); the generic RPB=16
+    /// route remains the fallback everywhere else. Frozen 48-byte ABI and
+    /// per-row arithmetic are unchanged. Retained-PM4 measured 246.167 ->
+    /// 248.025 tok/s on Ornith 1.5 with Q8 EF.
     pub fn gemv_mq4g256v2_moe_ninepath_d4(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -12457,11 +12458,7 @@ impl Gpu {
         down_m: usize,
         down_k: usize,
     ) -> HipResult<()> {
-        let use_rpb8 = self.arch_caps.is_gfx1100()
-            && down_m == 2_048
-            && down_k == 512
-            && hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8").as_deref()
-                == Ok("1");
+        let use_rpb8 = self.arch_caps.is_gfx1100() && down_m == 2_048 && down_k == 512;
         self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
             expert_ptrs,
             topk_indices,
@@ -12474,7 +12471,7 @@ impl Gpu {
         )
     }
 
-    /// Force incumbent RPB=16 ninepath (bypasses env candidate selection).
+    /// Force incumbent RPB=16 ninepath for the exact parity oracle.
     #[doc(hidden)]
     pub fn gemv_mq4g256v2_moe_ninepath_d4_rpb16_exact(
         &mut self,

@@ -2410,10 +2410,10 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
 pub const GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip");
 
-/// gfx1100 higher-parallelism MQ4G256V2 ninepath candidate: same TU, RPB=8.
-/// Symbol `gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100`. Frozen 48-byte ABI;
-/// only grid becomes `down_m/8`. Host selects under
-/// `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8=1` at exact down_m=2048, down_k=512.
+/// gfx1100 higher-parallelism MQ4G256V2 ninepath specialization: same TU,
+/// RPB=8. Symbol `gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100`. Frozen 48-byte
+/// ABI; only the grid becomes `down_m/8`. The host selects it at exact
+/// down_m=2048, down_k=512.
 pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n",
     "#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n",
