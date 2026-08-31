@@ -11697,21 +11697,21 @@ impl Gpu {
         // Value-preserving: the parity oracle reports identical rel_l2 either
         // way (4.767e-7 / 5.097e-7).
         //
-        // DEFAULT ON for gfx1151, where it is measured: +2.8% decode on the
-        // shipped Ornith 1.5 (qt44 routed experts), 4 alternations x 12 runs,
-        // WIDE 70.94 -> TIGHT 72.94 tok/s with no overlap between the arms
-        // (70.40-71.35 vs 72.75-73.40).
+        // DEFAULT ON where measured:
+        // - gfx1151: +2.8% decode on shipped Ornith 1.5, 4 alternations x
+        //   12 runs, WIDE 70.94 -> TIGHT 72.94 tok/s with no overlap
+        //   (70.40-71.35 vs 72.75-73.40).
+        // - gfx1201: +3.1% on bench_qwen35_mq4 TG128 (156.0 -> 160.8 tok/s)
+        //   and +2.9% on the q8_ef Redline daemon harness (153.7 -> 158.2
+        //   tok/s); the full retained-PM4 shadow remained bit-exact.
         //
-        // Opt-in elsewhere: the contraction is semantically target-neutral, but
-        // per this repo's admission rule a specialisation ships on the arch it
-        // was measured on. gfx12/RDNA4 in particular is unmeasured — whoever has
-        // an R9700 can flip it with HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID=1 and, if
-        // it holds, widen this condition.
+        // Opt-in elsewhere: the contraction is semantically target-neutral,
+        // but specialisations ship only on measured architectures.
         let tight =
             match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID").as_deref() {
                 Ok("1") => true,
                 Ok("0") => false,
-                _ => self.arch_caps.is_gfx1151(),
+                _ => self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201(),
             };
         let grid_x = if tight { (m as u32) >> 1 } else { m as u32 };
         let result = self.launch_maybe_blob(

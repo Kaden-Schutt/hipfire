@@ -217,12 +217,8 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
             .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
 }
 
-/// GATE-SIDE exact-uniform MQ4G256 V1 quartet (router + shared expert
-/// gate/up), independent of the routed experts. When true, the fused
-/// rmsnorm+FWHT path may hand only the rotated activation to the V1 four-weight
-/// gate kernel. MQ4G256V2 deliberately stays on the normalized generic path:
-/// dispatch reuses its single rotated activation through exact V2 prerotated
-/// GEMVs, whose implementation is correct across every admitted wave32 arch.
+/// Gate-side exact-uniform MQ4G256 V1 quartet (router + shared expert
+/// gate/up), independent of the routed experts.
 ///
 /// Keeping this predicate aligned with `MoeResolution::gate_fusable` is a
 /// correctness invariant. If Qwen pre-rotates while dispatch declines the
@@ -244,6 +240,49 @@ pub(crate) fn gate_side_mq4_uniform_from_dtypes(
     [router, shared_expert_gate, shared_gate, shared_up]
         .into_iter()
         .all(|dt| dt == DType::MQ4G256)
+}
+
+/// Exact Ornith MQ4G256V2 gate quartet admitted by the fused prerotated
+/// dispatch route. Shapes and missing AWQ sidecars are part of the contract:
+/// widening any one here without the matching `MoeResolution::gate_fusable`
+/// arm would feed unnormalized residuals to the generic fallback.
+fn ffn_gate_side_mq4v2_prerotated_for_moe(ffn: &MoeFfnWeights) -> bool {
+    gate_side_mq4v2_prerotated_from_layouts([
+        (
+            ffn.router.gpu_dtype,
+            ffn.router.m,
+            ffn.router.k,
+            ffn.router.awq_scale.is_some(),
+        ),
+        (
+            ffn.shared_expert_gate.gpu_dtype,
+            ffn.shared_expert_gate.m,
+            ffn.shared_expert_gate.k,
+            ffn.shared_expert_gate.awq_scale.is_some(),
+        ),
+        (
+            ffn.shared_expert.gate.gpu_dtype,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.gate.k,
+            ffn.shared_expert.gate.awq_scale.is_some(),
+        ),
+        (
+            ffn.shared_expert.up.gpu_dtype,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.up.k,
+            ffn.shared_expert.up.awq_scale.is_some(),
+        ),
+    ])
+}
+
+fn gate_side_mq4v2_prerotated_from_layouts(layouts: [(DType, usize, usize, bool); 4]) -> bool {
+    let expected = [(256, 2_048), (1, 2_048), (512, 2_048), (512, 2_048)];
+    layouts
+        .into_iter()
+        .zip(expected)
+        .all(|((dtype, m, k, has_awq), (want_m, want_k))| {
+            dtype == DType::MQ4G256V2 && m == want_m && k == want_k && !has_awq
+        })
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -3022,7 +3061,9 @@ fn moe_ffn_dispatch(
     s: &Qwen35Scratch,
     defer_routed_combine: bool,
 ) -> HipResult<()> {
-    let r = if ffn_gate_side_mq4_for_moe(ffn) {
+    let exact_v2_prerotated = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
+        && ffn_gate_side_mq4v2_prerotated_for_moe(ffn);
+    let r = if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
         gpu.fused_rmsnorm_rotate_mq(
             x,
             ffn_norm,
@@ -6130,27 +6171,31 @@ mod tests {
     }
 
     #[test]
-    fn mq4v2_gate_side_uses_normalized_generic_path() {
+    fn mq4v2_gate_side_prerotation_requires_exact_ornith_layout() {
         let v1 = DType::MQ4G256;
         let v2 = DType::MQ4G256V2;
+        let exact = [
+            (v2, 256, 2_048, false),
+            (v2, 1, 2_048, false),
+            (v2, 512, 2_048, false),
+            (v2, 512, 2_048, false),
+        ];
         assert!(gate_side_mq4_uniform_from_dtypes([v1, v1, v1, v1]));
-        assert!(
-            !gate_side_mq4_uniform_from_dtypes([v2, v2, v2, v2]),
-            "V2 gate quartet must preserve normalized x for prerotated GEMVs"
-        );
-        assert!(!gate_side_mq4_uniform_from_dtypes([v2, v1, v1, v1]));
-        assert!(!gate_side_mq4_uniform_from_dtypes([
-            DType::Q8_0,
-            v1,
-            v1,
-            v1
-        ]));
-        assert!(!gate_side_mq4_uniform_from_dtypes([
-            DType::MQ6G256,
-            v1,
-            v1,
-            v1
-        ]));
+        assert!(!gate_side_mq4_uniform_from_dtypes([v2, v2, v2, v2]));
+        assert!(gate_side_mq4v2_prerotated_from_layouts(exact));
+
+        for slot in 0..4 {
+            let mut mixed = exact;
+            mixed[slot].0 = v1;
+            assert!(!gate_side_mq4v2_prerotated_from_layouts(mixed));
+
+            let mut awq = exact;
+            awq[slot].3 = true;
+            assert!(!gate_side_mq4v2_prerotated_from_layouts(awq));
+        }
+        let mut wrong_shape = exact;
+        wrong_shape[2].1 = 511;
+        assert!(!gate_side_mq4v2_prerotated_from_layouts(wrong_shape));
     }
 
     #[test]

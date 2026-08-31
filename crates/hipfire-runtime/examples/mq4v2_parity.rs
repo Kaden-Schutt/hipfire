@@ -212,20 +212,23 @@ fn rel_err(got: &[f32], want: &[f64]) -> (f64, usize) {
 fn check_gfx1100_residual_r1_exact(gpu: &mut Gpu) {
     assert!(
         gpu.arch_caps.is_gfx1100(),
-        "HIPFIRE_MQ4V2_RESIDUAL_R1=1 parity requires exact gfx1100, got {}",
+        "Ornith residual parity requires exact gfx1100, got {}",
         gpu.arch
     );
 
-    // This is the exact Ornith attention-output shape admitted by the candidate.
-    // Starting Y at +0 makes residual addition bit-identical to the plain V2
-    // store, so every output bit is a direct oracle for unchanged decode and
-    // accumulation order. The padded tail catches an over-wide row grid.
+    // This is the exact Ornith attention-output shape admitted by the
+    // scratchless candidate. A nonzero deterministic residual makes both the
+    // legacy generic body and the candidate prove the real y += A*x contract;
+    // separate processes print the same output-bit hash for direct comparison.
+    // The padded tail catches an over-wide row grid.
     let (m, k) = (2_048usize, 4_096usize);
     let w = build_disjoint_halves(m, k);
     let blob = pack_mq4g256v2(&w, m, k);
     let x: Vec<f32> = (0..k).map(|i| prng(i, 0x51D3_0001) * 2.0 - 1.0).collect();
     let canary = f32::from_bits(0x4B5A_A55A);
-    let mut y_init = vec![0.0f32; m + 16];
+    let mut y_init: Vec<f32> = (0..m + 16)
+        .map(|i| prng(i, 0xA11C_E55E) * 0.25 - 0.125)
+        .collect();
     y_init[m..].fill(canary);
 
     let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
@@ -240,11 +243,14 @@ fn check_gfx1100_residual_r1_exact(gpu: &mut Gpu) {
 
     let plain = gpu.download_f32(&d_plain).unwrap();
     let residual = gpu.download_f32(&d_residual).unwrap();
-    if let Some(i) = (0..m).find(|&i| plain[i].to_bits() != residual[i].to_bits()) {
+    if let Some(i) = (0..m).find(|&i| {
+        let expected = (y_init[i] + plain[i]).to_bits();
+        expected != residual[i].to_bits()
+    }) {
         panic!(
-            "gfx1100 residual R1 differs from plain V2 at row {i}: \
-             plain={:#010x}, residual={:#010x}",
-            plain[i].to_bits(),
+            "gfx1100 residual differs from y_init + plain V2 at row {i}: \
+             expected={:#010x}, residual={:#010x}",
+            (y_init[i] + plain[i]).to_bits(),
             residual[i].to_bits()
         );
     }
@@ -255,8 +261,22 @@ fn check_gfx1100_residual_r1_exact(gpu: &mut Gpu) {
                 .all(|&v| v.to_bits() == canary.to_bits()),
         "gfx1100 residual R1 wrote past M={m}"
     );
+    let hash = residual[..m]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |mut h, v| {
+            for byte in v.to_bits().to_le_bytes() {
+                h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+            h
+        });
+    let route = if std::env::var("HIPFIRE_MQ4V2_RESIDUAL_R1").as_deref() == Ok("1") {
+        "scratchless-candidate"
+    } else {
+        "legacy-generic"
+    };
     eprintln!(
-        "gfx1100 residual R1 K4096: PASS — {m} outputs bit-exact vs plain V2; canaries intact"
+        "gfx1100 Ornith residual ({route}): PASS — {m} nonzero y += A*x outputs exact; \
+         hash={hash:016x}; canaries intact"
     );
 }
 
@@ -321,7 +341,7 @@ fn main() {
          a correct per-128 decode from v1 wearing v2's header."
     );
 
-    if std::env::var("HIPFIRE_MQ4V2_RESIDUAL_R1").as_deref() == Ok("1") {
+    if std::env::var("HIPFIRE_MQ4V2_RESIDUAL_R1_PARITY").as_deref() == Ok("1") {
         check_gfx1100_residual_r1_exact(&mut gpu);
     }
 
