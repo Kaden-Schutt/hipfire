@@ -28595,15 +28595,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         let variant = if self.arch == "gfx1100" && k == 2048 {
-            static GFX1100_MQ4V2_QKV_X_BUFFER: OnceLock<bool> = OnceLock::new();
-            if *GFX1100_MQ4V2_QKV_X_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_QKV_X_BUFFER").as_deref()
-                    == Ok("1")
-            }) {
-                Mq4v2QkvVariant::K2048XBufferGfx1100
-            } else {
-                Mq4v2QkvVariant::Generic
-            }
+            Mq4v2QkvVariant::K2048XBufferGfx1100
         } else {
             Mq4v2QkvVariant::Generic
         };
