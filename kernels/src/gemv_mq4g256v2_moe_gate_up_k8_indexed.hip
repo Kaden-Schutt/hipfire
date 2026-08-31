@@ -58,17 +58,6 @@
 #define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed
 #endif
 
-// Opt-in activation buffer path: only valid on the no-LDS body. Replaces
-// float4 activation loads with raw_buffer_load_b128 while keeping scalar
-// names and DOG/FMA order byte-for-byte equivalent.
-#if defined(HIPFIRE_MQ4V2_GATE_UP_X_BUFFER) && !defined(HIPFIRE_MQ4V2_GATE_UP_NOLDS)
-#error "HIPFIRE_MQ4V2_GATE_UP_X_BUFFER requires HIPFIRE_MQ4V2_GATE_UP_NOLDS"
-#endif
-#if defined(HIPFIRE_MQ4V2_GATE_UP_X_BUFFER)
-using hipfire_mq4v2_gate_i32x4 = int __attribute__((ext_vector_type(4)));
-using hipfire_mq4v2_gate_f32x4 = float __attribute__((ext_vector_type(4)));
-#endif
-
 #if defined(HIPFIRE_MQ4V2_GATE_UP_NOLDS)
 __launch_bounds__(32, 8)
 #else
@@ -93,10 +82,6 @@ extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
     // One-wave/row arithmetic below is unchanged vs the incumbent path.
     if (row >= mi) return;
     const float* __restrict__ xsrc = x;
-#if defined(HIPFIRE_MQ4V2_GATE_UP_X_BUFFER)
-    const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
-#endif
 #else
     // Stage x into LDS before any early-return so all 32 lanes hit the barrier.
     // Cap at 2048 (A3B hidden); larger K falls back to global x (value-identical).
@@ -154,23 +139,11 @@ extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-#if defined(HIPFIRE_MQ4V2_GATE_UP_X_BUFFER)
-    #define LOAD_X8_INTO(b, pfx) \
-        const hipfire_mq4v2_gate_f32x4 pfx##v0 = __builtin_bit_cast( \
-            hipfire_mq4v2_gate_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
-                x_rsrc, (unsigned int)(b) * 4u, 0, 0)); \
-        const hipfire_mq4v2_gate_f32x4 pfx##v1 = __builtin_bit_cast( \
-            hipfire_mq4v2_gate_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
-                x_rsrc, ((unsigned int)(b) + 4u) * 4u, 0, 0)); \
-        const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
-        const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
-#else
     #define LOAD_X8_INTO(b, pfx) \
         const float4 pfx##v0 = *reinterpret_cast<const float4*>(xsrc + (b)); \
         const float4 pfx##v1 = *reinterpret_cast<const float4*>(xsrc + (b) + 4); \
         const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
         const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
-#endif
 
     #define DOG_X8(gp, a, pfx) do { \
         unsigned int h = *(const unsigned int*)((gp) + hoff); \
@@ -209,25 +182,11 @@ extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
     }
 
     // Tail: at most 3 groups; sequential load is fine.
-#if defined(HIPFIRE_MQ4V2_GATE_UP_X_BUFFER)
-    // K=2048 has no tail (groups_per_row=8); keep the generic tail buildable
-    // under X_BUFFER by lowering LOAD_X8 the same way as LOAD_X8_INTO.
-    #define LOAD_X8(b) \
-        const hipfire_mq4v2_gate_f32x4 xv0 = __builtin_bit_cast( \
-            hipfire_mq4v2_gate_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
-                x_rsrc, (unsigned int)(b) * 4u, 0, 0)); \
-        const hipfire_mq4v2_gate_f32x4 xv1 = __builtin_bit_cast( \
-            hipfire_mq4v2_gate_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
-                x_rsrc, ((unsigned int)(b) + 4u) * 4u, 0, 0)); \
-        const float x0 = xv0.x, x1 = xv0.y, x2 = xv0.z, x3 = xv0.w; \
-        const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
-#else
     #define LOAD_X8(b) \
         const float4 xv0 = *reinterpret_cast<const float4*>(xsrc + (b)); \
         const float4 xv1 = *reinterpret_cast<const float4*>(xsrc + (b) + 4); \
         const float x0 = xv0.x, x1 = xv0.y, x2 = xv0.z, x3 = xv0.w; \
         const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
-#endif
 
     #define DOG_X8_TAIL(gp, a) do { \
         unsigned int h = *(const unsigned int*)((gp) + hoff); \

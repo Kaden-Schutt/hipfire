@@ -740,7 +740,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_mq4g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
-            | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100"
             // Batched Path1 sisters: same pointer set/modes; K_TOP scalar
             // only changes the recorded kernarg length (64 B padded).
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
@@ -1418,7 +1417,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_mq4g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
-            | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100"
             | "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq4g256v2_moe_ninepath_d4"
@@ -5558,7 +5556,6 @@ mod tests {
         "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151",
         "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
-        "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151",
@@ -6365,13 +6362,12 @@ mod tests {
         let grouped_effects = vec![read(0), read(8), read(16), read(24), write(32)];
 
         // Decode gate_up: 5 ptr + M,K = 48 B (already 16-aligned).
-        // Includes gfx1100 exact K=2048 nolds (admitted) and X_BUFFER (opt-in)
-        // candidates: same ABI/grid contract; only x-load lowering differs.
+        // Includes gfx1100 exact K=2048 nolds candidate: same ABI/grid contract
+        // as the generic gate_up, only workgroup/LDS/barrier removal differs.
         for symbol in [
             "gemv_mq4g256v2_moe_gate_up_k8_indexed",
             "gemv_mq6g256v2_moe_gate_up_k8_indexed",
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(48));
             let got = pointer_effects(symbol).expect("mqv2 gate_up pointer contract");

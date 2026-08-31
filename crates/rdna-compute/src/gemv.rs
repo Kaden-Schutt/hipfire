@@ -11737,20 +11737,8 @@ impl Gpu {
         //
         // Measured on Ornith 1.5 with Q8 EF and retained PM4 replay: the
         // complete admitted gfx1100 stack improved 241.002 -> 246.167 tok/s.
-        //
-        // Opt-in X_BUFFER candidate (NOLDS body + raw_buffer_load_b128 on x):
-        // HIPFIRE_GFX1100_MQ4V2_GATE_UP_X_BUFFER=1 until measured.
         let use_nolds = self.arch_caps.is_gfx1100() && m == 1024 && k == 2048;
-        let use_x_buffer = use_nolds
-            && hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4V2_GATE_UP_X_BUFFER").as_deref()
-                == Ok("1");
-        if use_x_buffer {
-            self.ensure_kernel(
-                "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100",
-                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_X_BUFFER_GFX1100_SRC,
-                "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100",
-            )?;
-        } else if use_nolds {
+        if use_nolds {
             self.ensure_kernel(
                 "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
                 kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC,
@@ -11781,9 +11769,7 @@ impl Gpu {
         ];
         // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let func_name = if use_x_buffer {
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100"
-        } else if use_nolds {
+        let func_name = if use_nolds {
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
         } else {
             "gemv_mq4g256v2_moe_gate_up_k8_indexed"
@@ -11825,133 +11811,6 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             func_name,
             [grid_x, 8, 1],
-            [32u32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// Direct-launch the admitted gfx1100 no-LDS gate_up specialization.
-    /// Same frozen 48-byte ABI / `[M/2,8,1]` / block32 / LDS0 as production.
-    /// Bypasses arch/env routing so parity oracles can raw-bit compare against
-    /// opt-in candidates without depending on the default selector.
-    #[doc(hidden)]
-    pub fn gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100_exact(
-        &mut self,
-        expert_ptrs: &GpuTensor,
-        topk_indices: &GpuTensor,
-        x: &GpuTensor,
-        y_gate: &GpuTensor,
-        y_up: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        const FUNC: &str = "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100";
-        self.ensure_kernel(
-            FUNC,
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC,
-            FUNC,
-        )?;
-        let pp = expert_ptrs.buf.as_ptr();
-        let ip = topk_indices.buf.as_ptr();
-        let xp = x.buf.as_ptr();
-        let ygp = y_gate.buf.as_ptr();
-        let yup = y_up.buf.as_ptr();
-        let m_val = m as i32;
-        let k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &ygp as *const _ as *mut c_void,
-            &yup as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
-        let result = self.launch_maybe_blob(
-            FUNC,
-            [(m as u32) >> 1, 8, 1],
-            [32u32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// Direct-launch the opt-in gfx1100 no-LDS + X_BUFFER gate_up candidate.
-    /// Same ABI/grid/FMA order as the admitted nolds route; activation loads
-    /// only. Used by raw-bit parity against the nolds exact wrapper.
-    #[doc(hidden)]
-    pub fn gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100_exact(
-        &mut self,
-        expert_ptrs: &GpuTensor,
-        topk_indices: &GpuTensor,
-        x: &GpuTensor,
-        y_gate: &GpuTensor,
-        y_up: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        const FUNC: &str = "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_x_buffer_gfx1100";
-        self.ensure_kernel(
-            FUNC,
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_X_BUFFER_GFX1100_SRC,
-            FUNC,
-        )?;
-        let pp = expert_ptrs.buf.as_ptr();
-        let ip = topk_indices.buf.as_ptr();
-        let xp = x.buf.as_ptr();
-        let ygp = y_gate.buf.as_ptr();
-        let yup = y_up.buf.as_ptr();
-        let m_val = m as i32;
-        let k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &ygp as *const _ as *mut c_void,
-            &yup as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
-        let result = self.launch_maybe_blob(
-            FUNC,
-            [(m as u32) >> 1, 8, 1],
             [32u32, 1, 1],
             0,
             &mut params,
