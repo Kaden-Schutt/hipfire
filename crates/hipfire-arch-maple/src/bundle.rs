@@ -93,6 +93,28 @@ pub fn load_maple_from_hfq(
     max_seq: usize,
     kv_mode_raw: &str,
 ) -> Result<MapleBundle, String> {
+    load_maple_from_hfq_with_head(hfq, gpu, max_seq, kv_mode_raw, None)
+}
+
+/// `load_maple_from_hfq` with an optional HEAD OVERLAY: a single-tensor `.hfq`
+/// built by `hipfire-quantize --head-only` whose `lm_head.weight` shadows the
+/// base's. One 6.5 GB body then serves every head carrier, instead of shipping
+/// a near-identical full model per carrier.
+///
+/// Attached BEFORE `MapleWeights::load`, because the loader reads the head
+/// through the same `find_tensor_info` path the overlay shadows — attaching
+/// afterwards would silently load the base's head and produce a model that
+/// looks right and is not the one requested.
+pub fn load_maple_from_hfq_with_head(
+    hfq: &mut HfqFile,
+    gpu: &mut Gpu,
+    max_seq: usize,
+    kv_mode_raw: &str,
+    head_overlay: Option<&std::path::Path>,
+) -> Result<MapleBundle, String> {
+    if let Some(head) = head_overlay {
+        hfq.attach_head_overlay(head)?;
+    }
     let config = MapleConfig::from_hfq(hfq)?;
     let weights = MapleWeights::load(hfq, &config, gpu)?;
     let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =

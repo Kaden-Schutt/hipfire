@@ -1151,3 +1151,31 @@ mod head_carrier_tests {
         assert!(e.contains("unsupported quant_type 200"), "got {e}");
     }
 }
+
+#[cfg(test)]
+mod head_overlay_tests {
+    /// The head-overlay contract, pinned as prose because the failure it
+    /// guards against is silent.
+    ///
+    /// `--head` points at a single-tensor `.hfq` from
+    /// `hipfire-quantize --head-only`, attached via
+    /// `HfqFile::attach_head_overlay` BEFORE `MapleWeights::load`. Ordering is
+    /// load-bearing: the loader resolves `lm_head.weight` through the same
+    /// `find_tensor_info` path the overlay shadows, so attaching afterwards
+    /// would quietly serve the BASE's head and produce a model that looks
+    /// correct and is not the one requested.
+    ///
+    /// The overlay must contain ONLY `lm_head.weight`. Without that check,
+    /// passing a full model to `--head` succeeds: every name exists in the
+    /// base at a matching shape, so `attach_overlay`'s arch/name/shape guards
+    /// all pass and the model silently shadows itself. That was found by a
+    /// negative control, not by inspection.
+    #[test]
+    fn head_overlay_contract_is_documented() {
+        // Executable only as documentation; the behavioural coverage is the
+        // GPU path exercised in review (valid q4k/bf16 overlays attach and
+        // generate; a full model is refused with a message naming the first
+        // offending tensor). Kept so the contract travels with the code.
+        assert_eq!(super::LM_HEAD_TENSOR_NAME, "lm_head.weight");
+    }
+}

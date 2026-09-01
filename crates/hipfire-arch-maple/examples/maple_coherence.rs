@@ -15,6 +15,7 @@
 //!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N]
 //!                   [--raw] [--kv-mode q8|bf16]
 //!                   [--temp T] [--top-p P] [--seed N]
+//!                   [--head <head-only.hfq>]
 //!
 //! `--kv-mode bf16` swaps the Q8_0 KV cache for the flat BF16 tier. Both run
 //! the same sliding-window kernels with the same dim mapping and FMA order, so
@@ -28,7 +29,7 @@
 //! against the HF reference is a separate follow-up; it needs a capture hook
 //! inside `decode_step_body`, which this harness deliberately does not have.
 
-use hipfire_arch_maple::bundle::load_maple_from_hfq;
+use hipfire_arch_maple::bundle::load_maple_from_hfq_with_head;
 use hipfire_arch_maple::forward::decode_step;
 use hipfire_runtime::hfq::HfqFile;
 use std::path::Path;
@@ -39,6 +40,8 @@ struct Args {
     max_tokens: usize,
     raw: bool,
     kv_mode: String,
+    /// Optional head-overlay `.hfq` (hipfire-quantize --head-only).
+    head: Option<String>,
     /// 0.0 = greedy (default, unchanged behaviour). > 0 = sample.
     temp: f32,
     top_p: f32,
@@ -127,6 +130,7 @@ fn parse_args() -> Args {
     let mut temp = 0.0f32;
     let mut top_p = 0.95f32;
     let mut seed = 0u64;
+    let mut head: Option<String> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -166,6 +170,12 @@ fn parse_args() -> Args {
                 seed = argv[i + 1].parse().expect("--seed");
                 i += 2;
             }
+            // Swap the lm_head without a second full model: point at a
+            // single-tensor .hfq from `hipfire-quantize --head-only`.
+            "--head" => {
+                head = Some(argv[i + 1].clone());
+                i += 2;
+            }
             other => panic!("unknown arg {other}"),
         }
     }
@@ -178,6 +188,7 @@ fn parse_args() -> Args {
         temp,
         top_p,
         seed,
+        head,
     }
 }
 
@@ -220,8 +231,14 @@ fn main() {
     let prompt_toks = tokenizer.encode(&text);
 
     let max_seq = prompt_toks.len() + args.max_tokens + 64;
-    let mut b =
-        load_maple_from_hfq(&mut hfq, &mut gpu, max_seq, &args.kv_mode).expect("load maple bundle");
+    let mut b = load_maple_from_hfq_with_head(
+        &mut hfq,
+        &mut gpu,
+        max_seq,
+        &args.kv_mode,
+        args.head.as_deref().map(std::path::Path::new),
+    )
+    .expect("load maple bundle");
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} moe_inter={} vocab={} eos={} max_seq={}",
         b.config.hidden_size,
