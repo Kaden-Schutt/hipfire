@@ -20,19 +20,19 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::carrier::Qwen35Bundle;
 use hipfire_arch_qwen35::dflash_verify_pm4::{
-    DFLASH_VERIFY_PM4_BLOCK, DflashVerifyPm4, DflashVerifyPm4Phase,
+    DflashVerifyPm4, DflashVerifyPm4Phase, DFLASH_VERIFY_PM4_BLOCK,
 };
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative::{
-    DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
-    verify_dflash_block, verify_dflash_block_retained,
+    verify_dflash_block, verify_dflash_block_retained, DeltaNetSnapshot, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_engine::redline::{
-    RedlineRegionHash, redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
-    redline_capture_json, redline_hash,
+    redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
+    redline_capture_json, redline_hash, RedlineRegionHash,
 };
-use hipfire_loader::LoadedModel;
 use hipfire_loader::spec_build::Qwen35SlotGuard;
+use hipfire_loader::LoadedModel;
 use rdna_compute::replay::ReplayQuiescence;
 use std::any::Any;
 use std::io::Read;
@@ -4336,7 +4336,7 @@ pub fn handle_redline_prefix_shadow(
 
 #[cfg(test)]
 mod redline_snapshot_tests {
-    use super::{RedlineQwenSnapshot, RedlineSnapshot, redline_snapshots_bit_exact};
+    use super::{redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot};
 
     fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
         RedlineSnapshot::Qwen(RedlineQwenSnapshot {

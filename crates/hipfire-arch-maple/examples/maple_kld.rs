@@ -54,7 +54,8 @@ use std::path::Path;
 use std::time::Instant;
 
 const USAGE: &str = "usage: maple_kld --model <model.hfq> --tokens <tokens.json> \
-                     --ref <ref_logits.bin> [--dump <out.bin>] [--per-pos <out.csv>] [--limit N]";
+                     --ref <ref_logits.bin> [--dump <out.bin>] [--per-pos <out.csv>] [--limit N] \\
+                     [--kv-mode q8|bf16]";
 
 struct Args {
     model: String,
@@ -63,6 +64,11 @@ struct Args {
     dump: Option<String>,
     per_pos: Option<String>,
     limit: Option<usize>,
+    /// KV storage tier request, resolved through MAPLE_POLICY. "" = q8.
+    /// This is what lets the Q8-KV contribution to the measured KL be
+    /// SUBTRACTED rather than assumed: run the same tokens and the same
+    /// reference under q8 and bf16 and diff the results.
+    kv_mode: String,
 }
 
 fn parse_args() -> Args {
@@ -74,6 +80,7 @@ fn parse_args() -> Args {
         dump: None,
         per_pos: None,
         limit: None,
+        kv_mode: String::new(),
     };
     let mut i = 1;
     while i < argv.len() {
@@ -90,6 +97,7 @@ fn parse_args() -> Args {
             "--dump" => a.dump = Some(val()),
             "--per-pos" => a.per_pos = Some(val()),
             "--limit" => a.limit = Some(val().parse().expect("--limit")),
+            "--kv-mode" => a.kv_mode = val(),
             other => panic!("unknown arg {other}\n{USAGE}"),
         }
         i += 2;
@@ -187,7 +195,8 @@ fn main() {
 
     eprintln!("Loading weights from {}...", args.model);
     let t_load = Instant::now();
-    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, n).expect("load maple bundle");
+    let mut b =
+        load_maple_from_hfq(&mut hfq, &mut gpu, n, &args.kv_mode).expect("load maple bundle");
     eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} vocab={}",

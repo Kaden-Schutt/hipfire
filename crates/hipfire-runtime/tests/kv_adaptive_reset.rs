@@ -33,6 +33,7 @@ fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize)
         quant_asym3: a3,
         quant_asym2: a2,
         quant_fwht: fwht,
+        quant_bf16: false,
         boundary_layers: 0,
         givens_cos: None,
         givens_sin: None,
@@ -49,12 +50,8 @@ fn adaptive_reset_invalidates_captured_execution_state() {
         return;
     };
     let mut cache = flag_standin(KvMode::Fwht2, VMode::Lloyd2, 4, 256);
-    let mut adaptive = kv_adaptive::KvAdaptive::from_preset(
-        kv_adaptive::Preset::Aggressive,
-        128,
-        4,
-        256,
-    );
+    let mut adaptive =
+        kv_adaptive::KvAdaptive::from_preset(kv_adaptive::Preset::Aggressive, 128, 4, 256);
     adaptive.cur_k = kv_adaptive::KMode::Fwht2;
     adaptive.cur_v = VMode::Lloyd2;
     adaptive.next_step = adaptive.steps.len();

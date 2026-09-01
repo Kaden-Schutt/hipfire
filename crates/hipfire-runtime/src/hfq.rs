@@ -42,6 +42,9 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
+/// The only tensor a head overlay may carry.
+const HEAD_TENSOR_NAME: &str = "lm_head.weight";
+
 impl HfqFile {
     /// Start a background parallel cache warmer: N worker threads pread the
     /// data region chunk-sequentially into the page cache while the loader
@@ -386,6 +389,50 @@ impl HfqFile {
             }
         }
         Ok(f)
+    }
+
+    /// Attach a HEAD overlay: a single-tensor `.hfq` (built by
+    /// `hipfire-quantize --head-only`) whose `lm_head.weight` shadows the
+    /// base's, so one body can serve several head carriers.
+    ///
+    /// Same guards as [`Self::attach_overlay`] — matching arch_id, the name
+    /// must already exist in the base, and the logical shape must match; only
+    /// the quant tier may differ. Failure is an ERROR, not a warning: unlike
+    /// the REAP path (where proceeding unpruned is a safe default for an
+    /// unrelated model that merely shares an env var), a head overlay is
+    /// requested explicitly, so silently serving the base's head would hand
+    /// back a model the operator did not ask for.
+    pub fn attach_head_overlay(&mut self, head_path: &Path) -> Result<(), String> {
+        let ov = Self::open_at_offset(head_path, 0)
+            .map_err(|e| format!("head overlay {head_path:?}: {e}"))?;
+        // A head overlay must contain ONLY head tensors. Without this, passing
+        // a full model to --head "succeeds": every name exists in the base with
+        // a matching shape, so attach_overlay's guards all pass and the entire
+        // model silently shadows itself. Caught by a negative control that
+        // passed the base as its own overlay.
+        let foreign: Vec<&str> = ov
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| *n != HEAD_TENSOR_NAME)
+            .collect();
+        if !foreign.is_empty() {
+            return Err(format!(
+                "head overlay {head_path:?}: expected only `{HEAD_TENSOR_NAME}`, found {} \
+                 tensor(s) including `{}` — this looks like a full model, not a \
+                 `hipfire-quantize --head-only` build",
+                ov.tensors.len(),
+                foreign[0],
+            ));
+        }
+        if ov.tensors.is_empty() {
+            return Err(format!("head overlay {head_path:?}: contains no tensors"));
+        }
+        let n = ov.tensors.len();
+        self.attach_overlay(ov)
+            .map_err(|e| format!("head overlay {head_path:?}: {e}"))?;
+        eprintln!("  head overlay: {n} tensor(s) from {head_path:?} shadow the base");
+        Ok(())
     }
 
     /// Attach an overlay whose tensors shadow this file's by name. Used by the

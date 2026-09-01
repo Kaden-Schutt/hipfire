@@ -100,6 +100,16 @@ __global__ void moe_topk_renorm_k8(
                     cur_v = -INFINITY; \
                     cur_i = -1; \
                 } \
+                /* REQUIRED. `warp_i[0]` is read here by every thread as this \
+                   iteration's winner, and rewritten by warp 0 lane 0 at the TOP \
+                   of the next iteration (`warp_i[warp_id]`) with no barrier in \
+                   between. Without this, a fast warp 0 clobbers the winner \
+                   before a slow warp has invalidated against it; that warp \
+                   keeps the picked expert live and it is selected AGAIN, so the \
+                   top-8 comes back with a DUPLICATE and a distinct expert \
+                   dropped. Measured 1 occurrence per ~46k router calls before \
+                   this barrier, always from bit-identical input logits. */ \
+                __syncthreads(); \
             } \
         } while (0)
 
@@ -163,6 +173,10 @@ __global__ void moe_topk_renorm_k8(
                     cur_v = -INFINITY;
                     cur_i = -1;
                 }
+                // REQUIRED, same hazard as the exact-256 path above: the next
+                // iteration's `warp_i[warp_id]` store races this read of
+                // `warp_i[0]`, and losing it yields a duplicated expert.
+                __syncthreads();
             }
         }
 

@@ -134,6 +134,43 @@ pub const QWEN35_PP_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
+/// Site 7 — maple (arch 15). Before this site existed, maple hardcoded
+/// `KvCache::new_gpu_q8` and `--kv-mode` was a silent no-op for arch 15.
+///
+/// The accept set is deliberately just {Q8, Bf16}. Every other mode in the
+/// ladder is a rotated or block-quantized tier whose attention kernels have NO
+/// sliding-window variant, and Maple is 3:1 sliding(512)/global — a tier that
+/// cannot carry the window would attend the full context on the sliding layers
+/// and be silently WRONG at ctx > 512, not merely slower. Accepting them and
+/// warning is the wrong trade here; refusing to the q8 default is right.
+///
+/// `"bf16"` is the only new name, and it is deliberately NOT added to
+/// `normalize_full`: no other site can allocate a bf16 cache, so putting it
+/// there would let `HIPFIRE_KV_MODE=bf16` on qwen35 normalize successfully and
+/// then fall to that site's default — a silent downgrade instead of a warning.
+///
+/// **The default is bf16, not q8.** Measured against a bf16 reference on 2048
+/// teacher-forced wikitext tokens, q8 KV costs 39% of the total divergence
+/// (mean KL 0.0842 q8 vs 0.0511 bf16, top-1 90.8% vs 91.9%), and the damage is
+/// in the TAIL rather than as uniform blur — the median moves only 24% but the
+/// worst position goes 10.36 -> 4.21 nats. The price is 1.88x KV bytes
+/// (26,112 -> 49,152 B/token) and about 2% decode, which is inside this box's
+/// run-to-run noise. `--kv-mode q8` restores the old tier for anyone who wants
+/// the memory back.
+fn normalize_maple(raw: &str) -> Option<KvMode> {
+    match raw {
+        "bf16" | "auto" | "" => Some(Bf16),
+        "q8" => Some(Q8),
+        _ => None, // every rotated/quantized tier → default (+warn)
+    }
+}
+pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
+    site: "maple",
+    normalize_alias: normalize_maple,
+    accepted: &[Q8, Bf16],
+    default: Bf16,
+};
+
 /// Pure: `&str + &'static policy + usize → ResolveResult`. No GPU, no env read.
 pub fn resolve(raw: &str, policy: &KvModePolicy, head_dim: usize) -> ResolveResult {
     // 1. site-LOCAL alias expansion.
@@ -173,6 +210,60 @@ pub fn resolve(raw: &str, policy: &KvModePolicy, head_dim: usize) -> ResolveResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truth_table_maple() {
+        let p = &MAPLE_POLICY;
+        assert_eq!(resolve("bf16", p, 128).mode, KvMode::Bf16);
+        assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
+        // Unset and "auto" both mean BF16, SILENTLY — bf16 is the shipped
+        // default and must not print a warning on every load.
+        assert_eq!(resolve("", p, 128).mode, KvMode::Bf16);
+        assert!(resolve("", p, 128).warning.is_none());
+        assert_eq!(resolve("auto", p, 128).mode, KvMode::Bf16);
+        assert!(resolve("auto", p, 128).warning.is_none());
+        // Asking for q8 explicitly is HONORED and must not warn — it is a
+        // supported tier and an intentional memory saving, not a degradation.
+        assert!(resolve("q8", p, 128).warning.is_none());
+
+        // Every ROTATED / block-quantized tier must be REFUSED and warn.
+        // These have no sliding-window attention kernel, so silently accepting
+        // one would make Maple's sliding layers attend the full context and be
+        // wrong past 512 tokens rather than merely slower.
+        for m in [
+            "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo",
+        ] {
+            let r = resolve(m, p, 128);
+            assert_eq!(r.mode, KvMode::Bf16, "{m} must fall back to the default");
+            assert!(r.warning.is_some(), "{m} must warn, not silently downgrade");
+        }
+        let garbage = resolve("garbage", p, 128);
+        assert_eq!(garbage.mode, KvMode::Bf16);
+        assert!(garbage.warning.is_some());
+    }
+
+    #[test]
+    fn bf16_is_maple_only() {
+        // NEGATIVE CONTROL: "bf16" must not be a globally-known alias. No other
+        // site can allocate a bf16 cache, so if `normalize_full` learned the
+        // name, HIPFIRE_KV_MODE=bf16 on qwen35 would normalize fine and then
+        // silently fall to that site's default. It must warn instead.
+        for p in [
+            &QWEN35_HFQ_POLICY,
+            &QWEN35_PARO_POLICY,
+            &LLAMA_HFQ_POLICY,
+            &QWEN35_PP_POLICY,
+            &DIR_SAFETENSORS_POLICY,
+        ] {
+            let r = resolve("bf16", p, 256);
+            assert_ne!(r.mode, KvMode::Bf16, "site {} must not accept bf16", p.site);
+            assert!(
+                r.warning.is_some(),
+                "site {} must WARN on bf16, not silently default",
+                p.site
+            );
+        }
+    }
 
     #[test]
     fn truth_table_qwen35_hfq() {

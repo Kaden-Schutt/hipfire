@@ -207,7 +207,7 @@ def main():
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument(
         "--kv-mode",
-        choices=("q8", "fwht2", "fwht3", "fwht4"),
+        choices=("q8", "bf16", "fwht2", "fwht3", "fwht4"),
         default="q8",
         help="KV layout used by capture, shadow replay, and the HIP oracle",
     )

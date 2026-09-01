@@ -2125,6 +2125,7 @@ impl DenseArch for Qwen2Dense<'_> {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            quant_bf16: false,
             f32_policy: F32AttnPolicy::Gqa {
                 n_heads: k.n_heads,
                 n_kv_heads: k.n_kv_heads,

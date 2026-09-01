@@ -24,6 +24,7 @@
 
 use crate::config::MapleConfig;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -128,18 +129,23 @@ fn load_wt(
 /// quant_type → DType. **qt=51 (`MQ2G256LloydU`) is the whole point of this
 /// arch**: it is the unrotated MQ2-Lloyd sibling that carries Maple's native
 /// ternary weights losslessly, and the dispatcher must NOT rotate x for it.
-fn wt_from_raw(
-    gpu: &mut Gpu,
-    qt: u8,
-    data: &[u8],
-    m: usize,
-    k: usize,
-) -> Result<WeightTensor, String> {
-    let dtype = match qt {
+/// quant_type -> DType for every carrier a Maple `.hfq` can hold. Pure, so the
+/// READER contract is testable without a GPU.
+///
+/// This map is append-only in practice: it is what lets an already-converted
+/// model load, so an entry may not be removed just because the CONVERTER stops
+/// producing that carrier. qt=30 is exactly that case — `--head-quant mq4` is
+/// deprecated and no longer selectable, but every qt=30 `.hfq` already on disk
+/// must keep loading.
+pub(crate) fn maple_dtype_for_quant_type(qt: u8) -> Result<DType, String> {
+    Ok(match qt {
         1 => DType::F16,
         2 => DType::F32,
         16 => DType::BF16,
         3 => DType::Q8_0,
+        // qt=4 arrives from `--head-quant q4k`. GGML-compatible Q4_K and
+        // UNROTATED — no FWHT seed contract, unlike qt=30/44.
+        4 => DType::Q4K,
         13 => DType::MQ4G256,
         15 => DType::MQ6G256,
         19 => DType::MQ2G256Lloyd,
@@ -150,9 +156,26 @@ fn wt_from_raw(
         // `pack_maple_head` quantized against; if the two ever diverge the
         // result is not an error but silently wrong logits.
         30 => DType::MQ4G256Lloyd,
+        // qt=44 arrives only from `--head-quant mq4v2`. Same FWHT-rotated
+        // contract as qt=30 above — it resolves to GemvMq4G256V2Prerotated, so
+        // weight_gemv rotates x with the same ensure_mq_signs seeds (42/1042)
+        // that pack_maple_head quantized against. It differs from qt=30 only in
+        // the 8 header bytes: a separate fp16 scale/zero per 128-weight half
+        // rather than one pair per 256, at 4.25 bpw instead of 5.0.
+        44 => DType::MQ4G256V2,
         51 => DType::MQ2G256LloydU,
         other => return Err(format!("unsupported quant_type {other}")),
-    };
+    })
+}
+
+fn wt_from_raw(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let dtype = maple_dtype_for_quant_type(qt)?;
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("upload_raw: {e:?}"))?;
@@ -668,16 +691,54 @@ pub struct MapleState {
     pub b_act_f16: GpuTensor, // [max_b × k_top × moe_inter] F16
 }
 
+/// Tile size the DECODE attention will actually use, for sizing
+/// `flash_partials`.
+///
+/// This used to be a hardcoded `128`, which is only correct on architectures
+/// whose default tile IS 128. `q8_flash_tile_size` returns **32 on gfx1100**
+/// (RDNA3), so the decode kernel there computes 4x as many tiles as a
+/// 128-derived allocation assumes, and indexes
+/// `partials + (h * max_tiles + tile_id) * (2 + head_dim)` against them.
+///
+/// It did not overflow, because the trailing `FLASH_PREFILL_SUBBATCH` factor
+/// left 64x of slack that absorbed the 4x — but that reduced the real margin
+/// on RDNA3 to 16x for a reason nothing in the code stated, and it made this a
+/// FOURTH independent copy of tile-size logic. `launch_asym_flash_batched`
+/// carries a comment about "the corruption bug three independent copies of
+/// this exact logic caused"; deriving the value is how that stops recurring.
+///
+/// `HIPFIRE_Q8_FLASH_TILE` is honoured by `q8_flash_tile_size`, so an operator
+/// override is now reflected in the allocation too rather than silently eating
+/// the slack.
+fn flash_partial_tile(gpu: &Gpu, cfg: &MapleConfig) -> usize {
+    rdna_compute::attention::q8_flash_tile_size(
+        &gpu.arch,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        // Shape-only: the tile policy reads max_seq solely to recognise one
+        // certified gfx1151 replay shape (max_seq == 2048), which Maple is not.
+        cfg.max_position_embeddings,
+    )
+    .max(1)
+}
+
 impl MapleState {
     pub fn new(gpu: &mut Gpu, cfg: &MapleConfig) -> Result<Self, String> {
         let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
-        Self::new_with_max_seq(gpu, cfg, max_seq)
+        Self::new_with_max_seq(gpu, cfg, max_seq, KvMode::Q8)
     }
 
+    /// `kv_mode` must already be resolved through `MAPLE_POLICY` — this is the
+    /// allocation site, not the policy site. Only `Q8` and `Bf16` are
+    /// serviceable; anything else is rejected rather than silently downgraded,
+    /// because the other tiers have no sliding-window attention kernel and
+    /// Maple's 3:1 sliding layers would then attend the full context.
     pub fn new_with_max_seq(
         gpu: &mut Gpu,
         cfg: &MapleConfig,
         max_seq: usize,
+        kv_mode: KvMode,
     ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
@@ -691,13 +752,32 @@ impl MapleState {
         gpu.ensure_mq_signs()
             .map_err(|e| format!("maple: ensure_mq_signs: {e:?}"))?;
 
-        let kv = KvCache::new_gpu_q8(
-            gpu,
-            cfg.num_hidden_layers,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            max_seq,
-        )
+        let kv = match kv_mode {
+            KvMode::Q8 => KvCache::new_gpu_q8(
+                gpu,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                max_seq,
+            ),
+            KvMode::Bf16 => KvCache::new_gpu_bf16(
+                gpu,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                max_seq,
+            ),
+            // Unreachable through the carrier: MAPLE_POLICY accepts only
+            // {Q8, Bf16} and `resolve` falls back to the site default for
+            // everything else. Reject loudly rather than serve a tier whose
+            // windowed kernels do not exist.
+            other => {
+                return Err(format!(
+                    "maple: KV mode {other:?} has no sliding-window attention kernel; \
+                     arch 15 supports q8 and bf16 only"
+                ))
+            }
+        }
         .map_err(|e| format!("maple: kv cache: {e:?}"))?;
         let pos_buf = gpu
             .hip
@@ -751,7 +831,7 @@ impl MapleState {
             flash_partials: alloc(
                 gpu,
                 cfg.num_attention_heads
-                    * max_seq.div_ceil(128)
+                    * max_seq.div_ceil(flash_partial_tile(gpu, cfg))
                     * (2 + cfg.head_dim)
                     * FLASH_PREFILL_SUBBATCH,
                 "flash_partials",
@@ -1019,5 +1099,83 @@ mod tests {
         assert_eq!(bf16_to_f32(0xBF80), -1.0);
         assert_eq!(bf16_to_f32(0x0000), 0.0);
         assert_eq!(bf16_to_f32(0x4049), f32::from_bits(0x40490000));
+    }
+}
+
+#[cfg(test)]
+mod head_carrier_tests {
+    use super::*;
+
+    /// Deprecating a CONVERTER option must never stop an existing model from
+    /// loading. `--head-quant mq4` is gone, but qt=30 heads are on disk and
+    /// must still resolve — this is the guard that keeps the reader and the
+    /// producer decoupled.
+    #[test]
+    fn deprecated_qt30_head_still_loads() {
+        assert_eq!(
+            maple_dtype_for_quant_type(30).unwrap(),
+            DType::MQ4G256Lloyd,
+            "qt=30 is deprecated as a CONVERTER option, not as a readable carrier"
+        );
+    }
+
+    #[test]
+    fn mq4v2_head_carrier_resolves() {
+        assert_eq!(
+            maple_dtype_for_quant_type(44).unwrap(),
+            DType::MQ4G256V2,
+            "qt=44 is the replacement fast head; without this arm it fails at \
+             load with 'unsupported quant_type 44'"
+        );
+    }
+
+    /// The three carriers the converter can still emit, plus the body tier.
+    #[test]
+    fn shipped_carriers_resolve() {
+        assert_eq!(maple_dtype_for_quant_type(16).unwrap(), DType::BF16);
+        assert_eq!(maple_dtype_for_quant_type(3).unwrap(), DType::Q8_0);
+        assert_eq!(maple_dtype_for_quant_type(44).unwrap(), DType::MQ4G256V2);
+        // qt=51 is the whole point of arch 15: the unrotated ternary body.
+        assert_eq!(
+            maple_dtype_for_quant_type(51).unwrap(),
+            DType::MQ2G256LloydU
+        );
+    }
+
+    /// An unknown carrier must FAIL rather than silently pick something —
+    /// these tiers differ in rotation, and a wrong guess yields plausible but
+    /// wrong logits with no error.
+    #[test]
+    fn unknown_quant_type_is_rejected() {
+        let e = maple_dtype_for_quant_type(200).unwrap_err();
+        assert!(e.contains("unsupported quant_type 200"), "got {e}");
+    }
+}
+
+#[cfg(test)]
+mod head_overlay_tests {
+    /// The head-overlay contract, pinned as prose because the failure it
+    /// guards against is silent.
+    ///
+    /// `--head` points at a single-tensor `.hfq` from
+    /// `hipfire-quantize --head-only`, attached via
+    /// `HfqFile::attach_head_overlay` BEFORE `MapleWeights::load`. Ordering is
+    /// load-bearing: the loader resolves `lm_head.weight` through the same
+    /// `find_tensor_info` path the overlay shadows, so attaching afterwards
+    /// would quietly serve the BASE's head and produce a model that looks
+    /// correct and is not the one requested.
+    ///
+    /// The overlay must contain ONLY `lm_head.weight`. Without that check,
+    /// passing a full model to `--head` succeeds: every name exists in the
+    /// base at a matching shape, so `attach_overlay`'s arch/name/shape guards
+    /// all pass and the model silently shadows itself. That was found by a
+    /// negative control, not by inspection.
+    #[test]
+    fn head_overlay_contract_is_documented() {
+        // Executable only as documentation; the behavioural coverage is the
+        // GPU path exercised in review (valid q4k/bf16 overlays attach and
+        // generate; a full model is refused with a message naming the first
+        // offending tensor). Kept so the contract travels with the code.
+        assert_eq!(super::LM_HEAD_TENSOR_NAME, "lm_head.weight");
     }
 }

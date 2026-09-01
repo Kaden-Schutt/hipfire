@@ -1147,6 +1147,8 @@ impl ServeRuntime {
                 max_tokens,
                 self.kv_override.as_deref(),
                 self.kv_backend_override.as_deref(),
+                // serve has no --head yet; models load their own head.
+                None,
             )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);

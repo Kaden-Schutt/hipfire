@@ -62,9 +62,33 @@ pub(crate) struct QuantizeArgs {
     /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
     /// per token — a RAM question, not a bandwidth one), the ternary expert
     /// path, or the router.
-    #[arg(long, value_name = "MODE", default_value = "bf16",
-          value_parser = ["bf16", "q8", "mq4"])]
+    /// Default is q8, not bf16. Measured on gfx1151 against a bf16 reference
+    /// (2048 teacher-forced tokens): q8 and bf16 heads give the IDENTICAL mean
+    /// KL of 0.0511, but q8 decodes 23% faster (144.6 vs 117.6 tok/s). A bf16
+    /// head is therefore strictly dominated -- it costs throughput and buys
+    /// exactly zero accuracy. mq4 (qt=30 Lloyd, 5.0 bpw) is +10.4% decode over
+    /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
+    /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
+    /// the same swap buys 49% rather than 10%.
+    ///
+    /// `mq4` (qt=30) is DEPRECATED and no longer selectable: mq4v2 (qt=44)
+    /// beats it on every axis -- lower KL (0.0744 vs 0.0772), faster (165.8 vs
+    /// 161.8 tok/s) and 15% smaller (4.25 vs 5.0 bpw). Existing .hfq files with
+    /// a qt=30 head still LOAD; only producing new ones is removed.
+    #[arg(long, value_name = "MODE", default_value = "q8",
+          value_parser = ["bf16", "q8", "mq4v2", "q4k"])]
     pub head_quant: String,
+
+    /// `--format maple` only: emit a HEAD-ONLY `.hfq` containing just
+    /// `lm_head.weight` at `--head-quant`, instead of a full model.
+    ///
+    /// The result is a load-time overlay for a full build: same arch_id, same
+    /// logical shape, differing only in the head's quant tier. Shipping heads
+    /// this way avoids duplicating the identical 6.17 GB body per carrier —
+    /// three head variants cost 7.30 GB rather than 19.63 GB, and switching
+    /// heads is a 175 MB download instead of 6.5 GB.
+    #[arg(long, default_value_t = false)]
+    pub head_only: bool,
 
     /// Override the architecture ID stamped into the HFQ header.
     #[arg(long, value_name = "ID")]

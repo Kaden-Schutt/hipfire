@@ -30,14 +30,23 @@ pub enum F32AttnPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KTier {
     F32,
+    /// Flat 2-byte BF16 K/V (maple). NOT a quantized tier — it is the
+    /// near-reference storage Maple's Q8 KV gets measured against.
+    Bf16,
     Q8,
     Hfq4,  // llama legacy
     Q4,    // llama legacy
     Int8c, // llama INT8-per-column
     Hfq8,  // llama HFQ8 flat-layout
-    Asym4 { fwht: bool },
-    Asym3 { fwht: bool },
-    Asym2 { fwht: bool },
+    Asym4 {
+        fwht: bool,
+    },
+    Asym3 {
+        fwht: bool,
+    },
+    Asym2 {
+        fwht: bool,
+    },
 }
 
 /// The single bool→tier decode. The only sanctioned producer of `KTier`.
@@ -52,6 +61,7 @@ pub fn classify(
     quant_int8: bool,
     quant_hfq8: bool,
     quant_fwht: bool,
+    quant_bf16: bool,
 ) -> KTier {
     debug_assert!(
         [
@@ -62,15 +72,24 @@ pub fn classify(
             quant_hfq4,
             quant_q4,
             quant_int8,
-            quant_hfq8
+            quant_hfq8,
+            quant_bf16
         ]
         .iter()
         .filter(|&&b| b)
         .count()
             <= 1,
-        "at most one KV quant tier flag should be set"
+        "at most one KV storage tier flag should be set"
     );
-    if quant_asym4 {
+    // BF16 is checked FIRST and unconditionally. It shares no flag with any
+    // quantized tier, so ordering cannot change the answer for a well-formed
+    // cache — but if a malformed cache ever set bf16 alongside a quant flag,
+    // resolving to bf16 is the safe failure: the bf16 kernels read a flat
+    // 2-byte layout and would produce visibly wrong numbers, whereas a
+    // quantized kernel reading a bf16 buffer walks off the end of it.
+    if quant_bf16 {
+        KTier::Bf16
+    } else if quant_asym4 {
         KTier::Asym4 { fwht: quant_fwht }
     } else if quant_asym3 {
         KTier::Asym3 { fwht: quant_fwht }
@@ -100,7 +119,12 @@ impl KTier {
             KTier::Asym4 { .. } => n_kv_heads * (4 + head_dim / 2),
             KTier::Asym3 { .. } => n_kv_heads * (4 + (head_dim * 3) / 8),
             KTier::Asym2 { .. } => n_kv_heads * (4 + head_dim / 4),
-            KTier::F32 | KTier::Hfq4 | KTier::Q4 | KTier::Int8c | KTier::Hfq8 => {
+            // Bf16 has a well-defined 2 bytes/element, but it is deliberately
+            // NOT compactable (see `is_compactable`), and this fn's contract
+            // is that callers gate on that first. Panicking keeps a
+            // compaction path that forgot the gate loud instead of silently
+            // compacting a layout no gather kernel can read.
+            KTier::F32 | KTier::Bf16 | KTier::Hfq4 | KTier::Q4 | KTier::Int8c | KTier::Hfq8 => {
                 panic!("k_bytes_per_pos undefined for {self:?}")
             }
         }
@@ -144,6 +168,8 @@ pub struct KvTierInputs {
     pub quant_q4: bool,   // llama legacy Q4 KV mode
     pub quant_int8: bool, // llama INT8-per-column KV mode
     pub quant_hfq8: bool, // llama HFQ8 flat-layout KV mode
+    /// Flat 2-byte BF16 K/V (maple). Mutually exclusive with every flag above.
+    pub quant_bf16: bool,
     /// F32-KV attention policy (Simple = attention_f32; Gqa = qwen2 selector).
     pub f32_policy: F32AttnPolicy,
     pub v_mode_bits: i32,
@@ -226,6 +252,7 @@ impl KvTierPlan {
             quant_q4,
             quant_int8,
             quant_hfq8,
+            quant_bf16,
             f32_policy,
             v_mode_bits,
             pos,
@@ -253,7 +280,18 @@ impl KvTierPlan {
                 quant_int8,
                 quant_hfq8,
                 quant_fwht,
+                quant_bf16,
             ) {
+                // BF16 always takes the windowed kernel, exactly as
+                // cohere2moe's Q8 does: `window == 0` already means full
+                // causal, so one attend key covers both of Maple's layer
+                // types and there is no second path that could silently drop
+                // the window at ctx > window.
+                KTier::Bf16 => (
+                    KernelKey::KvWriteBf16,
+                    KernelKey::AttnFlashBf16Windowed,
+                    false,
+                ),
                 KTier::Asym4 { fwht: true } => (
                     KernelKey::KvWriteAsym4Fwht,
                     KernelKey::AttnFlashAsym4Fwht,
@@ -417,6 +455,11 @@ fn batched_keys(
         (KvWriteQ8_0, AttnFlashQ8_0Windowed) => {
             Ok((KvWriteQ8_0Batched, AttnQ8_0KvBatchedMaskedWindowed))
         }
+        // maple windowed batched (sliding-window prefill). Masked, so it
+        // serves tree-verify too; no is_tree gate needed.
+        (KvWriteBf16, AttnFlashBf16Windowed) => {
+            Ok((KvWriteBf16Batched, AttnBf16KvBatchedMaskedWindowed))
+        }
         // F32 → no batched keys exist. Returning single-token keys with
         // batch_size > 1 will cause MissingImpl at resolve (BatchEq(1) gate).
         // Intentionally fall through to the default arm rather than silently
@@ -446,6 +489,8 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         | (KvWriteQ8_0, AttnFlashQ8_0)
         | (KvWriteQ8_0, AttnQ8_0Kv)
         | (KvWriteQ8_0, AttnFlashQ8_0Windowed)
+        // bf16 single-token (maple) — windowed only, by construction
+        | (KvWriteBf16, AttnFlashBf16Windowed)
         // hfq4 single-token (llama legacy)
         | (KvWriteHfq4, AttnHfq4Kv)
         // q4 single-token (llama legacy)
@@ -471,6 +516,8 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         // q8 batched
         | (KvWriteQ8_0Batched, AttnQ8_0KvBatchedMasked)
         | (KvWriteQ8_0Batched, AttnQ8_0KvBatchedMaskedWindowed)
+        // bf16 batched (maple)
+        | (KvWriteBf16Batched, AttnBf16KvBatchedMaskedWindowed)
     )
 }
 
@@ -490,6 +537,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            quant_bf16: false,
             f32_policy: F32AttnPolicy::Simple,
             v_mode_bits: 8,
             pos: 0,
@@ -647,6 +695,7 @@ mod tests {
     fn hfq8_tier() {
         let inputs = KvTierInputs {
             quant_hfq8: true,
+            quant_bf16: false,
             ..default_inputs()
         };
         let plan = KvTierPlan::derive(inputs).unwrap();
@@ -696,6 +745,115 @@ mod tests {
             KernelKey::AttnQ8_0KvBatchedMaskedWindowed
         );
         assert_eq!(batched.window, 4096);
+    }
+
+    #[test]
+    fn bf16_tier_is_windowed_in_both_shapes() {
+        // maple: bf16 resolves to the windowed key at EVERY pos and window,
+        // including window == 0 (the global/NoPE layers). There is no
+        // non-windowed bf16 attend key by construction, so unlike Q8 there is
+        // no heuristic that could drop the window at ctx > window.
+        for (pos, window) in [(10usize, 0i32), (10, 512), (20000, 512)] {
+            let plan = KvTierPlan::derive(KvTierInputs {
+                quant_bf16: true,
+                window,
+                pos,
+                ..default_inputs()
+            })
+            .unwrap();
+            assert_eq!(plan.write_key, KernelKey::KvWriteBf16);
+            assert_eq!(plan.attend_key, KernelKey::AttnFlashBf16Windowed);
+            assert_eq!(plan.window, window);
+            // bf16 is not a rotated tier — it must never request givens buffers.
+            assert!(!plan.uses_givens);
+        }
+
+        // Batched prefill picks the batched pair and carries the window.
+        let batched = KvTierPlan::derive(KvTierInputs {
+            quant_bf16: true,
+            window: 512,
+            batch_size: 128,
+            ..default_inputs()
+        })
+        .unwrap();
+        assert_eq!(batched.write_key, KernelKey::KvWriteBf16Batched);
+        assert_eq!(
+            batched.attend_key,
+            KernelKey::AttnBf16KvBatchedMaskedWindowed
+        );
+        assert_eq!(batched.window, 512);
+    }
+
+    #[test]
+    fn bf16_does_not_need_the_q8_windowed_flag() {
+        // NEGATIVE CONTROL for the test above. `q8_windowed` is the flag that
+        // makes the Q8 tier windowed; if bf16 accidentally depended on it, the
+        // test above would still pass (default_inputs has it false only
+        // because bf16 ignores it). Assert the two are genuinely independent:
+        // flipping q8_windowed must not change the bf16 plan at all.
+        let off = KvTierPlan::derive(KvTierInputs {
+            quant_bf16: true,
+            q8_windowed: false,
+            window: 512,
+            ..default_inputs()
+        })
+        .unwrap();
+        let on = KvTierPlan::derive(KvTierInputs {
+            quant_bf16: true,
+            q8_windowed: true,
+            window: 512,
+            ..default_inputs()
+        })
+        .unwrap();
+        assert_eq!(off.attend_key, on.attend_key);
+        assert_eq!(off.write_key, on.write_key);
+        assert_eq!(off.attend_key, KernelKey::AttnFlashBf16Windowed);
+    }
+
+    #[test]
+    fn bf16_tier_classifies_and_excludes_the_quant_tiers() {
+        // classify() must decode the flag, and bf16 must not answer yes to any
+        // question asked about quantized tiers.
+        assert_eq!(
+            classify(false, false, false, false, false, false, false, false, false, true),
+            KTier::Bf16
+        );
+        // All-false is still F32, not Bf16 — the flag has to actually be read.
+        assert_eq!(
+            classify(false, false, false, false, false, false, false, false, false, false),
+            KTier::F32
+        );
+        assert!(!KTier::Bf16.is_q8());
+        assert!(!KTier::Bf16.is_compactable());
+        assert!(!KTier::Bf16.storage_ok_for_pflash());
+    }
+
+    #[test]
+    fn bf16_write_and_attend_keys_pass_the_drift_guard() {
+        // The #30-class guard: a bf16 write must never be paired with a
+        // non-bf16 attend, and vice versa.
+        assert!(tiers_match(
+            KernelKey::KvWriteBf16,
+            KernelKey::AttnFlashBf16Windowed
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteBf16Batched,
+            KernelKey::AttnBf16KvBatchedMaskedWindowed
+        ));
+        // Cross-tier pairings are rejected in both directions.
+        assert!(!tiers_match(
+            KernelKey::KvWriteQ8_0,
+            KernelKey::AttnFlashBf16Windowed
+        ));
+        assert!(!tiers_match(
+            KernelKey::KvWriteBf16,
+            KernelKey::AttnFlashQ8_0Windowed
+        ));
+        // And a bf16 single-token write never pairs with the batched attend.
+        assert!(!tiers_match(
+            KernelKey::KvWriteBf16,
+            KernelKey::AttnBf16KvBatchedMaskedWindowed
+        ));
     }
 
     #[test]
@@ -1093,27 +1251,27 @@ mod tests {
     #[test]
     fn classify_carries_fwht_bit() {
         assert_eq!(
-            classify(false, false, true, false, false, false, false, false, true),
+            classify(false, false, true, false, false, false, false, false, true, false),
             KTier::Asym3 { fwht: true }
         );
         assert_eq!(
-            classify(false, false, true, false, false, false, false, false, false),
+            classify(false, false, true, false, false, false, false, false, false, false),
             KTier::Asym3 { fwht: false }
         );
         assert_eq!(
-            classify(true, false, false, false, false, false, false, false, false),
+            classify(true, false, false, false, false, false, false, false, false, false),
             KTier::Q8
         );
         assert_eq!(
-            classify(false, false, false, false, false, false, false, false, false),
+            classify(false, false, false, false, false, false, false, false, false, false),
             KTier::F32
         );
         assert_eq!(
-            classify(false, false, false, false, false, false, true, false, false),
+            classify(false, false, false, false, false, false, true, false, false, false),
             KTier::Int8c
         );
         assert_eq!(
-            classify(false, false, false, false, false, false, false, true, false),
+            classify(false, false, false, false, false, false, false, true, false, false),
             KTier::Hfq8
         );
     }

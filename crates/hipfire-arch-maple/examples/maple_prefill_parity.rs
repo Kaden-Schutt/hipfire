@@ -371,7 +371,7 @@ fn main() {
     // default sweep and (b) LEAK every copy but the last: `GpuTensor` has no
     // `Drop` and this crate frees explicitly via `free_gpu`, so a dropped
     // bundle's device memory is simply gone until the process exits.
-    let mut bundle = load_maple_from_hfq(&mut hfq, &mut gpu, n_tokens + 64).expect("load");
+    let mut bundle = load_maple_from_hfq(&mut hfq, &mut gpu, n_tokens + 64, "").expect("load");
     let mut want = Vec::with_capacity(n_tokens);
     for (p, &t) in tokens.iter().enumerate() {
         want.push(

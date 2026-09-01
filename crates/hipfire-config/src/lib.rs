@@ -477,9 +477,14 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+// The union of every KV-mode name any SITE accepts. This is the config
+// schema's allow-list only — it is NOT a promise that a given model supports a
+// mode. Per-site acceptance lives in `hipfire_runtime::kv_mode`'s policies,
+// which warn and fall back for anything they cannot allocate. `bf16` is
+// currently maple-only (arch 15).
 const KV_MODES: &[&str] = &[
-    "auto", "f32", "f16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo",
-    "turbo4", "turbo3", "turbo2",
+    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
+    "turbo", "turbo4", "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `off` disables thinking outright. It resolves to a cap of 1, the engine's

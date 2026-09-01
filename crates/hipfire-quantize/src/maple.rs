@@ -56,7 +56,29 @@ pub(crate) enum MapleHeadQuant {
     /// **FWHT-rotated**: the weights are encoded against FWHT-256-rotated
     /// blocks, so the runtime MUST rotate `x` to match. See
     /// `pack_maple_head` for why the seeds are not free parameters.
+    ///
+    /// **DEPRECATED — use `Mq4V2`.** Measured on gfx1151 (KV bf16, 2048
+    /// teacher-forced tokens): qt=44 is better on EVERY axis — mean KL 0.0744
+    /// vs 0.0772, decode 165.8 vs 161.8 tok/s, and 4.25 vs 5.0 bpw. There is
+    /// no workload where qt=30 is the right choice. Kept only so the packer
+    /// arm and its FWHT-seed contract stay documented next to qt=44's; the
+    /// CLI no longer offers it.
     Mq4,
+    /// MQ4-G256 **v2** (qt=44), 136 B per 256 weights = 4.25 bpw.
+    /// **FWHT-rotated**, same as `Mq4`, and the same nibble payload — but the
+    /// 8 header bytes carry a SEPARATE fp16 scale/zero per 128-weight half
+    /// instead of one pair governing all 256. Strictly finer quantization at a
+    /// SMALLER footprint than qt=30 (4.25 vs 5.0 bpw), so it is the natural
+    /// candidate if the mq4 head's accuracy cost is what rules it out.
+    Mq4V2,
+    /// GGML-compatible **Q4_K** (qt=4), 144 B per 256 weights = 4.5 bpw.
+    /// Unrotated, and the finest-grained 4-bit carrier available: a separate
+    /// scale AND min per 32-weight sub-block (8 per 256), with the sub-block
+    /// meta itself 6-bit quantized. Measured on the real lm_head, relative L2
+    /// error by granularity: 0.118 at 1 scale/256 (qt=30 class), 0.106 at 2
+    /// (qt=44), 0.080 at 8 (this). This is the exact carrier DeepGrove ship in
+    /// their own llama.cpp example, so it is the like-for-like comparison.
+    Q4K,
 }
 
 impl std::str::FromStr for MapleHeadQuant {
@@ -66,8 +88,10 @@ impl std::str::FromStr for MapleHeadQuant {
             "bf16" | "none" => Ok(Self::Bf16),
             "q8" | "q8_0" | "q8f16" => Ok(Self::Q8),
             "mq4" | "mq4-lloyd" | "mq4g256lloyd" => Ok(Self::Mq4),
+            "mq4v2" | "mq4-v2" | "mq4g256v2" => Ok(Self::Mq4V2),
+            "q4k" | "q4_k" | "q4km" => Ok(Self::Q4K),
             other => Err(format!(
-                "unknown --head-quant {other:?} (expected bf16, q8 or mq4)"
+                "unknown --head-quant {other:?} (expected bf16, q8, mq4v2 or q4k)"
             )),
         }
     }
@@ -80,6 +104,8 @@ impl MapleHeadQuant {
             Self::Bf16 => "bf16",
             Self::Q8 => "q8",
             Self::Mq4 => "mq4",
+            Self::Mq4V2 => "mq4v2",
+            Self::Q4K => "q4k",
         }
     }
 }
@@ -164,6 +190,36 @@ pub(crate) fn pack_maple_head(
                 QuantType::MQ4G256Lloyd,
                 256,
             ))
+        }
+        MapleHeadQuant::Mq4V2 => {
+            if k % 256 != 0 {
+                return Err(format!(
+                    "lm_head K={k} is not a multiple of 256 (MQ4-G256 block)"
+                ));
+            }
+            // Same FWHT seeds as the qt=30 arm above. They are NOT free
+            // parameters: the runtime rotates `x` with signs derived from the
+            // same seeds, so a mismatch here silently produces garbage logits
+            // rather than a load error.
+            let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+            let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+            let m = vals.len() / k;
+            Ok((
+                crate::quant_fwht::quantize_mq4g256v2(vals, m, k, &signs1, &signs2),
+                QuantType::MQ4G256V2,
+                256,
+            ))
+        }
+        MapleHeadQuant::Q4K => {
+            if k % 256 != 0 {
+                return Err(format!(
+                    "lm_head K={k} is not a multiple of 256 (Q4_K super-block)"
+                ));
+            }
+            // UNROTATED, unlike qt=30/44: Q4_K carries its own per-32 scales
+            // and has no FWHT convention, so there are no seeds to keep in
+            // sync with `ensure_mq_signs` here.
+            Ok((crate::quant_q4::quantize_q4k(vals), QuantType::Q4K, 256))
         }
     }
 }

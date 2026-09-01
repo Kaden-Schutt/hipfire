@@ -209,6 +209,79 @@ fn shard_paths(dir: &Path) -> Result<Vec<PathBuf>, String> {
 ///
 /// Shards are processed one at a time and their page cache dropped as they are
 /// consumed, so peak RSS stays bounded even though the source is ~40 GB.
+/// Emit a HEAD-ONLY `.hfq` containing just `lm_head.weight`, for use as a
+/// load-time overlay over a full Maple build.
+///
+/// WHY THIS EXISTS. The head is the only tensor whose carrier we vary, and it
+/// is 2.7% of the file (175-622 MB of ~6.5 GB). Shipping a whole 6.3-6.8 GB
+/// artifact per head carrier duplicates the identical 6.17 GB body every time;
+/// three variants cost 19.63 GB instead of 7.30 GB, and switching heads costs
+/// a user a full re-download instead of 175 MB.
+///
+/// The output is deliberately a NORMAL `.hfq` with the same `arch_id`, one
+/// tensor, and the SAME logical shape as the base's head — because
+/// `HfqFile::attach_overlay` requires exactly that. It rejects an overlay whose
+/// tensor is absent from the base or differs in shape, which is what stops an
+/// overlay built for another model from being spliced in silently. Emitting a
+/// head-only file this way means that guard keeps working unchanged; nothing
+/// about the overlay mechanism is relaxed to support this.
+///
+/// Every carrier `--head-quant` accepts works here, bf16 included: for bf16
+/// `convert_tensor` emits a `QuantType::BF16` passthrough and never reaches
+/// `pack_maple_head` (which has no Bf16 arm), so no special case is needed.
+///
+/// A headless BODY is deliberately NOT offered. It would require permitting an
+/// overlay to introduce names the base lacks, which is the very check that
+/// catches a wrong-model overlay, and it would ship an artifact that cannot
+/// run on its own.
+pub(crate) fn convert_maple_head_only(
+    input_dir: &Path,
+    output: &Path,
+    config_json: &str,
+    head_quant: MapleHeadQuant,
+) -> Result<MapleConvertStats, String> {
+    let shards = shard_paths(input_dir)?;
+    let mut stats = MapleConvertStats {
+        head_quant,
+        ..Default::default()
+    };
+    for shard in &shards {
+        let sf =
+            SafetensorsFile::open(shard).map_err(|e| format!("open {}: {e}", shard.display()))?;
+        if !sf.tensor_names().iter().any(|n| *n == LM_HEAD_NAME) {
+            continue;
+        }
+        let (meta, bytes) = sf
+            .tensor_data(LM_HEAD_NAME)
+            .ok_or_else(|| format!("{LM_HEAD_NAME}: vanished from {}", shard.display()))?;
+        let (t, _) = convert_tensor(
+            LM_HEAD_NAME,
+            &meta.dtype,
+            &meta.shape,
+            bytes,
+            head_quant,
+            &mut stats,
+        )?;
+        eprintln!(
+            "maple: head-only overlay — {} {:?} → {} ({:.1} MB)",
+            LM_HEAD_NAME,
+            meta.shape,
+            head_quant.label(),
+            t.data.len() as f64 / 1e6,
+        );
+        let metadata = build_metadata(input_dir, config_json, &stats)?;
+        // No spill: one tensor, and it is at most 622 MB.
+        write_hfq(output, ARCH_ID_MAPLE, &metadata, &[t], None)
+            .map_err(|e| format!("write {}: {e}", output.display()))?;
+        eprintln!("maple: wrote {}", output.display());
+        return Ok(stats);
+    }
+    Err(format!(
+        "{LM_HEAD_NAME} not found in any shard under {} — cannot build a head overlay",
+        input_dir.display()
+    ))
+}
+
 pub(crate) fn convert_maple_safetensors(
     input_dir: &Path,
     output: &Path,

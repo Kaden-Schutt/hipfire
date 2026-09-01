@@ -395,6 +395,21 @@ fn dispatch_kv_write(
                 ))
             }
         }
+        KernelKey::KvWriteBf16 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            // Two launches, K then V — same shape as the Q8 non-pair branch.
+            // There is no fused pair kernel for bf16: the write is pure
+            // convert-and-store with no amax reduction, so fusing would save a
+            // launch, not arithmetic.
+            hip!(gpu.kv_cache_write_bf16(
+                io.k_cache,
+                io.k,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))?;
+            hip!(gpu.kv_cache_write_bf16(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim,))
+        }
         KernelKey::KvWriteAsym4 => {
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
@@ -613,6 +628,32 @@ fn dispatch_kv_write(
                 io.n_kv_heads,
                 io.head_dim,
                 io.batch_size,
+            ))
+        }
+        KernelKey::KvWriteBf16Batched => {
+            // Called twice (K, then V), like the Q8 batched write. Legacy
+            // single-slot addressing (no slot_descs/row_slot) — maple does not
+            // use the multi-slot continuous-batching arena.
+            let pos = io.positions();
+            hip!(gpu.kv_cache_write_bf16_batched(
+                io.k_cache,
+                io.k,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+                None,
+                None,
+            ))?;
+            hip!(gpu.kv_cache_write_bf16_batched(
+                io.v_cache,
+                io.v,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+                None,
+                None,
             ))
         }
 
@@ -967,6 +1008,28 @@ fn dispatch_attend(
                 // window comes from the plan (cohere2moe: sliding_window on
                 // Sliding layers, 0 on full layers; 0 == plain flash).
                 hip!(gpu.attention_flash_q8_0_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    fp,
+                    plan.window,
+                ))
+            }
+            KernelKey::AttnFlashBf16Windowed => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                // window comes from the plan: maple's sliding layers pass
+                // sliding_window, its global/NoPE layers pass 0 (== plain
+                // causal flash).
+                hip!(gpu.attention_flash_bf16_windowed(
                     io.q,
                     io.k_cache,
                     io.v_cache,
@@ -1802,6 +1865,29 @@ fn dispatch_attend(
                     plan.window,
                 ))
             }
+            KernelKey::AttnBf16KvBatchedMaskedWindowed => {
+                // maple sliding-window prefill — same tiled shape as the Q8
+                // sibling, window from the plan (0 == full causal).
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_bf16_batched_masked_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.positions(),
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    fp,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                    plan.window,
+                ))
+            }
 
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "attention/attend",
@@ -1830,6 +1916,7 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     // Single-token
     KernelKey::KvWriteF32,
     KernelKey::KvWriteQ8_0,
+    KernelKey::KvWriteBf16,
     KernelKey::KvWriteAsym4,
     KernelKey::KvWriteAsym4Fwht,
     KernelKey::KvWriteAsym3,
@@ -1844,6 +1931,7 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     KernelKey::KvWriteAsym2Batched,
     KernelKey::KvWriteAsym2FwhtBatched,
     KernelKey::KvWriteQ8_0Batched,
+    KernelKey::KvWriteBf16Batched,
     // Llama legacy
     KernelKey::KvWriteHfq4,
     KernelKey::KvWriteQ4,
@@ -1857,6 +1945,7 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnF32,
     KernelKey::AttnFlashQ8_0,
     KernelKey::AttnFlashQ8_0Windowed,
+    KernelKey::AttnFlashBf16Windowed,
     KernelKey::AttnQ8_0Kv,
     KernelKey::AttnFlashAsym4,
     KernelKey::AttnFlashAsym4Fwht,
@@ -1877,6 +1966,7 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2FwhtBatched,
     KernelKey::AttnQ8_0KvBatchedMasked,
     KernelKey::AttnQ8_0KvBatchedMaskedWindowed,
+    KernelKey::AttnBf16KvBatchedMaskedWindowed,
     // Llama legacy
     KernelKey::AttnHfq4Kv,
     KernelKey::AttnQ4Kv,
@@ -2022,6 +2112,8 @@ mod tests {
             key,
             KvWriteF32
                 | KvWriteQ8_0
+                | KvWriteBf16
+                | KvWriteBf16Batched
                 | KvWriteAsym4
                 | KvWriteAsym4Fwht
                 | KvWriteAsym3
@@ -2054,6 +2146,7 @@ mod tests {
                 | KvWriteAsym2Batched
                 | KvWriteAsym2FwhtBatched
                 | KvWriteQ8_0Batched
+                | KvWriteBf16Batched
         )
     }
 
@@ -2130,6 +2223,7 @@ mod tests {
                 | AttnFlashAsym2FwhtBatched
                 | AttnQ8_0KvBatchedMasked
                 | AttnQ8_0KvBatchedMaskedWindowed
+                | AttnBf16KvBatchedMaskedWindowed
         )
     }
 
