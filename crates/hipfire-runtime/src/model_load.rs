@@ -7,7 +7,7 @@
 
 use crate::llama::{EmbeddingFormat, WeightTensor};
 use hip_bridge::HipResult;
-use hipfire_hardware::{DeviceMesh, DimKind, Gpus};
+use hipfire_hardware::{DeviceMesh, DimKind, Gpus, MeshError};
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Where each piece of the model lands across a device slice. `single` = the
@@ -35,24 +35,24 @@ impl Layout {
     /// manifest planner owns the full stage grid; this legacy loader view
     /// selects rank zero for each layer so existing orchestrators continue to
     /// have one deterministic device index until their typed mesh path lands.
-    pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> Self {
-        let mut output_coord = mesh.coord_of(0);
+    pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> Result<Self, MeshError> {
+        let mut output_coord = mesh.coord_of(0)?;
         if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
             output_coord[index] = mesh.size_of(DimKind::Pp).saturating_sub(1);
         }
         let layer_to_device = (0..n_layers)
             .map(|layer| {
-                let mut coord = mesh.coord_of(0);
+                let mut coord = mesh.coord_of(0)?;
                 if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
                     coord[index] = mesh.stage_for_layer(layer, n_layers);
                 }
                 mesh.device_of(&coord)
             })
-            .collect();
-        Self {
-            output_device: mesh.device_of(&output_coord),
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            output_device: mesh.device_of(&output_coord)?,
             layer_to_device,
-        }
+        })
     }
 
     /// Validate the pure layout before any source preparation or GPU upload.
@@ -181,7 +181,8 @@ mod tests {
     fn mesh_layout_selects_stage_rank_zero_without_io() {
         let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)])
             .expect("small test mesh construction cannot overflow");
-        let layout = Layout::from_mesh(&mesh, 4);
+        let layout =
+            Layout::from_mesh(&mesh, 4).expect("valid mesh must produce a deterministic layout");
         assert_eq!(layout.output_device(), 2);
         assert_eq!(
             (0..4)

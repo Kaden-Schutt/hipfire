@@ -17,7 +17,7 @@
 //! family-local reductions.
 
 use crate::tp_shard::ExpertAssign;
-use hipfire_hardware::{CollectiveHint, DeviceMesh, DimKind};
+use hipfire_hardware::{CollectiveHint, DeviceMesh, DimKind, MeshError};
 use rdna_compute::DType;
 use std::collections::HashSet;
 
@@ -315,7 +315,11 @@ pub struct ManifestPlan {
     pub band_xfers: Vec<(usize, CollectiveHint)>,
 }
 
-fn base_coord_for(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
+fn base_coord_for(
+    entry: &WeightEntry,
+    mesh: &DeviceMesh,
+    n_layers: usize,
+) -> Result<Vec<usize>, MeshError> {
     let stage = match (entry.placement, &entry.policy, entry.layer) {
         (PlacementHint::Pin(PinTarget::Embed), _, _)
         | (PlacementHint::Policy, ShardPolicy::Pin(PinTarget::Embed), _) => 0,
@@ -326,18 +330,22 @@ fn base_coord_for(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Ve
         (PlacementHint::Policy, _, Some(layer)) => mesh.stage_for_layer(layer, n_layers),
         (PlacementHint::Policy, _, None) => 0,
     };
-    let mut coord = mesh.coord_of(0);
+    let mut coord = mesh.coord_of(0)?;
     if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
         coord[index] = stage;
     }
-    coord
+    Ok(coord)
 }
 
 /// Compute global placement without touching a source, GPU, or allocator.
-pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
-    let coord = base_coord_for(entry, mesh, n_layers);
+pub fn placement_devices(
+    entry: &WeightEntry,
+    mesh: &DeviceMesh,
+    n_layers: usize,
+) -> Result<Vec<usize>, MeshError> {
+    let coord = base_coord_for(entry, mesh, n_layers)?;
     match &entry.policy {
-        ShardPolicy::Pin(_) | ShardPolicy::Tied { .. } => vec![mesh.device_of(&coord)],
+        ShardPolicy::Pin(_) | ShardPolicy::Tied { .. } => Ok(vec![mesh.device_of(&coord)?]),
         ShardPolicy::ExpertSharded { .. } => mesh.group_along(DimKind::Ep, &coord),
         ShardPolicy::ExpertTensorSharded { .. } => mesh.group_along(DimKind::Tp, &coord),
         _ => mesh.stage_devices(&coord),
@@ -575,23 +583,27 @@ pub fn plan_manifest(
         .collect();
     let weight_placements = weights
         .iter()
-        .map(|entry| WeightPlacement {
-            name: entry.name.clone(),
-            layer: entry.layer,
-            devices: placement_devices(entry, mesh, n_layers),
+        .map(|entry| {
+            Ok(WeightPlacement {
+                name: entry.name.clone(),
+                layer: entry.layer,
+                devices: placement_devices(entry, mesh, n_layers)?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, MeshError>>()
+        .map_err(|error| format!("weight placement failed: {error}"))?;
     let state_placements = state
         .iter()
         .map(|entry| {
-            let mut coord = mesh.coord_of(0);
+            let mut coord = mesh.coord_of(0)?;
             let stage = mesh.stage_for_layer(entry.layer, n_layers);
             if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
                 coord[index] = stage;
             }
-            (entry.clone(), mesh.stage_devices(&coord))
+            Ok((entry.clone(), mesh.stage_devices(&coord)?))
         })
-        .collect();
+        .collect::<Result<Vec<_>, MeshError>>()
+        .map_err(|error| format!("state placement failed: {error}"))?;
     let band_xfers = (0..n_layers)
         .filter_map(|layer| {
             mesh.band_xfer_after(layer, n_layers)
@@ -918,8 +930,8 @@ mod tests {
             ShardPolicy::Pin(PinTarget::Embed),
         );
         let row = layer_entry("wo", 2, ShardPolicy::RowShard { axis: 1 });
-        assert_eq!(placement_devices(&embed, &mesh, 4), vec![0]);
-        assert_eq!(placement_devices(&row, &mesh, 4), vec![2, 3]);
+        assert_eq!(placement_devices(&embed, &mesh, 4).unwrap(), vec![0]);
+        assert_eq!(placement_devices(&row, &mesh, 4).unwrap(), vec![2, 3]);
         let plan = plan_manifest(
             &[layer_entry("wo", 0, ShardPolicy::RowShard { axis: 1 }), row],
             &[],

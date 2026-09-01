@@ -705,7 +705,18 @@ where
     let origin = WeightOrigin::for_single(mesh, gpu);
     let mut store = WeightStore::with_origin(origin);
     for entry in weights {
-        let devices = placement_devices(entry, mesh, n_layers);
+        let devices = match placement_devices(entry, mesh, n_layers) {
+            Ok(devices) => devices,
+            Err(error) => {
+                let error = FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: 0,
+                    reason: format!("device placement failed: {error}"),
+                };
+                return Err(rollback_fulfill_error(store, gpu, error));
+            }
+        };
         if devices.as_slice() != [0] {
             let error = FulfillError {
                 name: entry.name.clone(),
@@ -967,7 +978,7 @@ mod tests {
         // The target guard is pure and can be checked without constructing a
         // Gpu; the closure would be unreachable on this path.
         assert!(target_error(&mesh).is_some());
-        assert_eq!(placement_devices(&entry, &mesh, 1), vec![0]);
+        assert_eq!(placement_devices(&entry, &mesh, 1).unwrap(), vec![0]);
     }
 
     #[test]
