@@ -502,7 +502,6 @@ pub fn validate_moe_step_schedule(
         }
     }
 
-
     experts.validate()?;
     route.validate_against(experts.n_experts(), batch_size)?;
     if !same_tensor(route_indices, route.route_buffers().0)
@@ -1783,7 +1782,8 @@ static MOE: std::sync::LazyLock<MoeFamily> = std::sync::LazyLock::new(MoeFamily:
 fn reject_unsealed_moe(steps: &[Step]) -> Result<(), DispatchError> {
     if steps.iter().any(is_moe_step) {
         return Err(DispatchError::Hip(
-            "unsealed MoE schedules require execute_sealed_steps or execute_sealed_steps_mesh".into(),
+            "unsealed MoE schedules require execute_sealed_steps or execute_sealed_steps_mesh"
+                .into(),
         ));
     }
     Ok(())

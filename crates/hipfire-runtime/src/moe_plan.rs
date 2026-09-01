@@ -1170,7 +1170,6 @@ mod tests {
         entries
     }
 
-
     fn separate_manifest() -> Vec<WeightEntry> {
         let mut entries = manifest();
         entries[1].name = "experts.gate".into();
@@ -1226,7 +1225,6 @@ mod tests {
         value
     }
 
-
     fn tensor_with_bytes(shape: Vec<usize>, dtype: DType, bytes: usize) -> GpuTensor {
         let mut tensor = GpuTensor::null_for_test();
         tensor.buf = unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), bytes) };
@@ -1270,8 +1268,8 @@ mod tests {
         } else {
             (spec(execution, parallelism), manifest_for(parallelism))
         };
-        let mut plan =
-            ExpertPlan::from_manifest(&group_spec, &group_manifest, mesh).expect("test expert plan");
+        let mut plan = ExpertPlan::from_manifest(&group_spec, &group_manifest, mesh)
+            .expect("test expert plan");
         let group_size = plan.group_size();
         let pointer_slots = plan.n_experts().checked_mul(2).expect("test pointer slots");
         for rank in 0..group_size {
@@ -1542,7 +1540,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn sealing_rejects_non_k8_softmax_routes() {
         let mesh = DeviceMesh::single().unwrap();
@@ -1680,8 +1677,7 @@ mod tests {
         let tensors = grouped_tensors();
         let steps = grouped_steps(&experts, &tensors);
         let mut collectives = vec![StepCollective::None; 7];
-        collectives[6] =
-            StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 1);
+        collectives[6] = StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 1);
         let schedule = MoeFamily::new()
             .seal_steps(ExpertExecutionPlan::GroupedQuantized, steps, collectives)
             .expect("collective descriptor is locally typed");
@@ -1700,8 +1696,7 @@ mod tests {
         let plan = resident_plan("grouped_quantized", ExpertParallelism::Single, &mesh);
         let experts = plan.bind_expert_ref(0).unwrap();
         let mut tensors = grouped_tensors();
-        tensors.indices =
-            tensor_with_bytes(vec![2, 8], DType::F32, 15 * DType::F32.size());
+        tensors.indices = tensor_with_bytes(vec![2, 8], DType::F32, 15 * DType::F32.size());
         let steps = grouped_steps(&experts, &tensors);
         let error = match MoeFamily::new().seal_steps(
             ExpertExecutionPlan::GroupedQuantized,
@@ -1799,10 +1794,8 @@ mod tests {
         let family = MoeFamily::new();
 
         let mut duplicate = vec![StepCollective::None; 7];
-        duplicate[5] =
-            StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
-        duplicate[6] =
-            StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
+        duplicate[5] = StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
+        duplicate[6] = StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
         let error = match family.seal_steps(
             ExpertExecutionPlan::GroupedQuantized,
             grouped_steps(&experts, &tensors),
@@ -1834,8 +1827,7 @@ mod tests {
         }
         let mut staged_spec = spec("indexed_quantized", ExpertParallelism::Single);
         staged_spec.layer = Some(1);
-        let mut plan =
-            ExpertPlan::from_manifest(&staged_spec, &staged_manifest, &mesh).unwrap();
+        let mut plan = ExpertPlan::from_manifest(&staged_spec, &staged_manifest, &mesh).unwrap();
         assert_eq!(plan.group_devices(), &[1]);
 
         for rank in 0..plan.group_size() {
