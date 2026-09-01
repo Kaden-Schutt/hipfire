@@ -26,6 +26,18 @@ pub enum PipelineOp {
     IndexedGateUp,
     IndexedDownExpanded,
     MoeCombine,
+    /// Bias-aware or precomputed top-k routing owned by the executor.
+    MoeRoute,
+    /// Typed routed expert projection (gate/up or down).
+    IndexedMoeGemv,
+    /// Grouped routed expert prefill scatter.
+    MoeScatter,
+    /// Grouped routed expert GEMM.
+    GroupedMoeGemm,
+    /// Deinterleave grouped gate/up output.
+    MoeGateUpUnscatter,
+    /// Routed SwiGLU/rotation activation.
+    MoeActivation,
     /// Fused rmsnorm + optional rotation (MQ-weight producer step).
     /// rotation=FwhtG256 → rmsnorm + FWHT. rotation=None → rmsnorm only.
     RmsnormAutomatic,

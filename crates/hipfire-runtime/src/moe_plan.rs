@@ -1,0 +1,1076 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 hipfire contributors
+
+//! Manifest-derived MoE placement, rank views, and storage ownership.
+//!
+//! This module is the only owner of the resolved expert placement contract.
+//! It is CPU-only: source identities and logical shapes come from G3, topology
+//! comes from G1, and architecture carriers bind borrowed pointer tables through
+//! [`ExpertPlan::bind_expert_ref`]. No family receives an allocator or a store
+//! representation, and no family-side teardown path exists.
+
+use std::fmt;
+
+use hipfire_dispatch::families::moe::{ExpertExecutionPlan, MoeExpertRef};
+use hipfire_dispatch::pipeline::StepCollective;
+use hipfire_hardware::{CollectiveHint, DeviceMesh, DimKind, MeshEpoch};
+use rdna_compute::{DType, GpuTensor};
+
+use crate::tp_shard::ExpertAssign;
+use crate::weight_manifest::{
+    collective_schedule, validate_expert_group_specs, ExpertGroupSpec, ExpertParallelism,
+    ExpertResourceRequirements, ExpertSourceLayout, ShardPolicy, WeightEntry,
+};
+
+/// One logical expert and its deterministic owner-local slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpertPlacement {
+    pub global_id: usize,
+    /// Rank-local owner index within the named DeviceMesh group.
+    pub owner: usize,
+    pub local_slot: usize,
+}
+
+/// Logical dimensions shared by the fused gate/up and down projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpertShape {
+    pub expert_m: usize,
+    pub expert_k: usize,
+    pub fused_gate_up: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertPlanError(String);
+
+impl ExpertPlanError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for ExpertPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExpertPlanError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpertStorageOwner {
+    slots: Vec<ExpertPlacement>,
+    resident: Vec<bool>,
+}
+
+impl ExpertStorageOwner {
+    fn new(slots: Vec<ExpertPlacement>) -> Self {
+        Self {
+            resident: vec![false; slots.len()],
+            slots,
+        }
+    }
+
+    fn index_of(&self, placement: ExpertPlacement) -> Option<usize> {
+        self.slots.iter().position(|candidate| *candidate == placement)
+    }
+
+    fn clear(&mut self) {
+        self.resident.fill(false);
+    }
+
+    fn resident_count(&self) -> usize {
+        self.resident.iter().filter(|resident| **resident).count()
+    }
+}
+
+/// A sealed, manifest-derived expert plan.
+///
+/// Every placement, source identity, shape, resource requirement, rank-local
+/// view, and collective row is private and fixed at construction. The only
+/// mutable state is the owner transaction's resident bitmap; it is never
+/// transferred to a family.
+pub struct ExpertPlan {
+    group: String,
+    layer: Option<usize>,
+    n_experts: usize,
+    parallelism: ExpertParallelism,
+    assignment: ExpertAssign,
+    shape: ExpertShape,
+    source_dtype: DType,
+    source_layout: ExpertSourceLayout,
+    resources: ExpertResourceRequirements,
+    router: String,
+    execution: String,
+    execution_plan: ExpertExecutionPlan,
+    mesh_epoch: MeshEpoch,
+    group_devices: Vec<usize>,
+    collective: Option<CollectiveHint>,
+    collective_row: Option<String>,
+    owner_views: Vec<Vec<usize>>,
+    owner: ExpertStorageOwner,
+}
+
+impl fmt::Debug for ExpertPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExpertPlan")
+            .field("group", &self.group)
+            .field("layer", &self.layer)
+            .field("n_experts", &self.n_experts)
+            .field("parallelism", &self.parallelism)
+            .field("assignment", &self.assignment)
+            .field("shape", &self.shape)
+            .field("source_dtype", &self.source_dtype)
+            .field("source_layout", &self.source_layout)
+            .field("resources", &self.resources)
+            .field("router", &self.router)
+            .field("execution", &self.execution)
+            .field("execution_plan", &self.execution_plan)
+            .field("mesh_epoch", &self.mesh_epoch)
+            .field("group_devices", &self.group_devices)
+            .field("collective", &self.collective)
+            .field("collective_row", &self.collective_row)
+            .field("resident_slots", &self.owner.resident_count())
+            .finish()
+    }
+}
+
+impl ExpertPlan {
+    /// Resolve one expert declaration against the G3 logical manifest and G1
+    /// named mesh. No GPU, source file, allocator, or `WeightStore` is touched.
+    pub fn from_manifest(
+        spec: &ExpertGroupSpec,
+        manifest: &[WeightEntry],
+        mesh: &DeviceMesh,
+    ) -> Result<Self, ExpertPlanError> {
+        validate_expert_group_specs(std::slice::from_ref(spec), manifest)
+            .map_err(ExpertPlanError::new)?;
+        validate_spec(spec, mesh)?;
+        let (shape, source_dtype) = resolve_shape(spec, manifest)?;
+        let execution_plan = parse_execution(&spec.execution, spec)?;
+        validate_execution_dtype(execution_plan, source_dtype, spec)?;
+
+        let group_devices = resolve_group_devices(spec, manifest, mesh);
+        if group_devices.is_empty() {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' resolved to an empty mesh group",
+                spec.group
+            )));
+        }
+        let owner = resolve_placements(
+            spec.n_experts,
+            group_devices.len(),
+            spec.parallelism,
+            spec.assignment,
+        );
+        let owner_views = (0..group_devices.len())
+            .map(|rank| {
+                owner
+                    .iter()
+                    .filter(|placement| placement.owner == rank)
+                    .map(|placement| placement.global_id)
+                    .collect()
+            })
+            .collect();
+        let (collective, collective_row) = resolve_collective(spec, manifest)?;
+
+        Ok(Self {
+            group: spec.group.clone(),
+            layer: spec.layer,
+            n_experts: spec.n_experts,
+            parallelism: spec.parallelism,
+            assignment: spec.assignment,
+            shape,
+            source_dtype,
+            source_layout: spec.source_layout.clone(),
+            resources: spec.resources,
+            router: spec.router.clone(),
+            execution: spec.execution.clone(),
+            execution_plan,
+            mesh_epoch: mesh.epoch(),
+            group_devices,
+            collective,
+            collective_row,
+            owner_views,
+            owner: ExpertStorageOwner::new(owner),
+        })
+    }
+
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+
+    pub fn layer(&self) -> Option<usize> {
+        self.layer
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_devices.len()
+    }
+
+    pub fn assignment(&self) -> ExpertAssign {
+        self.assignment
+    }
+
+    pub fn parallelism(&self) -> ExpertParallelism {
+        self.parallelism
+    }
+
+    pub fn shape(&self) -> ExpertShape {
+        self.shape
+    }
+
+    pub fn source_dtype(&self) -> DType {
+        self.source_dtype
+    }
+
+    pub fn source_layout(&self) -> &ExpertSourceLayout {
+        &self.source_layout
+    }
+
+    pub fn resources(&self) -> ExpertResourceRequirements {
+        self.resources
+    }
+
+    pub fn router(&self) -> &str {
+        &self.router
+    }
+
+    pub fn execution(&self) -> &str {
+        &self.execution
+    }
+
+    pub fn execution_plan(&self) -> ExpertExecutionPlan {
+        self.execution_plan
+    }
+
+    pub fn mesh_epoch(&self) -> MeshEpoch {
+        self.mesh_epoch
+    }
+
+    /// Global device IDs in the exact named-axis order used by collectives.
+    pub fn group_devices(&self) -> &[usize] {
+        &self.group_devices
+    }
+
+    /// The one ordered G3 manifest row that authorizes the routed reduction.
+    pub fn collective_row(&self) -> Option<&str> {
+        self.collective_row.as_deref()
+    }
+
+    /// The single post-combine collective implied by the declared parallelism.
+    pub fn collective(&self) -> Option<CollectiveHint> {
+        self.collective
+    }
+
+    pub fn placements(&self) -> &[ExpertPlacement] {
+        &self.owner.slots
+    }
+
+    pub fn placement(&self, global_id: usize, owner: usize) -> Option<ExpertPlacement> {
+        self.owner
+            .slots
+            .iter()
+            .copied()
+            .find(|placement| placement.global_id == global_id && placement.owner == owner)
+    }
+
+    pub fn owned_experts(&self, rank: usize) -> Result<&[usize], ExpertPlanError> {
+        self.owner_views.get(rank).map(Vec::as_slice).ok_or_else(|| {
+            ExpertPlanError::new(format!(
+                "expert group '{}' rank {rank} is outside group size {}",
+                self.group,
+                self.group_size()
+            ))
+        })
+    }
+
+    /// Bind canonical shape/dtype/owner metadata to a borrowed pointer-table
+    /// view. The family can retain only the returned immutable view; all
+    /// placement and storage state remains owned by this plan.
+    pub fn bind_expert_ref<'a>(
+        &'a self,
+        rank: usize,
+        gate_up_ptrs: &'a GpuTensor,
+        down_ptrs: &'a GpuTensor,
+        dummy_gate_up: Option<&'a GpuTensor>,
+    ) -> Result<MoeExpertRef<'a>, ExpertPlanError> {
+        let owned = self.owned_experts(rank)?;
+        let collective_kind = match self.collective {
+            Some(CollectiveHint::AllReduce { kind }) => Some(kind),
+            _ => None,
+        };
+        let view = MoeExpertRef::from_resolved(
+            gate_up_ptrs,
+            down_ptrs,
+            dummy_gate_up,
+            self.source_dtype,
+            self.n_experts,
+            self.shape.expert_m,
+            self.shape.expert_k,
+            owned,
+            collective_kind,
+        );
+        view.validate()
+            .map_err(|error| ExpertPlanError::new(error.to_string()))?;
+        Ok(view)
+    }
+
+    /// Build the descriptor for the one collective attached to the combine
+    /// position. Single is an explicit identity and emits `None`.
+    pub fn step_collective(
+        &self,
+        rank: usize,
+        dim: usize,
+    ) -> Result<StepCollective, ExpertPlanError> {
+        if rank >= self.group_size() {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' rank {rank} is outside group size {}",
+                self.group,
+                self.group_size()
+            )));
+        }
+        if dim == 0 {
+            return Err(ExpertPlanError::new(
+                "expert collective output dimension must be nonzero",
+            ));
+        }
+        match self.collective {
+            None => Ok(StepCollective::None),
+            Some(CollectiveHint::AllReduce { kind }) => Ok(StepCollective::all_reduce(
+                kind,
+                dim,
+                self.group_devices.clone(),
+                self.mesh_epoch,
+                rank,
+            )),
+            Some(CollectiveHint::BandXfer { .. }) => Err(ExpertPlanError::new(
+                "pipeline band transfer is not an expert reduction",
+            )),
+        }
+    }
+
+    /// Start one owner-controlled load transaction. A dropped or explicitly
+    /// rolled-back transaction removes only its staged slots.
+    pub fn begin_load(&mut self) -> ExpertLoadTxn<'_> {
+        ExpertLoadTxn {
+            owner: &mut self.owner,
+            staged: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Idempotent teardown. No family-side free path exists; all resident
+    /// slots return to the owner baseline and repeated unloads are harmless.
+    pub fn unload(&mut self) {
+        self.owner.clear();
+    }
+
+    pub fn resident_slots(&self) -> usize {
+        self.owner.resident_count()
+    }
+
+    pub fn allocated_slots(&self) -> usize {
+        self.owner.slots.len()
+    }
+}
+
+/// Owner-scoped transactional expert load state.
+pub struct ExpertLoadTxn<'a> {
+    owner: &'a mut ExpertStorageOwner,
+    staged: Vec<usize>,
+    finished: bool,
+}
+
+impl ExpertLoadTxn<'_> {
+    /// Reserve one manifest placement. Duplicate reservations are refused.
+    pub fn reserve(&mut self, placement: ExpertPlacement) -> Result<(), ExpertPlanError> {
+        let index = self.owner.index_of(placement).ok_or_else(|| {
+            ExpertPlanError::new(format!("unknown expert placement {placement:?}"))
+        })?;
+        if self.owner.resident[index] {
+            return Err(ExpertPlanError::new(format!(
+                "expert placement {placement:?} is already resident"
+            )));
+        }
+        self.owner.resident[index] = true;
+        self.staged.push(index);
+        Ok(())
+    }
+
+    /// Commit the staged reservations. The owner remains responsible for
+    /// teardown; committing never transfers ownership to a family.
+    pub fn commit(mut self) {
+        self.finished = true;
+    }
+
+    /// Roll back staged reservations and close the transaction.
+    pub fn rollback(&mut self) {
+        for index in self.staged.drain(..) {
+            self.owner.resident[index] = false;
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for ExpertLoadTxn<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            for index in self.staged.drain(..) {
+                self.owner.resident[index] = false;
+            }
+        }
+    }
+}
+
+fn validate_spec(spec: &ExpertGroupSpec, mesh: &DeviceMesh) -> Result<(), ExpertPlanError> {
+    if spec.group.is_empty() {
+        return Err(ExpertPlanError::new("expert group identity is empty"));
+    }
+    if spec.n_experts == 0 {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' has no experts",
+            spec.group
+        )));
+    }
+    if spec.resources.bytes_per_expert == 0 {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' bytes_per_expert is zero",
+            spec.group
+        )));
+    }
+    if spec.resources.alignment == 0 || !spec.resources.alignment.is_power_of_two() {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' alignment={} is invalid",
+            spec.group, spec.resources.alignment
+        )));
+    }
+    spec.n_experts
+        .checked_mul(spec.resources.bytes_per_expert)
+        .ok_or_else(|| ExpertPlanError::new("expert resource capacity overflows usize"))?;
+    if spec.router.is_empty() || spec.execution.is_empty() {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' router/execution identity is empty",
+            spec.group
+        )));
+    }
+    let group_size = match spec.parallelism {
+        ExpertParallelism::Single => 1,
+        ExpertParallelism::TensorParallel => mesh.size_of(DimKind::Tp),
+        ExpertParallelism::ExpertParallel => mesh.size_of(DimKind::Ep),
+    };
+    if group_size == 0 {
+        return Err(ExpertPlanError::new("expert group resolved to zero ranks"));
+    }
+    if matches!(spec.parallelism, ExpertParallelism::ExpertParallel)
+        && !spec.n_experts.is_multiple_of(group_size)
+    {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' n_experts={} is not divisible by group_size={group_size}",
+            spec.group, spec.n_experts, group_size
+        )));
+    }
+    Ok(())
+}
+
+fn parse_execution(
+    execution: &str,
+    spec: &ExpertGroupSpec,
+) -> Result<ExpertExecutionPlan, ExpertPlanError> {
+    match execution {
+        "indexed_quantized" => Ok(ExpertExecutionPlan::IndexedQuantized),
+        "grouped_quantized" => Ok(ExpertExecutionPlan::GroupedQuantized),
+        "per_expert_fallback" => Err(ExpertPlanError::new(format!(
+            "expert group '{}' uses PerExpertFallback, which is not a Step protocol",
+            spec.group
+        ))),
+        other => Err(ExpertPlanError::new(format!(
+            "expert group '{}' has unsupported execution identity '{other}'",
+            spec.group
+        ))),
+    }
+}
+
+fn validate_execution_dtype(
+    execution: ExpertExecutionPlan,
+    dtype: DType,
+    spec: &ExpertGroupSpec,
+) -> Result<(), ExpertPlanError> {
+    let supported = match execution {
+        ExpertExecutionPlan::IndexedQuantized => matches!(
+            dtype,
+            DType::MQ4G256 | DType::MQ6G256 | DType::MQ4G256V2 | DType::MQ6G256V2
+        ),
+        ExpertExecutionPlan::GroupedQuantized => matches!(
+            dtype,
+            DType::MQ2G256Lloyd
+                | DType::MQ2G256LloydU
+                | DType::MQ3G256Lloyd
+                | DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ6G256
+                | DType::MQ6G256V2
+                | DType::MFP4G32E8
+                | DType::ParoQ4G128
+        ),
+        ExpertExecutionPlan::PerExpertFallback => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(ExpertPlanError::new(format!(
+            "expert group '{}' execution {:?} has no generic kernel for source dtype {dtype:?}",
+            spec.group, execution
+        )))
+    }
+}
+
+fn resolve_group_devices(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+    mesh: &DeviceMesh,
+) -> Vec<usize> {
+    let n_layers = manifest
+        .iter()
+        .filter_map(|entry| entry.layer)
+        .max()
+        .map_or(1, |layer| layer.saturating_add(1));
+    let mut coord = mesh.coord_of(0);
+    if let Some(layer) = spec.layer {
+        if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
+            coord[index] = mesh.stage_for_layer(layer, n_layers);
+        }
+    }
+    match spec.parallelism {
+        ExpertParallelism::Single => vec![mesh.device_of(&coord)],
+        ExpertParallelism::TensorParallel => mesh.group_along(DimKind::Tp, &coord),
+        ExpertParallelism::ExpertParallel => mesh.group_along(DimKind::Ep, &coord),
+    }
+}
+
+fn resolve_placements(
+    n_experts: usize,
+    group_size: usize,
+    parallelism: ExpertParallelism,
+    assignment: ExpertAssign,
+) -> Vec<ExpertPlacement> {
+    let capacity = match parallelism {
+        ExpertParallelism::TensorParallel => n_experts.saturating_mul(group_size),
+        ExpertParallelism::Single | ExpertParallelism::ExpertParallel => n_experts,
+    };
+    let mut next_slot = vec![0usize; group_size];
+    let mut placements = Vec::with_capacity(capacity);
+    for global_id in 0..n_experts {
+        match parallelism {
+            ExpertParallelism::Single => placements.push(ExpertPlacement {
+                global_id,
+                owner: 0,
+                local_slot: global_id,
+            }),
+            ExpertParallelism::TensorParallel => {
+                for owner in 0..group_size {
+                    placements.push(ExpertPlacement {
+                        global_id,
+                        owner,
+                        local_slot: global_id,
+                    });
+                }
+            }
+            ExpertParallelism::ExpertParallel => {
+                let per = n_experts / group_size;
+                let owner = match assignment {
+                    ExpertAssign::Contiguous => global_id / per,
+                    ExpertAssign::Stride => global_id % group_size,
+                };
+                let local_slot = next_slot[owner];
+                next_slot[owner] += 1;
+                placements.push(ExpertPlacement {
+                    global_id,
+                    owner,
+                    local_slot,
+                });
+            }
+        }
+    }
+    placements
+}
+
+fn source_names<'a>(layout: &'a ExpertSourceLayout) -> Vec<(&'static str, Vec<&'a str>)> {
+    match layout {
+        ExpertSourceLayout::PackedFused {
+            gate_up,
+            down,
+            sidecars,
+        } => vec![
+            ("gate_up", vec![gate_up.as_str()]),
+            ("down", vec![down.as_str()]),
+            ("sidecar", sidecars.iter().map(String::as_str).collect()),
+        ],
+        ExpertSourceLayout::PackedSeparate {
+            gate,
+            up,
+            down,
+            sidecars,
+        } => vec![
+            ("gate", vec![gate.as_str()]),
+            ("up", vec![up.as_str()]),
+            ("down", vec![down.as_str()]),
+            ("sidecar", sidecars.iter().map(String::as_str).collect()),
+        ],
+        ExpertSourceLayout::PerExpertFused {
+            gate_up,
+            down,
+            sidecars,
+        } => vec![
+            ("gate_up", gate_up.iter().map(String::as_str).collect()),
+            ("down", down.iter().map(String::as_str).collect()),
+            ("sidecar", sidecars.iter().map(String::as_str).collect()),
+        ],
+        ExpertSourceLayout::PerExpertSeparate {
+            gate,
+            up,
+            down,
+            sidecars,
+        } => vec![
+            ("gate", gate.iter().map(String::as_str).collect()),
+            ("up", up.iter().map(String::as_str).collect()),
+            ("down", down.iter().map(String::as_str).collect()),
+            ("sidecar", sidecars.iter().map(String::as_str).collect()),
+        ],
+    }
+}
+
+
+fn entry_for<'a>(
+    spec: &ExpertGroupSpec,
+    manifest: &'a [WeightEntry],
+    label: &str,
+    name: &str,
+) -> Result<&'a WeightEntry, ExpertPlanError> {
+    manifest
+        .iter()
+        .find(|entry| entry.name == name && entry.layer == spec.layer)
+        .ok_or_else(|| {
+            ExpertPlanError::new(format!(
+                "expert group '{}' layer {:?} missing {label} source '{name}'",
+                spec.group, spec.layer
+            ))
+        })
+}
+
+fn check_shape(
+    spec: &ExpertGroupSpec,
+    label: &str,
+    entry: &WeightEntry,
+    per_expert: bool,
+) -> Result<Vec<usize>, ExpertPlanError> {
+    if !entry.dtype_constraint.accepts(entry.dtype) {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' {label} source '{}' violates dtype constraint",
+            spec.group, entry.name
+        )));
+    }
+    let shape = &entry.logical_shape;
+    let valid_rank = if per_expert { shape.len() == 2 } else { shape.len() == 3 };
+    if !valid_rank || shape.iter().any(|dim| *dim == 0) {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' layer {:?} {label} source '{}' has invalid logical_shape {:?}",
+            spec.group, spec.layer, entry.name, shape
+        )));
+    }
+    if !per_expert && shape[0] != spec.n_experts {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' layer {:?} {label} source '{}' has expert axis {}, expected {}",
+            spec.group, spec.layer, entry.name, shape[0], spec.n_experts
+        )));
+    }
+    Ok(if per_expert {
+        shape.clone()
+    } else {
+        shape[1..].to_vec()
+    })
+}
+
+fn resolve_shape(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+) -> Result<(ExpertShape, DType), ExpertPlanError> {
+    let per_expert = matches!(
+        spec.source_layout,
+        ExpertSourceLayout::PerExpertFused { .. } | ExpertSourceLayout::PerExpertSeparate { .. }
+    );
+    for (label, names) in source_names(&spec.source_layout) {
+        for name in names {
+            let entry = entry_for(spec, manifest, label, name)?;
+            if !entry.dtype_constraint.accepts(entry.dtype) {
+                return Err(ExpertPlanError::new(format!(
+                    "expert group '{}' {label} source '{}' violates dtype constraint",
+                    spec.group, name
+                )));
+            }
+        }
+    }
+    let (gate_shapes, up_shapes, down_shapes, fused) = match &spec.source_layout {
+        ExpertSourceLayout::PackedFused { gate_up, down, .. } => (
+            vec![check_shape(
+                spec,
+                "gate_up",
+                entry_for(spec, manifest, "gate_up", gate_up)?,
+                false,
+            )?],
+            Vec::new(),
+            vec![check_shape(
+                spec,
+                "down",
+                entry_for(spec, manifest, "down", down)?,
+                false,
+            )?],
+            true,
+        ),
+        ExpertSourceLayout::PackedSeparate {
+            gate, up, down, ..
+        } => (
+            vec![check_shape(
+                spec,
+                "gate",
+                entry_for(spec, manifest, "gate", gate)?,
+                false,
+            )?],
+            vec![check_shape(
+                spec,
+                "up",
+                entry_for(spec, manifest, "up", up)?,
+                false,
+            )?],
+            vec![check_shape(
+                spec,
+                "down",
+                entry_for(spec, manifest, "down", down)?,
+                false,
+            )?],
+            false,
+        ),
+        ExpertSourceLayout::PerExpertFused { gate_up, down, .. } => (
+            gate_up
+                .iter()
+                .map(|name| check_shape(spec, "gate_up", entry_for(spec, manifest, "gate_up", name)?, true))
+                .collect::<Result<_, _>>()?,
+            Vec::new(),
+            down
+                .iter()
+                .map(|name| check_shape(spec, "down", entry_for(spec, manifest, "down", name)?, true))
+                .collect::<Result<_, _>>()?,
+            true,
+        ),
+        ExpertSourceLayout::PerExpertSeparate { gate, up, down, .. } => (
+            gate
+                .iter()
+                .map(|name| check_shape(spec, "gate", entry_for(spec, manifest, "gate", name)?, true))
+                .collect::<Result<_, _>>()?,
+            up.iter()
+                .map(|name| check_shape(spec, "up", entry_for(spec, manifest, "up", name)?, true))
+                .collect::<Result<_, _>>()?,
+            down
+                .iter()
+                .map(|name| check_shape(spec, "down", entry_for(spec, manifest, "down", name)?, true))
+                .collect::<Result<_, _>>()?,
+            false,
+        ),
+    };
+    if gate_shapes.is_empty() || down_shapes.is_empty() || (!up_shapes.is_empty() && up_shapes[0] != gate_shapes[0]) {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' layer {:?} projection source count/shape mismatch",
+            spec.group, spec.layer
+        )));
+    }
+    if gate_shapes.iter().any(|shape| shape != &gate_shapes[0])
+        || down_shapes.iter().any(|shape| shape != &down_shapes[0])
+    {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' layer {:?} per-expert projection shape mismatch",
+            spec.group, spec.layer
+        )));
+    }
+    let gate = &gate_shapes[0];
+    let down = &down_shapes[0];
+    if gate.len() != 2 || down.len() != 2 || gate[0] % 2 != 0 {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' layer {:?} projection shapes are incompatible",
+            spec.group, spec.layer
+        )));
+    }
+    let shape = ExpertShape {
+        expert_m: gate[0] / 2,
+        expert_k: gate[1],
+        fused_gate_up: fused,
+    };
+    if down != &[shape.expert_k, shape.expert_m] {
+        return Err(ExpertPlanError::new(format!(
+            "expert group '{}' layer {:?} projection shape mismatch: gate_up={gate:?}, down={down:?}",
+            spec.group, spec.layer
+        )));
+    }
+    let source_names = source_names(&spec.source_layout);
+    let source_dtype = source_names
+        .iter()
+        .flat_map(|(_, names)| names.iter())
+        .find_map(|name| manifest.iter().find(|entry| entry.name == *name && entry.layer == spec.layer).map(|entry| entry.dtype))
+        .ok_or_else(|| ExpertPlanError::new("expert projection has no source dtype"))?;
+    for (_, names) in source_names {
+        for name in names {
+            let entry = entry_for(spec, manifest, "projection", name)?;
+            if entry.dtype != source_dtype && label_is_projection(name, &spec.source_layout) {
+                return Err(ExpertPlanError::new(format!(
+                    "expert group '{}' projection source '{}' dtype {:?} differs from {:?}",
+                    spec.group, name, entry.dtype, source_dtype
+                )));
+            }
+        }
+    }
+    Ok((shape, source_dtype))
+}
+
+fn label_is_projection(name: &str, layout: &ExpertSourceLayout) -> bool {
+    match layout {
+        ExpertSourceLayout::PackedFused { gate_up, down, .. } => name == gate_up || name == down,
+        ExpertSourceLayout::PackedSeparate { gate, up, down, .. } => {
+            name == gate || name == up || name == down
+        }
+        ExpertSourceLayout::PerExpertFused { gate_up, down, .. } => {
+            gate_up.iter().any(|candidate| candidate == name)
+                || down.iter().any(|candidate| candidate == name)
+        }
+        ExpertSourceLayout::PerExpertSeparate { gate, up, down, .. } => {
+            gate.iter().any(|candidate| candidate == name)
+                || up.iter().any(|candidate| candidate == name)
+                || down.iter().any(|candidate| candidate == name)
+        }
+    }
+}
+
+fn down_names(layout: &ExpertSourceLayout) -> Vec<&str> {
+    match layout {
+        ExpertSourceLayout::PackedFused { down, .. }
+        | ExpertSourceLayout::PackedSeparate { down, .. } => vec![down.as_str()],
+        ExpertSourceLayout::PerExpertFused { down, .. }
+        | ExpertSourceLayout::PerExpertSeparate { down, .. } => {
+            down.iter().map(String::as_str).collect()
+        }
+    }
+}
+
+fn resolve_collective(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+) -> Result<(Option<CollectiveHint>, Option<String>), ExpertPlanError> {
+    let expected = match spec.parallelism {
+        ExpertParallelism::Single => None,
+        ExpertParallelism::TensorParallel => Some(DimKind::Tp),
+        ExpertParallelism::ExpertParallel => Some(DimKind::Ep),
+    };
+    let Some(expected_kind) = expected else {
+        return Ok((None, None));
+    };
+    let rows = collective_schedule(manifest);
+    let mut selected = None;
+    for name in down_names(&spec.source_layout) {
+        let row = rows
+            .iter()
+            .find(|row| row.layer == spec.layer.unwrap_or(usize::MAX) && row.name == name)
+            .ok_or_else(|| {
+                ExpertPlanError::new(format!(
+                    "expert group '{}' has no ordered G3 collective row for down source '{name}'",
+                    spec.group
+                ))
+            })?;
+        if !matches!(
+            row.hint,
+            CollectiveHint::AllReduce { kind } if kind == expected_kind
+        ) {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' down source '{name}' collective {:?} does not match {:?}",
+                spec.group, row.hint, expected_kind
+            )));
+        }
+        if let Some(previous) = selected {
+            if previous != row.hint {
+                return Err(ExpertPlanError::new(format!(
+                    "expert group '{}' down sources disagree on collective axis",
+                    spec.group
+                )));
+            }
+        } else {
+            selected = Some(row.hint);
+        }
+    }
+    Ok((selected, down_names(&spec.source_layout).first().map(|name| (*name).to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh_ep() -> DeviceMesh {
+        DeviceMesh::rect(&[(DimKind::Ep, 2)]).expect("test mesh")
+    }
+
+    fn manifest() -> Vec<WeightEntry> {
+        vec![
+            WeightEntry::layer(
+                "router",
+                0,
+                vec![4, 4],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "experts.gate_up",
+                0,
+                vec![4, 128, 64],
+                DType::MQ4G256,
+                ShardPolicy::ExpertSharded {
+                    n_experts: 4,
+                    assign: ExpertAssign::Stride,
+                },
+            ),
+            WeightEntry::layer(
+                "experts.down",
+                0,
+                vec![4, 64, 64],
+                DType::MQ4G256,
+                ShardPolicy::ExpertSharded {
+                    n_experts: 4,
+                    assign: ExpertAssign::Stride,
+                },
+            ),
+        ]
+    }
+
+    fn spec(execution: &str, parallelism: ExpertParallelism) -> ExpertGroupSpec {
+        ExpertGroupSpec {
+            group: "block-0".into(),
+            layer: Some(0),
+            n_experts: 4,
+            parallelism,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PackedFused {
+                gate_up: "experts.gate_up".into(),
+                down: "experts.down".into(),
+                sidecars: vec![],
+            },
+            resources: ExpertResourceRequirements {
+                bytes_per_expert: 4096,
+                alignment: 256,
+            },
+            router: "router".into(),
+            execution: execution.into(),
+        }
+    }
+
+    fn table(shape: Vec<usize>) -> GpuTensor {
+        let mut tensor = GpuTensor::null_for_test();
+        tensor.shape = shape;
+        tensor
+    }
+
+    #[test]
+    fn stride_assignment_and_named_group_are_deterministic() {
+        let plan = ExpertPlan::from_manifest(
+            &spec("indexed_quantized", ExpertParallelism::ExpertParallel),
+            &manifest(),
+            &mesh_ep(),
+        )
+        .unwrap();
+        let owners: Vec<_> = plan
+            .placements()
+            .iter()
+            .map(|placement| (placement.global_id, placement.owner, placement.local_slot))
+            .collect();
+        assert_eq!(owners, vec![(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 1, 1)]);
+        assert_eq!(plan.group_devices(), &[0, 1]);
+        assert_eq!(plan.collective(), Some(CollectiveHint::AllReduce { kind: DimKind::Ep }));
+    }
+
+    #[test]
+    fn bound_view_uses_canonical_rank_owner() {
+        let plan = ExpertPlan::from_manifest(
+            &spec("indexed_quantized", ExpertParallelism::ExpertParallel),
+            &manifest(),
+            &mesh_ep(),
+        )
+        .unwrap();
+        let gate = table(vec![4]);
+        let down = table(vec![4]);
+        let view = plan.bind_expert_ref(1, &gate, &down, None).unwrap();
+        assert_eq!(view.owned(), &[1, 3]);
+        assert_eq!(view.n_experts(), 4);
+    }
+
+    #[test]
+    fn failed_load_rolls_back_and_unload_is_idempotent() {
+        let mut plan = ExpertPlan::from_manifest(
+            &spec("indexed_quantized", ExpertParallelism::ExpertParallel),
+            &manifest(),
+            &mesh_ep(),
+        )
+        .unwrap();
+        let first = plan.placements()[0];
+        {
+            let mut load = plan.begin_load();
+            load.reserve(first).unwrap();
+        }
+        assert_eq!(plan.resident_slots(), 0);
+        {
+            let mut load = plan.begin_load();
+            load.reserve(first).unwrap();
+            load.commit();
+        }
+        assert_eq!(plan.resident_slots(), 1);
+        plan.unload();
+        plan.unload();
+        assert_eq!(plan.resident_slots(), 0);
+    }
+
+    #[test]
+    fn per_expert_fallback_is_refused_at_plan_boundary() {
+        let error = ExpertPlan::from_manifest(
+            &spec("per_expert_fallback", ExpertParallelism::ExpertParallel),
+            &manifest(),
+            &mesh_ep(),
+        )
+        .expect_err("fallback is not a typed Step protocol");
+        assert!(error.to_string().contains("PerExpertFallback"));
+    }
+
+    #[test]
+    fn source_shape_mismatch_is_refused_before_owner_creation() {
+        let mut malformed = manifest();
+        malformed[1].logical_shape = vec![4, 64, 64];
+        let error = ExpertPlan::from_manifest(
+            &spec("indexed_quantized", ExpertParallelism::ExpertParallel),
+            &malformed,
+            &mesh_ep(),
+        )
+        .expect_err("gate/up and down shapes must agree");
+        assert!(error.to_string().contains("shape mismatch"));
+    }
+
+    #[test]
+    fn single_plan_emits_identity_collective() {
+        let mut single_manifest = manifest();
+        single_manifest[1].policy = ShardPolicy::Replicate;
+        single_manifest[2].policy = ShardPolicy::Replicate;
+        let mesh = DeviceMesh::single().unwrap();
+        let plan = ExpertPlan::from_manifest(
+            &spec("indexed_quantized", ExpertParallelism::Single),
+            &single_manifest,
+            &mesh,
+        )
+        .unwrap();
+        assert_eq!(plan.collective(), None);
+        assert_eq!(plan.step_collective(0, 64).unwrap(), StepCollective::None);
+    }
+}

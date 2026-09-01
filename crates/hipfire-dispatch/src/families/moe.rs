@@ -26,7 +26,331 @@ use crate::tables::moe_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
+/// The routing operation selected for one admitted MoE group.
+///
+/// The generic executor currently has two concrete forms: a normal softmax
+/// top-k launch and a precomputed route supplied by an upstream owner. Family
+/// policy (bias, hash, or sigmoid variants) stays outside this substrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterSelection {
+    SoftmaxTopK,
+    Precomputed,
+}
 
+/// Typed routing operands. Each variant carries only the operands required by
+/// its routing semantics, so a caller cannot accidentally drop normalization
+/// while lowering.
+pub enum RouterPlan<'a> {
+    SoftmaxTopK {
+        scores: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+        normalize: bool,
+    },
+    /// The route was selected by an owner outside this executor. This is a
+    /// real operation boundary, not a second route implementation.
+    Precomputed {
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+    },
+}
+
+impl<'a> RouterPlan<'a> {
+    pub fn selection(&self) -> RouterSelection {
+        match self {
+            Self::SoftmaxTopK { .. } => RouterSelection::SoftmaxTopK,
+            Self::Precomputed { .. } => RouterSelection::Precomputed,
+        }
+    }
+
+    pub fn k_top(&self) -> usize {
+        match self {
+            Self::SoftmaxTopK { k_top, .. } | Self::Precomputed { k_top, .. } => *k_top,
+        }
+    }
+
+    pub fn normalizes(&self) -> bool {
+        match self {
+            Self::SoftmaxTopK { normalize, .. } => *normalize,
+            Self::Precomputed { .. } => true,
+        }
+    }
+
+
+    pub fn route_buffers(&self) -> (&'a GpuTensor, &'a GpuTensor) {
+        match self {
+            Self::SoftmaxTopK {
+                topk_indices,
+                topk_weights,
+                ..
+            }
+            | Self::Precomputed {
+                topk_indices,
+                topk_weights,
+                ..
+            } => (topk_indices, topk_weights),
+        }
+    }
+
+    pub fn batch_size(&self) -> usize {
+        let indices = self.route_buffers().0;
+        match indices.shape.as_slice() {
+            [_, k] if *k == self.k_top() => indices.shape[0],
+            [_] => 1,
+            _ => 0,
+        }
+    }
+
+    /// Validate route metadata before any expert kernel can launch.
+    pub fn validate_against(
+        &self,
+        n_experts: usize,
+        batch_size: usize,
+    ) -> Result<(), DispatchError> {
+        if n_experts == 0 || batch_size == 0 || self.k_top() == 0 || self.k_top() > n_experts {
+            return Err(DispatchError::Hip(format!(
+                "MoE route has invalid n_experts={n_experts}, batch_size={batch_size}, k_top={}",
+                self.k_top()
+            )));
+        }
+        let (indices, weights) = self.route_buffers();
+        if indices.dtype != DType::F32 || weights.dtype != DType::F32 {
+            return Err(DispatchError::Hip(
+                "MoE route indices and weights must use F32 storage".into(),
+            ));
+        }
+        let expected_slots = batch_size
+            .checked_mul(self.k_top())
+            .ok_or_else(|| DispatchError::Hip("MoE route slot count overflow".into()))?;
+        if indices.numel() < expected_slots || weights.numel() < expected_slots {
+            return Err(DispatchError::Hip(format!(
+                "MoE route buffers have insufficient capacity for {expected_slots} slots"
+            )));
+        }
+        if !matches!(indices.shape.as_slice(), [_] | [_, _]) {
+            return Err(DispatchError::Hip(
+                "MoE route index shape must be [K] or [B,K]".into(),
+            ));
+        }
+        if indices.shape.last() != Some(&self.k_top())
+            || weights.shape.last() != Some(&self.k_top())
+        {
+            return Err(DispatchError::Hip(
+                "MoE route index/weight shape must end in k_top".into(),
+            ));
+        }
+        if let Self::SoftmaxTopK { scores, .. } = self {
+            if scores.dtype != DType::F32
+                || scores.shape.last() != Some(&n_experts)
+                || !matches!(scores.shape.len(), 1 | 2)
+                || scores.numel() < batch_size.saturating_mul(n_experts)
+            {
+                return Err(DispatchError::Hip(format!(
+                    "MoE router score shape/dtype does not match batch={batch_size}, experts={n_experts}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Executor shape choice for one admitted routed expert group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertExecutionPlan {
+    IndexedQuantized,
+    GroupedQuantized,
+    PerExpertFallback,
+}
+/// Executable grammar selected by the sealed plan. There is deliberately no
+/// generic fallback grammar: a fallback would bypass the owner and collective
+/// checks that make a Step program safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeProtocolKind {
+    Indexed,
+    Grouped,
+}
+
+impl ExpertExecutionPlan {
+    pub fn protocol(self) -> Result<MoeProtocolKind, DispatchError> {
+        match self {
+            Self::IndexedQuantized => Ok(MoeProtocolKind::Indexed),
+            Self::GroupedQuantized => Ok(MoeProtocolKind::Grouped),
+            Self::PerExpertFallback => Err(DispatchError::Hip(
+                "PerExpertFallback is not an executable MoE Step protocol".into(),
+            )),
+        }
+    }
+}
+
+/// Borrowed view over one resolver-owned rank-local expert table.
+///
+/// The view contains no allocation handle, source path, or storage owner. It
+/// is created by the manifest/runtime owner and borrowed by a Step until the
+/// owner is dropped. Keeping the fields private prevents a family from
+/// replacing the canonical placement metadata after binding.
+pub struct MoeExpertRef<'a> {
+    gate_up_ptrs: &'a GpuTensor,
+    down_ptrs: &'a GpuTensor,
+    dummy_gate_up: Option<&'a GpuTensor>,
+    dtype: DType,
+    n_experts: usize,
+    expert_m: usize,
+    expert_k: usize,
+    owned: &'a [usize],
+    collective_kind: Option<hipfire_hardware::DimKind>,
+}
+impl<'a> MoeExpertRef<'a> {
+    /// Bind a pointer-table view to metadata already resolved by an owner.
+    ///
+    /// This constructor deliberately accepts borrowed tables only. Runtime
+    /// owners should expose a narrower `bind_*` method that supplies the
+    /// canonical values from its sealed plan; no family receives an allocator
+    /// or a `WeightStore` representation.
+    #[doc(hidden)]
+    pub fn from_resolved(
+        gate_up_ptrs: &'a GpuTensor,
+        down_ptrs: &'a GpuTensor,
+        dummy_gate_up: Option<&'a GpuTensor>,
+        dtype: DType,
+        n_experts: usize,
+        expert_m: usize,
+        expert_k: usize,
+        owned: &'a [usize],
+        collective_kind: Option<hipfire_hardware::DimKind>,
+    ) -> Self {
+        Self {
+            gate_up_ptrs,
+            down_ptrs,
+            dummy_gate_up,
+            dtype,
+            n_experts,
+            expert_m,
+            expert_k,
+            owned,
+            collective_kind,
+        }
+    }
+
+    pub fn gate_up_ptrs(&self) -> &'a GpuTensor {
+        self.gate_up_ptrs
+    }
+
+    pub fn down_ptrs(&self) -> &'a GpuTensor {
+        self.down_ptrs
+    }
+
+    pub fn dummy_gate_up(&self) -> Option<&'a GpuTensor> {
+        self.dummy_gate_up
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn expert_m(&self) -> usize {
+        self.expert_m
+    }
+
+    pub fn expert_k(&self) -> usize {
+        self.expert_k
+    }
+
+    pub fn owned(&self) -> &'a [usize] {
+        self.owned
+    }
+
+    pub fn collective_kind(&self) -> Option<hipfire_hardware::DimKind> {
+        self.collective_kind
+    }
+
+    /// Validate the dimensions shared by the fused gate/up and down kernels.
+    /// Gate/up is `[2*expert_m, expert_k]`; down is `[expert_k, expert_m]`.
+    pub fn validate(&self) -> Result<(), DispatchError> {
+        if self.n_experts == 0 {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: n_experts must be nonzero".into(),
+            ));
+        }
+        if self.expert_m == 0 || self.expert_k == 0 {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: expert dimensions must be nonzero".into(),
+            ));
+        }
+        if self.gate_up_ptrs.numel() < self.n_experts
+            || self.down_ptrs.numel() < self.n_experts
+        {
+            return Err(DispatchError::Hip(format!(
+                "MoeExpertRef: pointer-table capacity is too small for {} experts",
+                self.n_experts
+            )));
+        }
+        if let Some(dummy) = self.dummy_gate_up {
+            if dummy.numel() == 0 {
+                return Err(DispatchError::Hip(
+                    "MoeExpertRef: dummy gate/up table is empty".into(),
+                ));
+            }
+        }
+        let mut previous = None;
+        for &expert in self.owned {
+            if expert >= self.n_experts {
+                return Err(DispatchError::Hip(format!(
+                    "MoeExpertRef: owned expert {expert} >= n_experts {}",
+                    self.n_experts
+                )));
+            }
+            if previous == Some(expert) {
+                return Err(DispatchError::Hip(format!(
+                    "MoeExpertRef: duplicate owned expert {expert}"
+                )));
+            }
+            previous = Some(expert);
+        }
+        Ok(())
+    }
+
+    /// Refuse a projection pair whose logical shapes cannot share this
+    /// executor view. This check is pure and runs before a kernel launch.
+    pub fn validate_projection_shapes(
+        &self,
+        gate_up_shape: &[usize],
+        down_shape: &[usize],
+    ) -> Result<(), DispatchError> {
+        self.validate()?;
+        let expected_gate_up = [2 * self.expert_m, self.expert_k];
+        let expected_down = [self.expert_k, self.expert_m];
+        if gate_up_shape != expected_gate_up || down_shape != expected_down {
+            return Err(DispatchError::Hip(format!(
+                "MoeExpertRef: projection shape mismatch: gate_up={gate_up_shape:?} \
+                 expected={expected_gate_up:?}, down={down_shape:?} expected={expected_down:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Launch-time activation form for routed experts. The concrete kernel family
+/// remains an architecture concern; these are the only semantic forms the
+/// generic Step substrate needs to name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeActivationVariant {
+    SiluMul,
+    SiluMulRotate,
+}
+
+/// Typed routed projection shape. Every down projection is expanded and is
+/// followed by the executor-owned `MoeCombine` step. Family kernels therefore
+/// cannot hide a second reduction inside this vocabulary.
+pub enum MoeProj<'a> {
+    GateUp { up_out: &'a GpuTensor },
+    DownExpanded,
+}
 // ── MoE eligibility lattice ────────────────────────────
 
 /// Routed-expert tiers the mixed-tier graded decode path can execute: the
@@ -66,27 +390,13 @@ pub struct MoeDtypes {
     pub routed_gate_up: DType, // ffn.experts[0].gate_up
     pub routed_down: DType,    // ffn.experts[0].down
     /// Per-expert mixed routed dtype: experts in one layer carry DIFFERENT
-    /// gate_up and/or down dtypes (N-tier graded: MQ6 hot / MQ4 mid / MQ2L
-    /// or MQ3L or E8-family cold), so `routed_gate_up` / `routed_down`
-    /// (= experts[0]) are NOT representative. Built by the model as
-    /// `ffn.expert_dtype_tags.is_some()` — the tag table is built iff any
-    /// expert's gate_up or down dtype differs from experts[0]. Tags:
-    ///   0 = MQ6G256       (200 B/grp affine)
-    ///   1 = MQ2G256Lloyd  ( 72 B/grp codebook)
-    ///   2 = MQ4G256       (136 B/grp affine)
-    ///   3 = MQ3G256Lloyd  (112 B/grp codebook)
-    ///   4 = MFP4G32E8     (16 B hdr + (K/32)*17 B; 4-bit E8 lattice, 4.25 bpw)
-    ///   5 = MFP3G32E8     (16 B hdr + (K/32)*13 B; 3-bit E8 lattice, 3.25 bpw)
-    ///   6 = MFP2G32E8     (16 B hdr + (K/32)*9  B; 2-bit E8 lattice, 2.25 bpw)
-    /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
+    /// gate_up and/or down dtypes; the tag table is built iff the layer is
+    /// heterogeneous and drives the merged decode kernels.
     pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool, // ffn.paro_shared.is_some()
-    /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch. `None`
-    /// (default) ⇒ today's uniform path (representative `routed_gate_up` drives
-    /// resolution). `Some(table)` with >1 distinct DType marks the layer
-    /// `mixed`; a `Some` table that is all-equal collapses to the uniform path.
+    /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch.
     pub per_expert_gate_up: Option<Vec<DType>>,
-    /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
+    /// Per-expert down tiers (parallel to `per_expert_gate_up`).
     pub per_expert_down: Option<Vec<DType>>,
 }
 
@@ -100,11 +410,10 @@ impl MoeDtypes {
             self.routed_down,
         ]
         .iter()
-        // V1 (qt14) and V2 (qt47) are both 6-bit FWHT projections that trip
-        // the gfx1151 MQ4-i8 grouped fence via `force_mq4_grouped_fp16`.
         .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
     }
 }
+
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
 /// routing-config logic, relocated from `moe_ffn_decode_impl` into one typed,
@@ -929,6 +1238,313 @@ impl MoeFamily {
     pub fn registry(&self) -> &KernelRegistry {
         &self.registry
     }
+    /// Execute the owner-bound route operation. Precomputed routes are an
+    /// explicit identity boundary; computed routes use the existing batched
+    /// k=8 router kernel and never infer a different policy.
+    pub(crate) fn run_route(
+        &self,
+        gpu: &mut Gpu,
+        plan: &RouterPlan<'_>,
+    ) -> Result<(), DispatchError> {
+        let batch_size = plan.batch_size();
+        match plan {
+            RouterPlan::SoftmaxTopK {
+                scores,
+                topk_indices,
+                topk_weights,
+                k_top,
+                normalize,
+            } => {
+                if *k_top != 8 {
+                    return Err(DispatchError::Hip(format!(
+                        "generic MoE softmax route requires k_top=8, got {k_top}"
+                    )));
+                }
+                let n_experts = *scores.shape.last().ok_or_else(|| {
+                    DispatchError::Hip("generic MoE route scores have no expert axis".into())
+                })?;
+                plan.validate_against(n_experts, batch_size)?;
+                gpu.moe_softmax_topk_renorm_k8_batched(
+                    scores,
+                    topk_indices,
+                    topk_weights,
+                    n_experts,
+                    *normalize,
+                    batch_size,
+                )
+                .map_err(|error| DispatchError::Hip(error.to_string()))
+            }
+            RouterPlan::Precomputed {
+                topk_indices,
+                topk_weights,
+                k_top,
+            } => {
+                if *k_top == 0
+                    || topk_indices.dtype != DType::F32
+                    || topk_weights.dtype != DType::F32
+                {
+                    return Err(DispatchError::Hip(
+                        "generic MoE precomputed route metadata is invalid".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn run_indexed(
+        &self,
+        gpu: &mut Gpu,
+        experts: &MoeExpertRef<'_>,
+        which: &MoeProj<'_>,
+        topk_indices: &GpuTensor,
+        input: &crate::pipeline::steps::GemvInput<'_>,
+        out: &GpuTensor,
+        k_top: usize,
+        batch_size: usize,
+    ) -> Result<(), DispatchError> {
+        experts.validate()?;
+        if batch_size != 1 {
+            return Err(DispatchError::Hip(
+                "indexed MoE Steps are decode-only; grouped Steps serve batches".into(),
+            ));
+        }
+        let x = match input {
+            crate::pipeline::steps::GemvInput::Prerotated(x) => *x,
+            crate::pipeline::steps::GemvInput::Raw(_) => {
+                return Err(DispatchError::Hip(
+                    "indexed MoE gate/down kernels require a pre-rotated activation".into(),
+                ))
+            }
+        };
+        match which {
+            MoeProj::GateUp { up_out } => crate::pipeline::run_uniform_moe_gate_up(
+                gpu,
+                experts.dtype,
+                experts.gate_up_ptrs,
+                topk_indices,
+                x,
+                out,
+                up_out,
+                experts.expert_m,
+                experts.expert_k,
+                k_top,
+            ),
+            MoeProj::DownExpanded => crate::pipeline::run_uniform_moe_down_expanded(
+                gpu,
+                experts.dtype,
+                experts.down_ptrs,
+                topk_indices,
+                x,
+                out,
+                experts.expert_k,
+                experts.expert_m,
+                k_top,
+                batch_size,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_scatter(
+        &self,
+        gpu: &mut Gpu,
+        topk_indices: &GpuTensor,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        total_slots: usize,
+        n_experts: usize,
+        m_total_max: usize,
+        block_m: usize,
+    ) -> Result<(), DispatchError> {
+        gpu.moe_scatter_fused_k8(
+            topk_indices,
+            expert_token_counts,
+            expert_offsets,
+            sorted_slot_index,
+            expert_tile_ids,
+            inverse_perm,
+            total_slots,
+            n_experts,
+            m_total_max,
+            block_m,
+        )
+        .map_err(|error| DispatchError::Hip(error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_grouped(
+        &self,
+        gpu: &mut Gpu,
+        experts: &MoeExpertRef<'_>,
+        which: &MoeProj<'_>,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m_total: usize,
+        batch_size: usize,
+        k_top: usize,
+    ) -> Result<(), DispatchError> {
+        experts.validate()?;
+        if batch_size == 0 || k_top == 0 || m_total == 0 {
+            return Err(DispatchError::Hip(
+                "grouped MoE GEMM dimensions must be nonzero".into(),
+            ));
+        }
+        let (ptrs, m, k, x_row_div, rows) = match which {
+            MoeProj::GateUp { .. } => (
+                experts.gate_up_ptrs,
+                2 * experts.expert_m,
+                experts.expert_k,
+                k_top,
+                batch_size,
+            ),
+            MoeProj::DownExpanded => (
+                experts.down_ptrs,
+                experts.expert_k,
+                experts.expert_m,
+                1,
+                batch_size
+                    .checked_mul(k_top)
+                    .ok_or_else(|| DispatchError::Hip("grouped MoE row count overflow".into()))?,
+            ),
+        };
+        crate::pipeline::run_grouped_moe_gemm(
+            gpu,
+            experts.dtype,
+            ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )
+    }
+
+    pub(crate) fn run_unscatter(
+        &self,
+        gpu: &mut Gpu,
+        y_grouped: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        gate_batch: &GpuTensor,
+        up_batch: &GpuTensor,
+        inter: usize,
+        k_top: usize,
+        m_total: usize,
+    ) -> Result<(), DispatchError> {
+        gpu.moe_gate_up_unscatter_k8(
+            y_grouped,
+            sorted_slot_index,
+            gate_batch,
+            up_batch,
+            inter,
+            k_top,
+            m_total,
+        )
+        .map_err(|error| DispatchError::Hip(error.to_string()))
+    }
+
+    pub(crate) fn run_activation(
+        &self,
+        gpu: &mut Gpu,
+        variant: MoeActivationVariant,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        rot_out: &GpuTensor,
+        inter: usize,
+        rows: usize,
+    ) -> Result<(), DispatchError> {
+        if inter == 0 || rows == 0 {
+            return Err(DispatchError::Hip(
+                "MoE activation dimensions must be nonzero".into(),
+            ));
+        }
+        match variant {
+            MoeActivationVariant::SiluMul => gpu
+                .silu_mul_f32(gate, up, rot_out)
+                .map_err(|error| DispatchError::Hip(error.to_string())),
+            MoeActivationVariant::SiluMulRotate => gpu
+                .fused_silu_mul_rotate_mq_batched(gate, up, rot_out, inter, rows)
+                .map_err(|error| DispatchError::Hip(error.to_string())),
+        }
+    }
+
+    pub(crate) fn run_combine(
+        &self,
+        gpu: &mut Gpu,
+        down_out: &GpuTensor,
+        topk_weights: &GpuTensor,
+        out: &GpuTensor,
+        hidden: usize,
+        k_top: usize,
+        batch_size: usize,
+        inverse_perm: Option<&GpuTensor>,
+    ) -> Result<(), DispatchError> {
+        if hidden == 0 || k_top == 0 || batch_size == 0 {
+            return Err(DispatchError::Hip(
+                "MoE combine dimensions must be nonzero".into(),
+            ));
+        }
+        let result = if let Some(inverse_perm) = inverse_perm {
+            gpu.moe_down_combine_grouped_k8(
+                down_out,
+                inverse_perm,
+                topk_weights,
+                out,
+                hidden,
+                k_top,
+                batch_size,
+            )
+        } else {
+            gpu.moe_down_combine_k8_batched(
+                down_out,
+                topk_weights,
+                out,
+                hidden,
+                k_top,
+                batch_size,
+            )
+        };
+        result.map_err(|error| DispatchError::Hip(error.to_string()))
+    }
+
+    /// Seal a generic typed program before any launch.
+    pub fn seal_steps<'a>(
+        &self,
+        execution: ExpertExecutionPlan,
+        steps: Vec<crate::pipeline::steps::Step<'a>>,
+        collectives: Vec<crate::pipeline::steps::StepCollective>,
+    ) -> Result<crate::pipeline::steps::SealedMoeSchedule<'a>, DispatchError> {
+        crate::pipeline::steps::SealedMoeSchedule::new(execution, steps, collectives)
+    }
+
+    pub fn execute_sealed<'a>(
+        &self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        schedule: &crate::pipeline::steps::SealedMoeSchedule<'a>,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::steps::execute_sealed_steps(gpu, ctx, schedule)
+    }
+
+    pub fn execute_sealed_mesh<'a>(
+        &self,
+        gpus: &mut hipfire_hardware::Gpus,
+        mesh: &hipfire_hardware::DeviceMesh,
+        ctx: &DispatchCtx,
+        rank_steps: &[&[crate::pipeline::steps::Step<'a>]],
+        collectives: &[crate::pipeline::steps::StepCollective],
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::steps::execute_steps_mesh(gpus, mesh, ctx, rank_steps, collectives)
+    }
 
     /// Resolve the best kernel key for the given MoE variant.
     ///
@@ -1206,5 +1822,68 @@ mod tests {
         let r = MoeResolution::resolve(&d, 6);
         assert!(r.routed_indexable_mq6v2);
         assert!(!r.use_gpu_topk);
+    }
+ 
+    #[test]
+    fn typed_router_preserves_selection_and_normalization_contract() {
+        let mut scores = GpuTensor::null_for_test();
+        scores.shape = vec![8];
+        let mut indices = GpuTensor::null_for_test();
+        indices.shape = vec![8];
+        let mut weights = GpuTensor::null_for_test();
+        weights.shape = vec![8];
+        let plan = RouterPlan::SoftmaxTopK {
+            scores: &scores,
+            topk_indices: &indices,
+            topk_weights: &weights,
+            k_top: 8,
+            normalize: true,
+        };
+        assert_eq!(plan.selection(), RouterSelection::SoftmaxTopK);
+        assert_eq!(plan.k_top(), 8);
+        assert!(plan.normalizes());
+        plan.validate_against(8, 1).unwrap();
+    }
+
+    #[test]
+    fn expert_ref_rejects_shape_and_owner_mismatch() {
+        let mut gate_ptrs = GpuTensor::null_for_test();
+        gate_ptrs.shape = vec![4];
+        let mut down_ptrs = GpuTensor::null_for_test();
+        down_ptrs.shape = vec![4];
+        let experts = MoeExpertRef::from_resolved(
+            &gate_ptrs,
+            &down_ptrs,
+            None,
+            DType::MQ4G256,
+            4,
+            64,
+            128,
+            &[0, 2],
+            Some(hipfire_hardware::DimKind::Ep),
+        );
+        experts
+            .validate_projection_shapes(&[128, 128], &[128, 64])
+            .unwrap();
+        assert!(experts
+            .validate_projection_shapes(&[64, 128], &[128, 64])
+            .is_err());
+        let unknown = MoeExpertRef::from_resolved(
+            &gate_ptrs,
+            &down_ptrs,
+            None,
+            DType::MQ4G256,
+            4,
+            64,
+            128,
+            &[4],
+            Some(hipfire_hardware::DimKind::Ep),
+        );
+        assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn fallback_execution_has_no_protocol() {
+        assert!(ExpertExecutionPlan::PerExpertFallback.protocol().is_err());
     }
 }

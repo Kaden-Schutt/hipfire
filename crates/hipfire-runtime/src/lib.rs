@@ -46,6 +46,7 @@ pub mod llama_spec;
 pub mod loader_api;
 pub mod loop_guard;
 pub mod model_load;
+pub mod moe_plan;
 pub mod model_source;
 pub mod paro;
 pub mod prefix;
