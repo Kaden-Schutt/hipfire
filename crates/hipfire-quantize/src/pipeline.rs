@@ -2988,12 +2988,19 @@ fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             });
-        match crate::pipeline_maple::convert_maple_safetensors(
+        let convert = if args.head_only {
+            crate::pipeline_maple::convert_maple_head_only
+        } else {
+            crate::pipeline_maple::convert_maple_safetensors
+        };
+        match convert(
             Path::new(input_dir),
             Path::new(output_path),
             &config_json,
             head_quant,
         ) {
+            // The head-only path prints its own line; the full path does not.
+            Ok(_) if args.head_only => {}
             Ok(_) => eprintln!("maple: wrote {output_path}"),
             Err(e) => {
                 eprintln!("error: {e}");

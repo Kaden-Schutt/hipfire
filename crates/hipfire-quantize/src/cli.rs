@@ -79,6 +79,17 @@ pub(crate) struct QuantizeArgs {
           value_parser = ["bf16", "q8", "mq4v2", "q4k"])]
     pub head_quant: String,
 
+    /// `--format maple` only: emit a HEAD-ONLY `.hfq` containing just
+    /// `lm_head.weight` at `--head-quant`, instead of a full model.
+    ///
+    /// The result is a load-time overlay for a full build: same arch_id, same
+    /// logical shape, differing only in the head's quant tier. Shipping heads
+    /// this way avoids duplicating the identical 6.17 GB body per carrier —
+    /// three head variants cost 7.30 GB rather than 19.63 GB, and switching
+    /// heads is a 175 MB download instead of 6.5 GB.
+    #[arg(long, default_value_t = false)]
+    pub head_only: bool,
+
     /// Override the architecture ID stamped into the HFQ header.
     #[arg(long, value_name = "ID")]
     pub arch_id: Option<u32>,
