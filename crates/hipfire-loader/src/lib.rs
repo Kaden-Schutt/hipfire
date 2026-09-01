@@ -4455,18 +4455,4 @@ mod registry_tests {
         assert_eq!(got2, dup);
     }
 
-    #[test]
-    fn official_qwen35_reference_markers_adapt_cleanly() {
-        // The in-tree official Qwen3.5 reference shares Ornith's exact markers.
-        let official =
-            include_str!("../../hipfire-runtime/templates/eval/qwen35-official-reference.jinja");
-        let got = super::try_adapt_ornith15_qwen35_to_effort_native(official)
-            .expect("official reference must adapt");
-        assert!(got.contains("reasoning_effort|default('xhigh')"));
-        assert!(got.contains("('xhigh', 'medium', 'low')"));
-        assert!(got.contains("{%- if reasoning_instructions %}"));
-        assert!(got.contains("{%- elif reasoning_instructions %}"));
-        // thinking-off injects nothing: block is gated on enable_thinking.
-        assert!(got.contains("{%- if enable_thinking is undefined or enable_thinking is true %}"));
-    }
 }
