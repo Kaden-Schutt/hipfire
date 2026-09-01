@@ -572,6 +572,43 @@ pub fn bundled() -> Result<RegistryV1> {
     RegistryV1::parse(BUNDLED_REGISTRY, "bundled registry/v1.json")
 }
 
+/// Prefer the BUNDLED registry when it is newer than whatever was fetched.
+///
+/// `registry/v1.json` is compiled into the binary, so on a branch the bundled
+/// copy IS that branch's registry — while the fetch targets master. Without
+/// this, editing the registry on a branch changes nothing for a locally built
+/// binary: the 24h cache or a master fetch silently wins, and nothing says so.
+/// That cost a real debugging detour (a branch's `heads` map read as empty).
+///
+/// `generated_at` is the existing signal and needs no new configuration:
+/// `scripts/registry_gen.py` stamps it on every regeneration, and its
+/// `%Y-%m-%dT%H:%M:%SZ` form compares correctly as a plain string.
+///
+/// This does NOT break distribution. A released binary's bundled registry is
+/// older than master's by construction, so the fetch keeps winning there and
+/// users still get new models without upgrading. Only a freshly regenerated
+/// local registry — i.e. someone editing it — takes precedence.
+fn prefer_bundled_if_newer(
+    loaded: LoadedRegistry,
+    bundled: RegistryV1,
+    warnings: &mut Vec<String>,
+) -> LoadedRegistry {
+    if loaded.source == RegistrySource::Bundled
+        || bundled.generated_at <= loaded.registry.generated_at
+    {
+        return loaded;
+    }
+    warnings.push(format!(
+        "using the bundled registry ({}), which is newer than the fetched one ({})",
+        bundled.generated_at, loaded.registry.generated_at
+    ));
+    LoadedRegistry {
+        registry: bundled,
+        source: RegistrySource::Bundled,
+        warnings: std::mem::take(warnings),
+    }
+}
+
 pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
     let mut warnings = Vec::new();
     let bundled = bundled().expect("checked-in registry/v1.json must validate");
@@ -590,14 +627,15 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
         .as_ref()
         .is_some_and(|cache| cache_is_fresh(cache, now, REGISTRY_CACHE_TTL))
     {
-        return LoadedRegistry {
+        let loaded = LoadedRegistry {
             registry: cache.expect("checked above").registry,
             source: RegistrySource::Cache,
-            warnings,
+            warnings: std::mem::take(&mut warnings),
         };
+        return prefer_bundled_if_newer(loaded, bundled, &mut warnings);
     }
 
-    match fetch_registry(&url) {
+    let loaded = match fetch_registry(&url) {
         Ok(registry) => {
             let cache_file = RegistryCache {
                 fetched_at: now,
@@ -610,7 +648,7 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
             LoadedRegistry {
                 registry,
                 source: RegistrySource::Network,
-                warnings,
+                warnings: std::mem::take(&mut warnings),
             }
         }
         Err(error) => {
@@ -619,17 +657,18 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
                 LoadedRegistry {
                     registry: cache.registry,
                     source: RegistrySource::StaleCache,
-                    warnings,
+                    warnings: std::mem::take(&mut warnings),
                 }
             } else {
                 LoadedRegistry {
-                    registry: bundled,
+                    registry: bundled.clone(),
                     source: RegistrySource::Bundled,
-                    warnings,
+                    warnings: std::mem::take(&mut warnings),
                 }
             }
         }
-    }
+    };
+    prefer_bundled_if_newer(loaded, bundled, &mut warnings)
 }
 
 fn read_cache(path: &Path, url: &str, warnings: &mut Vec<String>) -> Option<RegistryCache> {
@@ -753,6 +792,71 @@ mod tests {
         let (_, entry) = reg.model("m").unwrap();
         assert_eq!(entry.heads.len(), 1);
         assert_eq!(entry.heads["q4k"].file, "h.hfq");
+    }
+
+    fn reg_at(stamp: &str) -> RegistryV1 {
+        RegistryV1::parse(
+            &format!(
+                r#"{{"schema_version":1,"generated_at":"{stamp}",
+                   "models":{{"m":{{"repo":"r","file":"f","size_gb":1,"min_vram_gb":1,"desc":"d"}}}},
+                   "aliases":{{}}}}"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
+    /// A NEWER bundled registry wins — this is what makes a branch's registry
+    /// edits visible to a locally built binary instead of being silently
+    /// overridden by the 24h cache or a master fetch.
+    #[test]
+    fn newer_bundled_registry_beats_a_stale_fetch() {
+        let mut w = Vec::new();
+        let fetched = LoadedRegistry {
+            registry: reg_at("2026-08-31T05:32:38Z"),
+            source: RegistrySource::Cache,
+            warnings: Vec::new(),
+        };
+        let out = prefer_bundled_if_newer(fetched, reg_at("2026-09-01T13:14:39Z"), &mut w);
+        assert_eq!(out.source, RegistrySource::Bundled);
+        assert_eq!(out.registry.generated_at, "2026-09-01T13:14:39Z");
+        assert!(
+            out.warnings.iter().any(|x| x.contains("newer")),
+            "the override must be reported, not silent: {:?}",
+            out.warnings
+        );
+    }
+
+    /// The other direction is what keeps DISTRIBUTION working: a released
+    /// binary's bundled registry is older than master's, so the fetch must
+    /// still win and users get new models without upgrading. Without this the
+    /// change above would freeze every client at its build-time registry.
+    #[test]
+    fn older_bundled_registry_defers_to_the_fetch() {
+        let mut w = Vec::new();
+        let fetched = LoadedRegistry {
+            registry: reg_at("2026-09-01T13:14:39Z"),
+            source: RegistrySource::Network,
+            warnings: Vec::new(),
+        };
+        let out = prefer_bundled_if_newer(fetched, reg_at("2026-08-28T08:31:54Z"), &mut w);
+        assert_eq!(out.source, RegistrySource::Network);
+        assert_eq!(out.registry.generated_at, "2026-09-01T13:14:39Z");
+        assert!(out.warnings.is_empty(), "no override, so nothing to report");
+    }
+
+    /// Equal stamps must not flap between sources.
+    #[test]
+    fn equal_timestamps_keep_the_fetched_registry() {
+        let mut w = Vec::new();
+        let same = "2026-09-01T13:14:39Z";
+        let fetched = LoadedRegistry {
+            registry: reg_at(same),
+            source: RegistrySource::Cache,
+            warnings: Vec::new(),
+        };
+        let out = prefer_bundled_if_newer(fetched, reg_at(same), &mut w);
+        assert_eq!(out.source, RegistrySource::Cache);
     }
 
     #[test]

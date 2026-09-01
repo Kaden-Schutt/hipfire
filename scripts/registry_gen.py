@@ -90,6 +90,10 @@ KNOWN_KV_MODES = {
     "auto",
     "f32",
     "f16",
+    # maple (arch 15) only: a flat 2-byte BF16 KV tier. Per-site acceptance
+    # lives in hipfire_runtime::kv_mode's policies; this list is only the
+    # schema allow-list, and must stay in sync with hipfire-config's KV_MODES.
+    "bf16",
     "q8",
     "asym4",
     "asym3",
@@ -485,6 +489,15 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
             for kind in ("triattn", "mtp"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
+            # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
+            # single one — same annotation, once per entry, so a head that is
+            # missing from the repo fails the run like any other sidecar.
+            if isinstance(entry.get("heads"), dict):
+                new_entry["heads"] = {
+                    name: annotate_sidecar(sc, tree, tag, f"heads.{name}", errors)
+                    for name, sc in entry["heads"].items()
+                    if isinstance(sc, dict)
+                }
         # repo probe already failed → error recorded above; entry still gets
         # arch_id/quant so the error list is the only blocker.
 
