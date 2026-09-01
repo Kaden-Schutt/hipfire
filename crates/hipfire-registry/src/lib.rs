@@ -1635,6 +1635,7 @@ mod tests {
             "muse-glimmer",
             "muse-glimmer:fast",
             "ornith-1.5:35b-a3b",
+            "ornith-1.5:35b-a3b-mq4r",
         ] {
             let (_, entry) = registry
                 .model(tag)
@@ -1661,26 +1662,29 @@ mod tests {
             }
         }
 
-        // Ornith 1.5 release contract: default/general/coding xhigh, instruct none,
-        // no named thinking_budget (absence = uncapped).
-        let (_, ornith) = registry
-            .model("ornith-1.5:35b-a3b")
-            .expect("ornith-1.5:35b-a3b must exist");
-        let ornith_rs = ornith.recommended_settings.as_ref().unwrap();
-        assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("xhigh"));
-        assert!(
-            ornith_rs.thinking_budget.is_none(),
-            "ornith effort-native: absence means uncapped"
-        );
-        let ornith_general = ornith.sampling_profile("general").unwrap();
-        assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("xhigh"));
-        assert!(ornith_general.thinking_budget.is_none());
-        let ornith_coding = ornith.sampling_profile("coding").unwrap();
-        assert_eq!(ornith_coding.reasoning_effort.as_deref(), Some("xhigh"));
-        assert!(ornith_coding.thinking_budget.is_none());
-        let ornith_instruct = ornith.sampling_profile("instruct").unwrap();
-        assert_eq!(ornith_instruct.reasoning_effort.as_deref(), Some("none"));
-        assert!(ornith_instruct.thinking_budget.is_none());
+        // Both Ornith 1.5 artifacts share the release contract:
+        // default/general/coding xhigh, instruct none, and no named
+        // thinking_budget (absence = uncapped).
+        for tag in ["ornith-1.5:35b-a3b", "ornith-1.5:35b-a3b-mq4r"] {
+            let (_, ornith) = registry
+                .model(tag)
+                .unwrap_or_else(|| panic!("{tag} must exist"));
+            let ornith_rs = ornith.recommended_settings.as_ref().unwrap();
+            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(
+                ornith_rs.thinking_budget.is_none(),
+                "{tag} effort-native: absence means uncapped"
+            );
+            let ornith_general = ornith.sampling_profile("general").unwrap();
+            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(ornith_general.thinking_budget.is_none());
+            let ornith_coding = ornith.sampling_profile("coding").unwrap();
+            assert_eq!(ornith_coding.reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(ornith_coding.thinking_budget.is_none());
+            let ornith_instruct = ornith.sampling_profile("instruct").unwrap();
+            assert_eq!(ornith_instruct.reasoning_effort.as_deref(), Some("none"));
+            assert!(ornith_instruct.thinking_budget.is_none());
+        }
     }
 
     #[test]
