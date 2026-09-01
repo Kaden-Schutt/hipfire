@@ -25,10 +25,12 @@ The guaranteed outcome was attribution with zero default behavior change. A comp
 | Worktree | `/home/kaden/mqv2-paired-profile` |
 | GPU route | `HIP_VISIBLE_DEVICES=0` |
 | Device proof | logs report `GPU dev 0: gfx1100` and `.hipfire_kernels/gfx1100` |
-| Accounting commit | `fee8f9c4a` |
-| Accounting / Redline daemon md5 | `b77820aa15f4698704cb6ccccb8e562a` |
-| Final serving-check daemon md5 | `5973e154fe6ac3e978708b19159fd4fd` |
-| Final serving-check CLI md5 | `9a5077ca6e2a347cfecd85d393f4f92a` |
+| Accounting measurement commit | `fee8f9c4a` |
+| Reviewed fail-closed commit | `2a46a4b35` |
+| Accounting measurement daemon md5 | `b77820aa15f4698704cb6ccccb8e562a` |
+| Reviewed final daemon md5 | `6a8234e4d5556dfc4636d4c85bb5f198` |
+| Serving-check daemon md5 | `5973e154fe6ac3e978708b19159fd4fd` |
+| Serving-check CLI md5 | `9a5077ca6e2a347cfecd85d393f4f92a` |
 | Temporary reorder-screen daemon md5 | `8e4ec7ddd025bd5ee81b4bd0dae4fbb3` |
 | V1 artifact | `/mnt/nas/kaden/hipfire/models/Qwen3.6-35b-a3b/qwen3.6-35b-a3b.mq4r` |
 | V1 SHA-256 | `4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428` |
@@ -147,6 +149,20 @@ Artifacts:
 
 - `hipx:/home/kaden/mqv2-paired-profile/profiles/serve-pm4-accounting.json`
 - `hipx:/home/kaden/mqv2-paired-profile/profiles/serve-pm4-accounting.log`
+
+## Review fix verification
+
+The final review identified that an exact accounting opt-in could previously enter multi-queue lowering and bypass the single-IB report. Commit `2a46a4b35` moves the gate before the queue topology branch:
+
+- `cargo test -p rdna-compute pm4_stream_accounting`: 4 passed
+- `cargo test -p rdna-compute pm4_`: 14 passed
+- exact gfx1100, `HIPFIRE_REPLAY_PM4_QUEUES=2`: preparation refused with `HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING requires one PM4 queue, got 2`
+- exact gfx1100, one queue: Redline report passed with `exact=true`, `gdn_frame_exact=true`, 603 dispatches, and 16,920 dwords
+
+Final runtime artifacts:
+
+- `hipx:/home/kaden/mqv2-paired-profile/profiles/pm4-accounting-queues2-reject.log`
+- `hipx:/home/kaden/mqv2-paired-profile/profiles/pm4-accounting-final.{json,log}`
 
 ## Disposition
 
