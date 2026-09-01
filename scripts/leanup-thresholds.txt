@@ -22,10 +22,10 @@ substrate_clean_arch_refs   == 0
 required_features_daemon    == 0
 
 # --- ceilings ---
-# Raised by three lines for Maple's BF16 load plumbing in the daemon; preserving
-# the selected KV tier through load is preferable to silently demoting direct
-# and HTTP-ready Maple requests to Q8.
-daemon_lines                <= 4158
+# Raised for the admitted-load prepare/commit transaction in G2: the daemon now
+# retains and revalidates canonical artifact identity across the load boundary
+# instead of reopening a mutable path after admission.
+daemon_lines                <= 4564
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

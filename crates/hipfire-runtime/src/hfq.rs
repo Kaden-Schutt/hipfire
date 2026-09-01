@@ -754,6 +754,21 @@ impl HfqFile {
         &self.path
     }
 
+    /// File length from the retained file descriptor, not a later path stat.
+    ///
+    /// This is the TOCTOU-safe size for an admitted source: it describes the
+    /// opened inode, not whatever currently occupies the path string. Use this
+    /// for all post-admission sizing (e.g. Rig VRAM preflight) instead of
+    /// `std::fs::metadata(path).len()`.
+    pub fn file_len_via_fd(&self) -> std::io::Result<u64> {
+        self._file.metadata().map(|m| m.len())
+    }
+
+    /// Convenience: file length via fd, or 0 on error.
+    pub fn file_len(&self) -> u64 {
+        self._file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// The upstream HuggingFace Jinja `chat_template` baked into this
     /// .hfq's `tokenizer_config` metadata. `None` when the source model
     /// did not ship a chat_template (rare for instruct models, common
