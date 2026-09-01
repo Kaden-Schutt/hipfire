@@ -20,19 +20,19 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::carrier::Qwen35Bundle;
 use hipfire_arch_qwen35::dflash_verify_pm4::{
-    DflashVerifyPm4, DflashVerifyPm4Phase, DFLASH_VERIFY_PM4_BLOCK,
+    DFLASH_VERIFY_PM4_BLOCK, DflashVerifyPm4, DflashVerifyPm4Phase,
 };
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative::{
-    verify_dflash_block, verify_dflash_block_retained, DeltaNetSnapshot, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    verify_dflash_block, verify_dflash_block_retained,
 };
 use hipfire_engine::redline::{
-    redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
-    redline_capture_json, redline_hash, RedlineRegionHash,
+    RedlineRegionHash, redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
+    redline_capture_json, redline_hash,
 };
-use hipfire_loader::spec_build::Qwen35SlotGuard;
 use hipfire_loader::LoadedModel;
+use hipfire_loader::spec_build::Qwen35SlotGuard;
 use rdna_compute::replay::ReplayQuiescence;
 use std::any::Any;
 use std::io::Read;
@@ -3202,6 +3202,12 @@ pub fn handle_redline_shadow(
         .get("iterations")
         .and_then(|value| value.as_u64())
         .unwrap_or(1) as usize;
+    let position_step = msg
+        .get("position_step")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1) as usize;
+    let position =
+        |iteration: usize| context.saturating_add(iteration.saturating_mul(position_step));
     if model.as_ref().is_some_and(|loaded| {
         loaded.state.as_ref().is_some_and(|s| {
             (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
@@ -3286,15 +3292,15 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
             if pm4 {
-                let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
+                let timing = unsafe { gpu.replay.replay_pm4(position(i)) }?;
                 gpu_us += timing.span_microseconds();
             } else {
-                let timing = unsafe { gpu.replay.replay_linear_aql(context + i) }?;
+                let timing = unsafe { gpu.replay.replay_linear_aql(position(i)) }?;
                 gpu_us += timing.span_microseconds();
             }
         }
@@ -3337,11 +3343,11 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
-            gpu.replay_recorded_hip_prefix_at(prepared.0, context + i)
+            gpu.replay_recorded_hip_prefix_at(prepared.0, position(i))
                 .map_err(|error| error.to_string())?;
         }
         gpu.hip
@@ -3385,7 +3391,7 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &mut bundle.kv_cache,
                 &mut bundle.dn_state,
                 &bundle.scratch,
@@ -3781,7 +3787,7 @@ pub fn handle_redline_pm4_prefix_profile(
             "redline_pm4_prefix_profile requires captured single-GPU Qwen3.5 and valid start/step/repeats",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return;
@@ -4306,7 +4312,7 @@ pub fn handle_redline_prefix_shadow(
 
 #[cfg(test)]
 mod redline_snapshot_tests {
-    use super::{redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot};
+    use super::{RedlineQwenSnapshot, RedlineSnapshot, redline_snapshots_bit_exact};
 
     fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
         RedlineSnapshot::Qwen(RedlineQwenSnapshot {

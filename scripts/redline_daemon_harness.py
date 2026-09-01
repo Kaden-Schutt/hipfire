@@ -221,6 +221,12 @@ def main():
         help="consecutive token positions compared by the AQL/HIP/blob parity gate",
     )
     parser.add_argument(
+        "--shadow-position-step",
+        type=int,
+        default=1,
+        help="position increment per shadow replay; 0 isolates queue lifetime from context growth",
+    )
+    parser.add_argument(
         "--state-quant",
         choices=("q8", "fp32", "q4"),
         help=(
@@ -537,6 +543,7 @@ def main():
                     "type": "redline_shadow_pm4" if args.pm4 else "redline_shadow_aql",
                     "context_tokens": args.decode_context,
                     "iterations": args.shadow_iterations,
+                    "position_step": args.shadow_position_step,
                 }
             )
             shadow = report["aql_shadow"]
