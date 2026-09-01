@@ -3328,11 +3328,7 @@ fn triattn_tap(
     Ok(())
 }
 
-fn qwen35_fa_epilogue_route_supported(
-    is_gfx1201: bool,
-    q8_route: bool,
-    asym3_route: bool,
-) -> bool {
+fn qwen35_fa_epilogue_route_supported(is_gfx1201: bool, q8_route: bool, asym3_route: bool) -> bool {
     q8_route || (!is_gfx1201 && asym3_route)
 }
 
@@ -3360,8 +3356,7 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
     let fused_epilogue_route =
         qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
-    let fused_epilogue =
-        qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
+    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -5698,8 +5693,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
-        || (gfx1201_state_fusions_enabled(gpu)
-            && gfx1201_qwen35_a3b_state_fusion_shape(config))
+        || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -5728,8 +5722,7 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
-        || (gfx1201_state_fusions_enabled(gpu)
-            && gfx1201_qwen35_a3b_state_fusion_shape(config))
+        || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24

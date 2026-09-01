@@ -1100,17 +1100,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
-        | "qwen35_fa_prep_gfx1201" => {
-            Some(vec![
-                read(0),
-                write(8),
-                write(16),
-                write(24),
-                read(32),
-                read(40),
-                read(48),
-            ])
-        }
+        | "qwen35_fa_prep_gfx1201" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+        ]),
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"

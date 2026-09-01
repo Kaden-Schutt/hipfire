@@ -8355,7 +8355,10 @@ impl Gpu {
             n_heads > 0 && n_kv_heads > 0,
             "attention_dflash_sliding_f32: n_heads/n_kv_heads must be > 0"
         );
-        assert!(head_dim > 0, "attention_dflash_sliding_f32: head_dim must be > 0");
+        assert!(
+            head_dim > 0,
+            "attention_dflash_sliding_f32: head_dim must be > 0"
+        );
         assert!(
             sliding_window > 0,
             "attention_dflash_sliding_f32: sliding_window must be > 0"
@@ -8480,7 +8483,17 @@ impl Gpu {
         sliding_window: usize,
     ) -> HipResult<()> {
         self.attention_dflash_sliding_f32(
-            q, k, v, out, b, l, n_heads, n_kv_heads, head_dim, ctx_span, sliding_window,
+            q,
+            k,
+            v,
+            out,
+            b,
+            l,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_span,
+            sliding_window,
         )
     }
 
