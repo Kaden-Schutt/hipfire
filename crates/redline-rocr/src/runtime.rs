@@ -18,6 +18,13 @@ use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImag
 /// bound the foreign queue inactivation/destruction calls, for which the public
 /// HSA API exposes no timeout.
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Re-notify a queue only after normal retained PM4 latency is far behind us.
+///
+/// A parked KFD queue can retain a published packet without advancing its read
+/// index after HIP work has occupied the GPU between PM4 replay windows. An
+/// absolute HSA doorbell notification is idempotent: re-storing the same final
+/// packet ID cannot replay packets whose read index already advanced.
+const QUEUE_RENOTIFY_INTERVAL: Duration = Duration::from_millis(100);
 
 const QUEUE_FAULT_NONE: u64 = 0;
 
@@ -906,6 +913,9 @@ impl QueueDepthSample {
         self.depth
     }
 }
+fn pending_doorbell(sample: QueueDepthSample) -> Option<abi::SignalValue> {
+    (sample.depth != 0).then(|| sample.write_index.wrapping_sub(1) as abi::SignalValue)
+}
 
 /// Aggregate observations for one queue during one diagnostic completion wait.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1380,6 +1390,15 @@ impl AqlQueue {
             )
         };
     }
+    fn renotify_pending(&self) -> Result<bool, RuntimeError> {
+        self.ensure_active()?;
+        self.check_fault()?;
+        let Some(final_packet_id) = pending_doorbell(self.depth_sample()) else {
+            return Ok(false);
+        };
+        self.ring(final_packet_id);
+        Ok(true)
+    }
 
     fn inactivate(&mut self) -> Result<(), RuntimeError> {
         if !self.active {
@@ -1554,12 +1573,22 @@ impl QueueSet {
     ) -> Result<(), RuntimeError> {
         let started = Instant::now();
         let mut polls = 0_u32;
+        let mut next_renotify = QUEUE_RENOTIFY_INTERVAL;
+        let mut renotify_attempts = 0_u32;
         loop {
             self.check_faults()?;
             if signal.is_complete() {
+                if renotify_attempts != 0 {
+                    eprintln!(
+                        "HIPFIRE_REDLINE_QUEUE_RENOTIFY_RECOVERED attempts={} elapsed_us={}",
+                        renotify_attempts,
+                        started.elapsed().as_micros(),
+                    );
+                }
                 return Ok(());
             }
-            if started.elapsed() >= timeout {
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
                 let queue_state = self
                     .queues
                     .iter()
@@ -1567,14 +1596,24 @@ impl QueueSet {
                     .collect::<Vec<_>>()
                     .join(" ");
                 eprintln!(
-                    "HIPFIRE_REDLINE_QUEUE_TIMEOUT signal=0x{:x} signal_value={} {queue_state}",
+                    "HIPFIRE_REDLINE_QUEUE_TIMEOUT signal=0x{:x} signal_value={} \
+                     renotify_attempts={} {queue_state}",
                     signal.raw().0,
                     signal.value_scacquire(),
+                    renotify_attempts,
                 );
                 return Err(RuntimeError::SignalTimeout {
                     signal: signal.raw().0,
                     timeout,
                 });
+            }
+            if elapsed >= next_renotify {
+                for queue in &self.queues {
+                    if queue.renotify_pending()? {
+                        renotify_attempts = renotify_attempts.saturating_add(1);
+                    }
+                }
+                next_renotify = elapsed.saturating_add(QUEUE_RENOTIFY_INTERVAL);
             }
             bounded_poll_pause(&mut polls);
         }
@@ -2927,6 +2966,17 @@ mod tests {
             write_index,
             depth: write_index.wrapping_sub(read_index),
         }
+    }
+    #[test]
+    fn pending_doorbell_is_idempotent_for_one_unconsumed_packet() {
+        assert_eq!(
+            pending_doorbell(queue_depth_sample(7, 27_405, 27_406)),
+            Some(27_405)
+        );
+        assert_eq!(
+            pending_doorbell(queue_depth_sample(7, 27_406, 27_406)),
+            None
+        );
     }
 
     #[test]
