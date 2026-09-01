@@ -268,6 +268,17 @@ pub fn validate_moe_step_schedule(
         return Err(DispatchError::Hip("MoE schedule is empty".into()));
     }
 
+    if let Some(Step::MoeRoute {
+        plan: RouterPlan::SoftmaxTopK { k_top, .. },
+    }) = steps.first()
+    {
+        if *k_top != 8 {
+            return Err(DispatchError::Hip(format!(
+                "generic MoE softmax route requires k_top=8, got {k_top}"
+            )));
+        }
+    }
+
     let (protocol, route, experts, batch_size, combine_index, hidden, route_indices, route_weights) =
         match steps {
             [Step::MoeRoute { plan }, Step::IndexedMoeGemv {
@@ -494,13 +505,6 @@ pub fn validate_moe_step_schedule(
                 ))
             }
         };
-    if let RouterPlan::SoftmaxTopK { k_top, .. } = route {
-        if *k_top != 8 {
-            return Err(DispatchError::Hip(format!(
-                "generic MoE softmax route requires k_top=8, got {k_top}"
-            )));
-        }
-    }
 
     experts.validate()?;
     route.validate_against(experts.n_experts(), batch_size)?;
