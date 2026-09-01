@@ -78,7 +78,9 @@ impl ExpertStorageOwner {
     }
 
     fn index_of(&self, placement: ExpertPlacement) -> Option<usize> {
-        self.slots.iter().position(|candidate| *candidate == placement)
+        self.slots
+            .iter()
+            .position(|candidate| *candidate == placement)
     }
 
     fn rank_is_resident(&self, rank: usize) -> bool {
@@ -97,7 +99,6 @@ impl ExpertStorageOwner {
         self.resident.iter().filter(|resident| **resident).count()
     }
 }
-
 
 /// A sealed, manifest-derived expert plan.
 ///
@@ -308,13 +309,16 @@ impl ExpertPlan {
     }
 
     pub fn owned_experts(&self, rank: usize) -> Result<&[usize], ExpertPlanError> {
-        self.owner_views.get(rank).map(Vec::as_slice).ok_or_else(|| {
-            ExpertPlanError::new(format!(
-                "expert group '{}' rank {rank} is outside group size {}",
-                self.group,
-                self.group_size()
-            ))
-        })
+        self.owner_views
+            .get(rank)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                ExpertPlanError::new(format!(
+                    "expert group '{}' rank {rank} is outside group size {}",
+                    self.group,
+                    self.group_size()
+                ))
+            })
     }
 
     /// Commit the rank-local pointer tables to this owner. The plan validates
@@ -360,10 +364,7 @@ impl ExpertPlan {
 
     /// Bind the committed rank-local pointer tables to an opaque executable
     /// view. A rank cannot bind until its owned placements are resident.
-    pub fn bind_expert_ref<'a>(
-        &'a self,
-        rank: usize,
-    ) -> Result<MoeExpertRef<'a>, ExpertPlanError> {
+    pub fn bind_expert_ref<'a>(&'a self, rank: usize) -> Result<MoeExpertRef<'a>, ExpertPlanError> {
         let owned = self.owned_experts(rank)?;
         if !self.owner.rank_is_resident(rank) {
             return Err(ExpertPlanError::new(format!(
@@ -757,12 +758,13 @@ fn source_names<'a>(layout: &'a ExpertSourceLayout) -> Vec<(&'static str, Vec<&'
     }
 }
 
-
 fn checked_numel(tensor: &GpuTensor, label: &str) -> Result<usize, ExpertPlanError> {
     tensor
         .shape
         .iter()
-        .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
+        .try_fold(1usize, |elements, dimension| {
+            elements.checked_mul(*dimension)
+        })
         .ok_or_else(|| ExpertPlanError::new(format!("{label} logical shape overflows")))
 }
 
@@ -833,7 +835,11 @@ fn check_shape(
         )));
     }
     let shape = &entry.logical_shape;
-    let valid_rank = if per_expert { shape.len() == 2 } else { shape.len() == 3 };
+    let valid_rank = if per_expert {
+        shape.len() == 2
+    } else {
+        shape.len() == 3
+    };
     if !valid_rank || shape.iter().any(|dim| *dim == 0) {
         return Err(ExpertPlanError::new(format!(
             "expert group '{}' layer {:?} {label} source '{}' has invalid logical_shape {:?}",
@@ -889,9 +895,7 @@ fn resolve_shape(
             )?],
             true,
         ),
-        ExpertSourceLayout::PackedSeparate {
-            gate, up, down, ..
-        } => (
+        ExpertSourceLayout::PackedSeparate { gate, up, down, .. } => (
             vec![check_shape(
                 spec,
                 "gate",
@@ -915,31 +919,44 @@ fn resolve_shape(
         ExpertSourceLayout::PerExpertFused { gate_up, down, .. } => (
             gate_up
                 .iter()
-                .map(|name| check_shape(spec, "gate_up", entry_for(spec, manifest, "gate_up", name)?, true))
+                .map(|name| {
+                    check_shape(
+                        spec,
+                        "gate_up",
+                        entry_for(spec, manifest, "gate_up", name)?,
+                        true,
+                    )
+                })
                 .collect::<Result<_, _>>()?,
             Vec::new(),
-            down
-                .iter()
-                .map(|name| check_shape(spec, "down", entry_for(spec, manifest, "down", name)?, true))
+            down.iter()
+                .map(|name| {
+                    check_shape(spec, "down", entry_for(spec, manifest, "down", name)?, true)
+                })
                 .collect::<Result<_, _>>()?,
             true,
         ),
         ExpertSourceLayout::PerExpertSeparate { gate, up, down, .. } => (
-            gate
-                .iter()
-                .map(|name| check_shape(spec, "gate", entry_for(spec, manifest, "gate", name)?, true))
+            gate.iter()
+                .map(|name| {
+                    check_shape(spec, "gate", entry_for(spec, manifest, "gate", name)?, true)
+                })
                 .collect::<Result<_, _>>()?,
             up.iter()
                 .map(|name| check_shape(spec, "up", entry_for(spec, manifest, "up", name)?, true))
                 .collect::<Result<_, _>>()?,
-            down
-                .iter()
-                .map(|name| check_shape(spec, "down", entry_for(spec, manifest, "down", name)?, true))
+            down.iter()
+                .map(|name| {
+                    check_shape(spec, "down", entry_for(spec, manifest, "down", name)?, true)
+                })
                 .collect::<Result<_, _>>()?,
             false,
         ),
     };
-    if gate_shapes.is_empty() || down_shapes.is_empty() || (!up_shapes.is_empty() && up_shapes[0] != gate_shapes[0]) {
+    if gate_shapes.is_empty()
+        || down_shapes.is_empty()
+        || (!up_shapes.is_empty() && up_shapes[0] != gate_shapes[0])
+    {
         return Err(ExpertPlanError::new(format!(
             "expert group '{}' layer {:?} projection source count/shape mismatch",
             spec.group, spec.layer
@@ -988,7 +1005,12 @@ fn resolve_shape(
     let source_dtype = source_names
         .iter()
         .flat_map(|(_, names)| names.iter())
-        .find_map(|name| manifest.iter().find(|entry| entry.name == *name && entry.layer == spec.layer).map(|entry| entry.dtype))
+        .find_map(|name| {
+            manifest
+                .iter()
+                .find(|entry| entry.name == *name && entry.layer == spec.layer)
+                .map(|entry| entry.dtype)
+        })
         .ok_or_else(|| ExpertPlanError::new("expert projection has no source dtype"))?;
     for (_, names) in source_names {
         for name in names {
@@ -1077,7 +1099,12 @@ fn resolve_collective(
             selected = Some(row.hint);
         }
     }
-    Ok((selected, down_names(&spec.source_layout).first().map(|name| (*name).to_string())))
+    Ok((
+        selected,
+        down_names(&spec.source_layout)
+            .first()
+            .map(|name| (*name).to_string()),
+    ))
 }
 
 #[cfg(test)]
@@ -1094,13 +1121,7 @@ mod tests {
 
     fn manifest() -> Vec<WeightEntry> {
         vec![
-            WeightEntry::layer(
-                "router",
-                0,
-                vec![4, 4],
-                DType::F32,
-                ShardPolicy::Replicate,
-            ),
+            WeightEntry::layer("router", 0, vec![4, 4], DType::F32, ShardPolicy::Replicate),
             WeightEntry::layer(
                 "experts.gate_up",
                 0,
@@ -1185,9 +1206,7 @@ mod tests {
 
     fn tensor_with_bytes(shape: Vec<usize>, dtype: DType, bytes: usize) -> GpuTensor {
         let mut tensor = GpuTensor::null_for_test();
-        tensor.buf = unsafe {
-            hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), bytes)
-        };
+        tensor.buf = unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), bytes) };
         tensor.shape = shape;
         tensor.dtype = dtype;
         tensor
@@ -1198,7 +1217,9 @@ mod tests {
         tensor_with_bytes(
             shape,
             DType::F32,
-            elements.checked_mul(DType::F32.size()).expect("test tensor bytes"),
+            elements
+                .checked_mul(DType::F32.size())
+                .expect("test tensor bytes"),
         )
     }
 
@@ -1467,7 +1488,10 @@ mod tests {
             .collect();
         assert_eq!(owners, vec![(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 1, 1)]);
         assert_eq!(plan.group_devices(), &[0, 1]);
-        assert_eq!(plan.collective(), Some(CollectiveHint::AllReduce { kind: DimKind::Ep }));
+        assert_eq!(
+            plan.collective(),
+            Some(CollectiveHint::AllReduce { kind: DimKind::Ep })
+        );
     }
 
     #[test]
@@ -1522,7 +1546,8 @@ mod tests {
         assert_eq!(plan.resident_slots(), 0);
         {
             let mut load = plan.begin_load();
-            load.reserve(first).expect("rollback must release placement");
+            load.reserve(first)
+                .expect("rollback must release placement");
             load.commit();
         }
         assert_eq!(plan.resident_slots(), 1);
@@ -1549,19 +1574,17 @@ mod tests {
             .expect("nonresident owner must not bind");
         assert!(error.to_string().contains("nonresident"));
 
-        let plan = resident_plan("grouped_quantized", ExpertParallelism::ExpertParallel, &mesh);
+        let plan = resident_plan(
+            "grouped_quantized",
+            ExpertParallelism::ExpertParallel,
+            &mesh,
+        );
         let experts = plan.bind_expert_ref(0).unwrap();
         assert_eq!(experts.owner_rank(), 0);
         let tensors = grouped_tensors();
         let steps = grouped_steps(&experts, &tensors);
         let mut collectives = vec![StepCollective::None; 7];
-        collectives[6] = StepCollective::all_reduce(
-            DimKind::Ep,
-            64,
-            vec![0, 1],
-            mesh.epoch(),
-            1,
-        );
+        collectives[6] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 1);
         let schedule = MoeFamily::new()
             .seal_steps(ExpertExecutionPlan::GroupedQuantized, steps, collectives)
             .expect("collective descriptor is locally typed");
@@ -1573,7 +1596,6 @@ mod tests {
         .expect_err("rank-1 collective must not launch rank-0 owner view");
         assert!(error.to_string().contains("collective rank"));
     }
-
 
     #[test]
     fn sealed_route_rejects_physical_buffer_shorter_than_logical_shape() {
@@ -1590,16 +1612,24 @@ mod tests {
                 vec![StepCollective::None; 7],
             )
             .expect_err("logical shape must not stand in for physical capacity");
-        assert!(error.to_string().contains("insufficient logical/physical capacity"));
+        assert!(error
+            .to_string()
+            .contains("insufficient logical/physical capacity"));
     }
 
     #[test]
     fn mesh_preflight_rejects_cross_rank_protocol_disagreement() {
         let mesh = mesh_ep();
-        let indexed_plan =
-            resident_plan("indexed_quantized", ExpertParallelism::ExpertParallel, &mesh);
-        let grouped_plan =
-            resident_plan("grouped_quantized", ExpertParallelism::ExpertParallel, &mesh);
+        let indexed_plan = resident_plan(
+            "indexed_quantized",
+            ExpertParallelism::ExpertParallel,
+            &mesh,
+        );
+        let grouped_plan = resident_plan(
+            "grouped_quantized",
+            ExpertParallelism::ExpertParallel,
+            &mesh,
+        );
         let indexed_experts = indexed_plan.bind_expert_ref(0).unwrap();
         let grouped_experts = grouped_plan.bind_expert_ref(1).unwrap();
 
@@ -1662,16 +1692,18 @@ mod tests {
     #[test]
     fn parallel_sealing_rejects_duplicate_or_mixed_collectives() {
         let mesh = mesh_ep();
-        let plan = resident_plan("grouped_quantized", ExpertParallelism::ExpertParallel, &mesh);
+        let plan = resident_plan(
+            "grouped_quantized",
+            ExpertParallelism::ExpertParallel,
+            &mesh,
+        );
         let experts = plan.bind_expert_ref(0).unwrap();
         let tensors = grouped_tensors();
         let family = MoeFamily::new();
 
         let mut duplicate = vec![StepCollective::None; 7];
-        duplicate[5] =
-            StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
-        duplicate[6] =
-            StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
+        duplicate[5] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
+        duplicate[6] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
         let error = family
             .seal_steps(
                 ExpertExecutionPlan::GroupedQuantized,
@@ -1733,7 +1765,6 @@ mod tests {
         let mesh = DeviceMesh::single().unwrap();
         let plan = ExpertPlan::from_manifest(
             &spec("indexed_quantized", ExpertParallelism::Single),
-
             &single_manifest,
             &mesh,
         )

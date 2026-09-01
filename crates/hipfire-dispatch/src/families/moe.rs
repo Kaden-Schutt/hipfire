@@ -61,7 +61,9 @@ fn checked_numel(tensor: &GpuTensor, name: &str) -> Result<usize, DispatchError>
     tensor
         .shape
         .iter()
-        .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
+        .try_fold(1usize, |elements, dimension| {
+            elements.checked_mul(*dimension)
+        })
         .ok_or_else(|| DispatchError::Hip(format!("MoE {name} logical shape overflows")))
 }
 
@@ -181,7 +183,9 @@ impl<'a> RouterPlan<'a> {
                 .ok_or_else(|| DispatchError::Hip("MoE router score capacity overflow".into()))?;
             let score_bytes = score_capacity
                 .checked_mul(DType::F32.size())
-                .ok_or_else(|| DispatchError::Hip("MoE router score byte capacity overflow".into()))?;
+                .ok_or_else(|| {
+                    DispatchError::Hip("MoE router score byte capacity overflow".into())
+                })?;
             if scores.dtype != DType::F32
                 || !score_shape_ok
                 || score_elements < score_capacity
@@ -408,7 +412,6 @@ impl<'a> MoeExpertRef<'a> {
         self.router_identity
     }
 
-
     pub fn collective_kind(&self) -> Option<hipfire_hardware::DimKind> {
         self.collective_kind
     }
@@ -443,13 +446,14 @@ impl<'a> MoeExpertRef<'a> {
                 "MoeExpertRef: router identity is empty".into(),
             ));
         }
-        let pointer_slots = self
-            .n_experts
-            .checked_mul(2)
-            .ok_or_else(|| DispatchError::Hip("MoeExpertRef: pointer-table size overflows".into()))?;
+        let pointer_slots = self.n_experts.checked_mul(2).ok_or_else(|| {
+            DispatchError::Hip("MoeExpertRef: pointer-table size overflows".into())
+        })?;
         let pointer_bytes = pointer_slots
             .checked_mul(DType::F32.size())
-            .ok_or_else(|| DispatchError::Hip("MoeExpertRef: pointer-table bytes overflow".into()))?;
+            .ok_or_else(|| {
+                DispatchError::Hip("MoeExpertRef: pointer-table bytes overflow".into())
+            })?;
         if self.gate_up_ptrs.dtype != DType::F32
             || self.down_ptrs.dtype != DType::F32
             || self.gate_up_ptrs.shape.as_slice() != [pointer_slots]
@@ -466,11 +470,17 @@ impl<'a> MoeExpertRef<'a> {
             let dummy_elements = dummy
                 .shape
                 .iter()
-                .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
-                .ok_or_else(|| DispatchError::Hip("MoeExpertRef: dummy table shape overflows".into()))?;
+                .try_fold(1usize, |elements, dimension| {
+                    elements.checked_mul(*dimension)
+                })
+                .ok_or_else(|| {
+                    DispatchError::Hip("MoeExpertRef: dummy table shape overflows".into())
+                })?;
             let dummy_bytes = dummy_elements
                 .checked_mul(DType::F32.size())
-                .ok_or_else(|| DispatchError::Hip("MoeExpertRef: dummy table bytes overflow".into()))?;
+                .ok_or_else(|| {
+                    DispatchError::Hip("MoeExpertRef: dummy table bytes overflow".into())
+                })?;
             if dummy.dtype != DType::F32 || dummy_elements == 0 || dummy.buf.size() < dummy_bytes {
                 return Err(DispatchError::Hip(
                     "MoeExpertRef: dummy gate/up table is invalid".into(),
@@ -482,9 +492,12 @@ impl<'a> MoeExpertRef<'a> {
                 "MoeExpertRef: owner rank is outside its mesh group".into(),
             ));
         }
-        if self.group_devices.iter().enumerate().any(|(index, device)| {
-            self.group_devices[..index].contains(device)
-        }) {
+        if self
+            .group_devices
+            .iter()
+            .enumerate()
+            .any(|(index, device)| self.group_devices[..index].contains(device))
+        {
             return Err(DispatchError::Hip(
                 "MoeExpertRef: mesh group contains duplicate devices".into(),
             ));
@@ -666,7 +679,6 @@ impl MoeDtypes {
         .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
     }
 }
-
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
 /// routing-config logic, relocated from `moe_ffn_decode_impl` into one typed,
@@ -1757,14 +1769,7 @@ impl MoeFamily {
                 batch_size,
             )
         } else {
-            gpu.moe_down_combine_k8_batched(
-                down_out,
-                topk_weights,
-                out,
-                hidden,
-                k_top,
-                batch_size,
-            )
+            gpu.moe_down_combine_k8_batched(down_out, topk_weights, out, hidden, k_top, batch_size)
         };
         result.map_err(|error| DispatchError::Hip(error.to_string()))
     }
@@ -2075,7 +2080,7 @@ mod tests {
         assert!(r.routed_indexable_mq6v2);
         assert!(!r.use_gpu_topk);
     }
- 
+
     fn tensor(shape: Vec<usize>) -> GpuTensor {
         let elements = shape.iter().product::<usize>();
         let mut tensor = GpuTensor::null_for_test();
@@ -2107,7 +2112,6 @@ mod tests {
         assert!(plan.normalizes());
         plan.validate_against(8, 1).unwrap();
     }
-
 
     #[test]
     fn fallback_execution_has_no_protocol() {
