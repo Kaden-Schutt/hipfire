@@ -227,8 +227,10 @@ impl ExpertExecutionPlan {
 /// Opaque plan-produced data used to create an expert view.
 ///
 /// The binding is intentionally separate from [`MoeExpertRef`]: callers can
-/// retain the view for scheduling, but there is no public constructor that
-/// accepts arbitrary canonical metadata directly on the executable reference.
+/// retain the view for scheduling, but there is no safe constructor that
+/// accepts arbitrary canonical metadata. The only bridge is the hidden,
+/// `unsafe` function below; the runtime plan is responsible for proving its
+/// inputs before crossing that boundary.
 pub struct MoeExpertRefBinding<'a> {
     gate_up_ptrs: &'a GpuTensor,
     down_ptrs: &'a GpuTensor,
@@ -247,11 +249,49 @@ pub struct MoeExpertRefBinding<'a> {
 }
 
 impl<'a> MoeExpertRefBinding<'a> {
-    /// Runtime-plan bridge. The returned binding is opaque to callers and can
-    /// only be consumed by [`MoeExpertRef::from_binding`].
+    /// Cross-crate bridge for the sealed [`ExpertPlan`](https://docs.rs/hipfire-runtime/latest/hipfire_runtime/moe_plan/struct.ExpertPlan.html).
+    ///
+    /// This function is intentionally hidden from the normal API
+    /// documentation and is not re-exported by the dispatch crate. It has no
+    /// safe raw-constructor counterpart.
+    ///
+    /// A safe external caller cannot invoke this bridge:
+    ///
+    /// ```compile_fail
+    /// use hipfire_dispatch::families::moe::MoeExpertRefBinding;
+    /// use hipfire_hardware::DeviceMesh;
+    /// use rdna_compute::{DType, GpuTensor};
+    ///
+    /// fn safe_call(table: &GpuTensor) {
+    ///     let _ = MoeExpertRefBinding::from_validated_plan(
+    ///         table,
+    ///         table,
+    ///         None,
+    ///         DType::F32,
+    ///         1,
+    ///         1,
+    ///         1,
+    ///         &[0],
+    ///         &[(0, 0, 0)],
+    ///         "router",
+    ///         None,
+    ///         0,
+    ///         &[0],
+    ///         DeviceMesh::single().unwrap().epoch(),
+    ///     );
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the private `ExpertPlan::bind_expert_ref` path and
+    /// must have already proved that these references are the plan's committed
+    /// rank-local tables, that the owner placement is resident, and that all
+    /// metadata is derived from the same sealed plan/mesh epoch. Callers must
+    /// not retain or mutate a binding after its owner plan is dropped.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn from_plan(
+    pub unsafe fn from_validated_plan(
         gate_up_ptrs: &'a GpuTensor,
         down_ptrs: &'a GpuTensor,
         dummy_gate_up: Option<&'a GpuTensor>,
@@ -2068,53 +2108,6 @@ mod tests {
         plan.validate_against(8, 1).unwrap();
     }
 
-    #[test]
-    fn expert_ref_rejects_shape_and_owner_mismatch() {
-        let gate_ptrs = tensor(vec![8]);
-        let down_ptrs = tensor(vec![8]);
-        let mesh = hipfire_hardware::DeviceMesh::rect(&[(hipfire_hardware::DimKind::Ep, 2)])
-            .unwrap();
-        let partition = [(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 1, 1)];
-        let experts = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
-            &gate_ptrs,
-            &down_ptrs,
-            None,
-            DType::MQ4G256,
-            4,
-            64,
-            128,
-            &[0, 2],
-            &partition,
-            "router",
-            Some(hipfire_hardware::DimKind::Ep),
-            0,
-            &[0, 1],
-            mesh.epoch(),
-        ));
-        experts
-            .validate_projection_shapes(&[128, 128], &[128, 64])
-            .unwrap();
-        assert!(experts
-            .validate_projection_shapes(&[64, 128], &[128, 64])
-            .is_err());
-        let unknown = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
-            &gate_ptrs,
-            &down_ptrs,
-            None,
-            DType::MQ4G256,
-            4,
-            64,
-            128,
-            &[4],
-            &partition,
-            "router",
-            Some(hipfire_hardware::DimKind::Ep),
-            0,
-            &[0, 1],
-            mesh.epoch(),
-        ));
-        assert!(unknown.validate().is_err());
-    }
 
     #[test]
     fn fallback_execution_has_no_protocol() {

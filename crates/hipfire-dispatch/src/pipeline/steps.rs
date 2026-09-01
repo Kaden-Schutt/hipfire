@@ -12,8 +12,8 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
-    ExpertExecutionPlan, MoeActivationVariant, MoeExpertRef, MoeExpertRefBinding, MoeProj,
-    MoeProtocolKind, MoeFamily, RouterPlan,
+    ExpertExecutionPlan, MoeActivationVariant, MoeExpertRef, MoeProj, MoeProtocolKind, MoeFamily,
+    RouterPlan,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -679,25 +679,29 @@ pub fn execute_sealed_steps(
     execute_steps_inner(gpu, ctx, &schedule.steps)
 }
 
-/// Execute one sealed MoE schedule per participating device and perform its
-/// single manifest-owned routed reduction. Schedules are ordered by the
-/// collective's rank field; every schedule is validated before any GPU work.
-pub fn execute_sealed_steps_mesh<'a>(
-    gpus: &mut Gpus,
+/// Results of the host-only mesh checks shared by the executor and focused
+/// preflight tests. No device method is called while this value is built.
+struct MoeMeshPreflight<'a> {
+    dim: usize,
+    group: Vec<usize>,
+    outputs: Vec<&'a hip_bridge::DeviceBuffer>,
+}
+
+fn preflight_sealed_steps_mesh<'a>(
+    gpus_len: usize,
     mesh: &DeviceMesh,
-    ctx: &DispatchCtx,
     schedules: &[&SealedMoeSchedule<'a>],
-) -> Result<(), DispatchError> {
+) -> Result<MoeMeshPreflight<'a>, DispatchError> {
     if schedules.is_empty() {
         return Err(DispatchError::Hip(
             "parallel MoE execution has no rank schedules".into(),
         ));
     }
-    if mesh.n_devices() != gpus.devices.len() {
+    if mesh.n_devices() != gpus_len {
         return Err(DispatchError::Hip(format!(
             "MoE mesh has {} devices but Gpus owns {}",
             mesh.n_devices(),
-            gpus.devices.len()
+            gpus_len
         )));
     }
 
@@ -812,16 +816,46 @@ pub fn execute_sealed_steps_mesh<'a>(
     }
 
     for &device in &group {
-        if device >= gpus.devices.len() {
+        if device >= gpus_len {
             return Err(DispatchError::Hip(format!(
                 "MoE collective device {device} is outside the Gpus owner"
             )));
         }
     }
-    for (rank, &device) in group.iter().enumerate() {
+    Ok(MoeMeshPreflight {
+        dim,
+        group,
+        outputs,
+    })
+}
+/// Run the same host-only validation used by
+/// [`execute_sealed_steps_mesh`] without touching a device.
+///
+/// This is a hidden test/integration seam: callers still need fully sealed
+/// schedules, and the GPU executor invokes the identical preflight internally.
+#[doc(hidden)]
+pub fn validate_sealed_steps_mesh_preflight<'a>(
+    gpus_len: usize,
+    mesh: &DeviceMesh,
+    schedules: &[&SealedMoeSchedule<'a>],
+) -> Result<(), DispatchError> {
+    preflight_sealed_steps_mesh(gpus_len, mesh, schedules).map(|_| ())
+}
+
+/// Execute one sealed MoE schedule per participating device and perform its
+/// single manifest-owned routed reduction. Schedules are ordered by the
+/// collective's rank field; every schedule is validated before any GPU work.
+pub fn execute_sealed_steps_mesh<'a>(
+    gpus: &mut Gpus,
+    mesh: &DeviceMesh,
+    ctx: &DispatchCtx,
+    schedules: &[&SealedMoeSchedule<'a>],
+) -> Result<(), DispatchError> {
+    let preflight = preflight_sealed_steps_mesh(gpus.devices.len(), mesh, schedules)?;
+    for (rank, &device) in preflight.group.iter().enumerate() {
         execute_steps_inner(&mut gpus.devices[device], ctx, schedules[rank].steps())?;
     }
-    gpus.all_reduce_sum_f32_peer(&group, &outputs, dim)
+    gpus.all_reduce_sum_f32_peer(&preflight.group, &preflight.outputs, preflight.dim)
         .map_err(|error| DispatchError::Hip(error.to_string()))
 }
 
@@ -2810,203 +2844,6 @@ mod tests {
             "FusedGateUpQ8_0 missing from FUSED_TABLE"
         );
     }
-    fn tensor(shape: Vec<usize>) -> GpuTensor {
-        let elements = shape.iter().product::<usize>();
-        let mut tensor = GpuTensor::null_for_test();
-        tensor.buf = unsafe {
-            hip_bridge::DeviceBuffer::from_raw(
-                std::ptr::null_mut(),
-                elements
-                    .checked_mul(DType::F32.size())
-                    .expect("test tensor bytes"),
-            )
-        };
-        tensor.shape = shape;
-        tensor
-    }
-
-    fn indexed_steps<'a>(
-        experts: &'a MoeExpertRef<'a>,
-        scores: &'a GpuTensor,
-        indices: &'a GpuTensor,
-        weights: &'a GpuTensor,
-        x: &'a GpuTensor,
-        gate: &'a GpuTensor,
-        up: &'a GpuTensor,
-        rot: &'a GpuTensor,
-        down: &'a GpuTensor,
-        out: &'a GpuTensor,
-    ) -> Vec<Step<'a>> {
-        vec![
-            Step::MoeRoute {
-                plan: RouterPlan::SoftmaxTopK {
-                    scores,
-                    topk_indices: indices,
-                    topk_weights: weights,
-                    k_top: 8,
-                    normalize: true,
-                },
-            },
-            Step::IndexedMoeGemv {
-                experts,
-                which: MoeProj::GateUp { up_out: up },
-                topk_indices: indices,
-                input: GemvInput::Prerotated(x),
-                out: gate,
-                k_top: 8,
-                batch_size: 1,
-            },
-            Step::MoeActivation {
-                variant: MoeActivationVariant::SiluMul,
-                gate,
-                up,
-                rot_out: rot,
-                inter: 64,
-                rows: 8,
-            },
-            Step::IndexedMoeGemv {
-                experts,
-                which: MoeProj::DownExpanded,
-                topk_indices: indices,
-                input: GemvInput::Prerotated(rot),
-                out: down,
-                k_top: 8,
-                batch_size: 1,
-            },
-            Step::MoeCombine {
-                down_out: down,
-                topk_weights: weights,
-                out,
-                hidden: 128,
-                k_top: 8,
-                batch_size: 1,
-                inverse_perm: None,
-            },
-        ]
-    }
 
 
-    #[test]
-    fn typed_indexed_grammar_requires_one_combine() {
-        let scores = tensor(vec![8]);
-        let indices = tensor(vec![8]);
-        let weights = tensor(vec![8]);
-        let x = tensor(vec![128]);
-        let gate = tensor(vec![8 * 64]);
-        let up = tensor(vec![8 * 64]);
-        let rot = tensor(vec![8 * 64]);
-        let down = tensor(vec![8 * 128]);
-        let out = tensor(vec![128]);
-        let gate_ptrs = tensor(vec![16]);
-        let down_ptrs = tensor(vec![16]);
-        let ownership = (0..8).map(|expert| (expert, 0, expert)).collect::<Vec<_>>();
-        let experts = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
-            &gate_ptrs,
-            &down_ptrs,
-            None,
-            DType::MQ4G256,
-            8,
-            64,
-            128,
-            &[0, 1, 2, 3, 4, 5, 6, 7],
-            &ownership,
-            "router",
-            None,
-            0,
-            &[0],
-            DeviceMesh::single().unwrap().epoch(),
-        ));
-        let steps = indexed_steps(
-            &experts, &scores, &indices, &weights, &x, &gate, &up, &rot, &down, &out,
-        );
-        validate_moe_step_schedule(
-            &steps,
-            &[
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-            ],
-        )
-        .unwrap();
-        let mut duplicate = steps;
-        duplicate.push(Step::MoeCombine {
-            down_out: &down,
-            topk_weights: &weights,
-            out: &out,
-            hidden: 128,
-            k_top: 8,
-            batch_size: 1,
-            inverse_perm: None,
-        });
-        let error = validate_moe_step_schedule(
-            &duplicate,
-            &vec![StepCollective::None; duplicate.len()],
-        )
-        .expect_err("duplicate combine must be rejected by exact grammar");
-        assert!(error.to_string().contains("exactly indexed or grouped"));
-    }
-
-    #[test]
-    fn parallel_schedule_requires_named_axis_collective() {
-        let scores = tensor(vec![8]);
-        let indices = tensor(vec![8]);
-        let weights = tensor(vec![8]);
-        let x = tensor(vec![128]);
-        let gate = tensor(vec![8 * 64]);
-        let up = tensor(vec![8 * 64]);
-        let rot = tensor(vec![8 * 64]);
-        let down = tensor(vec![8 * 128]);
-        let out = tensor(vec![128]);
-        let gate_ptrs = tensor(vec![16]);
-        let down_ptrs = tensor(vec![16]);
-        let ownership = vec![
-            (0, 0, 0),
-            (1, 0, 1),
-            (2, 1, 0),
-            (3, 1, 1),
-            (4, 1, 2),
-            (5, 1, 3),
-            (6, 1, 4),
-            (7, 1, 5),
-        ];
-        let experts = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
-            &gate_ptrs,
-            &down_ptrs,
-            None,
-            DType::MQ4G256,
-            8,
-            64,
-            128,
-            &[0, 1],
-            &ownership,
-            "router",
-            Some(DimKind::Ep),
-            0,
-            &[0, 1],
-            DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap().epoch(),
-        ));
-        let steps = indexed_steps(
-            &experts, &scores, &indices, &weights, &x, &gate, &up, &rot, &down, &out,
-        );
-        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap();
-        let mut collectives = vec![StepCollective::None; steps.len()];
-        collectives[4] = StepCollective::all_reduce(
-            DimKind::Ep,
-            128,
-            vec![0, 1],
-            mesh.epoch(),
-            0,
-        );
-        validate_moe_parallel_schedule(&steps, &collectives).unwrap();
-        collectives[4] = StepCollective::all_reduce(
-            DimKind::Tp,
-            128,
-            vec![0, 1],
-            mesh.epoch(),
-            0,
-        );
-        assert!(validate_moe_parallel_schedule(&steps, &collectives).is_err());
-    }
 }
