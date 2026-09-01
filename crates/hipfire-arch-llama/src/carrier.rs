@@ -117,16 +117,26 @@ fn hfq_layer_names(layer: usize, relative: &str) -> Vec<String> {
         format!("layers.{layer}.{relative}.weight"),
     ]
 }
+const HFQ_LM_HEAD_NAMES: &[&str] = &[
+    "lm_head.weight",
+    "model.lm_head.weight",
+    "model.language_model.lm_head.weight",
+];
+
+fn hfq_has_separate_lm_head(hfq: &HfqFile) -> bool {
+    HFQ_LM_HEAD_NAMES
+        .iter()
+        .any(|name| hfq.find_tensor_info(name).is_some())
+}
 
 fn hfq_entry_names(entry: &WeightEntry) -> Result<Vec<String>, String> {
     let names = match (entry.name.as_str(), entry.layer) {
         ("token_embd", None) => vec!["model.embed_tokens.weight".to_string()],
         ("output_norm", None) => vec!["model.norm.weight".to_string()],
-        ("lm_head", None) => vec![
-            "lm_head.weight".to_string(),
-            "model.lm_head.weight".to_string(),
-            "model.language_model.lm_head.weight".to_string(),
-        ],
+        ("lm_head", None) => HFQ_LM_HEAD_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
         ("wq", Some(layer)) => hfq_layer_names(layer, "self_attn.q_proj"),
         ("wk", Some(layer)) => hfq_layer_names(layer, "self_attn.k_proj"),
         ("wv", Some(layer)) => hfq_layer_names(layer, "self_attn.v_proj"),
@@ -539,7 +549,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
             // Admission and route classification are pure source checks.
             // They must run before any manifest fulfillment or GPU upload.
             hipfire_runtime::hfq::validate_llama_hfq_admission(&hfq).map_err(|e| e.to_string())?;
-            let has_separate_lm_head = hfq.find_tensor_info("lm_head.weight").is_some();
+            let has_separate_lm_head = hfq_has_separate_lm_head(&hfq);
             let route = classify_hfq_route(&hfq);
             eprintln!("llama: HFQ source route = {route:?}");
             let (mesh, manifest_plan) = plan_single(&config, has_separate_lm_head)?;
@@ -834,6 +844,20 @@ mod tests {
         malformed_output_norm: bool,
         separate_lm_head: bool,
     ) -> (PathBuf, HfqFile) {
+        fixture_hfq_with_lm_head(
+            with_awq_sidecar,
+            with_q_proj_bias,
+            malformed_output_norm,
+            separate_lm_head.then_some("lm_head.weight"),
+        )
+    }
+
+    fn fixture_hfq_with_lm_head(
+        with_awq_sidecar: bool,
+        with_q_proj_bias: bool,
+        malformed_output_norm: bool,
+        lm_head_name: Option<&str>,
+    ) -> (PathBuf, HfqFile) {
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 32], false),
             f32_hfq_tensor("model.norm.weight", &[32], false),
@@ -870,8 +894,8 @@ mod tests {
                 32 * 2,
             ));
         }
-        if separate_lm_head {
-            tensors.push(f32_hfq_tensor("lm_head.weight", &[2, 32], false));
+        if let Some(lm_head_name) = lm_head_name {
+            tensors.push(f32_hfq_tensor(lm_head_name, &[2, 32], false));
         }
         let metadata = r#"{
             "config": {
@@ -1062,6 +1086,25 @@ mod tests {
         let (path, hfq) = fixture_hfq(true, false, false, false);
         assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
         std::fs::remove_file(path).expect("remove HFQ fixture");
+    }
+
+    #[test]
+    fn alternate_explicit_lm_head_names_are_not_tied() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        for name in &HFQ_LM_HEAD_NAMES[1..] {
+            let (path, hfq) = fixture_hfq_with_lm_head(false, false, false, Some(name));
+            assert!(hfq_has_separate_lm_head(&hfq));
+            let cask = CaskConfig::default();
+            let mut ctx = load_ctx(&path, &mut gpu, &cask);
+            let bundle =
+                load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load explicit lm_head");
+            drop(ctx);
+            assert!(!bundle.weights.lm_head_aliases_embd);
+            Box::new(bundle).free_gpu(&mut gpu);
+            std::fs::remove_file(path).expect("remove HFQ fixture");
+        }
     }
 
     #[test]
