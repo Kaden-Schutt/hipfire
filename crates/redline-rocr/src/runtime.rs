@@ -1202,6 +1202,33 @@ impl AqlQueue {
             depth: write_index.wrapping_sub(read_index),
         }
     }
+    fn timeout_diagnostic(&self) -> String {
+        let sample = self.depth_sample();
+        let doorbell = unsafe {
+            (self.runtime().symbols.signal_load_scacquire)(self.descriptor().doorbell_signal)
+        };
+        let last_packet_id = sample.write_index.wrapping_sub(1);
+        let slot_index = last_packet_id & u64::from(self.descriptor().size - 1);
+        let slot = unsafe {
+            self.descriptor()
+                .base_address
+                .cast::<u8>()
+                .add(slot_index as usize * AQL_PACKET_BYTES)
+        };
+        let header_word = unsafe { &*slot.cast::<AtomicU32>() }.load(Ordering::Acquire);
+        format!(
+            "queue_id={} active={} read_index={} write_index={} depth={} \
+             doorbell={} last_packet_id={} slot={} header_word=0x{header_word:08x}",
+            sample.queue_id,
+            self.active,
+            sample.read_index,
+            sample.write_index,
+            sample.depth,
+            doorbell,
+            last_packet_id,
+            slot_index,
+        )
+    }
 
     /// Reserve, fill, and release-publish one contiguous recorded batch without
     /// ringing its doorbell yet.
@@ -1533,6 +1560,17 @@ impl QueueSet {
                 return Ok(());
             }
             if started.elapsed() >= timeout {
+                let queue_state = self
+                    .queues
+                    .iter()
+                    .map(AqlQueue::timeout_diagnostic)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "HIPFIRE_REDLINE_QUEUE_TIMEOUT signal=0x{:x} signal_value={} {queue_state}",
+                    signal.raw().0,
+                    signal.value_scacquire(),
+                );
                 return Err(RuntimeError::SignalTimeout {
                     signal: signal.raw().0,
                     timeout,
