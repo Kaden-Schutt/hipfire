@@ -1249,6 +1249,15 @@ fn main() {
                 } else {
                     hipfire_loader::GEMMA4_EAGLE_DRAFT_LEN
                 };
+                // Path to a head overlay (`hipfire-quantize --head-only`),
+                // resolved by the CLI from the registry's `heads` map. Empty
+                // means "use the head baked into the model file".
+                let head_path = msg
+                    .get("params")
+                    .and_then(|p| p.get("head"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
                 let kv_mode_override = msg
                     .get("params")
                     .and_then(|p| p.get("kv_mode"))
@@ -1653,6 +1662,7 @@ fn main() {
                         deepseek4_experts_per_token,
                         deepseek4_compute_placement,
                         draft_path.as_deref(),
+                        head_path.as_deref(),
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
                         kv_mode_override.as_deref(),

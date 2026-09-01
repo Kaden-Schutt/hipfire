@@ -69,6 +69,11 @@ pub struct LoadCtx<'a> {
     pub deepseek4_experts_per_token: Option<usize>,
     pub draft_path: Option<&'a str>,
     pub kv_mode_override: Option<&'a str>,
+    /// Optional HEAD OVERLAY: a single-tensor `.hfq` from
+    /// `hipfire-quantize --head-only` whose `lm_head.weight` shadows the
+    /// base's, so one body serves several head carriers. `None` uses the head
+    /// baked into the model file. Only the maple carrier reads this today.
+    pub head_path: Option<&'a str>,
     pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,

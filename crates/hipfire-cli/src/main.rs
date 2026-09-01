@@ -378,6 +378,11 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long)]
+    /// Select a published lm_head variant (see the registry's `heads`), e.g.
+    /// `--head q4k`. The overlay shadows the model's own head at load time;
+    /// omitting this uses the head baked into the model file.
+    head: Option<String>,
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     /// One-shot KV storage backend override for this model load.
     kv_backend: Option<String>,
@@ -1948,6 +1953,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         max_tokens,
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
+        args.head.as_deref(),
     )?;
     let selector = args
         .speculation
@@ -2492,6 +2498,7 @@ pub(crate) fn load_params(
     max_tokens: u64,
     kv_override: Option<&str>,
     kv_backend_override: Option<&str>,
+    head_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
     let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
@@ -2526,6 +2533,45 @@ pub(crate) fn load_params(
             }
         }
     }
+    // Resolve --head <name> against the registry's `heads` map. The overlay
+    // lives beside the model file, exactly like the triattn sidecar. Refuse
+    // rather than fall back: a silent fall-back would serve the base's head
+    // and answer a different question than the operator asked.
+    let head_file = match head_override.filter(|s| !s.is_empty()) {
+        None => String::new(),
+        // A direct path is accepted as well as a registry name: loading a
+        // model BY PATH has no registry entry, so names cannot resolve there
+        // and only a path can work.
+        Some(name) if Path::new(name).is_file() => name.to_string(),
+        Some(name) => {
+            let heads = entry.map(|e| &e.heads);
+            let sidecar = heads.and_then(|h| h.get(name)).ok_or_else(|| {
+                let known: Vec<&str> = heads
+                    .map(|h| h.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                anyhow!(
+                    "--head {name}: not a file, and this model has no such head variant{}",
+                    if known.is_empty() {
+                        " (it publishes none)".to_string()
+                    } else {
+                        format!(" (available: {})", known.join(", "))
+                    }
+                )
+            })?;
+            let candidate = model_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&sidecar.file);
+            if !candidate.is_file() {
+                bail!(
+                    "--head {name}: overlay {} not found — fetch it with \
+                     `hipfire pull` or place it beside the model",
+                    candidate.display()
+                );
+            }
+            candidate.display().to_string()
+        }
+    };
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "deepseek4_compute_placement": config_string(
@@ -2545,6 +2591,7 @@ pub(crate) fn load_params(
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
         "cask_sidecar": cask_sidecar,
+        "head": head_file,
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
@@ -3995,6 +4042,8 @@ fn open_bench_engine(
         max_tokens,
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
+        // No --head on this path yet; the model's own head is used.
+        None,
     )?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
@@ -6254,7 +6303,8 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
+        let params =
+            load_params(&defaults, Some(entry), &model_path, 64, None, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
@@ -6269,7 +6319,7 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None).unwrap();
+        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
@@ -6280,8 +6330,16 @@ mod tests {
     pub(crate) fn load_params_forwards_explicit_vmm_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params =
-            load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            Some("vmm"),
+            None,
+        )
+        .unwrap();
         assert_eq!(params["kv_backend"], "vmm");
     }
 
@@ -6289,7 +6347,7 @@ mod tests {
     pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None, None).unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         assert_eq!(params["max_seq"], 32768);
     }
@@ -6591,12 +6649,21 @@ mod tests {
             64,
             Some("q8"),
             Some("contiguous"),
+            None,
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         // Without explicit override, load_params uses the resolved vmm.
-        let params2 =
-            load_params(&resolved, Some(entry), &model_path, 64, Some("q8"), None).unwrap();
+        let params2 = load_params(
+            &resolved,
+            Some(entry),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(params2["kv_backend"], "vmm");
         assert_eq!(params2["max_seq"], 262144);
 
@@ -6695,7 +6762,7 @@ mod tests {
     pub(crate) fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
         let model_path = PathBuf::from("/tmp/test-model.mq2r");
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None, None).unwrap();
         assert_eq!(params["deepseek4_compute_placement"], "single");
         assert!(params.get("deepseek4_experts_per_token").is_none());
 
@@ -6710,7 +6777,7 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None, None).unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
     }
 
@@ -6735,6 +6802,7 @@ mod tests {
             64,
             Some("q8"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(params["deepseek4_compute_placement"], raw);
@@ -6756,7 +6824,7 @@ mod tests {
         .unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
-        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None, None).unwrap();
         assert_eq!(params["draft"], draft);
     }
 
@@ -6780,7 +6848,8 @@ mod tests {
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
         // load_params alone must not carry the draft while config mode is off.
-        let mut params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        let mut params =
+            load_params(&resolved, None, &model_path, 64, Some("q8"), None, None).unwrap();
         assert_eq!(params["dflash_mode"], "off");
         assert!(
             params.get("draft").is_none(),
