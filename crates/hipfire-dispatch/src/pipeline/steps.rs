@@ -12,9 +12,13 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
-    ExpertExecutionPlan, MoeActivationVariant, MoeExpertRef, MoeProj, MoeProtocolKind, MoeFamily,
-    RouterPlan,
+    ExpertExecutionPlan, MoeActivationVariant, MoeExpertRef, MoeExpertRefBinding, MoeProj,
+    MoeProtocolKind, MoeFamily, RouterPlan,
 };
+use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::types::GemvVariant;
+use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
+
 /// Routing policy is carried by `RouterPlan`; no standalone score activation
 /// can be inserted between route and expert phases.
 
@@ -211,6 +215,27 @@ impl StepCollective {
         }
     }
 }
+/// Pointer-free identity for one executable rank schedule. Mesh execution
+/// compares this value for every rank before launching any device work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoeExecutionSignature<'a> {
+    pub protocol: MoeProtocolKind,
+    pub execution: ExpertExecutionPlan,
+    pub router_identity: &'a str,
+    pub router_selection: crate::families::moe::RouterSelection,
+    pub k_top: usize,
+    pub normalize: bool,
+    pub expert_dtype: DType,
+    pub n_experts: usize,
+    pub expert_k: usize,
+    pub expert_m: usize,
+    pub batch_size: usize,
+    pub hidden: usize,
+    /// Canonical `(global expert, owner rank, local slot)` tuples for every
+    /// rank. Unlike pointer tables, this is safe to compare across devices.
+    pub ownership_partition: &'a [(usize, usize, usize)],
+}
+
 fn collective_count(collectives: &[StepCollective]) -> usize {
     collectives
         .iter()
@@ -285,12 +310,15 @@ pub fn validate_moe_step_schedule(
                     inverse_perm,
                 },
             ] => {
+                let expected_rows = batch_size
+                    .checked_mul(*k_top)
+                    .ok_or_else(|| DispatchError::Hip("indexed MoE row count overflows".into()))?;
                 if *batch_size != 1
                     || *down_batch != 1
                     || inverse_perm.is_some()
                     || *k_top != plan.k_top()
                     || *inter != (*experts).expert_m()
-                    || *rows != batch_size.saturating_mul(*k_top)
+                    || *rows != expected_rows
                 {
                     return Err(DispatchError::Hip(
                         "indexed MoE grammar requires decode batch=1, normalized route, and no inverse permutation"
@@ -395,17 +423,24 @@ pub fn validate_moe_step_schedule(
                     inverse_perm: combine_inverse,
                 },
             ] => {
+                let expected_slots = batch_size
+                    .checked_mul(*k_top)
+                    .ok_or_else(|| DispatchError::Hip("grouped MoE slot count overflows".into()))?;
                 if *k_top != plan.k_top()
                     || *k_top != *unscatter_k
                     || *k_top != *down_k
                     || *k_top != *combine_k
                     || *batch_size != *down_batch
                     || *batch_size != *combine_batch
-                    || *total_slots != batch_size.saturating_mul(*k_top)
+                    || *total_slots != expected_slots
                     || *n_experts != experts.n_experts()
-                    || !same_tensor(topk_indices, route.route_buffers().0)
-                    || !same_tensor(topk_indices, gate_sorted)
-                    || !same_tensor(topk_indices, down_sorted)
+                    || !same_tensor(topk_indices, plan.route_buffers().0)
+                    || same_tensor(topk_indices, sorted_slot_index)
+                    || !same_tensor(sorted_slot_index, gate_sorted)
+                    || !same_tensor(sorted_slot_index, unscatter_sorted)
+                    || !same_tensor(sorted_slot_index, down_sorted)
+                    || !same_tensor(expert_tile_ids, gate_tiles)
+                    || !same_tensor(expert_tile_ids, down_tiles)
                 {
                     return Err(DispatchError::Hip(
                         "grouped MoE route width, batch, or route identity mismatch".into(),
@@ -429,9 +464,12 @@ pub fn validate_moe_step_schedule(
                         "grouped MoE scatter capacity or tile geometry is invalid".into(),
                     ));
                 }
-                if expert_token_counts.numel() == 0
-                    || expert_offsets.numel() < *n_experts + 1
-                {
+                let expected_offsets = n_experts
+                    .checked_add(1)
+                    .ok_or_else(|| DispatchError::Hip("MoE expert offset count overflows".into()))?;
+                let counts_elements = checked_numel(expert_token_counts, "expert counts")?;
+                let offset_elements = checked_numel(expert_offsets, "expert offsets")?;
+                if counts_elements == 0 || offset_elements < expected_offsets {
                     return Err(DispatchError::Hip(
                         "grouped MoE scatter metadata has empty or short buffers".into(),
                     ));
@@ -446,7 +484,7 @@ pub fn validate_moe_step_schedule(
                     || !same_tensor(gate_batch, act_gate)
                     || !same_tensor(up_batch, act_up)
                     || *inter != *act_inter
-                    || *rows != batch_size.saturating_mul(*k_top)
+                    || *rows != expected_slots
                     || !same_tensor(rot_out, down_x)
                     || !same_tensor(down_y, combine_down)
                     || !same_tensor(inverse_perm, combine_inverse)
@@ -487,7 +525,11 @@ pub fn validate_moe_step_schedule(
             "MoE combine hidden size does not match the expert down projection".into(),
         ));
     }
-    let shape_gate = [2 * experts.expert_m(), experts.expert_k()];
+    let gate_width = experts
+        .expert_m()
+        .checked_mul(2)
+        .ok_or_else(|| DispatchError::Hip("MoE gate/up shape overflows".into()))?;
+    let shape_gate = [gate_width, experts.expert_k()];
     let shape_down = [experts.expert_k(), experts.expert_m()];
     experts.validate_projection_shapes(&shape_gate, &shape_down)?;
     let dtype_supported = match protocol {
@@ -542,12 +584,56 @@ pub fn validate_moe_protocol_schedule(
     Ok(())
 }
 
+fn derive_moe_execution_signature<'a>(
+    steps: &[Step<'a>],
+    execution: ExpertExecutionPlan,
+) -> Result<MoeExecutionSignature<'a>, DispatchError> {
+    let route = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::MoeRoute { plan } => Some(plan),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE schedule has no route".into()))?;
+    let experts = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::IndexedMoeGemv { experts, .. }
+            | Step::GroupedMoeGemm { experts, .. } => Some(*experts),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE schedule has no expert owner view".into()))?;
+    let hidden = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::MoeCombine { hidden, .. } => Some(*hidden),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE schedule has no combine geometry".into()))?;
+    Ok(MoeExecutionSignature {
+        protocol: execution.protocol()?,
+        execution,
+        router_identity: experts.router_identity(),
+        router_selection: route.selection(),
+        k_top: route.k_top(),
+        normalize: route.normalizes(),
+        expert_dtype: experts.dtype(),
+        n_experts: experts.n_experts(),
+        expert_k: experts.expert_k(),
+        expert_m: experts.expert_m(),
+        batch_size: route.batch_size(),
+        hidden,
+        ownership_partition: experts.ownership_partition(),
+    })
+}
+
 /// An immutable, pre-validated typed MoE schedule.
 pub struct SealedMoeSchedule<'a> {
     execution: ExpertExecutionPlan,
     steps: Vec<Step<'a>>,
     collectives: Vec<StepCollective>,
 }
+
 
 impl<'a> SealedMoeSchedule<'a> {
     pub fn new(
@@ -573,6 +659,9 @@ impl<'a> SealedMoeSchedule<'a> {
 
     pub fn collectives(&self) -> &[StepCollective] {
         &self.collectives
+    }
+    pub fn execution_signature(&self) -> Result<MoeExecutionSignature<'a>, DispatchError> {
+        derive_moe_execution_signature(&self.steps, self.execution)
     }
 }
 
@@ -613,6 +702,7 @@ pub fn execute_sealed_steps_mesh<'a>(
     }
 
     let mut reduction: Option<(DimKind, usize, Vec<usize>, MeshEpoch)> = None;
+    let mut execution_signature: Option<MoeExecutionSignature<'a>> = None;
     let mut outputs = Vec::with_capacity(schedules.len());
     for (rank, schedule) in schedules.iter().enumerate() {
         validate_moe_protocol_schedule(
@@ -620,6 +710,16 @@ pub fn execute_sealed_steps_mesh<'a>(
             schedule.collectives(),
             schedule.execution(),
         )?;
+        let signature = schedule.execution_signature()?;
+        if let Some(expected) = &execution_signature {
+            if expected != &signature {
+                return Err(DispatchError::Hip(
+                    "MoE rank schedules disagree on executable identity".into(),
+                ));
+            }
+        } else {
+            execution_signature = Some(signature);
+        }
         let (kind, dim, group, epoch, descriptor_rank) = schedule
             .collectives()
             .iter()
@@ -730,19 +830,34 @@ fn same_tensor(a: &GpuTensor, b: &GpuTensor) -> bool {
         || (!a.buf.as_ptr().is_null() && a.buf.as_ptr() == b.buf.as_ptr())
 }
 
+fn checked_numel(tensor: &GpuTensor, name: &str) -> Result<usize, DispatchError> {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
+        .ok_or_else(|| DispatchError::Hip(format!("MoE {name} logical shape overflows")))
+}
+
 fn require_tensor(
     tensor: &GpuTensor,
     name: &str,
     dtype: DType,
     capacity: usize,
 ) -> Result<(), DispatchError> {
-    if tensor.dtype != dtype || tensor.numel() < capacity {
+    let logical_elements = checked_numel(tensor, name)?;
+    let required_bytes = capacity
+        .checked_mul(dtype.size())
+        .ok_or_else(|| DispatchError::Hip(format!("MoE {name} byte capacity overflows")))?;
+    if tensor.dtype != dtype
+        || logical_elements < capacity
+        || tensor.buf.size() < required_bytes
+    {
         return Err(DispatchError::Hip(format!(
-            "MoE {name} has dtype {:?}/capacity {}, expected {:?}/at least {}",
+            "MoE {name} has dtype {:?}/logical capacity {logical_elements}/physical bytes {}, \
+             expected {:?}/{capacity} elements/{required_bytes} bytes",
             tensor.dtype,
-            tensor.numel(),
-            dtype,
-            capacity
+            tensor.buf.size(),
+            dtype
         )));
     }
     Ok(())
@@ -756,16 +871,21 @@ fn require_raw_i32(
     let bytes = elements
         .checked_mul(std::mem::size_of::<i32>())
         .ok_or_else(|| DispatchError::Hip(format!("MoE {name} capacity overflows")))?;
-    if tensor.dtype != DType::Raw || tensor.numel() < bytes {
+    let logical_bytes = checked_numel(tensor, name)?;
+    if tensor.dtype != DType::Raw
+        || logical_bytes < bytes
+        || tensor.buf.size() < bytes
+    {
         return Err(DispatchError::Hip(format!(
-            "MoE {name} has dtype {:?}/capacity {}, expected Raw/at least {} bytes",
+            "MoE {name} has dtype {:?}/logical bytes {logical_bytes}/physical bytes {}, \
+             expected Raw/at least {bytes} bytes",
             tensor.dtype,
-            tensor.numel(),
-            bytes
+            tensor.buf.size()
         )));
     }
     Ok(())
 }
+
 
 fn validate_step_tensors(
     steps: &[Step],
@@ -881,7 +1001,7 @@ fn validate_step_tensors(
                     batch_size
                         .checked_mul(k_top)
                         .and_then(|slots| slots.checked_mul(*hidden))
-                        .ok_or_else(|| DispatchError::Hip("MoE combine input capacity overflows"))?,
+                        .ok_or_else(|| DispatchError::Hip("MoE combine input capacity overflows".into()))?,
                 )?;
                 require_tensor(
                     topk_weights,
@@ -895,7 +1015,7 @@ fn validate_step_tensors(
                     DType::F32,
                     batch_size
                         .checked_mul(*hidden)
-                        .ok_or_else(|| DispatchError::Hip("MoE output capacity overflow"))?,
+                        .ok_or_else(|| DispatchError::Hip("MoE output capacity overflow".into()))?,
                 )?;
                 if same_tensor(down_out, out) || same_tensor(topk_weights, out) {
                     return Err(DispatchError::Hip(
@@ -915,8 +1035,11 @@ fn validate_step_tensors(
                 block_m,
                 ..
             } => {
+                let offsets = n_experts
+                    .checked_add(1)
+                    .ok_or_else(|| DispatchError::Hip("MoE expert offsets overflow".into()))?;
                 require_raw_i32(expert_token_counts, "expert counts", *n_experts)?;
-                require_raw_i32(expert_offsets, "expert offsets", *n_experts + 1)?;
+                require_raw_i32(expert_offsets, "expert offsets", offsets)?;
                 require_raw_i32(sorted_slot_index, "sorted slots", *m_total_max)?;
                 require_raw_i32(inverse_perm, "inverse permutation", *total_slots)?;
                 require_raw_i32(
@@ -980,7 +1103,7 @@ fn validate_step_tensors(
                                 DispatchError::Hip("MoE unscatter width overflows".into())
                             })?,
                         )
-                        .ok_or_else(|| DispatchError::Hip("MoE unscatter input overflows"))?,
+                        .ok_or_else(|| DispatchError::Hip("MoE unscatter input overflows".into()))?,
                 )?;
                 require_tensor(
                     gate_batch,
@@ -2688,7 +2811,16 @@ mod tests {
         );
     }
     fn tensor(shape: Vec<usize>) -> GpuTensor {
+        let elements = shape.iter().product::<usize>();
         let mut tensor = GpuTensor::null_for_test();
+        tensor.buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                std::ptr::null_mut(),
+                elements
+                    .checked_mul(DType::F32.size())
+                    .expect("test tensor bytes"),
+            )
+        };
         tensor.shape = shape;
         tensor
     }
@@ -2767,7 +2899,8 @@ mod tests {
         let out = tensor(vec![128]);
         let gate_ptrs = tensor(vec![16]);
         let down_ptrs = tensor(vec![16]);
-        let experts = MoeExpertRef::from_resolved(
+        let ownership = (0..8).map(|expert| (expert, 0, expert)).collect::<Vec<_>>();
+        let experts = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
             &gate_ptrs,
             &down_ptrs,
             None,
@@ -2776,11 +2909,13 @@ mod tests {
             64,
             128,
             &[0, 1, 2, 3, 4, 5, 6, 7],
+            &ownership,
+            "router",
             None,
             0,
             &[0],
             DeviceMesh::single().unwrap().epoch(),
-        );
+        ));
         let steps = indexed_steps(
             &experts, &scores, &indices, &weights, &x, &gate, &up, &rot, &down, &out,
         );
@@ -2826,7 +2961,17 @@ mod tests {
         let out = tensor(vec![128]);
         let gate_ptrs = tensor(vec![16]);
         let down_ptrs = tensor(vec![16]);
-        let experts = MoeExpertRef::from_resolved(
+        let ownership = vec![
+            (0, 0, 0),
+            (1, 0, 1),
+            (2, 1, 0),
+            (3, 1, 1),
+            (4, 1, 2),
+            (5, 1, 3),
+            (6, 1, 4),
+            (7, 1, 5),
+        ];
+        let experts = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
             &gate_ptrs,
             &down_ptrs,
             None,
@@ -2835,11 +2980,13 @@ mod tests {
             64,
             128,
             &[0, 1],
+            &ownership,
+            "router",
             Some(DimKind::Ep),
             0,
             &[0, 1],
             DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap().epoch(),
-        );
+        ));
         let steps = indexed_steps(
             &experts, &scores, &indices, &weights, &x, &gate, &up, &rot, &down, &out,
         );

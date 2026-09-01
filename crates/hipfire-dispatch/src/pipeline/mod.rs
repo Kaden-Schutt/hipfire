@@ -10,6 +10,8 @@ use hip_bridge;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::{LazyLock, OnceLock};
 
+pub mod steps;
+
 pub use steps::{
     execute_sealed_steps_mesh, execute_steps, FusedPattern, GemvInput, SealedMoeSchedule, Step,
     StepCollective,

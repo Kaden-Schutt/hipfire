@@ -56,22 +56,37 @@ impl fmt::Display for ExpertPlanError {
 
 impl std::error::Error for ExpertPlanError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpertPointerTables {
+    gate_up: GpuTensor,
+    down: GpuTensor,
+    dummy_gate_up: Option<GpuTensor>,
+}
+
 struct ExpertStorageOwner {
     slots: Vec<ExpertPlacement>,
     resident: Vec<bool>,
+    rank_tables: Vec<Option<ExpertPointerTables>>,
 }
 
 impl ExpertStorageOwner {
-    fn new(slots: Vec<ExpertPlacement>) -> Self {
+    fn new(slots: Vec<ExpertPlacement>, group_size: usize) -> Self {
         Self {
             resident: vec![false; slots.len()],
             slots,
+            rank_tables: (0..group_size).map(|_| None).collect(),
         }
     }
 
     fn index_of(&self, placement: ExpertPlacement) -> Option<usize> {
         self.slots.iter().position(|candidate| *candidate == placement)
+    }
+
+    fn rank_is_resident(&self, rank: usize) -> bool {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, placement)| placement.owner == rank)
+            .all(|(index, _)| self.resident[index])
     }
 
     fn clear(&mut self) {
@@ -82,6 +97,7 @@ impl ExpertStorageOwner {
         self.resident.iter().filter(|resident| **resident).count()
     }
 }
+
 
 /// A sealed, manifest-derived expert plan.
 ///
@@ -107,6 +123,7 @@ pub struct ExpertPlan {
     collective: Option<CollectiveHint>,
     collective_row: Option<String>,
     owner_views: Vec<Vec<usize>>,
+    owner_partition: Vec<(usize, usize, usize)>,
     owner: ExpertStorageOwner,
 }
 
@@ -146,6 +163,12 @@ impl ExpertPlan {
             .map_err(ExpertPlanError::new)?;
         validate_spec(spec, mesh)?;
         let (shape, source_dtype) = resolve_shape(spec, manifest)?;
+        if !shape.fused_gate_up {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' uses separate gate/up sources, unsupported by the generic executor",
+                spec.group
+            )));
+        }
         let execution_plan = parse_execution(&spec.execution, spec)?;
         validate_execution_dtype(execution_plan, source_dtype, spec)?;
 
@@ -156,13 +179,14 @@ impl ExpertPlan {
                 spec.group
             )));
         }
+        let group_size = group_devices.len();
         let owner = resolve_placements(
             spec.n_experts,
-            group_devices.len(),
+            group_size,
             spec.parallelism,
             spec.assignment,
         );
-        let owner_views = (0..group_devices.len())
+        let owner_views = (0..group_size)
             .map(|rank| {
                 owner
                     .iter()
@@ -170,6 +194,10 @@ impl ExpertPlan {
                     .map(|placement| placement.global_id)
                     .collect()
             })
+            .collect();
+        let owner_partition = owner
+            .iter()
+            .map(|placement| (placement.global_id, placement.owner, placement.local_slot))
             .collect();
         let (collective, collective_row) = resolve_collective(spec, manifest)?;
 
@@ -191,7 +219,8 @@ impl ExpertPlan {
             collective,
             collective_row,
             owner_views,
-            owner: ExpertStorageOwner::new(owner),
+            owner_partition,
+            owner: ExpertStorageOwner::new(owner, group_size),
         })
     }
 
@@ -288,35 +317,92 @@ impl ExpertPlan {
         })
     }
 
-    /// Bind canonical shape/dtype/owner metadata to a borrowed pointer-table
-    /// view. The family can retain only the returned immutable view; all
-    /// placement and storage state remains owned by this plan.
+    /// Commit the rank-local pointer tables to this owner. The plan validates
+    /// the table ABI before retaining the tensors; binding later borrows only
+    /// these committed values.
+    pub fn commit_rank_tables(
+        &mut self,
+        rank: usize,
+        gate_up: GpuTensor,
+        down: GpuTensor,
+        dummy_gate_up: Option<GpuTensor>,
+    ) -> Result<(), ExpertPlanError> {
+        if rank >= self.group_size() {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' rank {rank} is outside group size {}",
+                self.group,
+                self.group_size()
+            )));
+        }
+        validate_pointer_table(&gate_up, "gate/up", self.n_experts)?;
+        validate_pointer_table(&down, "down", self.n_experts)?;
+        if let Some(dummy) = &dummy_gate_up {
+            validate_dummy_table(dummy)?;
+        }
+        let tables = self
+            .owner
+            .rank_tables
+            .get_mut(rank)
+            .expect("rank checked above");
+        if tables.is_some() {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' rank {rank} pointer tables are already committed",
+                self.group
+            )));
+        }
+        *tables = Some(ExpertPointerTables {
+            gate_up,
+            down,
+            dummy_gate_up,
+        });
+        Ok(())
+    }
+
+    /// Bind the committed rank-local pointer tables to an opaque executable
+    /// view. A rank cannot bind until its owned placements are resident.
     pub fn bind_expert_ref<'a>(
         &'a self,
         rank: usize,
-        gate_up_ptrs: &'a GpuTensor,
-        down_ptrs: &'a GpuTensor,
-        dummy_gate_up: Option<&'a GpuTensor>,
     ) -> Result<MoeExpertRef<'a>, ExpertPlanError> {
         let owned = self.owned_experts(rank)?;
+        if !self.owner.rank_is_resident(rank) {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' rank {rank} has nonresident placements",
+                self.group
+            )));
+        }
+        let tables = self
+            .owner
+            .rank_tables
+            .get(rank)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                ExpertPlanError::new(format!(
+                    "expert group '{}' rank {rank} has no committed pointer tables",
+                    self.group
+                ))
+            })?;
         let collective_kind = match self.collective {
             Some(CollectiveHint::AllReduce { kind }) => Some(kind),
             _ => None,
         };
-        let view = MoeExpertRef::from_resolved(
-            gate_up_ptrs,
-            down_ptrs,
-            dummy_gate_up,
+        let binding = hipfire_dispatch::families::moe::MoeExpertRefBinding::from_plan(
+            &tables.gate_up,
+            &tables.down,
+            tables.dummy_gate_up.as_ref(),
             self.source_dtype,
             self.n_experts,
             self.shape.expert_m,
             self.shape.expert_k,
             owned,
+            &self.owner_partition,
+            &self.router,
             collective_kind,
             rank,
             &self.group_devices,
             self.mesh_epoch,
         );
+        let view = MoeExpertRef::from_binding(binding);
         view.validate()
             .map_err(|error| ExpertPlanError::new(error.to_string()))?;
         Ok(view)
@@ -389,8 +475,14 @@ pub struct ExpertLoadTxn<'a> {
 }
 
 impl ExpertLoadTxn<'_> {
-    /// Reserve one manifest placement. Duplicate reservations are refused.
+    /// Reserve one manifest placement. Duplicate reservations and reuse after
+    /// commit/rollback are refused.
     pub fn reserve(&mut self, placement: ExpertPlacement) -> Result<(), ExpertPlanError> {
+        if self.finished {
+            return Err(ExpertPlanError::new(
+                "expert load transaction is already finished",
+            ));
+        }
         let index = self.owner.index_of(placement).ok_or_else(|| {
             ExpertPlanError::new(format!("unknown expert placement {placement:?}"))
         })?;
@@ -488,7 +580,7 @@ fn validate_spec(spec: &ExpertGroupSpec, mesh: &DeviceMesh) -> Result<(), Expert
     {
         return Err(ExpertPlanError::new(format!(
             "expert group '{}' n_experts={} is not divisible by group_size={group_size}",
-            spec.group, spec.n_experts, group_size
+            spec.group, spec.n_experts
         )));
     }
     Ok(())
@@ -662,6 +754,51 @@ fn source_names<'a>(layout: &'a ExpertSourceLayout) -> Vec<(&'static str, Vec<&'
 }
 
 
+fn checked_numel(tensor: &GpuTensor, label: &str) -> Result<usize, ExpertPlanError> {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
+        .ok_or_else(|| ExpertPlanError::new(format!("{label} logical shape overflows")))
+}
+
+fn validate_pointer_table(
+    tensor: &GpuTensor,
+    label: &str,
+    n_experts: usize,
+) -> Result<(), ExpertPlanError> {
+    let pointer_slots = n_experts
+        .checked_mul(2)
+        .ok_or_else(|| ExpertPlanError::new("pointer-table slot count overflows"))?;
+    let required_bytes = pointer_slots
+        .checked_mul(DType::F32.size())
+        .ok_or_else(|| ExpertPlanError::new("pointer-table byte capacity overflows"))?;
+    let logical_elements = checked_numel(tensor, label)?;
+    if tensor.dtype != DType::F32
+        || tensor.shape.as_slice() != [pointer_slots]
+        || logical_elements < pointer_slots
+        || tensor.buf.size() < required_bytes
+    {
+        return Err(ExpertPlanError::new(format!(
+            "{label} pointer table must be F32 [{pointer_slots}] with {required_bytes} physical bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dummy_table(tensor: &GpuTensor) -> Result<(), ExpertPlanError> {
+    let logical_elements = checked_numel(tensor, "dummy gate/up table")?;
+    let required_bytes = logical_elements
+        .checked_mul(DType::F32.size())
+        .ok_or_else(|| ExpertPlanError::new("dummy gate/up table byte capacity overflows"))?;
+    if tensor.dtype != DType::F32 || logical_elements == 0 || tensor.buf.size() < required_bytes {
+        return Err(ExpertPlanError::new(
+            "dummy gate/up table must be nonempty F32 storage with physical capacity",
+        ));
+    }
+    Ok(())
+}
+
 fn entry_for<'a>(
     spec: &ExpertGroupSpec,
     manifest: &'a [WeightEntry],
@@ -805,6 +942,7 @@ fn resolve_shape(
         )));
     }
     if gate_shapes.iter().any(|shape| shape != &gate_shapes[0])
+        || up_shapes.iter().any(|shape| shape != &up_shapes[0])
         || down_shapes.iter().any(|shape| shape != &down_shapes[0])
     {
         return Err(ExpertPlanError::new(format!(
@@ -814,14 +952,25 @@ fn resolve_shape(
     }
     let gate = &gate_shapes[0];
     let down = &down_shapes[0];
-    if gate.len() != 2 || down.len() != 2 || gate[0] % 2 != 0 {
+    if gate.len() != 2 || down.len() != 2 {
         return Err(ExpertPlanError::new(format!(
             "expert group '{}' layer {:?} projection shapes are incompatible",
             spec.group, spec.layer
         )));
     }
+    let expert_m = if fused {
+        if gate[0] % 2 != 0 {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' layer {:?} fused gate/up width is not even",
+                spec.group, spec.layer
+            )));
+        }
+        gate[0] / 2
+    } else {
+        gate[0]
+    };
     let shape = ExpertShape {
-        expert_m: gate[0] / 2,
+        expert_m,
         expert_k: gate[1],
         fused_gate_up: fused,
     };
@@ -989,7 +1138,16 @@ mod tests {
     }
 
     fn table(shape: Vec<usize>) -> GpuTensor {
+        let elements = shape.iter().product::<usize>();
         let mut tensor = GpuTensor::null_for_test();
+        tensor.buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                std::ptr::null_mut(),
+                elements
+                    .checked_mul(DType::F32.size())
+                    .expect("test tensor bytes"),
+            )
+        };
         tensor.shape = shape;
         tensor
     }
@@ -1014,7 +1172,7 @@ mod tests {
 
     #[test]
     fn bound_view_uses_canonical_rank_owner() {
-        let plan = ExpertPlan::from_manifest(
+        let mut plan = ExpertPlan::from_manifest(
             &spec("indexed_quantized", ExpertParallelism::ExpertParallel),
             &manifest(),
             &mesh_ep(),
@@ -1022,7 +1180,21 @@ mod tests {
         .unwrap();
         let gate = table(vec![8]);
         let down = table(vec![8]);
-        let view = plan.bind_expert_ref(1, &gate, &down, None).unwrap();
+        plan.commit_rank_tables(1, gate, down, None).unwrap();
+        {
+            let placements: Vec<_> = plan
+                .placements()
+                .iter()
+                .copied()
+                .filter(|placement| placement.owner == 1)
+                .collect();
+            let mut load = plan.begin_load();
+            for placement in placements {
+                load.reserve(placement).unwrap();
+            }
+            load.commit();
+        }
+        let view = plan.bind_expert_ref(1).unwrap();
         assert_eq!(view.owned(), &[1, 3]);
         assert_eq!(view.n_experts(), 4);
     }

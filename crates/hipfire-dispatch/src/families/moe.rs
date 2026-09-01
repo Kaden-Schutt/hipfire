@@ -57,6 +57,14 @@ pub enum RouterPlan<'a> {
     },
 }
 
+fn checked_numel(tensor: &GpuTensor, name: &str) -> Result<usize, DispatchError> {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
+        .ok_or_else(|| DispatchError::Hip(format!("MoE {name} logical shape overflows")))
+}
+
 impl<'a> RouterPlan<'a> {
     pub fn selection(&self) -> RouterSelection {
         match self {
@@ -147,9 +155,18 @@ impl<'a> RouterPlan<'a> {
         let expected_slots = batch_size
             .checked_mul(self.k_top())
             .ok_or_else(|| DispatchError::Hip("MoE route slot count overflow".into()))?;
-        if indices.numel() < expected_slots || weights.numel() < expected_slots {
+        let route_bytes = expected_slots
+            .checked_mul(DType::F32.size())
+            .ok_or_else(|| DispatchError::Hip("MoE route byte capacity overflow".into()))?;
+        let index_elements = checked_numel(indices, "route indices")?;
+        let weight_elements = checked_numel(weights, "route weights")?;
+        if index_elements < expected_slots
+            || weight_elements < expected_slots
+            || indices.buf.size() < route_bytes
+            || weights.buf.size() < route_bytes
+        {
             return Err(DispatchError::Hip(format!(
-                "MoE route buffers have insufficient capacity for {expected_slots} slots"
+                "MoE route buffers have insufficient logical/physical capacity for {expected_slots} slots"
             )));
         }
         if let Self::SoftmaxTopK { scores, .. } = self {
@@ -158,12 +175,20 @@ impl<'a> RouterPlan<'a> {
                 [batch, experts] => *batch == batch_size && *experts == n_experts,
                 _ => false,
             };
+            let score_elements = checked_numel(scores, "router scores")?;
+            let score_capacity = batch_size
+                .checked_mul(n_experts)
+                .ok_or_else(|| DispatchError::Hip("MoE router score capacity overflow".into()))?;
+            let score_bytes = score_capacity
+                .checked_mul(DType::F32.size())
+                .ok_or_else(|| DispatchError::Hip("MoE router score byte capacity overflow".into()))?;
             if scores.dtype != DType::F32
                 || !score_shape_ok
-                || scores.numel() < batch_size.saturating_mul(n_experts)
+                || score_elements < score_capacity
+                || scores.buf.size() < score_bytes
             {
                 return Err(DispatchError::Hip(format!(
-                    "MoE router score shape/dtype does not match batch={batch_size}, experts={n_experts}"
+                    "MoE router score shape/dtype/capacity does not match batch={batch_size}, experts={n_experts}"
                 )));
             }
         }
@@ -199,13 +224,12 @@ impl ExpertExecutionPlan {
     }
 }
 
-/// Borrowed view over one resolver-owned rank-local expert table.
+/// Opaque plan-produced data used to create an expert view.
 ///
-/// The view contains no allocation handle, source path, or storage owner. It
-/// is created by the manifest/runtime owner and borrowed by a Step until the
-/// owner is dropped. Keeping the fields private prevents a family from
-/// replacing the canonical placement metadata after binding.
-pub struct MoeExpertRef<'a> {
+/// The binding is intentionally separate from [`MoeExpertRef`]: callers can
+/// retain the view for scheduling, but there is no public constructor that
+/// accepts arbitrary canonical metadata directly on the executable reference.
+pub struct MoeExpertRefBinding<'a> {
     gate_up_ptrs: &'a GpuTensor,
     down_ptrs: &'a GpuTensor,
     dummy_gate_up: Option<&'a GpuTensor>,
@@ -214,21 +238,20 @@ pub struct MoeExpertRef<'a> {
     expert_m: usize,
     expert_k: usize,
     owned: &'a [usize],
+    ownership_partition: &'a [(usize, usize, usize)],
+    router_identity: &'a str,
     collective_kind: Option<hipfire_hardware::DimKind>,
     owner_rank: usize,
     group_devices: &'a [usize],
     mesh_epoch: MeshEpoch,
 }
-impl<'a> MoeExpertRef<'a> {
-    /// Bind a pointer-table view to metadata already resolved by an owner.
-    ///
-    /// This constructor deliberately accepts borrowed tables only. Runtime
-    /// owners should expose a narrower `bind_*` method that supplies the
-    /// canonical values from its sealed plan; no family receives an allocator
-    /// or a `WeightStore` representation.
+
+impl<'a> MoeExpertRefBinding<'a> {
+    /// Runtime-plan bridge. The returned binding is opaque to callers and can
+    /// only be consumed by [`MoeExpertRef::from_binding`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn from_resolved(
+    pub fn from_plan(
         gate_up_ptrs: &'a GpuTensor,
         down_ptrs: &'a GpuTensor,
         dummy_gate_up: Option<&'a GpuTensor>,
@@ -237,6 +260,8 @@ impl<'a> MoeExpertRef<'a> {
         expert_m: usize,
         expert_k: usize,
         owned: &'a [usize],
+        ownership_partition: &'a [(usize, usize, usize)],
+        router_identity: &'a str,
         collective_kind: Option<hipfire_hardware::DimKind>,
         owner_rank: usize,
         group_devices: &'a [usize],
@@ -251,10 +276,56 @@ impl<'a> MoeExpertRef<'a> {
             expert_m,
             expert_k,
             owned,
+            ownership_partition,
+            router_identity,
             collective_kind,
             owner_rank,
             group_devices,
             mesh_epoch,
+        }
+    }
+}
+
+/// Borrowed view over one resolver-owned rank-local expert table.
+///
+/// The view contains no allocation handle, source path, or storage owner. It
+/// is created from an opaque plan binding and borrowed by a Step until the
+/// owner is dropped.
+pub struct MoeExpertRef<'a> {
+    gate_up_ptrs: &'a GpuTensor,
+    down_ptrs: &'a GpuTensor,
+    dummy_gate_up: Option<&'a GpuTensor>,
+    dtype: DType,
+    n_experts: usize,
+    expert_m: usize,
+    expert_k: usize,
+    owned: &'a [usize],
+    ownership_partition: &'a [(usize, usize, usize)],
+    router_identity: &'a str,
+    collective_kind: Option<hipfire_hardware::DimKind>,
+    owner_rank: usize,
+    group_devices: &'a [usize],
+    mesh_epoch: MeshEpoch,
+}
+
+impl<'a> MoeExpertRef<'a> {
+    /// Consume an opaque plan binding into an executable expert view.
+    pub fn from_binding(binding: MoeExpertRefBinding<'a>) -> Self {
+        Self {
+            gate_up_ptrs: binding.gate_up_ptrs,
+            down_ptrs: binding.down_ptrs,
+            dummy_gate_up: binding.dummy_gate_up,
+            dtype: binding.dtype,
+            n_experts: binding.n_experts,
+            expert_m: binding.expert_m,
+            expert_k: binding.expert_k,
+            owned: binding.owned,
+            ownership_partition: binding.ownership_partition,
+            router_identity: binding.router_identity,
+            collective_kind: binding.collective_kind,
+            owner_rank: binding.owner_rank,
+            group_devices: binding.group_devices,
+            mesh_epoch: binding.mesh_epoch,
         }
     }
 
@@ -289,6 +360,14 @@ impl<'a> MoeExpertRef<'a> {
     pub fn owned(&self) -> &'a [usize] {
         self.owned
     }
+    pub fn ownership_partition(&self) -> &'a [(usize, usize, usize)] {
+        self.ownership_partition
+    }
+
+    pub fn router_identity(&self) -> &'a str {
+        self.router_identity
+    }
+
 
     pub fn collective_kind(&self) -> Option<hipfire_hardware::DimKind> {
         self.collective_kind
@@ -319,22 +398,40 @@ impl<'a> MoeExpertRef<'a> {
                 "MoeExpertRef: expert dimensions must be nonzero".into(),
             ));
         }
+        if self.router_identity.is_empty() {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: router identity is empty".into(),
+            ));
+        }
         let pointer_slots = self
             .n_experts
             .checked_mul(2)
             .ok_or_else(|| DispatchError::Hip("MoeExpertRef: pointer-table size overflows".into()))?;
+        let pointer_bytes = pointer_slots
+            .checked_mul(DType::F32.size())
+            .ok_or_else(|| DispatchError::Hip("MoeExpertRef: pointer-table bytes overflow".into()))?;
         if self.gate_up_ptrs.dtype != DType::F32
             || self.down_ptrs.dtype != DType::F32
             || self.gate_up_ptrs.shape.as_slice() != [pointer_slots]
             || self.down_ptrs.shape.as_slice() != [pointer_slots]
+            || self.gate_up_ptrs.buf.size() < pointer_bytes
+            || self.down_ptrs.buf.size() < pointer_bytes
         {
             return Err(DispatchError::Hip(format!(
-                "MoeExpertRef: pointer tables must be F32 [2*{}]",
+                "MoeExpertRef: pointer tables must be F32 [2*{}] with {pointer_bytes} bytes",
                 self.n_experts
             )));
         }
         if let Some(dummy) = self.dummy_gate_up {
-            if dummy.dtype != DType::F32 || dummy.numel() == 0 {
+            let dummy_elements = dummy
+                .shape
+                .iter()
+                .try_fold(1usize, |elements, dimension| elements.checked_mul(*dimension))
+                .ok_or_else(|| DispatchError::Hip("MoeExpertRef: dummy table shape overflows".into()))?;
+            let dummy_bytes = dummy_elements
+                .checked_mul(DType::F32.size())
+                .ok_or_else(|| DispatchError::Hip("MoeExpertRef: dummy table bytes overflow".into()))?;
+            if dummy.dtype != DType::F32 || dummy_elements == 0 || dummy.buf.size() < dummy_bytes {
                 return Err(DispatchError::Hip(
                     "MoeExpertRef: dummy gate/up table is invalid".into(),
                 ));
@@ -373,6 +470,37 @@ impl<'a> MoeExpertRef<'a> {
                 "MoeExpertRef: parallel owner view requires at least two ranks".into(),
             ));
         }
+        if self.ownership_partition.is_empty() {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: ownership partition is empty".into(),
+            ));
+        }
+        let mut previous_placement = None;
+        for &(global_id, owner, local_slot) in self.ownership_partition {
+            if global_id >= self.n_experts || owner >= self.group_devices.len() {
+                return Err(DispatchError::Hip(
+                    "MoeExpertRef: ownership partition contains an invalid placement".into(),
+                ));
+            }
+            let placement = (global_id, owner, local_slot);
+            if previous_placement.is_some_and(|previous| placement <= previous) {
+                return Err(DispatchError::Hip(
+                    "MoeExpertRef: ownership partition is not canonical".into(),
+                ));
+            }
+            previous_placement = Some(placement);
+        }
+        if self
+            .ownership_partition
+            .iter()
+            .filter(|(_, owner, _)| *owner == self.owner_rank)
+            .map(|(global_id, _, _)| *global_id)
+            .ne(self.owned.iter().copied())
+        {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: rank view does not match ownership partition".into(),
+            ));
+        }
         if self.owned.is_empty() {
             return Err(DispatchError::Hip(
                 "MoeExpertRef: owner view has no experts".into(),
@@ -404,7 +532,11 @@ impl<'a> MoeExpertRef<'a> {
         down_shape: &[usize],
     ) -> Result<(), DispatchError> {
         self.validate()?;
-        let expected_gate_up = [2 * self.expert_m, self.expert_k];
+        let gate_m = self
+            .expert_m
+            .checked_mul(2)
+            .ok_or_else(|| DispatchError::Hip("MoeExpertRef: gate/up shape overflows".into()))?;
+        let expected_gate_up = [gate_m, self.expert_k];
         let expected_down = [self.expert_k, self.expert_m];
         if gate_up_shape != expected_gate_up || down_shape != expected_down {
             return Err(DispatchError::Hip(format!(
@@ -1904,14 +2036,25 @@ mod tests {
         assert!(!r.use_gpu_topk);
     }
  
+    fn tensor(shape: Vec<usize>) -> GpuTensor {
+        let elements = shape.iter().product::<usize>();
+        let mut tensor = GpuTensor::null_for_test();
+        tensor.buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                std::ptr::null_mut(),
+                elements
+                    .checked_mul(DType::F32.size())
+                    .expect("test tensor bytes"),
+            )
+        };
+        tensor.shape = shape;
+        tensor
+    }
     #[test]
     fn typed_router_preserves_selection_and_normalization_contract() {
-        let mut scores = GpuTensor::null_for_test();
-        scores.shape = vec![8];
-        let mut indices = GpuTensor::null_for_test();
-        indices.shape = vec![8];
-        let mut weights = GpuTensor::null_for_test();
-        weights.shape = vec![8];
+        let scores = tensor(vec![8]);
+        let indices = tensor(vec![8]);
+        let weights = tensor(vec![8]);
         let plan = RouterPlan::SoftmaxTopK {
             scores: &scores,
             topk_indices: &indices,
@@ -1927,13 +2070,12 @@ mod tests {
 
     #[test]
     fn expert_ref_rejects_shape_and_owner_mismatch() {
-        let mut gate_ptrs = GpuTensor::null_for_test();
-        gate_ptrs.shape = vec![8];
-        let mut down_ptrs = GpuTensor::null_for_test();
-        down_ptrs.shape = vec![8];
+        let gate_ptrs = tensor(vec![8]);
+        let down_ptrs = tensor(vec![8]);
         let mesh = hipfire_hardware::DeviceMesh::rect(&[(hipfire_hardware::DimKind::Ep, 2)])
             .unwrap();
-        let experts = MoeExpertRef::from_resolved(
+        let partition = [(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 1, 1)];
+        let experts = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
             &gate_ptrs,
             &down_ptrs,
             None,
@@ -1942,18 +2084,20 @@ mod tests {
             64,
             128,
             &[0, 2],
+            &partition,
+            "router",
             Some(hipfire_hardware::DimKind::Ep),
             0,
             &[0, 1],
             mesh.epoch(),
-        );
+        ));
         experts
             .validate_projection_shapes(&[128, 128], &[128, 64])
             .unwrap();
         assert!(experts
             .validate_projection_shapes(&[64, 128], &[128, 64])
             .is_err());
-        let unknown = MoeExpertRef::from_resolved(
+        let unknown = MoeExpertRef::from_binding(MoeExpertRefBinding::from_plan(
             &gate_ptrs,
             &down_ptrs,
             None,
@@ -1962,11 +2106,13 @@ mod tests {
             64,
             128,
             &[4],
+            &partition,
+            "router",
             Some(hipfire_hardware::DimKind::Ep),
             0,
             &[0, 1],
             mesh.epoch(),
-        );
+        ));
         assert!(unknown.validate().is_err());
     }
 
