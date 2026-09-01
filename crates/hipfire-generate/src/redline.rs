@@ -3292,6 +3292,10 @@ pub fn handle_redline_shadow(
         let started = Instant::now();
         let mut gpu_us = 0.0;
         for i in 0..iterations {
+            bundle
+                .kv_cache
+                .ensure_mapped_capacity(gpu, position(i).saturating_add(1))
+                .map_err(|error| error.to_string())?;
             qwen35::prepare_scratch_inputs(
                 gpu,
                 &bundle.weights,
