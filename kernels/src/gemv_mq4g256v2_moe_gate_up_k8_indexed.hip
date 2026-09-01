@@ -52,8 +52,18 @@
 // hi == lo, giving 0 * q + zero == zero. That is the intended constant-group
 // value and needs no special case here.
 
+// Kernel-name macro: default keeps the incumbent exported symbol. Candidate
+// modules redefine HIPFIRE_MQ4V2_GATE_UP_KERNEL before including this TU.
+#ifndef HIPFIRE_MQ4V2_GATE_UP_KERNEL
+#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed
+#endif
+
+#if defined(HIPFIRE_MQ4V2_GATE_UP_NOLDS)
+__launch_bounds__(32, 8)
+#else
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed(
+#endif
+extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
     const int* __restrict__ topk_indices,                // [k_top]
     const float* __restrict__ x,                         // [K]
@@ -66,6 +76,13 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed(
     const int krank = blockIdx.y;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_MQ4V2_GATE_UP_NOLDS)
+    // Candidate exact-shape arm (K=2048 gfx1100): no LDS staging, no barrier.
+    // Dead rows (row >= mi) exit before any work; x is read from global only.
+    // One-wave/row arithmetic below is unchanged vs the incumbent path.
+    if (row >= mi) return;
+    const float* __restrict__ xsrc = x;
+#else
     // Stage x into LDS before any early-return so all 32 lanes hit the barrier.
     // Cap at 2048 (A3B hidden); larger K falls back to global x (value-identical).
     __shared__ float xs[2048];
@@ -102,12 +119,13 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed(
 
     if (row >= mi) return;
 
+    const float* __restrict__ xsrc = use_lds ? xs : x;
+#endif
+
     // Read expert_id from device and index into the pointer table.
     const int expert_id = topk_indices[krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
-
-    const float* __restrict__ xsrc = use_lds ? xs : x;
 
     const int groups_per_row = K / 256;
     const char* gate_ptr = A + (long long)row * groups_per_row * 136;

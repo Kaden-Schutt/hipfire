@@ -14,27 +14,29 @@
 //! untouched and out of scope (leanup map, §6); this only changes where the
 //! fixture code lives.
 
-use std::any::Any;
-use std::io::Read;
-use crate::common::*;
 use crate::batch::emit_uncorrelated_error;
-use hipfire_loader::LoadedModel;
-use std::time::Instant;
-use hipfire_engine::redline::{
-    redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
-    redline_capture_json, redline_hash, RedlineRegionHash,
-};
-use hipfire_arch_qwen35::carrier::Qwen35Bundle;
+use crate::common::*;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_qwen35::carrier::Qwen35Bundle;
+use hipfire_arch_qwen35::dflash_verify_pm4::{
+    DflashVerifyPm4, DflashVerifyPm4Phase, DFLASH_VERIFY_PM4_BLOCK,
+};
 use hipfire_arch_qwen35::qwen35;
-use hipfire_arch_qwen35::dflash_verify_pm4::{DflashVerifyPm4, DflashVerifyPm4Phase, DFLASH_VERIFY_PM4_BLOCK};
 use hipfire_arch_qwen35::speculative::{
     verify_dflash_block, verify_dflash_block_retained, DeltaNetSnapshot, GdnTape,
     HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
+use hipfire_engine::redline::{
+    redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
+    redline_capture_json, redline_hash, RedlineRegionHash,
+};
 use hipfire_loader::spec_build::Qwen35SlotGuard;
+use hipfire_loader::LoadedModel;
 use rdna_compute::replay::ReplayQuiescence;
+use std::any::Any;
+use std::io::Read;
+use std::time::Instant;
 #[derive(PartialEq)]
 pub struct RedlineQwenSnapshot {
     pub logits: Vec<u8>,
@@ -138,6 +140,15 @@ impl RedlineSnapshot {
         }
     }
 
+    /// Q8 GatedDeltaNet stochastic-rounding frame. Non-Qwen snapshots do not
+    /// carry this host-side state and therefore compare as `None`.
+    pub fn gdn_frame(&self) -> Option<u32> {
+        match self {
+            Self::Qwen(snapshot) => Some(snapshot.gdn_frame),
+            Self::Deepseek4(_) | Self::Lfm2Moe(_) => None,
+        }
+    }
+
     pub fn json(&self) -> serde_json::Value {
         match self {
             Self::Qwen(snapshot) => snapshot.json(),
@@ -145,6 +156,13 @@ impl RedlineSnapshot {
             Self::Lfm2Moe(snapshot) => snapshot.json(),
         }
     }
+}
+
+fn redline_snapshots_bit_exact(lhs: &RedlineSnapshot, rhs: &RedlineSnapshot) -> bool {
+    lhs.logits() == rhs.logits()
+        && lhs.kv() == rhs.kv()
+        && lhs.recurrent() == rhs.recurrent()
+        && lhs.gdn_frame() == rhs.gdn_frame()
 }
 
 pub fn redline_qwen_snapshot(
@@ -427,15 +445,17 @@ pub fn redline_snapshot(
         .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<Qwen35Bundle>())
     {
         redline_qwen_snapshot(gpu, bundle).map(RedlineSnapshot::Qwen)
-    } else if let Some(bundle) = loaded.state.as_ref().and_then(|s| {
-        (s.as_ref() as &dyn Any)
-            .downcast_ref::<deepseek4::Deepseek4Bundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_ref()
+        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<deepseek4::Deepseek4Bundle>())
+    {
         redline_deepseek4_snapshot(gpu, bundle).map(RedlineSnapshot::Deepseek4)
-    } else if let Some(bundle) = loaded.state.as_ref().and_then(|s| {
-        (s.as_ref() as &dyn Any)
-            .downcast_ref::<lfm2moe::Lfm2MoeBundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_ref()
+        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<lfm2moe::Lfm2MoeBundle>())
+    {
         if !bundle.config.is_dense() {
             return Err("retained snapshot requires dense LFM".to_string());
         }
@@ -634,7 +654,9 @@ pub fn redline_prime_deepseek4(
         pbs,
         ..
     } = bundle;
-    let pbs = pbs.as_mut().ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+    let pbs = pbs
+        .as_mut()
+        .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
     deepseek4::forward::forward_prefill_batch_chunked(
         config, weights, state, gpu, &synthetic, 0, pbs,
     )?;
@@ -669,22 +691,25 @@ pub fn redline_prime_retained_fixture(
     loaded: &mut LoadedModel,
     context: usize,
 ) -> Result<(), String> {
-    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<Qwen35Bundle>()
-    }) {
+    if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<Qwen35Bundle>())
+    {
         redline_reset_qwen(gpu, bundle)?;
         redline_prime_qwen(gpu, bundle, context)
-    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<deepseek4::Deepseek4Bundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<deepseek4::Deepseek4Bundle>())
+    {
         redline_reset_deepseek4(gpu, bundle)?;
         redline_prime_deepseek4(gpu, bundle, context)
-    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<lfm2moe::Lfm2MoeBundle>())
+    {
         if !bundle.config.is_dense() {
             return Err("retained fixture requires dense LFM".to_string());
         }
@@ -723,10 +748,11 @@ pub fn redline_prepare_retained_fixture(
     token_id: u32,
     context: usize,
 ) -> Result<(), String> {
-    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<Qwen35Bundle>()
-    }) {
+    if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<Qwen35Bundle>())
+    {
         qwen35::prepare_scratch_inputs(
             gpu,
             &bundle.weights,
@@ -736,10 +762,11 @@ pub fn redline_prepare_retained_fixture(
             &bundle.scratch,
         )
         .map_err(|error| error.to_string())
-    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<deepseek4::Deepseek4Bundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<deepseek4::Deepseek4Bundle>())
+    {
         bundle.state.n_tokens = context as u64;
         deepseek4::forward::prepare_retained_decode_inputs(
             &bundle.config,
@@ -749,10 +776,11 @@ pub fn redline_prepare_retained_fixture(
             token_id,
             context as u32,
         )
-    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<lfm2moe::Lfm2MoeBundle>())
+    {
         if !bundle.config.is_dense() {
             return Err("retained fixture requires dense LFM".to_string());
         }
@@ -775,10 +803,11 @@ pub fn redline_run_direct_fixture(
     context: usize,
     iterations: usize,
 ) -> Result<(), String> {
-    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<Qwen35Bundle>()
-    }) {
+    if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<Qwen35Bundle>())
+    {
         for index in 0..iterations {
             qwen35::forward_scratch(
                 gpu,
@@ -793,10 +822,11 @@ pub fn redline_run_direct_fixture(
             .map_err(|error| error.to_string())?;
         }
         Ok(())
-    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<deepseek4::Deepseek4Bundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<deepseek4::Deepseek4Bundle>())
+    {
         for index in 0..iterations {
             bundle.state.n_tokens = (context + index) as u64;
             deepseek4::forward::decode_step(
@@ -809,10 +839,11 @@ pub fn redline_run_direct_fixture(
             )?;
         }
         Ok(())
-    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any)
-            .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
-    }) {
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<lfm2moe::Lfm2MoeBundle>())
+    {
         if !bundle.config.is_dense() {
             return Err("retained fixture requires dense LFM".to_string());
         }
@@ -849,7 +880,9 @@ pub fn redline_bench_decode_deepseek4(
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1
         || loaded.ep.is_some()
-        || !loaded.state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        || !loaded.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        })
     {
         return Err("bench_decode requires a loaded single-GPU DeepSeek4 model".to_string());
     }
@@ -888,7 +921,9 @@ pub fn redline_bench_decode_deepseek4(
 
     loaded.seq_pos = 0;
     loaded.conversation_tokens.clear();
-    let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) else {
+    let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) else {
         unreachable!()
     };
     redline_reset_deepseek4(gpu, bundle)?;
@@ -1040,7 +1075,9 @@ pub fn redline_bench_decode_lfm2moe(
         // The first product warmup must still materialize lazy allocations and
         // record the route; later requests replay from their first timed token.
         if capture || (product_route && gpu.replay.prepared_route_identity().is_some()) {
-            if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+            if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
                 bundle.state.retained_warmed_up = true;
             }
         }
@@ -1056,7 +1093,13 @@ pub fn redline_bench_decode_lfm2moe(
                 .map_err(|error| error.to_string())?;
             let started = Instant::now();
             {
-                let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+                let bundle = match loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any)
+                        .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                }) {
+                    Some(bundle) => bundle,
+                    None => unreachable!(),
+                };
                 lfm2moe::forward::run_retained_decode_body(
                     &bundle.config,
                     &bundle.weights,
@@ -1077,7 +1120,12 @@ pub fn redline_bench_decode_lfm2moe(
             capture_started = false;
             loaded.seq_pos = 0;
             loaded.conversation_tokens.clear();
-            let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+            let bundle = match loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
+                Some(bundle) => bundle,
+                None => unreachable!(),
+            };
             redline_reset_lfm2moe(gpu, bundle)?;
             let mut response = serde_json::json!({
                 "type": "decode_result",
@@ -1103,7 +1151,13 @@ pub fn redline_bench_decode_lfm2moe(
                 let token = 101 + (i as u32 % 1000);
                 let pos = (context + i) as u32;
                 {
-                    let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+                    let bundle = match loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
+                        Some(bundle) => bundle,
+                        None => unreachable!(),
+                    };
                     lfm2moe::forward::decode_step(
                         &bundle.config,
                         &bundle.weights,
@@ -1123,7 +1177,12 @@ pub fn redline_bench_decode_lfm2moe(
             let replay_after = gpu.replay.replay_observation();
             loaded.seq_pos = 0;
             loaded.conversation_tokens.clear();
-            let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+            let bundle = match loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
+                Some(bundle) => bundle,
+                None => unreachable!(),
+            };
             redline_reset_lfm2moe(gpu, bundle)?;
             let mut response = serde_json::json!({
                 "type": "decode_result",
@@ -1178,7 +1237,13 @@ pub fn redline_bench_decode_lfm2moe(
                 let pos = context + i;
                 redline_prepare_retained_fixture(gpu, loaded, token, pos)?;
                 {
-                    let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+                    let bundle = match loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
+                        Some(bundle) => bundle,
+                        None => unreachable!(),
+                    };
                     lfm2moe::forward::run_retained_decode_body(
                         &bundle.config,
                         &bundle.weights,
@@ -1196,7 +1261,12 @@ pub fn redline_bench_decode_lfm2moe(
             let elapsed = started.elapsed().as_secs_f64();
             loaded.seq_pos = 0;
             loaded.conversation_tokens.clear();
-            let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+            let bundle = match loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
+                Some(bundle) => bundle,
+                None => unreachable!(),
+            };
             redline_reset_lfm2moe(gpu, bundle)?;
             Ok(serde_json::json!({
                 "type": "decode_result",
@@ -1217,7 +1287,9 @@ pub fn redline_bench_decode_lfm2moe(
             // Ensure host state is cleaned even on failure.
             loaded.seq_pos = 0;
             loaded.conversation_tokens.clear();
-            if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+            if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
                 let _ = redline_reset_lfm2moe(gpu, bundle);
             } else {
                 let _ = gpu.hip.device_synchronize();
@@ -1236,7 +1308,9 @@ pub fn redline_shadow_deepseek4(
 ) -> Result<serde_json::Value, String> {
     let is_ds4 = loaded.pp == 1
         && loaded.ep.is_none()
-        && loaded.state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>());
+        && loaded.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        });
     let is_lfm = redline_is_dense_lfm(loaded);
     if !is_ds4 && !is_lfm {
         return Err(
@@ -1302,9 +1376,9 @@ pub fn redline_shadow_deepseek4(
             let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
             let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
             let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
-            let blob_bit_exact = aql_snapshot.logits() == blob_snapshot.logits()
-                && aql_snapshot.kv() == blob_snapshot.kv()
-                && aql_snapshot.recurrent() == blob_snapshot.recurrent();
+            let gdn_frame_equal = aql_snapshot.gdn_frame() == hip_snapshot.gdn_frame();
+            let blob_gdn_frame_equal = aql_snapshot.gdn_frame() == blob_snapshot.gdn_frame();
+            let blob_bit_exact = redline_snapshots_bit_exact(&aql_snapshot, &blob_snapshot);
             Ok(serde_json::json!({
                 "type": "redline_shadow_result",
                 "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
@@ -1314,11 +1388,13 @@ pub fn redline_shadow_deepseek4(
                 "packets": prepared.1,
                 "queue_id": prepared.2,
                 "command_dwords": prepared.3,
-                "bit_exact": logits_equal && kv_equal && recurrent_equal,
+                "bit_exact": redline_snapshots_bit_exact(&aql_snapshot, &hip_snapshot),
                 "blob_bit_exact": blob_bit_exact,
                 "logits_equal": logits_equal,
                 "kv_equal": kv_equal,
                 "recurrent_equal": recurrent_equal,
+                "gdn_frame_equal": gdn_frame_equal,
+                "blob_gdn_frame_equal": blob_gdn_frame_equal,
                 "aql_host_us": aql_host_us,
                 "aql_gpu_us": gpu_us,
                 "hip_host_us": hip_host_us,
@@ -1331,7 +1407,10 @@ pub fn redline_shadow_deepseek4(
             Ok(value) => Ok(value),
             Err(error) => {
                 rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
-                if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) {
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any)
+                        .downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+                }) {
                     let _ = redline_reset_deepseek4(gpu, bundle);
                     let _ = gpu.hip.device_synchronize();
                 }
@@ -1367,14 +1446,20 @@ pub fn redline_shadow_deepseek4(
                     .map_err(|error| error.to_string())?;
                 if pm4 {
                     let timing = unsafe { gpu.replay.replay_pm4(context + index) }?;
-                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
                         bundle.state.n_tokens = context + index + 1;
                         loaded.seq_pos = context + index + 1;
                     }
                     gpu_us += timing.span_microseconds();
                 } else {
                     let timing = unsafe { gpu.replay.replay_linear_aql(context + index) }?;
-                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
                         bundle.state.n_tokens = context + index + 1;
                         loaded.seq_pos = context + index + 1;
                     }
@@ -1391,7 +1476,10 @@ pub fn redline_shadow_deepseek4(
                 redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
                 gpu.replay_recorded_hip_prefix(prepared.0)
                     .map_err(|error| error.to_string())?;
-                if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any)
+                        .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                }) {
                     bundle.state.n_tokens = context + index + 1;
                     loaded.seq_pos = context + index + 1;
                 }
@@ -1415,9 +1503,9 @@ pub fn redline_shadow_deepseek4(
             let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
             let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
             let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
-            let blob_bit_exact = aql_snapshot.logits() == blob_snapshot.logits()
-                && aql_snapshot.kv() == blob_snapshot.kv()
-                && aql_snapshot.recurrent() == blob_snapshot.recurrent();
+            let gdn_frame_equal = aql_snapshot.gdn_frame() == hip_snapshot.gdn_frame();
+            let blob_gdn_frame_equal = aql_snapshot.gdn_frame() == blob_snapshot.gdn_frame();
+            let blob_bit_exact = redline_snapshots_bit_exact(&aql_snapshot, &blob_snapshot);
             Ok(serde_json::json!({
                 "type": "redline_shadow_result",
                 "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
@@ -1427,11 +1515,13 @@ pub fn redline_shadow_deepseek4(
                 "packets": prepared.1,
                 "queue_id": prepared.2,
                 "command_dwords": prepared.3,
-                "bit_exact": logits_equal && kv_equal && recurrent_equal,
+                "bit_exact": redline_snapshots_bit_exact(&aql_snapshot, &hip_snapshot),
                 "blob_bit_exact": blob_bit_exact,
                 "logits_equal": logits_equal,
                 "kv_equal": kv_equal,
                 "recurrent_equal": recurrent_equal,
+                "gdn_frame_equal": gdn_frame_equal,
+                "blob_gdn_frame_equal": blob_gdn_frame_equal,
                 "aql_host_us": aql_host_us,
                 "aql_gpu_us": gpu_us,
                 "hip_host_us": hip_host_us,
@@ -1443,7 +1533,10 @@ pub fn redline_shadow_deepseek4(
         match inner {
             Ok(value) => {
                 rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
-                if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any)
+                        .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                }) {
                     let _ = redline_reset_lfm2moe(gpu, bundle);
                     loaded.seq_pos = 0;
                     loaded.conversation_tokens.clear();
@@ -1453,7 +1546,10 @@ pub fn redline_shadow_deepseek4(
             }
             Err(error) => {
                 rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
-                if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any)
+                        .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                }) {
                     let _ = redline_reset_lfm2moe(gpu, bundle);
                     loaded.seq_pos = 0;
                     loaded.conversation_tokens.clear();
@@ -1494,7 +1590,12 @@ pub fn redline_prime_dspark_shadow_arm(
     loaded: &mut LoadedModel,
     context: usize,
 ) -> Result<(), String> {
-    let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => return Err("DSpark shadow requires DeepSeek4".to_string()), };
+    let bundle = match loaded.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) {
+        Some(bundle) => bundle,
+        None => return Err("DSpark shadow requires DeepSeek4".to_string()),
+    };
     redline_reset_deepseek4(gpu, bundle)?;
     redline_prime_deepseek4(gpu, bundle, context)?;
     Ok(())
@@ -1515,7 +1616,12 @@ pub fn redline_run_dspark_direct_arm(
     capture_safe: bool,
 ) -> Result<RedlineDsparkArm, String> {
     redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
-    let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+    let bundle = match loaded.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) {
+        Some(bundle) => bundle,
+        None => unreachable!(),
+    };
     let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
     let started = Instant::now();
     let mut picks = Vec::with_capacity(batch * iterations);
@@ -1553,7 +1659,12 @@ pub fn redline_run_dspark_capture_arm(
     String,
 > {
     redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
-    let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+    let bundle = match loaded.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) {
+        Some(bundle) => bundle,
+        None => unreachable!(),
+    };
     let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
     let started = Instant::now();
     let first_block = redline_dspark_shadow_block(0, batch);
@@ -1603,7 +1714,12 @@ pub fn redline_run_dspark_replay_arm(
     route: RedlineDsparkReplayArm,
 ) -> Result<RedlineDsparkArm, String> {
     redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
-    let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+    let bundle = match loaded.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) {
+        Some(bundle) => bundle,
+        None => unreachable!(),
+    };
     let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
     let started = Instant::now();
     let mut picks = Vec::with_capacity(batch * iterations);
@@ -1651,7 +1767,9 @@ pub fn redline_shadow_dspark_verify_pm4(
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1
         || loaded.ep.is_some()
-        || !loaded.state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        || !loaded.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        })
     {
         return Err("DSpark shadow requires a loaded single-GPU DeepSeek4 model".to_string());
     }
@@ -1669,7 +1787,12 @@ pub fn redline_shadow_dspark_verify_pm4(
         ));
     }
     {
-        let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+        let bundle = match loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        }) {
+            Some(bundle) => bundle,
+            None => unreachable!(),
+        };
         if bundle.weights.dspark.is_none() {
             return Err("DSpark shadow requires a loaded DSpark sidecar".to_string());
         }
@@ -1680,7 +1803,12 @@ pub fn redline_shadow_dspark_verify_pm4(
     // a guard snapshot or starts recording.
     redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
     {
-        let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => unreachable!(), };
+        let bundle = match loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        }) {
+            Some(bundle) => bundle,
+            None => unreachable!(),
+        };
         let warm_block = redline_dspark_shadow_block(0, batch);
         let _ = bundle.redline_dspark_verify_direct(gpu, &warm_block, context, false)?;
     }
@@ -1768,7 +1896,9 @@ pub fn redline_shadow_dspark_verify_pm4(
         "captured_hip": captured_hip.json(),
         "pm4": pm4.json(),
     });
-    if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) {
+    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) {
         redline_reset_deepseek4(gpu, bundle)?;
     }
     Ok(response)
@@ -1785,7 +1915,9 @@ pub fn redline_pm4_prefix_profile_deepseek4(
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1
         || loaded.ep.is_some()
-        || !loaded.state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        || !loaded.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        })
     {
         return Err("prefix profile requires a loaded single-GPU DeepSeek4 model".to_string());
     }
@@ -1916,9 +2048,7 @@ pub fn handle_redline_dspark_shadow_pm4(
         .as_mut()
         .ok_or_else(|| "DSpark shadow requires a loaded model".to_string())
         .and_then(|loaded| {
-            redline_shadow_dspark_verify_pm4(
-                gpu, loaded, context, batch, iterations,
-            )
+            redline_shadow_dspark_verify_pm4(gpu, loaded, context, batch, iterations)
         });
     match response {
         Ok(response) => {
@@ -1940,11 +2070,15 @@ pub fn handle_redline_dspark_shadow_pm4(
 
 const DFLASH_SHADOW_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
 
-/// Unconditional Q8 byte parity is not a correctness oracle: Q8 DeltaNet
-/// uses stochastic rounding keyed on the GDN frame. Every arm resets the
-/// same frame checkpoint; tokens/argmax/indices stay bit-exact, and
-/// dequantized recurrent/hidden/logit regions are claim-scoped max-abs/rel.
+/// Legacy stochastic Q8 (no error-feedback residual) is not a byte-parity
+/// oracle: GDN requant uses stochastic rounding keyed on the frame. Retained
+/// only when `StateQuant::Q8` runs without EF. Deterministic Q8+EF and non-Q8
+/// state claim bit-exact recurrent bytes instead.
 const DFLASH_Q8_BYTE_PARITY_INVALID: &str = "unconditional Q8 recurrent-state byte parity is not a correctness oracle (stochastic GDN rounding); arms share a GDN frame checkpoint and compare tokens/argmax/indices bit-exact plus claim-scoped max-abs/rel on dequantized regions";
+
+/// Deterministic recurrent state (Q8+EF residual or non-Q8) may claim
+/// bit-exact DeltaNet bytes across arms, including the EF residual itself.
+const DFLASH_DETERMINISTIC_BYTE_PARITY: &str = "deterministic DeltaNet state (Q8 error-feedback residual or non-Q8) admits bit-exact recurrent-state byte parity across arms; tokens/argmax/indices stay bit-exact and claim-scoped max-abs/rel cover dequantized regions";
 
 struct RedlineDflashFixtures {
     hidden_rb: HiddenStateRingBuffer,
@@ -1975,9 +2109,11 @@ struct RedlineDflashWindowSnap {
     dn_s_after_forward: Vec<u8>,
     dn_scales_after_forward: Vec<u8>,
     dn_conv_after_forward: Vec<u8>,
+    dn_ef_after_forward: Vec<u8>,
     dn_s_after_rollback: Vec<u8>,
     dn_scales_after_rollback: Vec<u8>,
     dn_conv_after_rollback: Vec<u8>,
+    dn_ef_after_rollback: Vec<u8>,
     kv_active_hash: u64,
     kv_guard: Vec<u8>,
     hidden_staging: Vec<u8>,
@@ -2170,7 +2306,7 @@ fn redline_dflash_zero_fixtures(
 fn redline_append_dn_parts(
     gpu: &rdna_compute::Gpu,
     slot: &ModelSlot,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
     let mut s = Vec::new();
     for tensor in &slot.dn_state.s_matrices {
         redline_append_buffer(gpu, &mut s, &tensor.buf)?;
@@ -2183,7 +2319,11 @@ fn redline_append_dn_parts(
     for tensor in &slot.dn_state.conv_states {
         redline_append_buffer(gpu, &mut conv, &tensor.buf)?;
     }
-    Ok((s, scales, conv))
+    let mut ef = Vec::new();
+    for tensor in &slot.dn_state.s_ef_residual {
+        redline_append_buffer(gpu, &mut ef, &tensor.buf)?;
+    }
+    Ok((s, scales, conv, ef))
 }
 
 fn redline_dflash_kv_regions(
@@ -2198,12 +2338,7 @@ fn redline_dflash_kv_regions(
     let head_dim = slot.config.head_dim.max(1);
     let blocks = (head_dim / 32).max(1);
     let bytes_per_pos = n_kv * blocks * 34;
-    for tensor in slot
-        .kv_cache
-        .k_gpu
-        .iter()
-        .chain(slot.kv_cache.v_gpu.iter())
-    {
+    for tensor in slot.kv_cache.k_gpu.iter().chain(slot.kv_cache.v_gpu.iter()) {
         let mut bytes = Vec::new();
         redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
         mix ^= redline_hash(&bytes);
@@ -2249,8 +2384,8 @@ fn redline_dflash_snapshot_window(
     position: usize,
     tokens: Vec<u32>,
     argmax: Vec<u32>,
-    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>),
-    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>),
+    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
 ) -> Result<RedlineDflashWindowSnap, String> {
     let batch = tokens.len();
     let dim = fixtures.verify_scratch.dim;
@@ -2273,7 +2408,13 @@ fn redline_dflash_snapshot_window(
     )?;
     let mut gdn_qkv = Vec::new();
     for tensor in &fixtures.gdn_tape.qkv_bufs {
-        redline_append_tensor_slice(gpu, &mut gdn_qkv, tensor, 0, batch * fixtures.gdn_tape.qkv_dim)?;
+        redline_append_tensor_slice(
+            gpu,
+            &mut gdn_qkv,
+            tensor,
+            0,
+            batch * fixtures.gdn_tape.qkv_dim,
+        )?;
     }
     let mut gdn_alpha = Vec::new();
     for tensor in &fixtures.gdn_tape.alpha_bufs {
@@ -2301,7 +2442,10 @@ fn redline_dflash_snapshot_window(
         redline_append_tensor_slice(gpu, &mut hidden_staging, tensor, 0, batch * dim)?;
     }
     let mut hidden_ring = Vec::new();
-    let written = fixtures.hidden_rb.written.min(fixtures.hidden_rb.max_positions);
+    let written = fixtures
+        .hidden_rb
+        .written
+        .min(fixtures.hidden_rb.max_positions);
     for tensor in &fixtures.hidden_rb.layer_bufs {
         if written > 0 {
             redline_append_tensor_slice(gpu, &mut hidden_ring, tensor, 0, written * dim)?;
@@ -2320,9 +2464,11 @@ fn redline_dflash_snapshot_window(
         dn_s_after_forward: after_forward.0,
         dn_scales_after_forward: after_forward.1,
         dn_conv_after_forward: after_forward.2,
+        dn_ef_after_forward: after_forward.3,
         dn_s_after_rollback: after_rollback.0,
         dn_scales_after_rollback: after_rollback.1,
         dn_conv_after_rollback: after_rollback.2,
+        dn_ef_after_rollback: after_rollback.3,
         kv_active_hash,
         kv_guard,
         hidden_staging,
@@ -2382,13 +2528,8 @@ fn redline_dflash_recorded_hip(
             .final_hidden
             .sub_offset(i * dim, dim);
         let logits_row = fixtures.verify_scratch.logits.sub_offset(i * vocab, vocab);
-        hipfire_runtime::llama::weight_gemv(
-            gpu,
-            &slot.weights.output,
-            &hidden_row,
-            &logits_row,
-        )
-        .map_err(|e| e.to_string())?;
+        hipfire_runtime::llama::weight_gemv(gpu, &slot.weights.output, &hidden_row, &logits_row)
+            .map_err(|e| e.to_string())?;
         let row = gpu.download_f32(&logits_row).map_err(|e| e.to_string())?;
         argmax.push(
             row.iter()
@@ -2415,18 +2556,20 @@ fn redline_dflash_run_window(
         .save_from(&slot.dn_state, gpu)
         .map_err(|e| e.to_string())?;
     let argmax = match kind {
-        RedlineDflashArmKind::HipAuto => verify_dflash_block(
-            gpu,
-            slot,
-            tokens,
-            position,
-            &mut fixtures.hidden_rb,
-            Some(&mut fixtures.gdn_tape),
-            false,
-            &fixtures.verify_scratch,
-        )
-        .map_err(|e| e.to_string())?
-        .argmax_per_pos,
+        RedlineDflashArmKind::HipAuto => {
+            verify_dflash_block(
+                gpu,
+                slot,
+                tokens,
+                position,
+                &mut fixtures.hidden_rb,
+                Some(&mut fixtures.gdn_tape),
+                false,
+                &fixtures.verify_scratch,
+            )
+            .map_err(|e| e.to_string())?
+            .argmax_per_pos
+        }
         RedlineDflashArmKind::DirectCaptureSafe | RedlineDflashArmKind::Pm4 => {
             verify_dflash_block_retained(
                 gpu,
@@ -2442,13 +2585,11 @@ fn redline_dflash_run_window(
             .map_err(|e| e.to_string())?
             .argmax_per_pos
         }
-        RedlineDflashArmKind::RecordedHip => redline_dflash_recorded_hip(
-            gpu, slot, fixtures, route, tokens, position,
-        )?,
+        RedlineDflashArmKind::RecordedHip => {
+            redline_dflash_recorded_hip(gpu, slot, fixtures, route, tokens, position)?
+        }
     };
-    gpu.hip
-        .device_synchronize()
-        .map_err(|e| e.to_string())?;
+    gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
     let after_forward = redline_append_dn_parts(gpu, slot)?;
     let accept_n = tokens.len() / 2;
     fixtures
@@ -2467,9 +2608,7 @@ fn redline_dflash_run_window(
             )
             .map_err(|e| e.to_string())?;
     }
-    gpu.hip
-        .device_synchronize()
-        .map_err(|e| e.to_string())?;
+    gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
     let after_rollback = redline_append_dn_parts(gpu, slot)?;
     redline_dflash_snapshot_window(
         gpu,
@@ -2514,9 +2653,11 @@ fn redline_dflash_compare_window(
         "dn_s_after_forward": err(&reference.dn_s_after_forward, &other.dn_s_after_forward),
         "dn_scales_after_forward": err(&reference.dn_scales_after_forward, &other.dn_scales_after_forward),
         "dn_conv_after_forward": err(&reference.dn_conv_after_forward, &other.dn_conv_after_forward),
+        "dn_ef_after_forward_equal": bit(&reference.dn_ef_after_forward, &other.dn_ef_after_forward),
         "dn_s_after_rollback": err(&reference.dn_s_after_rollback, &other.dn_s_after_rollback),
         "dn_scales_after_rollback": err(&reference.dn_scales_after_rollback, &other.dn_scales_after_rollback),
         "dn_conv_after_rollback": err(&reference.dn_conv_after_rollback, &other.dn_conv_after_rollback),
+        "dn_ef_after_rollback_equal": bit(&reference.dn_ef_after_rollback, &other.dn_ef_after_rollback),
     })
 }
 
@@ -2615,10 +2756,8 @@ pub fn redline_shadow_dflash_verify_pm4(
             &slot.config,
         )
         .map_err(|e| e.to_string())?,
-        gdn_tape: GdnTape::new_for_config(gpu, &slot.config, max_n)
-            .map_err(|e| e.to_string())?,
-        target_snap: DeltaNetSnapshot::new_for(gpu, &slot.dn_state)
-            .map_err(|e| e.to_string())?,
+        gdn_tape: GdnTape::new_for_config(gpu, &slot.config, max_n).map_err(|e| e.to_string())?,
+        target_snap: DeltaNetSnapshot::new_for(gpu, &slot.dn_state).map_err(|e| e.to_string())?,
     };
 
     let mut route = DflashVerifyPm4::armed();
@@ -2635,8 +2774,7 @@ pub fn redline_shadow_dflash_verify_pm4(
         // lead-in windows are not compared.
         let lead_in = 3usize;
         let lead_base = positions[0].saturating_sub(lead_in * batch);
-        let lead_positions: Vec<usize> =
-            (0..lead_in).map(|i| lead_base + i * batch).collect();
+        let lead_positions: Vec<usize> = (0..lead_in).map(|i| lead_base + i * batch).collect();
 
         let mut run_arm = |kind: RedlineDflashArmKind,
                            name: &'static str|
@@ -2713,8 +2851,10 @@ pub fn redline_shadow_dflash_verify_pm4(
         };
 
         let (hip_auto, _, _) = run_arm(RedlineDflashArmKind::HipAuto, "hip_auto")?;
-        let (direct_capture_safe, _, _) =
-            run_arm(RedlineDflashArmKind::DirectCaptureSafe, "direct_capture_safe")?;
+        let (direct_capture_safe, _, _) = run_arm(
+            RedlineDflashArmKind::DirectCaptureSafe,
+            "direct_capture_safe",
+        )?;
         let (recorded_hip, _, _) = run_arm(RedlineDflashArmKind::RecordedHip, "recorded_hip")?;
         let (pm4, mut route, warm_us) = run_arm(RedlineDflashArmKind::Pm4, "pm4")?;
         capture_prepare_us = warm_us;
@@ -2729,7 +2869,6 @@ pub fn redline_shadow_dflash_verify_pm4(
                 .map(|rows| rows.len())
                 .unwrap_or(0);
         }
-
 
         // Two references, deliberately.
         //
@@ -2750,7 +2889,8 @@ pub fn redline_shadow_dflash_verify_pm4(
             row["direct_capture_safe_vs_hip_auto"] =
                 redline_dflash_compare_window(graph_reference, reference, "direct_capture_safe");
             if let Some(other) = recorded_hip.windows.get(idx) {
-                row["recorded_hip"] = redline_dflash_compare_window(reference, other, "recorded_hip");
+                row["recorded_hip"] =
+                    redline_dflash_compare_window(reference, other, "recorded_hip");
             }
             if let Some(other) = pm4.windows.get(idx) {
                 row["pm4"] = redline_dflash_compare_window(reference, other, "pm4");
@@ -2918,6 +3058,18 @@ pub fn redline_shadow_dflash_verify_pm4(
             .as_ref()
             .and_then(|s| s.verify_pm4_report());
 
+        // Q8+EF (default-on) and non-Q8 state are deterministic byte-parity
+        // oracles. Only legacy stochastic Q8 without an EF residual keeps the
+        // invalid-parity warning — decide from StateQuant, not vector emptiness.
+        let is_q8 = matches!(slot.dn_state.quant, qwen35::StateQuant::Q8);
+        let q8_error_feedback_enabled = is_q8 && !slot.dn_state.s_ef_residual.is_empty();
+        let q8_byte_parity_invalid = is_q8 && !q8_error_feedback_enabled;
+        let oracle = if q8_byte_parity_invalid {
+            DFLASH_Q8_BYTE_PARITY_INVALID
+        } else {
+            DFLASH_DETERMINISTIC_BYTE_PARITY
+        };
+
         Ok(serde_json::json!({
             "type": "redline_dflash_shadow_result",
             "backend": "pm4_ib",
@@ -2930,7 +3082,7 @@ pub fn redline_shadow_dflash_verify_pm4(
             "arch_id": loaded.arch_id,
             "physical_cap": loaded.physical_cap,
             "model": redline_artifact_fingerprint(&loaded.model_path),
-            "oracle": DFLASH_Q8_BYTE_PARITY_INVALID,
+            "oracle": oracle,
             "arms": {
                 "hip_auto": redline_dflash_arm_json(&hip_auto),
                 "direct_capture_safe": redline_dflash_arm_json(&direct_capture_safe),
@@ -2938,7 +3090,8 @@ pub fn redline_shadow_dflash_verify_pm4(
                 "pm4": redline_dflash_arm_json(&pm4),
             },
             "parity": {
-                "q8_byte_parity_invalid": true,
+                "q8_error_feedback_enabled": q8_error_feedback_enabled,
+                "q8_byte_parity_invalid": q8_byte_parity_invalid,
                 "windows": parity_windows,
             },
             "capture": {
@@ -3016,13 +3169,7 @@ pub fn handle_redline_dflash_verify_shadow_pm4(
         .as_mut()
         .ok_or_else(|| "DFlash shadow requires a loaded model".to_string())
         .and_then(|loaded| {
-            redline_shadow_dflash_verify_pm4(
-                gpu,
-                loaded,
-                batch,
-                iterations,
-                steady_state_windows,
-            )
+            redline_shadow_dflash_verify_pm4(gpu, loaded, batch, iterations, steady_state_windows)
         });
     match response {
         Ok(response) => {
@@ -3046,8 +3193,7 @@ pub fn handle_redline_shadow(
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut impl std::io::Write,
 ) {
-    let pm4 =
-        msg.get("type").and_then(|value| value.as_str()) == Some("redline_shadow_pm4");
+    let pm4 = msg.get("type").and_then(|value| value.as_str()) == Some("redline_shadow_pm4");
     let context = msg
         .get("context_tokens")
         .and_then(|value| value.as_u64())
@@ -3056,9 +3202,21 @@ pub fn handle_redline_shadow(
         .get("iterations")
         .and_then(|value| value.as_u64())
         .unwrap_or(1) as usize;
+    let position_step = msg
+        .get("position_step")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1) as usize;
+    let position =
+        |iteration: usize| context.saturating_add(iteration.saturating_mul(position_step));
+    let replay_only = pm4
+        && msg
+            .get("replay_only")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
     if model.as_ref().is_some_and(|loaded| {
-        loaded.state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
-            || redline_is_dense_lfm(loaded)
+        loaded.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        }) || redline_is_dense_lfm(loaded)
     }) {
         let loaded = model.as_mut().expect("retained route checked");
         match redline_shadow_deepseek4(gpu, loaded, pm4, context, iterations) {
@@ -3124,28 +3282,34 @@ pub fn handle_redline_shadow(
 
     let aql_result = (|| -> Result<(RedlineQwenSnapshot, f64, f64), String> {
         let loaded = model.as_mut().expect("eligibility checked");
-        let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+        let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) else {
+            unreachable!()
+        };
         redline_reset_qwen(gpu, bundle)?;
         redline_prime_qwen(gpu, bundle, context)?;
         let started = Instant::now();
         let mut gpu_us = 0.0;
         for i in 0..iterations {
+            bundle
+                .kv_cache
+                .ensure_mapped_capacity(gpu, position(i).saturating_add(1))
+                .map_err(|error| error.to_string())?;
             qwen35::prepare_scratch_inputs(
                 gpu,
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
             if pm4 {
-                let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
+                let timing = unsafe { gpu.replay.replay_pm4(position(i)) }?;
                 gpu_us += timing.span_microseconds();
             } else {
-                let timing = unsafe { gpu.replay.replay_linear_aql(context + i) }?;
+                let timing = unsafe { gpu.replay.replay_linear_aql(position(i)) }?;
                 gpu_us += timing.span_microseconds();
             }
         }
@@ -3171,12 +3335,30 @@ pub fn handle_redline_shadow(
             return;
         }
     };
+    if replay_only {
+        let response = serde_json::json!({
+            "type": "redline_shadow_pm4",
+            "replay_only": true,
+            "context_tokens": context,
+            "iterations": iterations,
+            "position_step": position_step,
+            "queue_id": prepared.2,
+            "aql_host_us": aql_host_us,
+            "aql_gpu_us": aql_gpu_us,
+        });
+        let _ = writeln!(stdout, "{response}");
+        let _ = stdout.flush();
+        return;
+    }
 
     let blob_result = (|| -> Result<RedlineQwenSnapshot, String> {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
         let loaded = model.as_mut().expect("eligibility checked");
-        let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+        let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) else {
+            unreachable!()
+        };
         redline_reset_qwen(gpu, bundle)?;
         redline_prime_qwen(gpu, bundle, context)?;
         for i in 0..iterations {
@@ -3185,11 +3367,11 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
-            gpu.replay_recorded_hip_prefix(prepared.0)
+            gpu.replay_recorded_hip_prefix_at(prepared.0, position(i))
                 .map_err(|error| error.to_string())?;
         }
         gpu.hip
@@ -3216,9 +3398,11 @@ pub fn handle_redline_shadow(
     let hip_result = (|| -> Result<(RedlineQwenSnapshot, f64), String> {
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
         let loaded = model.as_mut().expect("eligibility checked");
-        let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+        let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) else {
+            unreachable!()
+        };
         redline_reset_qwen(gpu, bundle)?;
         redline_prime_qwen(gpu, bundle, context)?;
         gpu.hip
@@ -3231,7 +3415,7 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &mut bundle.kv_cache,
                 &mut bundle.dn_state,
                 &bundle.scratch,
@@ -3263,10 +3447,10 @@ pub fn handle_redline_shadow(
     let logits_equal = aql_snapshot.logits == hip_snapshot.logits;
     let kv_equal = aql_snapshot.kv == hip_snapshot.kv;
     let recurrent_equal = aql_snapshot.recurrent == hip_snapshot.recurrent;
-    let bit_exact = logits_equal && kv_equal && recurrent_equal;
-    let blob_bit_exact = aql_snapshot.logits == blob_snapshot.logits
-        && aql_snapshot.kv == blob_snapshot.kv
-        && aql_snapshot.recurrent == blob_snapshot.recurrent;
+    let gdn_frame_equal = aql_snapshot.gdn_frame == hip_snapshot.gdn_frame;
+    let blob_gdn_frame_equal = aql_snapshot.gdn_frame == blob_snapshot.gdn_frame;
+    let bit_exact = aql_snapshot == hip_snapshot;
+    let blob_bit_exact = aql_snapshot == blob_snapshot;
     let _ = writeln!(
         stdout,
         "{}",
@@ -3284,6 +3468,8 @@ pub fn handle_redline_shadow(
             "logits_equal": logits_equal,
             "kv_equal": kv_equal,
             "recurrent_equal": recurrent_equal,
+            "gdn_frame_equal": gdn_frame_equal,
+            "blob_gdn_frame_equal": blob_gdn_frame_equal,
             "aql_host_us": aql_host_us,
             "aql_gpu_us": aql_gpu_us,
             "hip_host_us": hip_host_us,
@@ -3334,7 +3520,7 @@ pub fn handle_redline_dispatch_profile(
             "redline_dispatch_profile requires captured single-GPU Qwen3.5 and sample_replays > 0",
             "unsupported",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return;
@@ -3391,9 +3577,11 @@ pub fn handle_redline_dispatch_profile(
     let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
     let result = (|| -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
         let loaded = model.as_mut().expect("eligibility checked");
-        let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+        let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) else {
+            unreachable!()
+        };
 
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
         redline_reset_qwen(gpu, bundle)?;
@@ -3565,7 +3753,9 @@ pub fn handle_redline_pm4_prefix_profile(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     if model.as_ref().is_some_and(|loaded| {
-        loaded.state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        loaded.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        })
     }) {
         let start = msg
             .get("start")
@@ -3621,7 +3811,7 @@ pub fn handle_redline_pm4_prefix_profile(
             "redline_pm4_prefix_profile requires captured single-GPU Qwen3.5 and valid start/step/repeats",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return;
@@ -3643,9 +3833,11 @@ pub fn handle_redline_pm4_prefix_profile(
         if steady_state {
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
             let loaded = model.as_mut().expect("eligibility checked");
-            let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+            let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) else {
+                unreachable!()
+            };
             redline_reset_qwen(gpu, bundle)?;
             redline_prime_qwen(gpu, bundle, context)?;
         }
@@ -3658,13 +3850,13 @@ pub fn handle_redline_pm4_prefix_profile(
             let mut samples = Vec::with_capacity(repeats);
             for _ in 0..repeats {
                 let loaded = model.as_mut().expect("eligibility checked");
-                let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+                let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                }) else {
+                    unreachable!()
+                };
                 if !steady_state {
-                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
-                        frame_checkpoint,
-                    );
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
                     redline_reset_qwen(gpu, bundle)?;
                     redline_prime_qwen(gpu, bundle, context)?;
                 }
@@ -3761,20 +3953,16 @@ pub fn handle_redline_prefix_shadow(
             Ok(summary) => summary,
             Err(reason) => {
                 if let Some(loaded) = model.as_mut() {
-                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
                         let _ = redline_reset_lfm2moe(gpu, bundle);
                         loaded.seq_pos = 0;
                         let _ = gpu.hip.device_synchronize();
                     }
                 }
-                emit_uncorrelated_error(
-                    stdout,
-                    None,
-                    &reason,
-                    "internal",
-                    false,
-                    false,
-                );
+                emit_uncorrelated_error(stdout, None, &reason, "internal", false, false);
                 let _ = stdout.flush();
                 return;
             }
@@ -3794,7 +3982,9 @@ pub fn handle_redline_prefix_shadow(
                 unsafe { gpu.replay.replay_linear_aql(context) }?;
             }
             // Commit host n_tokens only after successful replay body.
-            if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+            if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
                 bundle.state.n_tokens = context + 1;
                 loaded.seq_pos = context + 1;
             }
@@ -3809,7 +3999,10 @@ pub fn handle_redline_prefix_shadow(
             Ok(result) => result,
             Err(reason) => {
                 if let Some(loaded) = model.as_mut() {
-                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
                         let _ = redline_reset_lfm2moe(gpu, bundle);
                         loaded.seq_pos = 0;
                         let _ = gpu.hip.device_synchronize();
@@ -3839,7 +4032,9 @@ pub fn handle_redline_prefix_shadow(
             gpu.replay_recorded_hip_prefix(prefix)
                 .map_err(|error| error.to_string())?;
             // Commit host n_tokens only after successful blob body.
-            if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+            if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
                 bundle.state.n_tokens = context + 1;
                 loaded.seq_pos = context + 1;
             }
@@ -3854,7 +4049,10 @@ pub fn handle_redline_prefix_shadow(
             Ok(result) => result,
             Err(reason) => {
                 if let Some(loaded) = model.as_mut() {
-                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
                         let _ = redline_reset_lfm2moe(gpu, bundle);
                         loaded.seq_pos = 0;
                         let _ = gpu.hip.device_synchronize();
@@ -3906,7 +4104,9 @@ pub fn handle_redline_prefix_shadow(
             })
         );
         if let Some(loaded) = model.as_mut() {
-            if let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()) {
+            if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
                 let _ = redline_reset_lfm2moe(gpu, bundle);
                 loaded.seq_pos = 0;
                 loaded.conversation_tokens.clear();
@@ -3948,23 +4148,18 @@ pub fn handle_redline_prefix_shadow(
     } {
         Ok(summary) => summary,
         Err(reason) => {
-            emit_uncorrelated_error(
-                stdout,
-                None,
-                &reason,
-                "internal",
-                false,
-                false,
-            );
+            emit_uncorrelated_error(stdout, None, &reason, "internal", false, false);
             let _ = stdout.flush();
             return;
         }
     };
     let aql_hashes = (|| -> Result<_, String> {
         let loaded = model.as_mut().unwrap();
-        let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+        let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) else {
+            unreachable!()
+        };
         redline_reset_qwen(gpu, bundle)?;
         redline_prime_qwen(gpu, bundle, context)?;
         qwen35::prepare_scratch_inputs(
@@ -4012,9 +4207,11 @@ pub fn handle_redline_prefix_shadow(
     };
     let hip_hashes = (|| -> Result<_, String> {
         let loaded = model.as_mut().unwrap();
-        let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
-        unreachable!()
-    };
+        let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) else {
+            unreachable!()
+        };
         redline_reset_qwen(gpu, bundle)?;
         redline_prime_qwen(gpu, bundle, context)?;
         qwen35::prepare_scratch_inputs(
@@ -4079,10 +4276,9 @@ pub fn handle_redline_prefix_shadow(
             })
         });
     let pointer_debug = model.as_mut().and_then(|loaded| {
-        let bundle = loaded
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())?;
+        let bundle = loaded.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        })?;
         let launch = gpu.replay.recorded_launches().get(prefix.checked_sub(1)?)?;
         let pointers = launch
             .kernarg
@@ -4136,4 +4332,30 @@ pub fn handle_redline_prefix_shadow(
         })
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod redline_snapshot_tests {
+    use super::{redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot};
+
+    fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
+        RedlineSnapshot::Qwen(RedlineQwenSnapshot {
+            logits: vec![1, 2],
+            kv: vec![3, 4],
+            recurrent: vec![5, 6],
+            gdn_frame,
+        })
+    }
+
+    #[test]
+    fn q8_gdn_frame_participates_in_shadow_bit_exactness() {
+        assert!(redline_snapshots_bit_exact(
+            &qwen_snapshot(17),
+            &qwen_snapshot(17)
+        ));
+        assert!(!redline_snapshots_bit_exact(
+            &qwen_snapshot(17),
+            &qwen_snapshot(18)
+        ));
+    }
 }

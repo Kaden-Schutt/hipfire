@@ -132,8 +132,8 @@ THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
 def _effort_native_tag(tag: str) -> bool:
     """True for families whose reasoning is effort-semantic with no registry cap.
 
-    Qwen3.8, DeepSeek V4 Flash (+preview/SKU suffixes), and Muse Glimmer product
-    SKUs. Draft/dflash sidecars are excluded. `thinking_budget` is rejected on
+    Qwen3.8, DeepSeek V4 Flash (+preview/SKU suffixes), Muse Glimmer, and Ornith
+    product SKUs. Draft/dflash sidecars are excluded. `thinking_budget` is rejected on
     these tags; absence means uncapped.
     """
     # Strip optional "sampling_profiles.<mode>" suffix used by callers.

@@ -113,14 +113,13 @@ DFLASH_EXACT_FIELDS = (
     "kv_guard_equal",
     "pbs_guard_equal",
     "gdn_frame_equal",
+    "dn_ef_after_forward_equal",
+    "dn_ef_after_rollback_equal",
 )
 
-# Arms judged against the `direct_capture_safe` reference. `hip_auto` is the
-# shipping HipGraph path, which replays a frozen Q8 GatedDeltaNet
-# stochastic-rounding frame; its comparison is reported as
-# `direct_capture_safe_vs_hip_auto` for documentation but is NOT a verdict,
-# because the retained route reproduces live frame consumption and the graph
-# does not.
+# Arms judged against the `direct_capture_safe` reference. `hip_auto` remains
+# diagnostic rather than verdict-bearing: this harness certifies the retained
+# recorded-HIP/PM4 routes, not the separate HipGraph route.
 DFLASH_COMPARED_ARMS = ("recorded_hip", "pm4")
 
 
@@ -160,7 +159,12 @@ def dflash_shadow_failures(shadow):
             f"prepared route is not single-queue/single-phase: {identity!r}"
         )
 
-    windows = ((shadow.get("parity") or {}).get("windows")) or []
+    parity = shadow.get("parity") or {}
+    if "q8_byte_parity_invalid" not in parity:
+        failures.append("parity.q8_byte_parity_invalid missing")
+    elif parity.get("q8_byte_parity_invalid"):
+        failures.append("parity.q8_byte_parity_invalid is true (production Q8 EF evidence required)")
+    windows = parity.get("windows") or []
     if not windows:
         failures.append("parity table has no windows")
     for window in windows:
@@ -171,7 +175,9 @@ def dflash_shadow_failures(shadow):
                 failures.append(f"position {position}: arm {arm} missing from parity")
                 continue
             for field in DFLASH_EXACT_FIELDS:
-                if field in row and not row[field]:
+                if field not in row:
+                    failures.append(f"position {position}: {arm}.{field} missing")
+                elif not row[field]:
                     failures.append(f"position {position}: {arm}.{field} is false")
             for field, value in row.items():
                 if isinstance(value, dict) and "max_abs" in value:
@@ -215,14 +221,25 @@ def main():
         help="consecutive token positions compared by the AQL/HIP/blob parity gate",
     )
     parser.add_argument(
+        "--shadow-position-step",
+        type=int,
+        default=1,
+        help="position increment per shadow replay; 0 isolates queue lifetime from context growth",
+    )
+    parser.add_argument(
+        "--shadow-replay-only",
+        action="store_true",
+        help="run only retained PM4 shadow replays, without HIP/blob parity arms",
+    )
+    parser.add_argument(
         "--state-quant",
         choices=("q8", "fp32", "q4"),
         help=(
-            "DeltaNet state precision for the run. Pass fp32 for any BYTE-PARITY "
-            "claim: Q8 state uses stochastic rounding, which makes a bit-exact "
-            "PM4/HIP path report exact=False and misattributes the failure to the "
-            "lowering (see CLAUDE.md 'Byte-parity validation is meaningless under "
-            "stochastic state'). Omit to keep the daemon default (q8)."
+            "DeltaNet state precision for the run. Omit to validate the production "
+            "default: Q8 with default-on deterministic error feedback (q8_ef). "
+            "Pass fp32 only when explicitly testing the FP32 state route. If "
+            "HIPFIRE_DN_STATE_EF=0 selects legacy stochastic Q8, byte parity is "
+            "meaningless; re-enable EF or use fp32 plus HIPFIRE_DETERMINISTIC=1."
         ),
     )
     parser.add_argument("--max-seq", type=int, default=2048)
@@ -333,6 +350,8 @@ def main():
             "kv_mode": args.kv_mode,
             "dflash_mode": "on" if args.dflash_verify_shadow else "off",
             "dspark_mode": "on" if args.dspark_verify_shadow else "off",
+            "mtp_mode": "off",
+            "ngram_draft": False,
         }
         # DeepSeek4 discovers `<stem>-dspark.<ext>` itself. Passing the same file
         # through params.draft would incorrectly enter the Qwen DFlash lm_head
@@ -529,16 +548,44 @@ def main():
                     "type": "redline_shadow_pm4" if args.pm4 else "redline_shadow_aql",
                     "context_tokens": args.decode_context,
                     "iterations": args.shadow_iterations,
+                    "position_step": args.shadow_position_step,
+                    "replay_only": args.shadow_replay_only,
                 }
             )
-            shadow_pass = report["aql_shadow"]["bit_exact"]
-            print(
-                f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
-                f"exact={shadow_pass} "
-                f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
-                f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
-                flush=True,
-            )
+            shadow = report["aql_shadow"]
+            if args.shadow_replay_only:
+                shadow_pass = bool(shadow.get("replay_only"))
+                print(
+                    f"shadow: backend=pm4_ib replay_only=true "
+                    f"iterations={shadow.get('iterations')} "
+                    f"position_step={shadow.get('position_step')} "
+                    f"queue_id={shadow.get('queue_id')} "
+                    f"host_us={shadow.get('aql_host_us'):.1f}",
+                    flush=True,
+                )
+            else:
+                frame_values = [
+                    shadow.get(arm, {}).get("gdn_frame")
+                    for arm in ("hip", "aql", "blob")
+                ]
+                frame_present = any(frame is not None for frame in frame_values)
+                frame_exact = not frame_present or (
+                    all(frame is not None for frame in frame_values)
+                    and frame_values[0] == frame_values[1] == frame_values[2]
+                )
+                shadow["gdn_frame_exact"] = frame_exact
+                shadow_pass = (
+                    bool(shadow["bit_exact"])
+                    and bool(shadow["blob_bit_exact"])
+                    and frame_exact
+                )
+                print(
+                    f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
+                    f"exact={shadow_pass} gdn_frame_exact={frame_exact} "
+                    f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
+                    f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
+                    flush=True,
+                )
         else:
             report["prefix_shadow"] = daemon.request(
                 {

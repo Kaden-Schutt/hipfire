@@ -112,10 +112,15 @@ impl MoeDtypes {
 #[derive(Clone, Copy, Debug)]
 pub struct MoeResolution {
     pub gate_side_mq4: bool,
-    /// Router + shared expert are MQ4 (fused gate path applicable, independent
-    /// of routed-expert dtype). True for uniform MQ4 AND graded files whose
-    /// gate-side is MQ4 (e.g. the redline mq4r).
+    /// Router + shared expert gate/up are an exact-uniform MQ4G256 V1
+    /// quartet. The fused gate path is independent of routed-expert dtype.
+    /// MQ4G256V2 is admitted separately via `gate_fusable_mq4v2` (exact V2
+    /// quartet → `fused_qkvza_hfq4g256_mq4v2`); mixed V1/V2 stays non-fusable.
     pub gate_fusable: bool,
+    /// Router + shared scalar gate + shared expert gate/up are an
+    /// exact-uniform MQ4G256V2 quartet. Independent of routed-expert dtype.
+    /// Mixed V1/V2 gate-side dtypes never set this (or `gate_fusable`).
+    pub gate_fusable_mq4v2: bool,
     pub routed_indexable_mq4: bool,
     pub routed_indexable_mq4v2: bool,
     pub routed_indexable_mq5: bool,
@@ -194,14 +199,20 @@ impl MoeResolution {
 
     pub fn resolve_arch(d: &MoeDtypes, k: usize, arch_has_e8_wmma: bool) -> Self {
         use DType::*;
-        // Gate-side weights (router + shared expert) all MQ4 → the fused gate
-        // kernel (fused_qkvza_hfq4g256 on one rotated xr) is applicable. This is
-        // INDEPENDENT of the routed-expert dtype (all MQ-family share the same
-        // FwhtG256 rotation), so it can fire on graded files too (redline mq4r).
+        // The fused four-weight gate kernel is admitted only for the exact
+        // MQ4G256 V1 quartet. The exact MQ4G256V2 quartet is admitted on a
+        // separate predicate (`gate_fusable_mq4v2`) that routes to the V2
+        // scalar fused launcher. Mixed V1/V2 gate-side stays on the generic
+        // four-GEMV path. Independent of routed-expert dtype: all rotated MQ
+        // families consume the same FwhtG256 activation.
         let gate_fusable = d.router == MQ4G256
             && d.shared_gate == MQ4G256
             && d.shared_expert_gate == MQ4G256
             && d.shared_expert_up == MQ4G256;
+        let gate_fusable_mq4v2 = d.router == MQ4G256V2
+            && d.shared_gate == MQ4G256V2
+            && d.shared_expert_gate == MQ4G256V2
+            && d.shared_expert_up == MQ4G256V2;
         // gate_side_mq4 keeps the stricter all-MQ4 meaning (incl. routed experts)
         // for the rotate/AWQ branch + callers that assume a uniform-MQ4 FFN.
         let gate_side_mq4 = gate_fusable && d.experts_all_gate_up_mq4;
@@ -296,6 +307,7 @@ impl MoeResolution {
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
+            || gate_fusable_mq4v2
             || routed_indexable_mixed_per_expert
             || routed_gate_up_mq4
             || routed_gate_up_mq4v2
@@ -336,6 +348,7 @@ impl MoeResolution {
         Self {
             gate_side_mq4,
             gate_fusable,
+            gate_fusable_mq4v2,
             routed_indexable_mq4,
             routed_indexable_mq4v2,
             routed_indexable_mq5,

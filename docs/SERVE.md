@@ -176,9 +176,10 @@ map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
 - Malformed types and out-of-range integers remain hard request errors.
 - Effort is **never** converted into a token cap (including on Qwen3.6 and other
   non-effort-native templates).
-- Qwen3.8 defaults to an uncapped think span unless the request sets a positive
-  integer cap. DeepSeek V4 and Muse Glimmer expose semantic effort but no
-  independent parent-defined cap; cap fields are dropped+warned.
+- Qwen3.8 and Ornith 1.5 default to an uncapped think span unless the request sets a
+  positive integer cap (semantic effort stays independent of that cap). DeepSeek V4 and
+  Muse Glimmer expose semantic effort but no independent parent-defined cap; cap fields
+  are dropped+warned.
 
 **Examples:**
 
@@ -195,6 +196,13 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "model": "qwen3.8:27b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
   "reasoning_effort": "medium"
+}'
+
+# Ornith 1.5 — Qwen3.8-compatible semantic effort (default xhigh; still uncapped unless max_think_tokens)
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "ornith-1.5:35b-a3b",
+  "messages": [{"role": "user", "content": "plan a refactor"}],
+  "reasoning_effort": "low"
 }'
 
 # Qwen3.6 — no native effort: effort is dropped+warned; set an explicit cap if wanted
@@ -230,7 +238,8 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
 
 | Family | Mode | Effort | Cap |
 |---|---|---|---|
-| Qwen3.8 | `enable_thinking=false` → empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`) | Integer only; named budget dropped |
+| Qwen3.8 | `enable_thinking=false` → empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`; semantic prompt only) | Integer only; named budget dropped |
+| Ornith 1.5 | same Qwen on/off | Qwen3.8-compatible `low` \| `medium` \| `xhigh` (default `xhigh`; not a budget) | Integer only; named budget dropped |
 | Qwen3.6 | on/off | Dropped+warned (never → cap) | Named preset or integer if set |
 | DeepSeek V4 | `thinking.type` enabled/disabled (default on) | `low` \| `high` \| `max` (`medium`/`xhigh`→`high`) | Integer only; default uncapped |
 | Gemma4 | Boolean; default **off** | Dropped+warned | Dropped+warned unless explicit engine integer |
@@ -243,6 +252,35 @@ When `messages` contains no `system` or `developer` role, the serve layer insert
 Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
 LCP can hit. Other arches reset every request (stateless OpenAI shape).
+
+### Client notes (Zed / OpenAI-compatible agents)
+
+Live-GPU endpoint validation on gfx1100 and gfx1201 exercised Zed-shaped
+streamed requests against the canonical Qwen3.6 35B-A3B MQ4R artifact. The
+matrix covered automatic and required tool calls, multiple calls in one turn,
+multi-turn `reasoning_content` replay, `tool_choice: "none"`, usage chunks, and
+strict UTF-8 SSE/JSON decoding. This validates the OpenAI-compatible endpoint,
+not the Zed application UI itself.
+
+Inbound assistant `tool_calls[].function.arguments` strings are parsed into
+JSON objects for Qwen template replay; outbound OpenAI arguments remain JSON
+strings. Tool-call deltas are emitted in bulk at the terminal chunk,
+`finish_reason=tool_calls` is produced, and disconnect cancels in-flight
+generation.
+
+Current caveats for agent clients:
+
+- **Multi-turn reasoning replay:** Qwen3.5/3.6-family arches replay assistant
+  `reasoning_content` into the next turn (alongside `muse_glimmer`).
+- **Tool-argument streaming:** progressive per-token argument deltas are not
+  emitted; arguments arrive bulk-at-terminal with the tool-call chunk.
+- **`parallel_tool_calls`:** the explicit request field is ignored.
+- **Zed temperature:** Zed defaults sampling temperature to **1.0** unless the
+  agent profile overrides it.
+
+For Qwen3.5/3.6 agent use, prefer temperature **0.2–0.6** in the profile, and
+enable interleaved reasoning on Zed’s OpenAI-compatible capability when the
+client exposes that toggle.
 
 ## Auto-routing from `hipfire run`
 

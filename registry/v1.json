@@ -781,7 +781,7 @@
       "file": "qwen3.6-35b-a3b.mq4r",
       "size_gb": 18.7,
       "min_vram_gb": 22,
-      "desc": "MQ4 Redline speed SKU: uniform MQ4 attention and gate-side weights, graded routed experts, fused gate path. TG128 AR: 253.3 tok/s gfx1100, 115.1 gfx1151, 203.9 gfx1201. Lower quality than protected-attention MQ4P/MFP4.",
+      "desc": "MQ4 Redline speed SKU: uniform MQ4G256/qt13 across routed experts, shared experts, attention, router, and lm_head (embed Q8F16 only); zero MQ6 graded experts, zero qt44; fused gate path. TG128 AR: 253.3 tok/s gfx1100, 115.1 gfx1151, 203.9 gfx1201. Lower quality than protected-attention MQ4P/MFP4.",
       "sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
       "size_bytes": 18700048128,
       "arch_id": 6,
@@ -1818,7 +1818,8 @@
         "top_k": 20,
         "min_p": 0.0,
         "presence_penalty": 0.0,
-        "repeat_penalty": 1.0
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1827,7 +1828,8 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
         },
         "coding": {
           "temperature": 0.6,
@@ -1835,7 +1837,8 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
         },
         "instruct": {
           "temperature": 0.6,
@@ -1843,14 +1846,71 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "none"
         }
       },
-      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE.",
+      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap.",
       "sha256": "f329b497eb8684d889c184a0dcf1388ab6171f99a1c72052d7e2a3bee4f5934b",
       "size_bytes": 19020296510,
       "arch_id": 6,
       "quant": "mq4"
+    },
+    "ornith-1.5:35b-a3b-mq4r": {
+      "repo": "hipfire-models/ornith-1.5-35b-a3b",
+      "mtp": {
+        "file": "ornith-1.5-35b-a3b.mtp",
+        "sha256": "38c22accd08c46f2dd6b2bec1e88550ce0f223c69ea038ff13ddb80f6ccb3a37",
+        "size_bytes": 484778112
+      },
+      "file": "ornith-1.5-35b-a3b.mq4r",
+      "size_gb": 18.7,
+      "size_bytes": 18700570368,
+      "sha256": "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6",
+      "min_vram_gb": 22,
+      "quant_recipe": "mq4v2-uniform-no-q8-router@10fbf86f",
+      "default_kv_mode": "q8",
+      "recommended_settings": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        },
+        "instruct": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "none"
+        }
+      },
+      "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap.",
+      "arch_id": 6,
+      "quant": "mq4r"
     }
   },
   "aliases": {

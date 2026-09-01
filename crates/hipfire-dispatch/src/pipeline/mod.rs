@@ -8,7 +8,7 @@ use crate::types::*;
 #[allow(unused_imports)]
 use hip_bridge;
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
@@ -681,7 +681,44 @@ pub fn run_moe_decode(
     let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
     if res.gate_fusable {
         let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
+        // Exact-uniform V1 MQ4G256 gate quartet → one fused launch.
         hip!(gpu.fused_qkvza_hfq4g256(
+            &p.router.buf,
+            &p.shared_expert_gate.buf,
+            &p.shared_gate_w.buf,
+            &p.shared_up_w.buf,
+            xr,
+            p.router_logits,
+            p.scalar_buf,
+            &shared_gate,
+            &shared_up,
+            p.router.m,
+            p.shared_expert_gate.m,
+            p.shared_gate_w.m,
+            p.shared_up_w.m,
+            p.router.k,
+        ))?;
+    } else if res.gate_fusable_mq4v2
+        && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+        && p.batch_size == 1
+        && p.router.awq_scale.is_none()
+        && p.shared_expert_gate.awq_scale.is_none()
+        && p.shared_gate_w.awq_scale.is_none()
+        && p.shared_up_w.awq_scale.is_none()
+        && p.router.k == 2048
+        && p.shared_expert_gate.k == 2048
+        && p.shared_gate_w.k == 2048
+        && p.shared_up_w.k == 2048
+        && p.router.m == 256
+        && p.shared_expert_gate.m == 1
+        && p.shared_gate_w.m == 512
+        && p.shared_up_w.m == 512
+    {
+        let xr = x_rot_local.expect("gate_fusable_mq4v2 implies x_rot_local (needs_x_rot_local)");
+        // Exact official Ornith qt44 gate quartet on gfx1100/gfx1201 only →
+        // one V2 fused launch. Any miss (arch/AWQ/shape/batch) falls through
+        // to the generic four-GEMV branch below — never errors.
+        hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
             &p.router.buf,
             &p.shared_expert_gate.buf,
             &p.shared_gate_w.buf,
@@ -700,10 +737,59 @@ pub fn run_moe_decode(
     } else {
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
-        gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+        // Reuse the single normalized FWHT activation for structural MQ
+        // router/scalar weights when the fused quartet is not admitted
+        // (mixed dtype, non-MQ4 gate side, AWQ, etc.).
+        let router_prerot = x_rot_local.is_some()
+            && p.router.awq_scale.is_none()
+            && p.shared_expert_gate.awq_scale.is_none()
+            && matches!(
+                crate::types::dtype_post_rotation_variant(p.router.dtype),
+                crate::types::GemvVariant::Prerotated
+            )
+            && matches!(
+                crate::types::dtype_post_rotation_variant(p.shared_expert_gate.dtype),
+                crate::types::GemvVariant::Prerotated
+            )
+            && crate::types::KernelKey::dtype_arch_predicate(p.router.dtype).eval_arch(ctx)
+            && crate::types::KernelKey::dtype_arch_predicate(p.shared_expert_gate.dtype)
+                .eval_arch(ctx);
+        if router_prerot {
+            let xr = x_rot_local.expect("router_prerot implies x_rot_local");
+            gemv.run(
+                ctx,
+                gpu,
+                &crate::families::gemv::GemvParams {
+                    w: &p.router,
+                    x: xr,
+                    y: p.router_logits,
+                    variant: crate::types::GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+            gemv.run(
+                ctx,
+                gpu,
+                &crate::families::gemv::GemvParams {
+                    w: &p.shared_expert_gate,
+                    x: xr,
+                    y: p.scalar_buf,
+                    variant: crate::types::GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        } else {
+            gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
         // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
         // (fused_qkvza_hfq4g256 on the single rotated `xr`) doesn't apply because
         // the router is Q8. But the dense shared gate/up are still MQ-family, and
@@ -930,33 +1016,64 @@ pub fn run_moe_decode(
             } else if !router_shared_fuse {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
-            #[cfg(feature = "deltanet")]
-            {
-                hip!(gpu.sigmoid_f32(p.scalar_buf))?;
-                static GEMV_SHARED_V2: OnceLock<GemvFamily> = OnceLock::new();
-                let gemv = GEMV_SHARED_V2.get_or_init(GemvFamily::new);
-                gemv.run(
-                    ctx,
-                    gpu,
-                    &crate::families::gemv::GemvParams {
-                        w: &p.shared_down_w,
-                        x: &x_rot_alias,
-                        y: p.ffn_out,
-                        variant: crate::types::GemvVariant::Prerotated,
-                        residual: None,
-                        gate: None,
-                        up: None,
-                    },
-                )?;
-                hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, p.scalar_buf))?;
-            }
-            #[cfg(not(feature = "deltanet"))]
-            return Err(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "shared-down-v2-requires-deltanet",
-                arch: "",
-                quant: dtype_name(p.shared_down_w.dtype),
+            // Default-on one-launch fuse for the exact Ornith qt44 shared-down
+            // shape. The scalar has no later read in this executor. `ffn_out`
+            // is dead here on the indexed path; on the generic fallback its
+            // next access is an overwrite by routed-expert down. `0` or an
+            // invalid override keeps sigmoid + plain V2 GEMV + scaled_add.
+            static MQ4V2_SHARED_DOWN_FUSED: LazyLock<bool> = LazyLock::new(|| {
+                hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED")
+                    .map(|value| value == "1")
+                    .unwrap_or(true)
             });
+            let use_mq4v2_shared_down_fused = *MQ4V2_SHARED_DOWN_FUSED
+                && p.shared_down_w.dtype == DType::MQ4G256V2
+                && p.shared_down_w.awq_scale.is_none()
+                && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+                && p.shared_down_w.m == 2_048
+                && p.shared_down_w.k == 512;
+            if use_mq4v2_shared_down_fused {
+                hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
+                    &p.shared_down_w.buf,
+                    &x_rot_alias,
+                    out_target,
+                    p.scalar_buf,
+                    p.shared_down_w.m,
+                    p.shared_down_w.k,
+                ))?;
+            } else {
+                #[cfg(feature = "deltanet")]
+                {
+                    hip!(gpu.sigmoid_f32(p.scalar_buf))?;
+                    static GEMV_SHARED_V2: OnceLock<GemvFamily> = OnceLock::new();
+                    let gemv = GEMV_SHARED_V2.get_or_init(GemvFamily::new);
+                    gemv.run(
+                        ctx,
+                        gpu,
+                        &crate::families::gemv::GemvParams {
+                            w: &p.shared_down_w,
+                            x: &x_rot_alias,
+                            y: p.ffn_out,
+                            variant: crate::types::GemvVariant::Prerotated,
+                            residual: None,
+                            gate: None,
+                            up: None,
+                        },
+                    )?;
+                    hip!(gpu.scaled_add_inplace_gpu_scalar_f32(
+                        out_target,
+                        p.ffn_out,
+                        p.scalar_buf
+                    ))?;
+                }
+                #[cfg(not(feature = "deltanet"))]
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "shared-down-v2-requires-deltanet",
+                    arch: "",
+                    quant: dtype_name(p.shared_down_w.dtype),
+                });
+            }
         } else {
             // Non-MQ4 / non-V2 shared expert down. Requires deltanet feature for
             // sigmoid_f32. Returns UnsupportedVariant for builds without the
@@ -1847,33 +1964,59 @@ fn run_moe_decode_cpu_fallback(
         } else {
             hip!(gpu.fused_silu_mul_rotate_mq(shared_gate, shared_up, &x_rot_alias, p.smi))?;
         }
-        #[cfg(feature = "deltanet")]
-        {
-            hip!(gpu.sigmoid_f32(p.scalar_buf))?;
-            static GEMV_SHARED_V2_FB: OnceLock<GemvFamily> = OnceLock::new();
-            let gemv = GEMV_SHARED_V2_FB.get_or_init(GemvFamily::new);
-            gemv.run(
-                ctx,
-                gpu,
-                &crate::families::gemv::GemvParams {
-                    w: &p.shared_down_w,
-                    x: &x_rot_alias,
-                    y: p.ffn_out,
-                    variant: crate::types::GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )?;
-            hip!(gpu.scaled_add_inplace_gpu_scalar_f32(p.x_residual, p.ffn_out, p.scalar_buf))?;
-        }
-        #[cfg(not(feature = "deltanet"))]
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "shared-down-v2-requires-deltanet",
-            arch: "",
-            quant: dtype_name(p.shared_down_w.dtype),
+        // `scalar_buf` has no later read; `ffn_out` is overwritten by the first
+        // routed-expert down before being consumed. The exact product shape
+        // therefore defaults to the fused arm; `0` or an invalid override
+        // retains the generic three-launch route.
+        static MQ4V2_SHARED_DOWN_FUSED_FB: LazyLock<bool> = LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED")
+                .map(|value| value == "1")
+                .unwrap_or(true)
         });
+        let use_mq4v2_shared_down_fused = *MQ4V2_SHARED_DOWN_FUSED_FB
+            && p.shared_down_w.dtype == DType::MQ4G256V2
+            && p.shared_down_w.awq_scale.is_none()
+            && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+            && p.shared_down_w.m == 2_048
+            && p.shared_down_w.k == 512;
+        if use_mq4v2_shared_down_fused {
+            hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
+                &p.shared_down_w.buf,
+                &x_rot_alias,
+                p.x_residual,
+                p.scalar_buf,
+                p.shared_down_w.m,
+                p.shared_down_w.k,
+            ))?;
+        } else {
+            #[cfg(feature = "deltanet")]
+            {
+                hip!(gpu.sigmoid_f32(p.scalar_buf))?;
+                static GEMV_SHARED_V2_FB: OnceLock<GemvFamily> = OnceLock::new();
+                let gemv = GEMV_SHARED_V2_FB.get_or_init(GemvFamily::new);
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: &p.shared_down_w,
+                        x: &x_rot_alias,
+                        y: p.ffn_out,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )?;
+                hip!(gpu.scaled_add_inplace_gpu_scalar_f32(p.x_residual, p.ffn_out, p.scalar_buf))?;
+            }
+            #[cfg(not(feature = "deltanet"))]
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "shared-down-v2-requires-deltanet",
+                arch: "",
+                quant: dtype_name(p.shared_down_w.dtype),
+            });
+        }
     } else {
         #[cfg(feature = "deltanet")]
         {

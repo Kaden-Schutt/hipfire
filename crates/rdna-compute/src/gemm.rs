@@ -70,6 +70,17 @@ enum MqV2PrefillProjection {
     GateUp,
     Residual,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq4v2QkvzaVariant {
+    Generic,
+    HoistX32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq4v2QkvVariant {
+    Generic,
+    K2048XBufferGfx1100,
+}
 
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
@@ -28394,10 +28405,119 @@ impl Gpu {
         alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Measured gfx1100 K=2048 hoist specialization is the only production
+        // route (generic ~18 us/call → hoist ~10.38 us/call).
+        let variant = if self.arch == "gfx1100" && k == 2048 {
+            Mq4v2QkvzaVariant::HoistX32
+        } else {
+            Mq4v2QkvzaVariant::Generic
+        };
+        self.fused_qkvza_hfq4g256_mq4v2_dispatch(
+            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+            alpha_m, k, variant,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn fused_qkvza_hfq4g256_mq4v2_generic_exact(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.fused_qkvza_hfq4g256_mq4v2_dispatch(
+            a_qkv,
+            a_z,
+            a_beta,
+            a_alpha,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            qkv_m,
+            z_m,
+            beta_m,
+            alpha_m,
+            k,
+            Mq4v2QkvzaVariant::Generic,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn fused_qkvza_hfq4g256_mq4v2_k2048_hoist_x32_exact(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let variant = if self.arch == "gfx1100" && k == 2048 {
+            Mq4v2QkvzaVariant::HoistX32
+        } else {
+            Mq4v2QkvzaVariant::Generic
+        };
+        self.fused_qkvza_hfq4g256_mq4v2_dispatch(
+            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+            alpha_m, k, variant,
+        )
+    }
+
+    fn fused_qkvza_hfq4g256_mq4v2_dispatch(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        variant: Mq4v2QkvzaVariant,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        let module_v2 = "fused_qkvza_hfq4g256_mq4v2";
-        let func_name = "fused_qkvza_mq4g256v2";
-        self.ensure_kernel(module_v2, kernels::FUSED_QKVZA_MQ4G256V2_SRC, func_name)?;
+        let (module, src, func_name, profile_name) = match variant {
+            Mq4v2QkvzaVariant::Generic => (
+                "fused_qkvza_hfq4g256_mq4v2",
+                kernels::FUSED_QKVZA_MQ4G256V2_SRC,
+                "fused_qkvza_mq4g256v2",
+                "fused_qkvza_mq4g256v2",
+            ),
+            Mq4v2QkvzaVariant::HoistX32 => (
+                "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+                kernels::FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC,
+                "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+                "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+            ),
+        };
+        self.ensure_kernel(module, src, func_name)?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
         let ab = a_beta.buf.as_ptr();
@@ -28433,7 +28553,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
-        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_mq4g256v2", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result =
             self.launch_maybe_blob(func_name, [total, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -28474,7 +28594,78 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.fused_qkv_hfq4g256_impl_mq4v2(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, None)
+        let variant = if self.arch == "gfx1100" && k == 2048 {
+            Mq4v2QkvVariant::K2048XBufferGfx1100
+        } else {
+            Mq4v2QkvVariant::Generic
+        };
+        self.fused_qkv_hfq4g256_mq4v2_dispatch(
+            a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, variant, None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn fused_qkv_hfq4g256_mq4v2_generic_exact(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.fused_qkv_hfq4g256_mq4v2_dispatch(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            Mq4v2QkvVariant::Generic,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn fused_qkv_hfq4g256_mq4v2_k2048_x_buffer_gfx1100_exact(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.fused_qkv_hfq4g256_mq4v2_dispatch(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            Mq4v2QkvVariant::K2048XBufferGfx1100,
+            None,
+        )
     }
 
     /// MQ4 v2 with bias.
@@ -28496,7 +28687,7 @@ impl Gpu {
         bias_k_ptr: *mut c_void,
         bias_v_ptr: *mut c_void,
     ) -> HipResult<()> {
-        self.fused_qkv_hfq4g256_impl_mq4v2(
+        self.fused_qkv_hfq4g256_mq4v2_dispatch(
             a_q,
             a_k,
             a_v,
@@ -28508,12 +28699,13 @@ impl Gpu {
             k_m,
             v_m,
             k,
+            Mq4v2QkvVariant::Generic,
             Some((bias_q_ptr, bias_k_ptr, bias_v_ptr)),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn fused_qkv_hfq4g256_impl_mq4v2(
+    fn fused_qkv_hfq4g256_mq4v2_dispatch(
         &mut self,
         a_q: &GpuTensor,
         a_k: &GpuTensor,
@@ -28526,6 +28718,7 @@ impl Gpu {
         k_m: usize,
         v_m: usize,
         k: usize,
+        variant: Mq4v2QkvVariant,
         bias: Option<(*mut c_void, *mut c_void, *mut c_void)>,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -28538,13 +28731,22 @@ impl Gpu {
                 (q_m + k_m + v_m) as u32,
             )
         } else {
-            (
-                "fused_qkv_hfq4g256_mq4v2",
-                kernels::FUSED_QKV_MQ4G256V2_SRC,
-                "fused_qkv_mq4g256v2",
-                [32u32, 1, 1],
-                (q_m + k_m + v_m) as u32,
-            )
+            match variant {
+                Mq4v2QkvVariant::Generic => (
+                    "fused_qkv_hfq4g256_mq4v2",
+                    kernels::FUSED_QKV_MQ4G256V2_SRC,
+                    "fused_qkv_mq4g256v2",
+                    [32u32, 1, 1],
+                    (q_m + k_m + v_m) as u32,
+                ),
+                Mq4v2QkvVariant::K2048XBufferGfx1100 => (
+                    "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+                    kernels::FUSED_QKV_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC,
+                    "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+                    [32u32, 1, 1],
+                    (q_m + k_m + v_m) as u32,
+                ),
+            }
         };
         self.ensure_kernel(&module_v2, src_v2, func_name)?;
         let aq = a_q.buf.as_ptr();

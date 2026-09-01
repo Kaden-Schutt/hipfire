@@ -23,10 +23,11 @@ use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
-    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
-    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
-    QueuePolicy, Quiescence, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
+    Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
+    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
+    PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,6 +431,13 @@ impl Pm4Commands {
         }
     }
 
+    fn set_sh_reg_records(&self) -> Option<Result<Vec<Gfx10SetShRegRecord>, usize>> {
+        match self {
+            Self::Legacy { commands, .. } => Some(commands.set_sh_reg_records()),
+            Self::Gfx12(_) => None,
+        }
+    }
+
     fn populate_dispatch_span_boundaries(
         &self,
         boundaries: &mut [Pm4DispatchBoundary],
@@ -634,6 +642,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_gate_up_hfq4g256_setprio_gfx1100"
             | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
+            | "fused_gate_up_mq4g256v2"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -738,6 +747,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
+            | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
             // Batched Path1 sisters: same pointer set/modes; K_TOP scalar
             // only changes the recorded kernarg length (64 B padded).
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
@@ -754,7 +764,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     if matches!(
         kernel,
-        "gemv_mq4g256v2_moe_ninepath_d4" | "gemv_mq6g256v2_moe_ninepath_d4"
+        "gemv_mq4g256v2_moe_ninepath_d4"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
+            | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
         return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
@@ -810,6 +822,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
+            | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -1032,7 +1045,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
-        | "fused_qkvza_hfq4g256_reduce_chain" => Some(vec![
+        | "fused_qkvza_hfq4g256_reduce_chain"
+        | "fused_qkvza_mq4g256v2"
+        | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1081,7 +1096,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
-        | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+        | "gated_norm_mq_rotate_gfx1151"
+        | "gated_norm_mq_rotate_gfx1201" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1089,17 +1105,18 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "qwen35_fa_prep_gfx1100" | "qwen36_27b_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => {
-            Some(vec![
-                read(0),
-                write(8),
-                write(16),
-                write(24),
-                read(32),
-                read(40),
-                read(48),
-            ])
-        }
+        "qwen35_fa_prep_gfx1100"
+        | "qwen36_27b_fa_prep_gfx1100"
+        | "qwen35_fa_prep_gfx1151"
+        | "qwen35_fa_prep_gfx1201" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+        ]),
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
@@ -1122,7 +1139,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
-        "gemv_hfq4g256_residual_sigmoid_scaled_gpu" => {
+        "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
@@ -1161,7 +1179,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             write(48),
         ]),
-        "fused_qkv_hfq4g256" => Some(vec![
+        "fused_qkv_hfq4g256"
+        | "fused_qkv_mq4g256v2"
+        | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1189,7 +1209,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "attention_flash_q8_0_tile" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
-        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => Some(vec![
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201" => Some(vec![
             read(0),
             write(8),
             read(16),
@@ -1299,6 +1320,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_gate_up_hfq4g256_setprio_gfx1100"
             | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
+            | "fused_gate_up_mq4g256v2"
     ) {
         return Some(64);
     }
@@ -1407,9 +1429,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_mq4g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
+            | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
             | "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq4g256v2_moe_ninepath_d4"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         return Some(48);
@@ -1434,6 +1458,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
+            | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -1533,6 +1558,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
@@ -1544,11 +1570,14 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
+        | "gated_norm_mq_rotate_gfx1201"
         | "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
+        | "qwen35_fa_prep_gfx1201"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
@@ -1557,6 +1586,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
+        | "fused_qkv_mq4g256v2"
+        | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -1566,6 +1597,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
+        | "fused_qkvza_mq4g256v2"
+        | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
         | "gated_delta_net_q8_fast" => Some(96),
         "gated_delta_net_f32" => Some(80),
         _ => None,
@@ -2731,6 +2764,54 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
             )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+            )
+            | (
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+            )
     )
 }
 
@@ -3126,6 +3207,345 @@ fn report_dispatch_spans(spans: &[u64]) {
         sorted[sorted.len() - 1],
         100.0 * tail as f64 / total.max(1) as f64,
     );
+}
+
+/// PACKET3 opcodes used only by preparation-time PM4 stream accounting.
+const PACKET3_SET_SH_REG: u32 = 0x76;
+const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
+const DISPATCH_DIRECT_PACKET_DWORDS: u32 = 5;
+
+/// Opt-in preparation-only PM4 stream accounting. Default off; exact `1` only.
+fn pm4_stream_accounting_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn validate_pm4_stream_accounting_queue_count(
+    stream_accounting: bool,
+    queue_count: usize,
+) -> Result<(), String> {
+    if stream_accounting && queue_count != 1 {
+        return Err(format!(
+            "HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING requires one PM4 queue, got {queue_count}"
+        ));
+    }
+    Ok(())
+}
+
+/// Entry sentinel used when a SET_SH_REG feeds dispatch 0 (no previous kernel).
+const PM4_STREAM_ENTRY_TRANSITION: &str = "<entry>";
+
+/// Map a SET_SH `following_dispatch` onto the captured previous/current kernels
+/// in frozen execution order. `order[i]` is the recorded launch index executed
+/// as dispatch `i`.
+fn pm4_set_sh_transition(
+    order: &[usize],
+    recorded: &[RecordedHipLaunch],
+    following_dispatch: u32,
+) -> Result<(String, String), String> {
+    let dispatch = following_dispatch as usize;
+    if dispatch >= order.len() {
+        return Err(format!(
+            "SET_SH following_dispatch={following_dispatch} is outside frozen order len {}",
+            order.len()
+        ));
+    }
+    let current_index = order[dispatch];
+    if current_index >= recorded.len() {
+        return Err(format!(
+            "SET_SH following_dispatch={following_dispatch} maps to recorded index {current_index} outside prefix {}",
+            recorded.len()
+        ));
+    }
+    let current = recorded[current_index].kernel.clone();
+    let previous = if dispatch == 0 {
+        PM4_STREAM_ENTRY_TRANSITION.to_owned()
+    } else {
+        let previous_index = order[dispatch - 1];
+        if previous_index >= recorded.len() {
+            return Err(format!(
+                "SET_SH previous dispatch maps to recorded index {previous_index} outside prefix {}",
+                recorded.len()
+            ));
+        }
+        recorded[previous_index].kernel.clone()
+    };
+    Ok((previous, current))
+}
+
+/// Deterministic preparation-time attribution of a gfx10/gfx11 PM4 stream.
+///
+/// Owns no retained state: callers log the formatted report and drop it before
+/// graph installation so nothing reaches [`PreparedPm4Replay`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Pm4StreamAccountingReport {
+    architecture: String,
+    dispatch_count: usize,
+    command_dwords: u32,
+    execution_sequence_hash: u64,
+    dependency_waits: usize,
+    dependency_acquires: usize,
+    packet_classes: BTreeMap<(u32, u32), usize>,
+    set_sh_header_dwords: u32,
+    set_sh_value_dwords: u32,
+    set_sh_repeated_value_dwords: u32,
+    /// Value-dword writes keyed by architectural first-register offset.
+    writes_by_register_offset: BTreeMap<u32, u32>,
+    /// Value-dword writes keyed by captured previous→current kernel transition.
+    writes_by_transition: BTreeMap<(String, String), u32>,
+}
+
+impl Pm4StreamAccountingReport {
+    /// Aggregate census + SET_SH records against the frozen order and reconcile.
+    fn build(
+        architecture: &str,
+        order: &[usize],
+        recorded: &[RecordedHipLaunch],
+        command_dwords: u32,
+        execution_sequence_hash: u64,
+        dependency_waits: usize,
+        dependency_acquires: usize,
+        census: &BTreeMap<(u32, u32), usize>,
+        records: &[Gfx10SetShRegRecord],
+    ) -> Result<Self, String> {
+        // Packet-class dwords must exhaust the stream.
+        let accounted_dwords =
+            census
+                .iter()
+                .try_fold(0_u64, |acc, ((_, packet_dwords), count)| {
+                    let packet = u64::from(*packet_dwords);
+                    let n = *count as u64;
+                    packet
+                        .checked_mul(n)
+                        .and_then(|part| acc.checked_add(part))
+                        .ok_or_else(|| "PM4 packet census dword product overflowed".to_owned())
+                })?;
+        if accounted_dwords != u64::from(command_dwords) {
+            return Err(format!(
+                "PM4 packet census accounts for {accounted_dwords} dwords but stream has {command_dwords}"
+            ));
+        }
+
+        let dispatch_packets = census
+            .get(&(PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS))
+            .copied()
+            .unwrap_or(0);
+        if dispatch_packets != order.len() {
+            return Err(format!(
+                "PM4 DISPATCH_DIRECT count {dispatch_packets} does not match frozen order len {}",
+                order.len()
+            ));
+        }
+        // No other DISPATCH_DIRECT packet sizes are legal for this encoder.
+        let other_dispatch = census
+            .iter()
+            .filter(|((opcode, packet_dwords), _)| {
+                *opcode == PACKET3_DISPATCH_DIRECT
+                    && *packet_dwords != DISPATCH_DIRECT_PACKET_DWORDS
+            })
+            .map(|((_, _), count)| *count)
+            .sum::<usize>();
+        if other_dispatch != 0 {
+            return Err(format!(
+                "PM4 stream contains {other_dispatch} non-5-dword DISPATCH_DIRECT packets"
+            ));
+        }
+
+        // SET_SH payload value dwords from census (packet = header + first + values).
+        let census_set_sh_value_dwords =
+            census
+                .iter()
+                .try_fold(0_u64, |acc, ((opcode, packet_dwords), count)| {
+                    if *opcode != PACKET3_SET_SH_REG {
+                        return Ok(acc);
+                    }
+                    if *packet_dwords < 3 {
+                        return Err(format!(
+                            "PM4 SET_SH_REG census entry has packet_dwords={packet_dwords} (< 3)"
+                        ));
+                    }
+                    let values = u64::from(*packet_dwords - 2);
+                    let n = *count as u64;
+                    values
+                        .checked_mul(n)
+                        .and_then(|part| acc.checked_add(part))
+                        .ok_or_else(|| {
+                            "PM4 SET_SH census value dword product overflowed".to_owned()
+                        })
+                })?;
+        let census_set_sh_packets = census
+            .iter()
+            .filter(|((opcode, _), _)| *opcode == PACKET3_SET_SH_REG)
+            .map(|((_, _), count)| *count)
+            .sum::<usize>();
+
+        let mut set_sh_header_dwords = 0_u32;
+        let mut set_sh_value_dwords = 0_u32;
+        let mut set_sh_repeated_value_dwords = 0_u32;
+        let mut writes_by_register_offset = BTreeMap::<u32, u32>::new();
+        let mut writes_by_transition = BTreeMap::<(String, String), u32>::new();
+
+        for record in records {
+            if record.following_dispatch as usize >= order.len() {
+                return Err(format!(
+                    "SET_SH at dword {} following_dispatch={} is outside frozen order len {}",
+                    record.packet_dword,
+                    record.following_dispatch,
+                    order.len()
+                ));
+            }
+            if record.repeated_value_dwords > record.value_dwords {
+                return Err(format!(
+                    "SET_SH at dword {} repeated_value_dwords={} exceeds value_dwords={}",
+                    record.packet_dword, record.repeated_value_dwords, record.value_dwords
+                ));
+            }
+            set_sh_header_dwords = set_sh_header_dwords
+                .checked_add(1)
+                .ok_or_else(|| "PM4 SET_SH header dword count overflowed".to_owned())?;
+            set_sh_value_dwords = set_sh_value_dwords
+                .checked_add(record.value_dwords)
+                .ok_or_else(|| "PM4 SET_SH value dword count overflowed".to_owned())?;
+            set_sh_repeated_value_dwords = set_sh_repeated_value_dwords
+                .checked_add(record.repeated_value_dwords)
+                .ok_or_else(|| "PM4 SET_SH repeated value dword count overflowed".to_owned())?;
+            let register_writes = writes_by_register_offset
+                .entry(record.first_register)
+                .or_default();
+            *register_writes = register_writes
+                .checked_add(record.value_dwords)
+                .ok_or_else(|| "PM4 SET_SH register-offset write count overflowed".to_owned())?;
+            let transition = pm4_set_sh_transition(order, recorded, record.following_dispatch)?;
+            let transition_writes = writes_by_transition.entry(transition).or_default();
+            *transition_writes = transition_writes
+                .checked_add(record.value_dwords)
+                .ok_or_else(|| "PM4 SET_SH transition write count overflowed".to_owned())?;
+        }
+
+        if records.len() != census_set_sh_packets {
+            return Err(format!(
+                "SET_SH record count {} does not match census SET_SH packets {census_set_sh_packets}",
+                records.len()
+            ));
+        }
+        if u64::from(set_sh_value_dwords) != census_set_sh_value_dwords {
+            return Err(format!(
+                "SET_SH record value dwords {set_sh_value_dwords} do not match census payload values {census_set_sh_value_dwords}"
+            ));
+        }
+
+        Ok(Self {
+            architecture: architecture.to_owned(),
+            dispatch_count: order.len(),
+            command_dwords,
+            execution_sequence_hash,
+            dependency_waits,
+            dependency_acquires,
+            packet_classes: census.clone(),
+            set_sh_header_dwords,
+            set_sh_value_dwords,
+            set_sh_repeated_value_dwords,
+            writes_by_register_offset,
+            writes_by_transition,
+        })
+    }
+
+    fn format_report(&self) -> String {
+        // Stable BTreeMap iteration: packet classes, register offsets, transitions.
+        let mut packet_parts = Vec::with_capacity(self.packet_classes.len());
+        for ((opcode, packet_dwords), count) in &self.packet_classes {
+            packet_parts.push(format!(
+                "(op=0x{opcode:02x},dwords={packet_dwords})×{count}"
+            ));
+        }
+        let mut register_parts = Vec::with_capacity(self.writes_by_register_offset.len());
+        for (register, writes) in &self.writes_by_register_offset {
+            register_parts.push(format!("0x{register:x}={writes}"));
+        }
+        let mut transition_parts = Vec::with_capacity(self.writes_by_transition.len());
+        for ((previous, current), writes) in &self.writes_by_transition {
+            transition_parts.push(format!("{previous}->{current}={writes}"));
+        }
+        format!(
+            "[redline] PM4 stream accounting arch={} dispatches={} command_dwords={} \
+             execution_sequence_hash={:016x} dependency_waits={} dependency_acquires={} \
+             terminal_waits=1 packet_classes=[{}] set_sh_headers={} set_sh_values={} \
+             set_sh_repeated={} writes_by_register_offset=[{}] writes_by_transition=[{}]",
+            self.architecture,
+            self.dispatch_count,
+            self.command_dwords,
+            self.execution_sequence_hash,
+            self.dependency_waits,
+            self.dependency_acquires,
+            packet_parts.join(", "),
+            self.set_sh_header_dwords,
+            self.set_sh_value_dwords,
+            self.set_sh_repeated_value_dwords,
+            register_parts.join(", "),
+            transition_parts.join(", "),
+        )
+    }
+}
+
+/// Run gfx10/gfx11 stream accounting after terminal idle and before graph create.
+///
+/// Malformed or partial accounting fails preparation. The report is logged and
+/// dropped; nothing is retained on the prepared replay object.
+fn report_pm4_stream_accounting(
+    architecture: &str,
+    order: &[usize],
+    recorded: &[RecordedHipLaunch],
+    commands: &Pm4Commands,
+    command_dwords: u32,
+    execution_sequence_hash: u64,
+    dependency_waits: usize,
+    dependency_acquires: usize,
+) -> Result<(), String> {
+    let census = match commands.packet_census() {
+        Some(Ok(census)) => census,
+        Some(Err(dword)) => {
+            return Err(format!(
+                "PM4 stream accounting packet census failed at dword {dword}"
+            ));
+        }
+        None => {
+            return Err(
+                "PM4 stream accounting requested but architecture has no gfx10/gfx11 census"
+                    .to_owned(),
+            );
+        }
+    };
+    let records = match commands.set_sh_reg_records() {
+        Some(Ok(records)) => records,
+        Some(Err(dword)) => {
+            return Err(format!(
+                "PM4 stream accounting SET_SH records failed at dword {dword}"
+            ));
+        }
+        None => {
+            return Err(
+                "PM4 stream accounting requested but architecture has no gfx10/gfx11 SET_SH records"
+                    .to_owned(),
+            );
+        }
+    };
+    let report = Pm4StreamAccountingReport::build(
+        architecture,
+        order,
+        recorded,
+        command_dwords,
+        execution_sequence_hash,
+        dependency_waits,
+        dependency_acquires,
+        &census,
+        &records,
+    )?;
+    eprintln!("{}", report.format_report());
+    // Explicit drop: report must not escape into PreparedPm4Replay.
+    drop(report);
+    Ok(())
 }
 
 enum PreparedPm4Graph {
@@ -4332,6 +4752,8 @@ impl ReplayController {
         } else {
             1
         };
+        let stream_accounting = pm4_stream_accounting_enabled();
+        validate_pm4_stream_accounting_queue_count(stream_accounting, queue_limit)?;
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
@@ -4493,7 +4915,9 @@ impl ReplayController {
                     dependency_waits,
                     dependency_acquires,
                 );
-                if device.name().eq_ignore_ascii_case("gfx1151") {
+                // Legacy gfx1151 census stays when stream accounting is off.
+                // With the flag set, the richer report below subsumes it.
+                if !stream_accounting && device.name().eq_ignore_ascii_case("gfx1151") {
                     match commands.packet_census() {
                         Some(Ok(census)) => {
                             eprintln!("[redline] gfx1151 PM4 packet census: {census:?}");
@@ -4502,6 +4926,33 @@ impl ReplayController {
                             eprintln!("WARNING: gfx1151 PM4 packet census failed at dword {dword}");
                         }
                         None => {}
+                    }
+                }
+            }
+            // Preparation-only stream accounting: after terminal idle, before
+            // graph creation. Reachable on gfx10/gfx11 (incl. gfx1100) without
+            // requiring the reorder flag. Fail closed on malformed streams.
+            if stream_accounting {
+                match pm4_architecture {
+                    Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
+                        let execution_sequence_hash =
+                            replay_sequence_hash(order.iter().map(|index| &recorded[*index]));
+                        report_pm4_stream_accounting(
+                            device.name(),
+                            &order,
+                            recorded,
+                            &commands,
+                            command_dwords,
+                            execution_sequence_hash,
+                            dependency_waits,
+                            dependency_acquires,
+                        )?;
+                    }
+                    Pm4Architecture::Gfx12 => {
+                        return Err(
+                            "HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING requires gfx10/gfx11 PM4"
+                                .to_owned(),
+                        );
                     }
                 }
             }
@@ -5442,6 +5893,11 @@ mod tests {
         "fused_qkvza_hfq4g256_wavepack4",
         "fused_qkvza_hfq4g256_ldsx8",
         "fused_qkvza_hfq4g256_reduce_chain",
+        "fused_qkvza_mq4g256v2",
+        "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+        "fused_qkv_mq4g256v2",
+        "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        "fused_gate_up_mq4g256v2",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
@@ -5452,15 +5908,18 @@ mod tests {
         "gated_norm_mq_rotate_gfx1100",
         "gated_norm_mq_rotate_k6144_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
+        "gated_norm_mq_rotate_gfx1201",
         "qwen35_fa_prep_gfx1100",
         "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
+        "qwen35_fa_prep_gfx1201",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
         "gemv_hfq4g256_residual_cpol_rt_low",
         "gemv_hfq4g256_residual_cpol_slc",
         "gemv_hfq4g256_residual_k2048",
+        "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
         "gemv_hfq4g256_residual_rt_low_gfx1151",
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",
@@ -5472,6 +5931,7 @@ mod tests {
         "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate",
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+        "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
@@ -5484,6 +5944,7 @@ mod tests {
         "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
         "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151",
+        "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151",
@@ -5503,6 +5964,7 @@ mod tests {
         "attention_flash_q8_0_reduce",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
         "gemv_hfq4g256_multirow_r4",
@@ -6290,9 +6752,12 @@ mod tests {
         let grouped_effects = vec![read(0), read(8), read(16), read(24), write(32)];
 
         // Decode gate_up: 5 ptr + M,K = 48 B (already 16-aligned).
+        // Includes gfx1100 exact K=2048 nolds candidate: same ABI/grid contract
+        // as the generic gate_up, only workgroup/LDS/barrier removal differs.
         for symbol in [
             "gemv_mq4g256v2_moe_gate_up_k8_indexed",
             "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(48));
             let got = pointer_effects(symbol).expect("mqv2 gate_up pointer contract");
@@ -6353,8 +6818,10 @@ mod tests {
         }
 
         // Ninepath fused down+combine: 5 ptr + down_m,down_k = 48.
+        // RPB8 gfx1100 candidate shares the frozen 48-byte ABI.
         for symbol in [
             "gemv_mq4g256v2_moe_ninepath_d4",
+            "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
             "gemv_mq6g256v2_moe_ninepath_d4",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(48));
@@ -6544,6 +7011,7 @@ mod tests {
         for symbol in [
             "gemv_mq4g256v2",
             "gemv_mq4g256v2_residual",
+            "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
             "gemv_mq6g256v2",
             "gemv_mq6g256v2_residual",
             "gemv_mq4g256v2_multirow_r2",
@@ -6626,6 +7094,204 @@ mod tests {
     }
 
     #[test]
+    fn mq4g256v2_residual_r1_k4096_gfx1100_noscratch_keeps_exact_residual_contract() {
+        // gfx1100-only residual R1 K=4096 noscratch candidate: same 32-B plain V2
+        // residual ABI (A@0, x@8, y@16 RMW/write; M@24, K@28). Distinct symbol —
+        // never collapses onto generic residual or unknown names.
+        let symbol = "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch";
+        let want = [read(0), read(8), write(16)];
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..3 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 32, "{symbol} explicit args occupy 32 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 32, "{symbol} recorded launches pad to 16");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+
+        let got = pointer_effects(symbol).expect("noscratch residual pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // Fail-closed: unknown / mismatched residual names stay unrecognized.
+        assert!(pointer_effects("gemv_mq4g256v2_residual_r1_k4096_gfx1100").is_none());
+        assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_r1_k4096_gfx1100").is_none());
+        assert_ne!(symbol, "gemv_mq4g256v2_residual");
+        assert_ne!(symbol, "gemv_hfq4g256_residual_k2048");
+    }
+
+    #[test]
+    fn mq4g256v2_residual_sigmoid_scaled_k512_keeps_exact_40b_abi() {
+        // Ornith qt44 shared-down fuse: A@0, x@8, y@16 RMW/write, c_buf@24 read;
+        // M@32, K@36 → 40 explicit bytes, pad_to(16) → 48. Four pointer offsets.
+        let symbol = "gemv_mq4g256v2_residual_sigmoid_scaled_k512";
+        let want = [read(0), read(8), write(16), read(24)];
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..4 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 40, "{symbol} explicit args occupy 40 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+
+        let got = pointer_effects(symbol).expect("sigmoid residual pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // Distinct from V1 residual_sigmoid and plain V2 residual; fail-closed on typos.
+        assert_ne!(symbol, "gemv_hfq4g256_residual_sigmoid_scaled_gpu");
+        assert_ne!(symbol, "gemv_mq4g256v2_residual");
+        assert!(pointer_effects("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
+        assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
+    }
+
+    #[test]
+    fn fused_qkvza_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let want = [
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ];
+
+        // Generic plus gfx1100 K=2048 HOIST_X32 share the same 14-arg ABI:
+        // reads@0/8/16/24/32, writes@40/48/56/64, pad96.
+        for symbol in [
+            "fused_qkvza_mq4g256v2",
+            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(96));
+            let got = pointer_effects(symbol).expect("mq4g256v2 qkvza pointer contract");
+            assert_eq!(got.len(), want.len());
+            for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+                assert_eq!(got_effect.offset, want_effect.offset);
+                assert_eq!(got_effect.mode, want_effect.mode);
+            }
+        }
+
+        // Identities stay independent: hoist never collapses onto generic.
+        assert_ne!(
+            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+            "fused_qkvza_mq4g256v2"
+        );
+
+        // 9 ptr + 5 i32 dimensions = 92 explicit bytes, pad_to(16) → 96.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..9 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..5 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 92, "explicit kernel arguments occupy 92 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 96, "recorded launches pad to 16 bytes");
+        for symbol in [
+            "fused_qkvza_mq4g256v2",
+            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+        }
+    }
+
+    #[test]
+    fn fused_qkv_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let want = [
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ];
+
+        // Generic plus gfx1100 K=2048 X_BUFFER share the same 11-arg ABI:
+        // reads@0/8/16/24, writes@32/40/48, pad80.
+        for symbol in [
+            "fused_qkv_mq4g256v2",
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(80));
+            let got = pointer_effects(symbol).expect("mq4g256v2 qkv pointer contract");
+            assert_eq!(got.len(), want.len());
+            for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+                assert_eq!(got_effect.offset, want_effect.offset);
+                assert_eq!(got_effect.mode, want_effect.mode);
+            }
+        }
+
+        // Identities stay independent: x_buffer never collapses onto generic.
+        assert_ne!(
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+            "fused_qkv_mq4g256v2"
+        );
+
+        // 7 ptr + 4 i32 dimensions = 72 explicit bytes, pad_to(16) → 80.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 72, "explicit kernel arguments occupy 72 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 80, "recorded launches pad to 16 bytes");
+        for symbol in [
+            "fused_qkv_mq4g256v2",
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+        }
+    }
+
+    #[test]
+    fn fused_gate_up_mq4g256v2_keeps_exact_scalar_replay_contract() {
+        let symbol = "fused_gate_up_mq4g256v2";
+        let want = [read(0), read(8), read(16), write(24), write(32)];
+
+        assert_eq!(expected_kernarg_bytes(symbol), Some(64));
+        let got = pointer_effects(symbol).expect("mq4g256v2 gate_up pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+
+        // 5 ptr + 3 i32 dimensions = 52 explicit bytes, pad_to(16) → 64.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..3 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 52, "explicit kernel arguments occupy 52 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 64, "recorded launches pad to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+    }
+
+    #[test]
     fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
         assert!(independent_sibling(
             "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
@@ -6636,7 +7302,15 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
         ));
         assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        ));
+        assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+        ));
+        assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         ));
         assert!(independent_sibling(
@@ -6644,11 +7318,23 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
         ));
         assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+        ));
+        assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         ));
         assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
+        ));
+        assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
+        ));
+        assert!(independent_sibling(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
         ));
         for kernel in [
@@ -6658,6 +7344,10 @@ mod tests {
         ] {
             assert!(independent_sibling(
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                kernel,
+            ));
+            assert!(independent_sibling(
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
                 kernel,
             ));
         }
@@ -8179,5 +8869,258 @@ mod tests {
         assert_ne!(err, err2);
         assert_ne!(err2, err3);
         assert_ne!(err, err3);
+    }
+
+    fn test_launch(kernel: &str) -> RecordedHipLaunch {
+        RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1, 1, 1],
+            block: [64, 1, 1],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: None,
+        }
+    }
+
+    fn sample_set_sh(
+        packet_dword: u32,
+        following_dispatch: u32,
+        first_register: u32,
+        value_dwords: u32,
+        repeated_value_dwords: u32,
+    ) -> Gfx10SetShRegRecord {
+        Gfx10SetShRegRecord {
+            packet_dword,
+            following_dispatch,
+            first_register,
+            value_dwords,
+            repeated_value_dwords,
+        }
+    }
+
+    #[test]
+    fn pm4_set_sh_transition_identity_and_non_identity_order() {
+        let recorded = [
+            test_launch("kernel_a"),
+            test_launch("kernel_b"),
+            test_launch("kernel_c"),
+        ];
+        let identity = [0usize, 1, 2];
+        assert_eq!(
+            pm4_set_sh_transition(&identity, &recorded, 0).unwrap(),
+            (
+                PM4_STREAM_ENTRY_TRANSITION.to_owned(),
+                "kernel_a".to_owned()
+            )
+        );
+        assert_eq!(
+            pm4_set_sh_transition(&identity, &recorded, 1).unwrap(),
+            ("kernel_a".to_owned(), "kernel_b".to_owned())
+        );
+        assert_eq!(
+            pm4_set_sh_transition(&identity, &recorded, 2).unwrap(),
+            ("kernel_b".to_owned(), "kernel_c".to_owned())
+        );
+
+        // Non-identity schedule: execution order c, a, b.
+        let reordered = [2usize, 0, 1];
+        assert_eq!(
+            pm4_set_sh_transition(&reordered, &recorded, 0).unwrap(),
+            (
+                PM4_STREAM_ENTRY_TRANSITION.to_owned(),
+                "kernel_c".to_owned()
+            )
+        );
+        assert_eq!(
+            pm4_set_sh_transition(&reordered, &recorded, 1).unwrap(),
+            ("kernel_c".to_owned(), "kernel_a".to_owned())
+        );
+        assert_eq!(
+            pm4_set_sh_transition(&reordered, &recorded, 2).unwrap(),
+            ("kernel_a".to_owned(), "kernel_b".to_owned())
+        );
+        assert!(pm4_set_sh_transition(&reordered, &recorded, 3).is_err());
+    }
+
+    #[test]
+    fn pm4_stream_accounting_rejects_multi_queue_lowering() {
+        assert!(validate_pm4_stream_accounting_queue_count(false, 2).is_ok());
+        assert!(validate_pm4_stream_accounting_queue_count(true, 1).is_ok());
+        let error = validate_pm4_stream_accounting_queue_count(true, 2).unwrap_err();
+        assert!(error.contains("requires one PM4 queue"));
+        assert!(error.contains('2'));
+    }
+
+    #[test]
+    fn pm4_stream_accounting_stable_btreemap_ordering() {
+        let recorded = [test_launch("alpha"), test_launch("beta")];
+        let order = [0usize, 1];
+        // Insert census keys out of sorted order; BTreeMap must emit sorted rows.
+        let mut census = BTreeMap::new();
+        census.insert((0x58, 8), 1usize);
+        census.insert((PACKET3_SET_SH_REG, 4), 2usize);
+        census.insert((PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS), 2);
+        census.insert((0x46, 2), 1);
+        // 8 + 4*2 + 5*2 + 2 = 28
+        let command_dwords = 28_u32;
+        let records = [
+            sample_set_sh(8, 0, 0x20c, 2, 0),
+            sample_set_sh(12, 1, 0x207, 2, 0),
+        ];
+        let report = Pm4StreamAccountingReport::build(
+            "gfx1100",
+            &order,
+            &recorded,
+            command_dwords,
+            0xabc_u64,
+            1,
+            1,
+            &census,
+            &records,
+        )
+        .expect("reconciled sample");
+        let formatted = report.format_report();
+        // Packet classes: BTreeMap sorts by (opcode, dwords)
+        let classes_idx = formatted.find("packet_classes=[").unwrap();
+        let classes = &formatted[classes_idx..];
+        let pos_15 = classes.find("op=0x15").unwrap();
+        let pos_46 = classes.find("op=0x46").unwrap();
+        let pos_58 = classes.find("op=0x58").unwrap();
+        let pos_76 = classes.find("op=0x76").unwrap();
+        assert!(pos_15 < pos_46 && pos_46 < pos_58 && pos_58 < pos_76);
+        // Register offsets sorted numerically: 0x207 before 0x20c
+        let regs_idx = formatted.find("writes_by_register_offset=[").unwrap();
+        let regs = &formatted[regs_idx..];
+        assert!(regs.find("0x207=").unwrap() < regs.find("0x20c=").unwrap());
+        // Transitions sorted by (prev, curr) string order
+        let tr_idx = formatted.find("writes_by_transition=[").unwrap();
+        let tr = &formatted[tr_idx..];
+        let entry_alpha = tr.find("<entry>->alpha=").unwrap();
+        let alpha_beta = tr.find("alpha->beta=").unwrap();
+        assert!(entry_alpha < alpha_beta);
+        // No raw addresses in the report.
+        assert!(!formatted.contains("address"));
+    }
+
+    #[test]
+    fn pm4_stream_accounting_reconciliation_failures() {
+        let recorded = [test_launch("a"), test_launch("b")];
+        let order = [0usize, 1];
+        let mut census = BTreeMap::new();
+        census.insert((PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS), 2);
+        census.insert((PACKET3_SET_SH_REG, 4), 1);
+        // 5*2 + 4 = 14, but claim 15 → dword sum failure
+        let err = Pm4StreamAccountingReport::build(
+            "gfx1100",
+            &order,
+            &recorded,
+            15,
+            0,
+            0,
+            0,
+            &census,
+            &[sample_set_sh(0, 0, 0x207, 2, 0)],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("accounts for") && err.contains("14") && err.contains("15"),
+            "dword mismatch: {err}"
+        );
+
+        // Dispatch count mismatch
+        let mut census = BTreeMap::new();
+        census.insert((PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS), 1);
+        census.insert((PACKET3_SET_SH_REG, 3), 1);
+        // 5 + 3 = 8
+        let err = Pm4StreamAccountingReport::build(
+            "gfx1100",
+            &order,
+            &recorded,
+            8,
+            0,
+            0,
+            0,
+            &census,
+            &[sample_set_sh(0, 0, 0x207, 1, 0)],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("DISPATCH_DIRECT count"),
+            "dispatch mismatch: {err}"
+        );
+
+        // following_dispatch outside order
+        let mut census = BTreeMap::new();
+        census.insert((PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS), 2);
+        census.insert((PACKET3_SET_SH_REG, 4), 1);
+        let err = Pm4StreamAccountingReport::build(
+            "gfx1100",
+            &order,
+            &recorded,
+            14,
+            0,
+            0,
+            0,
+            &census,
+            &[sample_set_sh(0, 9, 0x207, 2, 0)],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("following_dispatch=9") || err.contains("outside frozen order"),
+            "following_dispatch failure: {err}"
+        );
+
+        // SET_SH value count vs census payload mismatch
+        let mut census = BTreeMap::new();
+        census.insert((PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS), 2);
+        census.insert((PACKET3_SET_SH_REG, 5), 1); // 3 values
+        let err = Pm4StreamAccountingReport::build(
+            "gfx1100",
+            &order,
+            &recorded,
+            15, // 10 + 5
+            0,
+            0,
+            0,
+            &census,
+            &[sample_set_sh(0, 0, 0x207, 2, 0)], // only 2 values recorded
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("value dwords") || err.contains("payload"),
+            "value mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn pm4_stream_accounting_report_is_not_retained() {
+        // Report is preparation-only and dropped before graph install.
+        // PreparedPm4Replay has no accounting field; constructing and dropping
+        // the report does not require stashing it on the retained type.
+        let recorded = [test_launch("k0")];
+        let order = [0usize];
+        let mut census = BTreeMap::new();
+        census.insert((PACKET3_DISPATCH_DIRECT, DISPATCH_DIRECT_PACKET_DWORDS), 1);
+        census.insert((PACKET3_SET_SH_REG, 3), 1);
+        let report = Pm4StreamAccountingReport::build(
+            "gfx1100",
+            &order,
+            &recorded,
+            8, // 5 + 3
+            0xabc,
+            0,
+            0,
+            &census,
+            &[sample_set_sh(0, 0, 0x207, 1, 0)],
+        )
+        .unwrap();
+        let line = report.format_report();
+        assert!(line.contains("arch=gfx1100"));
+        assert!(line.contains("dispatches=1"));
+        assert!(line.contains("command_dwords=8"));
+        drop(report);
+        let _ = std::mem::size_of::<PreparedPm4Replay>();
     }
 }

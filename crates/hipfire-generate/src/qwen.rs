@@ -84,6 +84,8 @@ pub fn generate_ep(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
     sampling: EpSampling,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
 ) {
     // ── Canonical multi-turn render via the arch's trained chat_template
     // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
@@ -118,10 +120,10 @@ pub fn generate_ep(
                     template,
                     system: system_prompt,
                     user: prompt,
-                    enable_thinking: max_think_tokens != 1,
+                    enable_thinking,
                     bos_token: None,
                     reasoning_strength: None,
-                    reasoning_effort: None,
+                    reasoning_effort,
                 };
                 let render_result = if tools.is_some() || messages_history.is_some() {
                     let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;

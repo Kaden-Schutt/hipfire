@@ -1123,6 +1123,14 @@ pub const GATED_NORM_MQ_ROTATE_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
 );
+/// Exact-gfx1201 32-head DeltaNet gated-norm/MQ rotation. The gfx1100 body is
+/// structurally valid on RDNA4 (wave32 ds_swizzle butterfly, two wave32s per
+/// workgroup, identical LDS handoff); only the module/entry symbol differs so
+/// stale gfx1100/gfx1151 HSACO caches cannot alias it.
+pub const GATED_NORM_MQ_ROTATE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1201\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
+);
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
@@ -1659,6 +1667,28 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
 );
+/// gfx1100-only one-row residual candidate from the plain V2 body: fixed K=4096
+/// groups for Ornith attention out_proj, residual store (`y[row] += acc`), and
+/// a unique symbol. Zero private segment target for retained-PM4 qualification.
+/// Launcher-gated; the default residual path stays on dual-row
+/// `GEMV_MQ4G256V2_RESIDUAL_SRC`.
+pub const GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch\n",
+    "#define HIPFIRE_MQ4G256V2_K4096 1\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// Ornith qt44 shared-expert down fuse: fixed K=512 dual-half MQ4G256V2 body with
+/// lane-0 `sigmoid(c_buf[0]) * acc` residual store. ABI is 40 B (A/x/y/c_buf/M/K).
+/// Launcher-gated to exact gfx1100|gfx1201 / M=2048 / K=512; default shared-down
+/// stays on sigmoid_f32 + plain V2 GEMV + scaled_add.
+pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_sigmoid_scaled_k512\n",
+    "#define HIPFIRE_MQ4G256V2_K512 1\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -2333,6 +2363,17 @@ pub const GEMV_MQ6G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat
 pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip");
 
+/// Exact-shape gfx1100 MQ4G256V2 MoE gate_up specialization: drop LDS x
+/// staging and the dead-workgroup barrier while keeping one-wave/row
+/// arithmetic identical to [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC`].
+/// Symbol `gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100`;
+/// the host selects it by architecture and exact M=1024, K=2048 shape.
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100\n",
+    "#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip")
+);
+
 /// MQ6G256V2 (qt=47) sister of [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC`].
 /// Same grid/ABI/output split; only group stride (200 B) and 6-bit payload
 /// decode change. V1 f32 header must not collapse into this dual-half path.
@@ -2373,8 +2414,19 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
 /// group header decode. qt44 previously matched neither `ninepath_hfq4` nor
 /// `ninepath_mq3l`, so it was denied the fused down path despite clearing the
 /// shape gate — which the published Ornith 1.5 artifact does exactly.
+/// Default export: `gemv_mq4g256v2_moe_ninepath_d4`, RPB=16.
 pub const GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip");
+
+/// gfx1100 higher-parallelism MQ4G256V2 ninepath specialization: same TU,
+/// RPB=8. Symbol `gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100`. Frozen 48-byte
+/// ABI; only the grid becomes `down_m/8`. The host selects it at exact
+/// down_m=2048, down_k=512.
+pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n",
+    "#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip")
+);
 
 /// MQ6G256V2 (qt=47) sister of [`GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC`].
 /// Identical staging / warp-per-krank / LDS fold; only the 200 B dual-half
@@ -3975,6 +4027,14 @@ pub const FUSED_QKVZA_MQ4G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
 );
+pub const FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+);
 pub const FUSED_QKVZA_MQ5G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -4327,6 +4387,14 @@ pub const FUSED_QKV_MQ2G256V2_SRC: &str = concat!(
 pub const FUSED_QKV_MQ4G256V2_QWEN2_BIAS_SRC: &str = concat!(
     "#define HIPFIRE_QKV_WITH_BIAS 1\n",
     "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256v2_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+);
+pub const FUSED_QKV_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_QKV_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKV_X_BUFFER 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
@@ -5287,6 +5355,14 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC: &str = concat
     "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
 );
+/// Exact-gfx1201 gated MQ-rotate attention reduce epilogue. Same body as the
+/// gfx1100 sibling (portable reducer order, sigmoid gate, exact mq_rotate_x
+/// butterfly) under its own translation unit and entry symbol; the source
+/// uses only wave32 ds_swizzle/LDS constructs that compile on RDNA4.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
+);
 
 /// Turbo common header: shared definitions for turbo/givens kernels.
 pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
@@ -5546,6 +5622,16 @@ pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
+    include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+);
+/// Exact-gfx1201 16Q/2K full-attention preparation. The gfx1100 body
+/// (deinterleave + 256-thread rmsnorm_f32 shared-memory reduction + partial
+/// half-split RoPE per head) compiles unchanged on RDNA4; the distinct
+/// module/entry symbol keeps HSACO caches from aliasing the gfx1100/gfx1151
+/// builds.
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
 
@@ -7339,8 +7425,14 @@ mod dispatch_tests {
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC.starts_with(
             "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC.starts_with(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
+        ));
         assert!(GATED_NORM_MQ_ROTATE_GFX1151_SRC.starts_with(
             "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_GFX1201_SRC.starts_with(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1201"
         ));
         let k6144 = gated_norm_mq_rotate_k6144_gfx1100_src();
         assert!(k6144.starts_with(
@@ -7353,6 +7445,9 @@ mod dispatch_tests {
         #[cfg(feature = "deltanet")]
         assert!(QWEN35_FA_PREP_GFX1151_SRC
             .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151"));
+        #[cfg(feature = "deltanet")]
+        assert!(QWEN35_FA_PREP_GFX1201_SRC
+            .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201"));
         #[cfg(feature = "deltanet")]
         {
             let q24k4 = qwen36_27b_fa_prep_gfx1100_src();
@@ -8014,9 +8109,37 @@ mod mqv2_moe {
 
     #[test]
     fn existing_mq4v2_moe_sources_untouched() {
+        assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC.contains(
+            "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed"
+        ));
         assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC
-            .contains("void gemv_mq4g256v2_moe_gate_up_k8_indexed("));
-        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("void gemv_mq4g256v2_moe_ninepath_d4("));
+            .contains("void HIPFIRE_MQ4V2_GATE_UP_KERNEL("));
+        assert!(!GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC
+            .contains("#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1"));
+        assert!(GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC.contains(
+            "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
+        ));
+        assert!(
+            GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC
+                .contains("#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1")
+        );
+        assert!(
+            GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC
+                .contains("void HIPFIRE_MQ4V2_GATE_UP_KERNEL(")
+        );
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("void HIPFIRE_MQ4V2_NINEPATH_KERNEL("));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC
+            .contains("#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_d4"));
+        assert!(
+            GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC.contains("#define HIPFIRE_MQ4V2_NINEPATH_RPB 16")
+        );
+        assert!(!GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC
+            .contains("gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC.starts_with(
+            "#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100\n#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n"
+        ));
+        assert!(GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC
+            .contains("void HIPFIRE_MQ4V2_NINEPATH_KERNEL("));
         assert!(GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC
             .contains("void gemm_mq4g256v2_moe_grouped_wmma_k2("));
         assert!(GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC

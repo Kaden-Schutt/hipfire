@@ -217,28 +217,72 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
             .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
 }
 
-/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
-/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
-/// applicable even on a graded file: the MQ4 router routes on the rotated x via
-/// the fused gate kernel (MoeResolution::gate_fusable), and the routed experts
-/// (any FwhtG256 MQ-family) consume the same single rotated activation — saving
-/// the un-fused rmsnorm + the per-component rotates the else-branch incurs.
-/// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
-/// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
+/// Gate-side exact-uniform MQ4G256 V1 quartet (router + shared expert
+/// gate/up), independent of the routed experts.
+///
+/// Keeping this predicate aligned with `MoeResolution::gate_fusable` is a
+/// correctness invariant. If Qwen pre-rotates while dispatch declines the
+/// fused route, generic `run_auto` receives the raw residual in its `x_norm`
+/// slot and silently rotates an unnormalized activation.
 pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)
-        && matches!(
+    gate_side_mq4_uniform_from_dtypes([
+        ffn.router.gpu_dtype,
+        ffn.shared_expert_gate.gpu_dtype,
+        ffn.shared_expert.gate.gpu_dtype,
+        ffn.shared_expert.up.gpu_dtype,
+    ])
+}
+
+/// Pure core of [`ffn_gate_side_mq4_for_moe`] for unit tests (no live weights).
+pub(crate) fn gate_side_mq4_uniform_from_dtypes(
+    [router, shared_expert_gate, shared_gate, shared_up]: [DType; 4],
+) -> bool {
+    [router, shared_expert_gate, shared_gate, shared_up]
+        .into_iter()
+        .all(|dt| dt == DType::MQ4G256)
+}
+
+/// Exact Ornith MQ4G256V2 gate quartet admitted by the fused prerotated
+/// dispatch route. Shapes and missing AWQ sidecars are part of the contract:
+/// widening any one here without the matching `MoeResolution::gate_fusable`
+/// arm would feed unnormalized residuals to the generic fallback.
+fn ffn_gate_side_mq4v2_prerotated_for_moe(ffn: &MoeFfnWeights) -> bool {
+    gate_side_mq4v2_prerotated_from_layouts([
+        (
+            ffn.router.gpu_dtype,
+            ffn.router.m,
+            ffn.router.k,
+            ffn.router.awq_scale.is_some(),
+        ),
+        (
             ffn.shared_expert_gate.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
-        && matches!(
+            ffn.shared_expert_gate.m,
+            ffn.shared_expert_gate.k,
+            ffn.shared_expert_gate.awq_scale.is_some(),
+        ),
+        (
             ffn.shared_expert.gate.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
-        && matches!(
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.gate.k,
+            ffn.shared_expert.gate.awq_scale.is_some(),
+        ),
+        (
             ffn.shared_expert.up.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.up.k,
+            ffn.shared_expert.up.awq_scale.is_some(),
+        ),
+    ])
+}
+
+fn gate_side_mq4v2_prerotated_from_layouts(layouts: [(DType, usize, usize, bool); 4]) -> bool {
+    let expected = [(256, 2_048), (1, 2_048), (512, 2_048), (512, 2_048)];
+    layouts
+        .into_iter()
+        .zip(expected)
+        .all(|((dtype, m, k, has_awq), (want_m, want_k))| {
+            dtype == DType::MQ4G256V2 && m == want_m && k == want_k && !has_awq
+        })
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -3017,7 +3061,9 @@ fn moe_ffn_dispatch(
     s: &Qwen35Scratch,
     defer_routed_combine: bool,
 ) -> HipResult<()> {
-    let r = if ffn_gate_side_mq4_for_moe(ffn) {
+    let exact_v2_prerotated = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
+        && ffn_gate_side_mq4v2_prerotated_for_moe(ffn);
+    let r = if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
         gpu.fused_rmsnorm_rotate_mq(
             x,
             ffn_norm,
@@ -3282,6 +3328,10 @@ fn triattn_tap(
     Ok(())
 }
 
+fn qwen35_fa_epilogue_route_supported(is_gfx1201: bool, q8_route: bool, asym3_route: bool) -> bool {
+    q8_route || (!is_gfx1201 && asym3_route)
+}
+
 /// KV cache write + attention dispatch. Inline from original.
 pub(crate) fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
@@ -3304,7 +3354,9 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let asym3_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteAsym3
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
-    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && (q8_route || asym3_route);
+    let fused_epilogue_route =
+        qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
+    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -5505,6 +5557,25 @@ fn forward_lowered_enabled() -> bool {
 fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx1151()
 }
+/// Exact gfx1201 admission gate for the ported Qwen3.5 decode state fusions
+/// (gated-norm/MQ rotation, full-attention prep, gated MQ-rotate FA epilogue).
+/// Keep architecture and model-shape checks separate from broad capability
+/// checks so no neighboring GPU or lookalike Qwen configuration inherits the
+/// gfx1201 schedules.
+fn gfx1201_state_fusions_enabled(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx1201()
+}
+
+fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
+    config.dim == 2_048
+        && config.n_heads == 16
+        && config.n_kv_heads == 2
+        && config.head_dim == 256
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 32
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+}
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
@@ -5586,7 +5657,8 @@ fn gated_norm_mq_rotate_enabled(
             != Some("0")
     });
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu)
+        || gfx1201_state_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
         || (gpu.arch_caps.is_gfx1100() && super::config::qwen36_27b_dense_shape(config, n_v_heads));
@@ -5621,6 +5693,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -5649,6 +5722,7 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -5973,6 +6047,13 @@ mod tests {
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
     }
 
+    #[test]
+    fn gfx1201_fa_epilogue_is_q8_only() {
+        assert!(qwen35_fa_epilogue_route_supported(true, true, false));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, true));
+        assert!(qwen35_fa_epilogue_route_supported(false, false, true));
+    }
+
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
     // The lowered LayerProgram per variant must mirror the hand-arm op sequence
     // in forward_scratch_layers exactly. These are CPU-pure (no GPU/GpuTensor).
@@ -6125,19 +6206,31 @@ mod tests {
     }
 
     #[test]
-    fn mq4_family_gate_side_match_keeps_v1_and_v2() {
-        // Mirrors ffn_gate_side_mq4_for_moe / experts_all_gate_up_mq4 arms:
-        // both V1 and V2 are MQ4-family for prerotate admission; neither is MQ6.
-        let is_mq4 = |dt: DType| matches!(dt, DType::MQ4G256 | DType::MQ4G256V2);
-        let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256 | DType::MQ6G256V2);
-        assert!(is_mq4(DType::MQ4G256));
-        assert!(is_mq4(DType::MQ4G256V2));
-        assert!(!is_mq4(DType::MQ6G256));
-        assert!(!is_mq4(DType::MQ6G256V2));
-        assert!(is_mq6(DType::MQ6G256));
-        assert!(is_mq6(DType::MQ6G256V2));
-        assert!(!is_mq6(DType::MQ4G256));
-        assert!(!is_mq6(DType::MQ4G256V2));
+    fn mq4v2_gate_side_prerotation_requires_exact_ornith_layout() {
+        let v1 = DType::MQ4G256;
+        let v2 = DType::MQ4G256V2;
+        let exact = [
+            (v2, 256, 2_048, false),
+            (v2, 1, 2_048, false),
+            (v2, 512, 2_048, false),
+            (v2, 512, 2_048, false),
+        ];
+        assert!(gate_side_mq4_uniform_from_dtypes([v1, v1, v1, v1]));
+        assert!(!gate_side_mq4_uniform_from_dtypes([v2, v2, v2, v2]));
+        assert!(gate_side_mq4v2_prerotated_from_layouts(exact));
+
+        for slot in 0..4 {
+            let mut mixed = exact;
+            mixed[slot].0 = v1;
+            assert!(!gate_side_mq4v2_prerotated_from_layouts(mixed));
+
+            let mut awq = exact;
+            awq[slot].3 = true;
+            assert!(!gate_side_mq4v2_prerotated_from_layouts(awq));
+        }
+        let mut wrong_shape = exact;
+        wrong_shape[2].1 = 511;
+        assert!(!gate_side_mq4v2_prerotated_from_layouts(wrong_shape));
     }
 
     #[test]

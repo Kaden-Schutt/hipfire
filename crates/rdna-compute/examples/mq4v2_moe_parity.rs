@@ -56,12 +56,26 @@
 //! * Production K/M: gate/up 1024×2048, down/ninepath 2048×512, grouped 32×1024×2048.
 //! * Isolated half controls: lower-only / upper-only activations per token.
 //! * Equal-length and finite scoring: Report rejects empty/unequal/non-finite.
+//! * gfx1100 nolds candidate exactness: incumbent vs
+//!   `gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100` raw bits at
+//!   M=1024/K=2048/k=8 (high IDs + half-isolated activations).
 
+use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 const GROUP: usize = 256;
 const HALF: usize = 128;
 const GROUP_BYTES: usize = 136;
+
+/// Exact-shape nolds candidate (no LDS / no barrier). Same HIP TU as the
+/// incumbent with `HIPFIRE_MQ4V2_GATE_UP_NOLDS` + renamed entry; mirrors
+/// `kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC`.
+const GATE_UP_NOLDS_SYM: &str = "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100";
+const GATE_UP_NOLDS_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4V2_GATE_UP_KERNEL gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100\n",
+    "#define HIPFIRE_MQ4V2_GATE_UP_NOLDS 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip"),
+);
 
 // ── fixture + packing (shared convention with test_mq4v2_residual_bt_*) ──
 
@@ -313,6 +327,49 @@ impl Report {
             self.failures += 1;
         }
     }
+
+    /// Raw-bit identity gate for the nolds candidate vs incumbent (or any two
+    /// device outputs that must be bit-identical). Length / non-finite failures
+    /// count as mismatches.
+    fn check_bits_exact(&mut self, label: &str, got: &[f32], want: &[f32]) {
+        let len_ok = got.len() == want.len() && !got.is_empty();
+        let finite_got = got.iter().all(|v| v.is_finite());
+        let finite_want = want.iter().all(|v| v.is_finite());
+        let mismatches = if !len_ok {
+            usize::MAX
+        } else {
+            got.iter()
+                .zip(want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count()
+        };
+        let ok = len_ok && finite_got && finite_want && mismatches == 0;
+        let mismatch_txt = if mismatches == usize::MAX {
+            "len".to_string()
+        } else {
+            mismatches.to_string()
+        };
+        println!(
+            "  {:<44} bit_mismatch={}/{} {}",
+            label,
+            mismatch_txt,
+            got.len().max(want.len()),
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !len_ok {
+            println!(
+                "      -> length mismatch or empty: got {} want {}",
+                got.len(),
+                want.len()
+            );
+        }
+        if !finite_got || !finite_want {
+            println!("      -> non-finite values in got or want");
+        }
+        if !ok {
+            self.failures += 1;
+        }
+    }
 }
 
 // ── host self-test: runs with no GPU ────────────────────────────────────
@@ -406,6 +463,38 @@ fn half_isolated_x(k: usize, lower_only: bool, salt: u32) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+/// JIT the nolds candidate once and launch it with the frozen 48-byte ABI /
+/// exact-shape grid `[mi, 8, 1]` block `[32,1,1]` LDS 0.
+fn ensure_gate_up_nolds(gpu: &mut Gpu) -> Result<(), String> {
+    gpu.ensure_kernel_public(GATE_UP_NOLDS_SYM, GATE_UP_NOLDS_SRC, GATE_UP_NOLDS_SYM)
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn launch_gate_up_nolds(
+    gpu: &Gpu,
+    expert_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    x: &GpuTensor,
+    y_gate: &GpuTensor,
+    y_up: &GpuTensor,
+    m: usize,
+    k: usize,
+) {
+    let mut blob = KernargBlob::new();
+    blob.push_ptr(expert_ptrs.buf.as_ptr());
+    blob.push_ptr(topk_indices.buf.as_ptr());
+    blob.push_ptr(x.buf.as_ptr());
+    blob.push_ptr(y_gate.buf.as_ptr());
+    blob.push_ptr(y_up.buf.as_ptr());
+    blob.push_i32(m as i32);
+    blob.push_i32(k as i32);
+    // Exact candidate grid: mi workgroups × 8 ranks (dead row >= mi removed).
+    let grid = [(m as u32) >> 1, 8, 1];
+    let block = [32u32, 1, 1];
+    gpu.launch_kernel_blob(GATE_UP_NOLDS_SYM, grid, block, 0, blob.as_mut_slice())
+        .unwrap_or_else(|e| panic!("nolds launch {GATE_UP_NOLDS_SYM}: {e:?}"));
 }
 
 // ── GPU checks ──────────────────────────────────────────────────────────
@@ -509,6 +598,7 @@ fn gate_up_check(gpu: &mut Gpu, rep: &mut Report) {
     );
 
     // Isolated half controls: lower-only and upper-only activations via same kernel (two extra launches)
+    let mut half_incumbent: Vec<(bool, Vec<f32>, Vec<f32>)> = Vec::with_capacity(2);
     for (label, lower) in [
         ("gate_up lower-only half", true),
         ("gate_up upper-only half", false),
@@ -521,6 +611,7 @@ fn gate_up_check(gpu: &mut Gpu, rep: &mut Report) {
             .expect("gate_up half isolated launch");
         gpu.hip.device_synchronize().unwrap();
         let got_g2 = gpu.download_f32(&yg2).unwrap();
+        let got_u2 = gpu.download_f32(&yu2).unwrap();
         let mut want_g2 = vec![0.0f32; k_top * mi];
         for (r, &e) in topk.iter().enumerate() {
             let blob = if e == 255 || e == 1 {
@@ -533,7 +624,76 @@ fn gate_up_check(gpu: &mut Gpu, rep: &mut Report) {
                 want_g2[r * mi + row] = wr.iter().zip(&xh).map(|(a, b)| a * b).sum();
             }
         }
+        // CPU 1e-5 remains the secondary correctness gate for half isolation.
         rep.check(label, &got_g2, &want_g2, 1e-5);
+        half_incumbent.push((lower, got_g2, got_u2));
+    }
+
+    // ── nolds candidate exactness (incumbent vs candidate raw bits) ────────
+    // Production M=1024 K=2048 k=8; high expert IDs + half-isolated x.
+    // Direct JIT/launch so the oracle does not depend on the env opt-in gate.
+    match ensure_gate_up_nolds(gpu) {
+        Err(e) => {
+            println!(
+                "  {:<44} JIT failed ({e}) FAIL",
+                "gate_up nolds candidate exactness"
+            );
+            rep.failures += 1;
+        }
+        Ok(()) => {
+            let yg_c = gpu.alloc_tensor(&[k_top * mi], DType::F32).unwrap();
+            let yu_c = gpu.alloc_tensor(&[k_top * mi], DType::F32).unwrap();
+            launch_gate_up_nolds(gpu, &ptr_tab, &topk_t, &x_t, &yg_c, &yu_c, m, k);
+            gpu.hip.device_synchronize().unwrap();
+            let cand_g = gpu.download_f32(&yg_c).unwrap();
+            let cand_u = gpu.download_f32(&yu_c).unwrap();
+
+            rep.check_bits_exact("gate_up nolds vs incumbent y_gate", &cand_g, &got_g);
+            rep.check_bits_exact("gate_up nolds vs incumbent y_up", &cand_u, &got_u);
+            // Candidate must still disagree with the grid-swapped negative control.
+            rep.check_disagrees(
+                "gate_up nolds vs grid-swapped ref (neg)",
+                &cand_g,
+                &want_g_swapped_precise,
+                1e-2,
+            );
+
+            for (lower, inc_g, inc_u) in &half_incumbent {
+                let xh = half_isolated_x(k, *lower, if *lower { 0xA11 } else { 0xB22 });
+                let xh_t = gpu.upload_f32(&xh, &[k]).unwrap();
+                let yg_c2 = gpu.alloc_tensor(&[k_top * mi], DType::F32).unwrap();
+                let yu_c2 = gpu.alloc_tensor(&[k_top * mi], DType::F32).unwrap();
+                launch_gate_up_nolds(gpu, &ptr_tab, &topk_t, &xh_t, &yg_c2, &yu_c2, m, k);
+                gpu.hip.device_synchronize().unwrap();
+                let cg = gpu.download_f32(&yg_c2).unwrap();
+                let cu = gpu.download_f32(&yu_c2).unwrap();
+                let half = if *lower { "lower" } else { "upper" };
+                rep.check_bits_exact(&format!("gate_up nolds {half}-half y_gate"), &cg, inc_g);
+                rep.check_bits_exact(&format!("gate_up nolds {half}-half y_up"), &cu, inc_u);
+            }
+
+            let g_mm = cand_g
+                .iter()
+                .zip(&got_g)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let u_mm = cand_u
+                .iter()
+                .zip(&got_u)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let exact = g_mm == 0
+                && u_mm == 0
+                && cand_g.len() == got_g.len()
+                && cand_u.len() == got_u.len();
+            println!(
+                "  gate_up nolds candidate exactness M={m} K={k} k_top={k_top} arch={} y_gate_mismatch={g_mm}/{} y_up_mismatch={u_mm}/{} {}",
+                gpu.arch,
+                got_g.len(),
+                got_u.len(),
+                if exact { "PASS" } else { "FAIL" }
+            );
+        }
     }
     println!();
 }

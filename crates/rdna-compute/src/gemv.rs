@@ -3317,6 +3317,12 @@ impl Gpu {
                 kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
                 "gated_norm_mq_rotate_k6144_gfx1100",
             )
+        } else if self.arch_caps.is_gfx1201() {
+            (
+                "gated_norm_mq_rotate_gfx1201",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1201_SRC,
+                "gated_norm_mq_rotate_gfx1201",
+            )
         } else if self.arch_caps.is_gfx1151() {
             (
                 "gated_norm_mq_rotate_gfx1151",
@@ -7467,6 +7473,56 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Default-on one-row residual specialization for the exact Ornith
+        // attention out_proj shape: gfx1100, M=2048, K=4096. It reuses the
+        // plain V2 body with a residual epilogue and fixed K4096, requires no
+        // private scratch, and is bit-identical to the legacy generic route
+        // with nonzero residuals. `=0` (or an invalid value) is the kill switch;
+        // every architecture/shape miss keeps the generic route.
+        use std::sync::LazyLock;
+        static MQ4V2_RESIDUAL_R1: LazyLock<bool> = LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_MQ4V2_RESIDUAL_R1")
+                .map(|value| value == "1")
+                .unwrap_or(true)
+        });
+        let use_r1_noscratch =
+            self.arch_caps.is_gfx1100() && m == 2_048 && k == 4_096 && *MQ4V2_RESIDUAL_R1;
+        if use_r1_noscratch {
+            const FUNC: &str = "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch";
+            self.ensure_kernel(
+                FUNC,
+                kernels::GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC,
+                FUNC,
+            )?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+            let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+            let result =
+                self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                });
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         // Preserve arch-dependent row selection identical to v1.
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
         let rows = if rdna3 {
@@ -7511,6 +7567,70 @@ impl Gpu {
                 b.push_ptr(a_ptr);
                 b.push_ptr(x_ptr);
                 b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Ornith qt44 shared-expert down fuse: MQ4G256V2 dual-half decode with
+    /// lane-0 `y[row] += sigmoid(c_buf[0]) * acc`. Fail-closed to exact
+    /// gfx1100|gfx1201, M=2048, K=512. 40-byte ABI (A/x/y/c_buf/M/K); grid M,
+    /// block 32, LDS 0. Does not mutate `c_buf`.
+    pub fn gemv_mq4g256v2_residual_sigmoid_scaled_k512(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        c_buf: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) || m != 2_048 || k != 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4g256v2_residual_sigmoid_scaled_k512: requires exact gfx1100|gfx1201 M=2048 K=512",
+            ));
+        }
+        const FUNC: &str = "gemv_mq4g256v2_residual_sigmoid_scaled_k512";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC,
+            FUNC,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let c_ptr = c_buf.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+            bytes,
+        );
+        let result =
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_ptr(c_ptr);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b
@@ -11615,11 +11735,28 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
-        )?;
+        // Default gfx1100 exact-shape route: removes dead workgroups, LDS
+        // staging, and the barrier while preserving one-wave/row arithmetic
+        // exactly. The generic kernel remains the fallback for other shapes
+        // and architectures. Frozen 48-byte ABI: expert_ptrs@0,
+        // topk_indices@8, x@16, y_gate@24, y_up@32, M i32@40, K i32@44.
+        //
+        // Measured on Ornith 1.5 with Q8 EF and retained PM4 replay: the
+        // complete admitted gfx1100 stack improved 241.002 -> 246.167 tok/s.
+        let use_nolds = self.arch_caps.is_gfx1100() && m == 1024 && k == 2048;
+        if use_nolds {
+            self.ensure_kernel(
+                "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
+                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC,
+                "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
+            )?;
+        } else {
+            self.ensure_kernel(
+                "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
+                "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            )?;
+        }
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -11638,37 +11775,47 @@ impl Gpu {
         ];
         // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemv",
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
-            bytes,
-        );
+        let func_name = if use_nolds {
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
+        } else {
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed"
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
         // Launch contraction. The kernel maps blockIdx.x to one row in each of
         // the two M/2 outputs and returns for `row >= mi`, so m/2 workgroups
         // cover M — the other half were launched only to exit at the guard.
         // Value-preserving: the parity oracle reports identical rel_l2 either
         // way (4.767e-7 / 5.097e-7).
         //
-        // DEFAULT ON for gfx1151, where it is measured: +2.8% decode on the
-        // shipped Ornith 1.5 (qt44 routed experts), 4 alternations x 12 runs,
-        // WIDE 70.94 -> TIGHT 72.94 tok/s with no overlap between the arms
-        // (70.40-71.35 vs 72.75-73.40).
+        // DEFAULT ON where measured:
+        // - gfx1151: +2.8% decode on shipped Ornith 1.5, 4 alternations x
+        //   12 runs, WIDE 70.94 -> TIGHT 72.94 tok/s with no overlap
+        //   (70.40-71.35 vs 72.75-73.40).
+        // - gfx1201: +3.1% on bench_qwen35_mq4 TG128 (156.0 -> 160.8 tok/s)
+        //   and +2.9% on the q8_ef Redline daemon harness (153.7 -> 158.2
+        //   tok/s); the full retained-PM4 shadow remained bit-exact.
         //
-        // Opt-in elsewhere: the contraction is semantically target-neutral, but
-        // per this repo's admission rule a specialisation ships on the arch it
-        // was measured on. gfx12/RDNA4 in particular is unmeasured — whoever has
-        // an R9700 can flip it with HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID=1 and, if
-        // it holds, widen this condition.
-        let tight =
-            match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID").as_deref() {
+        // Opt-in elsewhere: the contraction is semantically target-neutral,
+        // but specialisations ship only on measured architectures.
+        let grid_x = if use_nolds {
+            // Candidate exact shape: M=1024 => [512,8,1], block [32,1,1], LDS 0.
+            (m as u32) >> 1
+        } else {
+            let tight = match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID")
+                .as_deref()
+            {
                 Ok("1") => true,
                 Ok("0") => false,
-                _ => self.arch_caps.is_gfx1151(),
+                _ => self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201(),
             };
-        let grid_x = if tight { (m as u32) >> 1 } else { m as u32 };
+            if tight {
+                (m as u32) >> 1
+            } else {
+                m as u32
+            }
+        };
         let result = self.launch_maybe_blob(
-            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            func_name,
             [grid_x, 8, 1],
             [32u32, 1, 1],
             0,
@@ -12301,6 +12448,12 @@ impl Gpu {
     /// MQ4G256V2 (qt=44) sister of [`Self::gemv_hfq4g256_moe_ninepath_d4`].
     /// Same launch contract; the byte estimate reuses the qt13 helper because
     /// both formats are 136 B/group.
+    ///
+    /// gfx1100 uses the higher-parallelism RPB=8 specialization by default at
+    /// exact down_m=2048, down_k=512 (grid `down_m/8`); the generic RPB=16
+    /// route remains the fallback everywhere else. Frozen 48-byte ABI and
+    /// per-row arithmetic are unchanged. Retained-PM4 measured 246.167 ->
+    /// 248.025 tok/s on Ornith 1.5 with Q8 EF.
     pub fn gemv_mq4g256v2_moe_ninepath_d4(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -12311,12 +12464,95 @@ impl Gpu {
         down_m: usize,
         down_k: usize,
     ) -> HipResult<()> {
+        let use_rpb8 = self.arch_caps.is_gfx1100() && down_m == 2_048 && down_k == 512;
+        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+            expert_ptrs,
+            topk_indices,
+            topk_weights,
+            rot_batch,
+            out,
+            down_m,
+            down_k,
+            use_rpb8,
+        )
+    }
+
+    /// Force incumbent RPB=16 ninepath for the exact parity oracle.
+    #[doc(hidden)]
+    pub fn gemv_mq4g256v2_moe_ninepath_d4_rpb16_exact(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+            expert_ptrs,
+            topk_indices,
+            topk_weights,
+            rot_batch,
+            out,
+            down_m,
+            down_k,
+            false,
+        )
+    }
+
+    /// Force gfx1100 RPB=8 ninepath candidate (bypasses env gate).
+    #[doc(hidden)]
+    pub fn gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100_exact(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+            expert_ptrs,
+            topk_indices,
+            topk_weights,
+            rot_batch,
+            out,
+            down_m,
+            down_k,
+            true,
+        )
+    }
+
+    fn gemv_mq4g256v2_moe_ninepath_d4_dispatch(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+        use_rpb8: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq4g256v2_moe_ninepath_d4",
-            kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC,
-            "gemv_mq4g256v2_moe_ninepath_d4",
-        )?;
+        let (module, src, func, rpb) = if use_rpb8 {
+            (
+                "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
+                kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC,
+                "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
+                8u32,
+            )
+        } else {
+            (
+                "gemv_mq4g256v2_moe_ninepath_d4",
+                kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC,
+                "gemv_mq4g256v2_moe_ninepath_d4",
+                16u32,
+            )
+        };
+        self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
@@ -12335,11 +12571,10 @@ impl Gpu {
         ];
         let bytes =
             8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_moe_ninepath_d4", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func, bytes);
         let result = self.launch_maybe_blob(
-            "gemv_mq4g256v2_moe_ninepath_d4",
-            [(down_m as u32) / 16, 1, 1],
+            func,
+            [(down_m as u32) / rpb, 1, 1],
             [256, 1, 1],
             0,
             &mut params,

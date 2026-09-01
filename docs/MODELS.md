@@ -26,7 +26,7 @@ hipfire run qwen3.5:9b "hello"
 hipfire list -r
 ```
 
-Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Per-tag sampling defaults come from registry `recommended_settings` only (applied by the native CLI request resolver). Cards may set intentional `reasoning_effort` (semantic prompt strength only — never a budget). Effort-native families (Qwen3.8, DeepSeek V4, Muse Glimmer) omit `thinking_budget`; absence means no implicit cap. Qwen3.8 alone accepts hipfire's explicit integer Qwen continuation cap. DeepSeek V4 and Muse Glimmer cap fields are dropped+warned rather than translated into hand-written tokenizer closure. Registry `sampling` blocks are legacy metadata and are not promoted by the native request resolver. Full contract: [`CONFIG.md`](CONFIG.md); HTTP examples: [`SERVE.md`](SERVE.md).
+Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Per-tag sampling defaults come from registry `recommended_settings` only (applied by the native CLI request resolver). Cards may set intentional `reasoning_effort` (semantic prompt strength only — never a budget). Effort-native families (Qwen3.8, Ornith 1.5, DeepSeek V4, Muse Glimmer) omit `thinking_budget`; absence means no implicit cap. Qwen3.8 and Ornith 1.5 accept hipfire's explicit integer Qwen continuation cap. DeepSeek V4 and Muse Glimmer cap fields are dropped+warned rather than translated into hand-written tokenizer closure. Registry `sampling` blocks are legacy metadata and are not promoted by the native request resolver. Full contract: [`CONFIG.md`](CONFIG.md); HTTP examples: [`SERVE.md`](SERVE.md).
 
 ---
 
@@ -66,7 +66,7 @@ Sizes below are **registry declarations**, not a substitute for runtime MoE layo
 | `qwen3.6:35b-a3b-mq3p` | `qwen3.6-35b-a3b.mq3p` | 17.2 | 20 | | MQ3+P graded |
 | `qwen3.6:35b-a3b-mq4p` | `qwen3.6-35b-a3b.mq4p` | 19.8 | 22 | | MQ4+P graded |
 | `qwen3.6:35b-a3b-mfp4` | `qwen3.6-35b-a3b.mfp4` | 20.2 | 22 | | MFP4-E8 |
-| `qwen3.6:35b-a3b-mq4r` | `qwen3.6-35b-a3b.mq4r` | 18.7 | 22 | | MQ4 Redline speed SKU (registry desc includes dated tok/s — treat as registry text, not a live baseline) |
+| `qwen3.6:35b-a3b-mq4r` | `qwen3.6-35b-a3b.mq4r` | 18.7 | 22 | | Uniform MQ4G256V1/qt13 Redline speed SKU; zero qt44/graded experts. Dated tok/s in registry text is not a live baseline. |
 | `qwen3.6:35b-a3b-mq5` | `qwen3.6-35b-a3b.mq5` | 23.7 | 26 | | Quality SKU |
 | `qwen3.6:35b-a3b-mq6` | `qwen3.6-35b-a3b.mq6` | 27.7 | 30 | | Max quality |
 
@@ -138,6 +138,8 @@ Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLA
 | `qwopus:27b-mq6` | `qwopus-27b.mq6` | 21.4 | 24 | |
 | `qwopus3.6:27b-coder` | `qwopus3.6-27b-coder.mq4` | 15.0 | 16 | q8 default KV; agentic coder finetune |
 | `nex-n2:mini` | `nex-n2-mini.mq4p` | 19.82 | 22 | q8 default KV; Qwen3.5-35B-A3B agentic MoE finetune |
+| `ornith-1.5:35b-a3b` | `ornith-1.5-35b-a3b.mq4` | 19.02 | 22 | q8 default KV; MQ4G256V2 quality trunk with selective MQ6/Q8 protection; semantic `low`/`medium`/`xhigh` effort (default `xhigh`), uncapped unless an explicit integer cap is set |
+| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | q8 default KV; uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk |
 
 ### Other families (registry)
 
@@ -255,6 +257,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:small` | `qwen3.5:0.8b` |
 | `qwen3.5:large` | `qwen3.5:27b` |
 | `qwen3.6` / `qwen3.6:a3b` | `qwen3.6:35b-a3b` |
+| `ornith` / `ornith-1.5` / `ornith1.5` / `ornith1.5:35b-a3b` | `ornith-1.5:35b-a3b` |
 | `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
 | `qwen3.8:fast` / `qwen3.8:27b-fast` | `qwen3.8:27b-mq4-xt` |
 | `qwen3.8:27b-mq4` | `qwen3.8:27b` |
@@ -281,7 +284,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 |---|---:|---|---|
 | LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, many GGUF/HF4 dense |
 | Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, carnice/qwopus dense |
-| Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `nex-n2:mini` |
+| Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b`, `nex-n2:mini` |
 | Qwen2 | 7 | `hipfire-arch-qwen2` | `vibethinker:3b`, `vibethinker:3b-mq6` (support, not admission) |
 | DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash` |
 | MiniMax-M2 | 10 | `hipfire-arch-minimax` | `minimax-m2.7` |
@@ -362,10 +365,11 @@ by config and the OpenAI request layer — not by inventing per-tag field meanin
 - Chat template overrides — `chat_template`, `default_chatml` / env in [`env-vars.md`](env-vars.md)
 
 Registry cards may publish `reasoning_effort` defaults. Effort-native tags should
-**not** pin a hipfire named `thinking_budget`; absence means uncapped. Qwen
-`<think>` framing is not universal — Gemma uses boolean thinking (default off),
-Glimmer uses Onyx channel strength, DeepSeek uses `thinking.type` + its own
-effort ladder.
+**not** pin a hipfire named `thinking_budget`; absence means uncapped. Ornith 1.5
+uses Qwen3.8-compatible `low`/`medium`/`xhigh` semantic prompt steering (default
+`xhigh`) — never a budget reinterpretation. Qwen `<think>` framing is not
+universal — Gemma uses boolean thinking (default off), Glimmer uses Onyx channel
+strength, DeepSeek uses `thinking.type` + its own effort ladder.
 
 ---
 

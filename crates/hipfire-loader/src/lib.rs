@@ -1136,6 +1136,18 @@ impl LoadedModel {
         self.qwen35().and_then(|b| b.vision_config.as_ref())
     }
 
+    pub fn ack_dims(&self) -> (usize, usize, usize) {
+        if let Some(st) = self.state.as_ref() {
+            let arch = st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
+            return (arch.dim(), arch.n_layers(), arch.vocab_size());
+        }
+        // EP and dense-TP loads keep the model in `ep`, leaving `state` empty.
+        self.ep
+            .as_ref()
+            .map(|ep| ep.inner.model_dims())
+            .unwrap_or((0, 0, 0))
+    }
+
     pub fn vision_weights(&self) -> Option<&qwen35_vl::VisionWeights> {
         self.qwen35().and_then(|b| b.vision_weights.as_ref())
     }
@@ -1274,6 +1286,29 @@ pub enum EpArch {
     },
 }
 
+impl EpArch {
+    // A dense-TP rank config keeps global dim/n_layers/vocab: `local_dense_tp_config` narrows only head counts and `hidden_dim`.
+    pub fn model_dims(&self) -> (usize, usize, usize) {
+        match self {
+            EpArch::Ds4 { config, .. } => (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.vocab_size,
+            ),
+            EpArch::Minimax { config, .. } => (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.vocab_size,
+            ),
+            EpArch::Qwen35 { config, .. } => (config.dim, config.n_layers, config.vocab_size),
+            EpArch::Qwen35DenseTp { configs, .. } => configs
+                .first()
+                .map(|c| (c.dim, c.n_layers, c.vocab_size))
+                .unwrap_or((0, 0, 0)),
+        }
+    }
+}
+
 // ─── Helper functions ─────────────────────────────────────────────────
 
 /// Layer 1 (resolved config) + Layer 2 (per-model ~/.hipfire/templates).
@@ -1329,7 +1364,12 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
         // Prefer HFQ-embedded tokenizer_config.chat_template (Qwen3.8 official
         // low/medium/xhigh reasoning_effort). Fall back to froggeric for older
         // Qwen3.5/3.6 files that lack one.
-        5 | 6 => return Some(qwen35_template_from_embedded(hfq.chat_template())),
+        5 | 6 => {
+            return Some(qwen35_template_from_embedded(
+                hfq.chat_template(),
+                model_path,
+            ))
+        }
         11 => {
             if let Some(t) = hfq.chat_template() {
                 return Some(t);
@@ -1357,8 +1397,191 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
 
 /// Arch 5/6 template after configured/per-model overrides: embedded HFQ
 /// `tokenizer_config.chat_template` when present, else froggeric fallback.
-fn qwen35_template_from_embedded(embedded: Option<String>) -> String {
-    embedded.unwrap_or_else(|| FROGGERIC_QWEN35_TEMPLATE.to_string())
+/// Ornith 1.5 basenames get a load-time Qwen3.8-shaped `reasoning_effort`
+/// adaptation of the embedded (non-native) parent template; other models and
+/// the froggeric missing-template path are left alone.
+fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> String {
+    match embedded {
+        Some(t) if is_ornith15_artifact(model_path) => adapt_ornith15_embedded_chat_template(t),
+        Some(t) => t,
+        None => FROGGERIC_QWEN35_TEMPLATE.to_string(),
+    }
+}
+
+/// Case-insensitive basename match for Ornith 1.5 MQ4/MQ4R artifacts.
+/// Scope is exact: filename prefix `ornith-1.5-` or legacy `ornith1.5-`,
+/// AND final extension case-insensitively exactly `.mq4` or `.mq4r`.
+/// Other extensions (`.mq6`, `.hfq`, `.json`, sidecars) and bare names
+/// are out of scope even when the Ornith 1.5 prefix matches.
+fn is_ornith15_artifact(model_path: &str) -> bool {
+    let basename = std::path::Path::new(model_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let lower = basename.to_ascii_lowercase();
+    let prefix_ok = lower.starts_with("ornith-1.5-") || lower.starts_with("ornith1.5-");
+    if !prefix_ok {
+        return false;
+    }
+    // Path::extension is the final suffix after the last `.`.
+    let ext = std::path::Path::new(basename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    ext == "mq4" || ext == "mq4r"
+}
+
+/// Qwen3.8 reasoning_effort system-prompt block (official chat_template.jinja).
+const QWEN38_REASONING_BLOCK: &str = "\
+{%- set reasoning_instructions = '' %}\n\
+{%- if enable_thinking is undefined or enable_thinking is true %}\n\
+    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n\
+    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n\
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\n\
+    {%- endif %}\n\
+    {%- if resolved_reasoning_effort == 'xhigh' %}\n\
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}\n\
+    {%- elif resolved_reasoning_effort == 'low' %}\n\
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}\n\
+    {%- endif %}\n\
+{%- endif %}\n";
+
+/// Unique marker: tools gate opening the system tools block.
+const ORNITH_TOOLS_GATE: &str = "{%- if tools and tools is iterable and tools is not mapping %}";
+
+/// Unique compound marker: tools system open immediately followed by the
+/// `# Tools` header (no reasoning_instructions yet).
+const ORNITH_TOOLS_SYSTEM_OPEN: &str = concat!(
+    "{%- if tools and tools is iterable and tools is not mapping %}\n",
+    "    {{- '<|im_start|>system\\n' }}\n",
+    "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}"
+);
+
+/// Replacement: same tools open, with non-empty reasoning_instructions
+/// prepended into the system turn (Qwen3.8 structure).
+const ORNITH_TOOLS_SYSTEM_OPEN_ADAPTED: &str = concat!(
+    "{%- if tools and tools is iterable and tools is not mapping %}\n",
+    "    {{- '<|im_start|>system\\n' }}\n",
+    "    {%- if reasoning_instructions %}\n",
+    "        {{- reasoning_instructions + '\\n\\n' }}\n",
+    "    {%- endif %}\n",
+    "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}"
+);
+
+/// Unique marker: no-tools branch that only emits a system turn when a
+/// system message exists (no effort injection, no no-system path).
+const ORNITH_NO_TOOLS_SYSTEM_BRANCH: &str = concat!(
+    "{%- else %}\n",
+    "    {%- if messages[0].role == 'system' %}\n",
+    "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+    "        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n",
+    "    {%- endif %}\n",
+    "{%- endif %}"
+);
+
+/// Replacement: Qwen3.8 system/no-system logic with reasoning_instructions.
+/// Double space before `+ content` matches the official Qwen3.8 template.
+const ORNITH_NO_TOOLS_SYSTEM_BRANCH_ADAPTED: &str = concat!(
+    "{%- else %}\n",
+    "    {%- if messages[0].role == 'system' %}\n",
+    "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+    "        {%- if content %}\n",
+    "            {{- '<|im_start|>system\\n' + (reasoning_instructions + '\\n\\n' if reasoning_instructions else '')  + content + '<|im_end|>\\n' }}\n",
+    "        {%- elif reasoning_instructions %}\n",
+    "            {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n",
+    "        {%- endif %}\n",
+    "    {%- elif reasoning_instructions %}\n",
+    "        {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n",
+    "    {%- endif %}\n",
+    "{%- endif %}"
+);
+
+/// Load-time adapter for Ornith 1.5 embedded Qwen3.5/3.6 templates: inject the
+/// official Qwen3.8 `reasoning_effort` low/medium/xhigh system-prompt contract
+/// via exact-marker rewrite. Already-native templates and marker drift are
+/// returned unchanged so `probe_effort_capability` stays honest.
+fn adapt_ornith15_embedded_chat_template(template: String) -> String {
+    if template.contains("reasoning_effort") {
+        return template;
+    }
+    match try_adapt_ornith15_qwen35_to_effort_native(&template) {
+        Ok(adapted) => adapted,
+        Err(reason) => {
+            eprintln!(
+                "[chat_template] ornith-1.5 reasoning_effort adapter skipped ({reason}); keeping embedded template"
+            );
+            template
+        }
+    }
+}
+
+/// Atomic exact-marker rewrite. Preflights every required unique marker, then
+/// applies all three substitutions. Any missing/duplicate marker → Err so the
+/// caller returns the original string.
+fn try_adapt_ornith15_qwen35_to_effort_native(template: &str) -> Result<String, String> {
+    let gate_n = template.matches(ORNITH_TOOLS_GATE).count();
+    if gate_n != 1 {
+        return Err(format!("expected 1 tools gate marker, found {gate_n}"));
+    }
+    let tools_open_n = template.matches(ORNITH_TOOLS_SYSTEM_OPEN).count();
+    if tools_open_n != 1 {
+        return Err(format!(
+            "expected 1 tools system-open marker, found {tools_open_n}"
+        ));
+    }
+    let no_tools_n = template.matches(ORNITH_NO_TOOLS_SYSTEM_BRANCH).count();
+    if no_tools_n != 1 {
+        return Err(format!(
+            "expected 1 no-tools system branch marker, found {no_tools_n}"
+        ));
+    }
+
+    // Insert the reasoning block immediately before the tools gate.
+    let mut out = template.replacen(
+        ORNITH_TOOLS_GATE,
+        &(QWEN38_REASONING_BLOCK.to_string() + ORNITH_TOOLS_GATE),
+        1,
+    );
+    // Prepend non-empty instruction into the tools system turn.
+    out = out.replacen(
+        ORNITH_TOOLS_SYSTEM_OPEN,
+        ORNITH_TOOLS_SYSTEM_OPEN_ADAPTED,
+        1,
+    );
+    // Replace the no-tools system/no-system branch.
+    out = out.replacen(
+        ORNITH_NO_TOOLS_SYSTEM_BRANCH,
+        ORNITH_NO_TOOLS_SYSTEM_BRANCH_ADAPTED,
+        1,
+    );
+
+    // Honesty post-conditions: effort vocabulary + both instruction literals +
+    // tools/system/no-system insertion branches present; original no-tools
+    // emission gone.
+    let has_effort_default = out.contains("reasoning_effort|default('xhigh')");
+    let has_rungs = out.contains("('xhigh', 'medium', 'low')");
+    let has_low = out.contains(
+        "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
+    );
+    let has_xhigh = out.contains(
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
+    );
+    // Jinja source stores `\n` as backslash+n inside quotes.
+    let has_tools_prepend = out.contains("reasoning_instructions + '\\n\\n'");
+    let has_no_system = out.contains("{%- elif reasoning_instructions %}");
+    let original_no_tools_gone = !out.contains(ORNITH_NO_TOOLS_SYSTEM_BRANCH);
+    if !(has_effort_default
+        && has_rungs
+        && has_low
+        && has_xhigh
+        && has_tools_prepend
+        && has_no_system
+        && original_no_tools_gone)
+    {
+        return Err("post-condition failed after marker rewrite".into());
+    }
+    Ok(out)
 }
 
 /// Rewrite the Onyx/Harmony chat template for Muse Glimmer (arch 14) so
@@ -4159,7 +4382,7 @@ mod registry_tests {
     fn qwen_embedded_template_wins_over_froggeric() {
         // Qwen3.8-style embedded template carries official reasoning_effort.
         let embedded = "{% if reasoning_effort %}{{ reasoning_effort }}{% endif %}".to_string();
-        let got = super::qwen35_template_from_embedded(Some(embedded.clone()));
+        let got = super::qwen35_template_from_embedded(Some(embedded.clone()), "qwen3.8-27b.mq4");
         assert_eq!(got, embedded);
         assert!(got.contains("reasoning_effort"));
         assert_ne!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
@@ -4168,7 +4391,455 @@ mod registry_tests {
     #[test]
     fn qwen_missing_template_uses_froggeric_fallback() {
         // Legacy Qwen3.5/3.6 HFQs without tokenizer_config.chat_template.
-        let got = super::qwen35_template_from_embedded(None);
+        // Ornith path without embedded also keeps plain froggeric (no adapt).
+        let got = super::qwen35_template_from_embedded(None, "ornith-1.5-35b-a3b.mq4");
         assert_eq!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+        let got2 = super::qwen35_template_from_embedded(None, "qwen3.6-35b.mq4");
+        assert_eq!(got2.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+    }
+
+    /// Official Qwen3.8 low / xhigh instruction literals (exact contract).
+    const ORNITH_LOW_INSTR: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+    const ORNITH_XHIGH_INSTR: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
+    /// Minimal Qwen3.5/3.6-shaped skeleton with the exact Ornith/official
+    /// tools + no-tools system markers the load-time adapter rewrites, plus
+    /// enough surrounding Jinja to actually render tools / system / user-only
+    /// branches through `JinjaChatFrame::render_messages`.
+    fn ornith_parent_template_skeleton() -> String {
+        // This is an independent fixture copied from the embedded Ornith parent
+        // template shape. Do not construct it from the production marker
+        // constants: the fixture must catch whitespace drift in those markers.
+        concat!(
+            "{%- macro render_content(content, do_vision_count, is_system_content=false) %}{{- content }}{%- endmacro %}\n",
+            "{%- if tools and tools is iterable and tools is not mapping %}\n",
+            "    {{- '<|im_start|>system\\n' }}\n",
+            "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n",
+            "    {%- for tool in tools %}\n",
+            "        {{- \"\\n\" }}\n",
+            "        {{- tool | tojson }}\n",
+            "    {%- endfor %}\n",
+            "    {{- \"\\n</tools>\" }}\n",
+            "    {%- if messages[0].role == 'system' %}\n",
+            "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+            "        {%- if content %}\n",
+            "            {{- '\\n\\n' + content }}\n",
+            "        {%- endif %}\n",
+            "    {%- endif %}\n",
+            "    {{- '<|im_end|>\\n' }}\n",
+            "{%- else %}\n",
+            "    {%- if messages[0].role == 'system' %}\n",
+            "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+            "        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n",
+            "    {%- endif %}\n",
+            "{%- endif %}\n",
+            "{%- for message in messages %}\n",
+            "    {%- if message.role != 'system' %}\n",
+            "        {%- set content = render_content(message.content, false)|trim %}\n",
+            "        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n",
+            "    {%- endif %}\n",
+            "{%- endfor %}",
+        )
+        .to_string()
+    }
+
+    /// Hermetic GPT-2-BPE tokenizer sufficient for Jinja string rendering
+    /// (bos override is empty; encode path is unused by these tests).
+    fn test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
+        // GPT-2 mode trigger (`Ġ`) + full byte fallback so any short
+        // ASCII content round-trips if a future test encodes.
+        let mut entries: Vec<String> = Vec::new();
+        entries.push(r#""<|im_start|>": 0"#.to_string());
+        entries.push(r#""<|im_end|>": 1"#.to_string());
+        entries.push(r#""system": 2"#.to_string());
+        entries.push(r#""user": 3"#.to_string());
+        entries.push(r#""assistant": 4"#.to_string());
+        entries.push(r#""\n": 5"#.to_string());
+        entries.push(r#""Ġ": 6"#.to_string());
+        for b in 0u32..=255u32 {
+            let ch = byte_to_gpt2_char_test(b as u8);
+            let escaped = json_escape(&ch.to_string());
+            entries.push(format!(r#""{escaped}": {}"#, 100 + b));
+        }
+        let vocab = entries.join(", ");
+        let json = format!(
+            r#"{{
+                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
+                "added_tokens": [
+                    {{"id": 0, "content": "<|im_start|>", "special": true}},
+                    {{"id": 1, "content": "<|im_end|>", "special": true}}
+                ]
+            }}"#
+        );
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    }
+
+    fn byte_to_gpt2_char_test(b: u8) -> char {
+        let mut bs: Vec<u32> = Vec::new();
+        bs.extend((b'!' as u32)..=(b'~' as u32));
+        bs.extend((0xA1u32)..=(0xACu32));
+        bs.extend((0xAEu32)..=(0xFFu32));
+        let mut cs: Vec<u32> = bs.clone();
+        let mut n = 0u32;
+        for b2 in 0u32..=255u32 {
+            if !bs.contains(&b2) {
+                bs.push(b2);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        for (i, &bv) in bs.iter().enumerate() {
+            if bv == b as u32 {
+                return char::from_u32(cs[i]).unwrap();
+            }
+        }
+        char::from_u32(b as u32).unwrap()
+    }
+
+    fn json_escape(s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    fn test_msg(
+        role: hipfire_runtime::prompt_frame::Role,
+        content: &str,
+    ) -> hipfire_runtime::prompt_frame::Message {
+        hipfire_runtime::prompt_frame::Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    fn adapted_ornith_template() -> String {
+        super::qwen35_template_from_embedded(
+            Some(ornith_parent_template_skeleton()),
+            "ornith-1.5-35b-a3b.mq4",
+        )
+    }
+
+    fn render_ornith(
+        template: &str,
+        messages: &[hipfire_runtime::prompt_frame::Message],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+    ) -> String {
+        let tok = test_tokenizer();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer: &tok,
+            template,
+            system: None,
+            user: "",
+            enable_thinking,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort,
+        };
+        frame
+            .render_messages(messages, tools, None)
+            .unwrap_or_else(|e| panic!("render failed (effort={reasoning_effort:?}): {e}"))
+    }
+
+    /// Extract the first `<|im_start|>system ... <|im_end|>` body (no markers).
+    fn first_system_body(rendered: &str) -> Option<&str> {
+        const START: &str = "<|im_start|>system\n";
+        const END: &str = "<|im_end|>";
+        let i = rendered.find(START)?;
+        let rest = &rendered[i + START.len()..];
+        let j = rest.find(END)?;
+        Some(&rest[..j])
+    }
+
+    #[test]
+    fn ornith15_canonical_and_legacy_basenames_adapt() {
+        let skeleton = ornith_parent_template_skeleton();
+        for path in [
+            "/models/ornith-1.5-35b-a3b.mq4",
+            "/models/ornith-1.5-35b-a3b.mq4r",
+            "/models/ORNITH-1.5-35B-A3B.MQ4",
+            "/models/ORNITH-1.5-35B-A3B.MQ4R",
+            "/models/ornith1.5-35b-a3b.mq4",
+            "ornith1.5-35b-a3b.mq4r",
+        ] {
+            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert!(
+                got.contains("reasoning_effort|default('xhigh')"),
+                "path {path} must adapt: missing default"
+            );
+            assert!(
+                got.contains("('xhigh', 'medium', 'low')"),
+                "path {path} must accept exact rungs"
+            );
+            assert!(
+                got.contains(ORNITH_LOW_INSTR),
+                "path {path} missing low instruction"
+            );
+            assert!(
+                got.contains(ORNITH_XHIGH_INSTR),
+                "path {path} missing xhigh instruction"
+            );
+            // medium injects nothing: no medium instruction string.
+            assert!(
+                !got.contains("Reasoning effort is set to medium"),
+                "path {path} must not steer medium"
+            );
+            // tools prepend + system/no-system branches.
+            assert!(
+                got.contains("reasoning_instructions + '\\n\\n'"),
+                "path {path} missing tools/system prepend"
+            );
+            assert!(
+                got.contains("{%- elif reasoning_instructions %}"),
+                "path {path} missing no-system branch"
+            );
+            assert_ne!(got, skeleton, "path {path} must change the template");
+        }
+    }
+
+    #[test]
+    fn unrelated_qwen_basename_is_untouched() {
+        let skeleton = ornith_parent_template_skeleton();
+        for path in [
+            "qwen3.6-35b-a3b.mq4",
+            "qwen3.5-397b.mq4",
+            "ornith-1.0-35b.mq4",
+            "ornith-2.0-35b-a3b.mq4",
+            "not-ornith-1.5-35b.mq4",
+        ] {
+            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert_eq!(got, skeleton, "path {path} must not adapt");
+            assert!(!got.contains("reasoning_effort"), "path {path}");
+        }
+    }
+
+    #[test]
+    fn ornith15_wrong_extension_is_untouched() {
+        let skeleton = ornith_parent_template_skeleton();
+        for path in [
+            "ornith-1.5-35b-a3b.mq6",
+            "ornith-1.5-35b-a3b.hfq",
+            "ornith-1.5-35b-a3b",
+            "ornith-1.5-35b-a3b.json",
+            "ornith-1.5-35b-a3b.mq4.sidecar",
+            "ornith1.5-35b-a3b.MQ6",
+            "/models/ORNITH-1.5-35B-A3B.hfq",
+            "ornith-1.5-35b-a3b.mq4r.bak",
+        ] {
+            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert_eq!(got, skeleton, "path {path} must not adapt (extension gate)");
+            assert!(
+                !got.contains("reasoning_effort"),
+                "path {path} must not gain effort"
+            );
+        }
+    }
+
+    #[test]
+    fn already_native_ornith_template_stays_unchanged() {
+        let native = format!(
+            "{}{}",
+            super::QWEN38_REASONING_BLOCK,
+            ornith_parent_template_skeleton()
+        );
+        assert!(native.contains("reasoning_effort"));
+        let got =
+            super::qwen35_template_from_embedded(Some(native.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(got, native, "already-native must not be rewritten");
+    }
+
+    #[test]
+    fn marker_drift_returns_original_unadapted() {
+        // Missing the no-tools branch marker → adapter must no-op.
+        let drifted = format!(
+            "{}\n{{%- set ns = namespace(x=1) %}}",
+            super::ORNITH_TOOLS_SYSTEM_OPEN
+        );
+        let got =
+            super::qwen35_template_from_embedded(Some(drifted.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(
+            got, drifted,
+            "drift must keep original so probe stays honest"
+        );
+        assert!(!got.contains("reasoning_effort|default('xhigh')"));
+
+        // Duplicate tools gate without the compound tools-open → no-op.
+        let dup = format!(
+            "{gate}\n{gate}\n{no_tools}",
+            gate = super::ORNITH_TOOLS_GATE,
+            no_tools = super::ORNITH_NO_TOOLS_SYSTEM_BRANCH
+        );
+        let got2 =
+            super::qwen35_template_from_embedded(Some(dup.clone()), "ornith1.5-35b-a3b.mq4r");
+        assert_eq!(got2, dup);
+    }
+
+    #[test]
+    fn ornith15_adapted_jinja_renders_effort_contract() {
+        use hipfire_runtime::prompt_frame::Role;
+
+        let template = adapted_ornith_template();
+        assert!(
+            template.contains("reasoning_effort|default('xhigh')"),
+            "adapter must inject effort block"
+        );
+
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "echo",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let tools = [tool];
+
+        let user_only = [test_msg(Role::User, "hi")];
+        let with_system = [test_msg(Role::System, "SYS"), test_msg(Role::User, "hi")];
+
+        // Four effort states × three structural branches.
+        let efforts: [(Option<&str>, Option<&str>); 4] = [
+            (None, Some(ORNITH_XHIGH_INSTR)),          // undefined → xhigh
+            (Some("low"), Some(ORNITH_LOW_INSTR)),     // explicit low
+            (Some("medium"), None),                    // medium: no instruction
+            (Some("xhigh"), Some(ORNITH_XHIGH_INSTR)), // explicit xhigh
+        ];
+
+        for (effort, want_instr) in efforts {
+            // 1) tools present
+            let r = render_ornith(&template, &with_system, Some(&tools), true, effort);
+            let sys = first_system_body(&r).expect("tools path emits system");
+            assert!(
+                sys.contains("# Tools"),
+                "tools branch missing header (effort={effort:?}): {sys:?}"
+            );
+            match want_instr {
+                Some(instr) => {
+                    assert!(
+                        sys.starts_with(instr),
+                        "tools: instruction must lead system turn (effort={effort:?}): {sys:?}"
+                    );
+                    assert!(
+                        sys.contains(&format!("{instr}\n\n# Tools")),
+                        "tools: instruction must sit before # Tools (effort={effort:?})"
+                    );
+                    // system content still appended after tools block
+                    assert!(sys.contains("SYS"), "tools: system content lost");
+                }
+                None => {
+                    assert!(
+                        !sys.contains("Reasoning effort is set to"),
+                        "medium must not inject instruction (tools): {sys:?}"
+                    );
+                    assert!(
+                        sys.starts_with("# Tools"),
+                        "medium tools system starts at # Tools: {sys:?}"
+                    );
+                }
+            }
+
+            // 2) no tools + existing system message
+            let r = render_ornith(&template, &with_system, None, true, effort);
+            let sys = first_system_body(&r).expect("system path emits system");
+            match want_instr {
+                Some(instr) => {
+                    assert_eq!(
+                        sys,
+                        format!("{instr}\n\nSYS"),
+                        "no-tools+system placement (effort={effort:?})"
+                    );
+                }
+                None => {
+                    assert_eq!(sys, "SYS", "medium no-tools+system is bare content");
+                }
+            }
+            assert!(
+                r.contains("<|im_start|>user\nhi<|im_end|>"),
+                "user turn must remain (effort={effort:?})"
+            );
+
+            // 3) no tools + user-only (no system message)
+            let r = render_ornith(&template, &user_only, None, true, effort);
+            match want_instr {
+                Some(instr) => {
+                    let sys = first_system_body(&r).expect("user-only effort injects system");
+                    assert_eq!(
+                        sys, instr,
+                        "no-tools user-only system body (effort={effort:?})"
+                    );
+                }
+                None => {
+                    assert!(
+                        first_system_body(&r).is_none(),
+                        "medium user-only must not invent a system turn: {r:?}"
+                    );
+                }
+            }
+            assert!(
+                r.contains("<|im_start|>user\nhi<|im_end|>"),
+                "user turn must remain user-only (effort={effort:?})"
+            );
+        }
+
+        // Undefined effort matches explicit xhigh on every branch.
+        for tools_arg in [Some(tools.as_slice()), None] {
+            for msgs in [with_system.as_slice(), user_only.as_slice()] {
+                // Skip tools+user_only if tools need messages[0] system check —
+                // still valid: tools path tolerates non-system first message.
+                let undef = render_ornith(&template, msgs, tools_arg, true, None);
+                let xhigh = render_ornith(&template, msgs, tools_arg, true, Some("xhigh"));
+                assert_eq!(
+                    undef,
+                    xhigh,
+                    "undefined must match xhigh (tools={})",
+                    tools_arg.is_some()
+                );
+            }
+        }
+
+        // Thinking disabled: effort instructions absent on every branch.
+        for effort in [None, Some("low"), Some("medium"), Some("xhigh")] {
+            for (msgs, tools_arg) in [
+                (with_system.as_slice(), Some(tools.as_slice())),
+                (with_system.as_slice(), None),
+                (user_only.as_slice(), None),
+            ] {
+                let r = render_ornith(&template, msgs, tools_arg, false, effort);
+                assert!(
+                    !r.contains("Reasoning effort is set to"),
+                    "thinking-off must drop effort instr (effort={effort:?}): {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ornith15_adapted_template_probe_effort_capability() {
+        let template = adapted_ornith_template();
+        let tok = test_tokenizer();
+        let cap = hipfire_runtime::prompt_frame::probe_effort_capability(&tok, &template);
+        assert!(cap.native, "adapted Ornith template must be effort-native");
+        assert_eq!(
+            cap.supported,
+            vec!["low", "medium", "xhigh"],
+            "supported rungs must be exactly the Qwen3.8 contract"
+        );
     }
 }

@@ -96,7 +96,7 @@ pub struct RecommendedSettings {
     pub reasoning_effort: Option<String>,
     /// Optional named cap policy for reasoning tokens
     /// (`off|low|med|high|xhigh|max|uncapped`). Absence means uncapped.
-    /// Effort-native families (Qwen3.8, DeepSeek4, Muse Glimmer) omit this field.
+    /// Effort-native families (Qwen3.8, DeepSeek4, Muse Glimmer, Ornith) omit this field.
     #[serde(default)]
     pub thinking_budget: Option<String>,
 }
@@ -539,9 +539,9 @@ fn is_leap_year(year: u16) -> bool {
 fn is_effort_native_tag(tag: &str) -> bool {
     // Mirrors scripts/registry_gen.py:_effort_native_tag and the family/tag
     // conventions already used by config_layer_for_tag. Effort-native families
-    // (Qwen3.8, DeepSeek V4 Flash/preview, Muse Glimmer product SKUs) have
-    // no registry thinking_budget; absence means uncapped. Draft/dflash
-    // sidecars are excluded.
+    // (Qwen3.8, DeepSeek V4 Flash/preview, Muse Glimmer product SKUs, Ornith
+    // 1.5/legacy) have no registry thinking_budget; absence means uncapped.
+    // Draft/dflash sidecars are excluded.
     let base = tag.split(" sampling_profiles.").next().unwrap_or(tag);
     if base.contains("draft") || base.contains("dflash") {
         return false;
@@ -554,6 +554,9 @@ fn is_effort_native_tag(tag: &str) -> bool {
         return true;
     }
     if base == "muse-glimmer" || base == "muse-glimmer:fast" {
+        return true;
+    }
+    if matches!(family, "ornith-1.5" | "ornith1.5" | "ornith") {
         return true;
     }
     false
@@ -947,6 +950,20 @@ mod tests {
         assert_eq!(
             model.sha256.as_deref(),
             Some("4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428")
+        );
+
+        let (tag, model) = registry.model("ornith-1.5:35b-a3b-mq4r").unwrap();
+        assert_eq!(tag, "ornith-1.5:35b-a3b-mq4r");
+        assert_eq!(model.file, "ornith-1.5-35b-a3b.mq4r");
+        assert_eq!(model.quant.as_deref(), Some("mq4r"));
+        assert_eq!(model.size_bytes, Some(18_700_570_368));
+        assert_eq!(
+            model.quant_recipe.as_deref(),
+            Some("mq4v2-uniform-no-q8-router@10fbf86f")
+        );
+        assert_eq!(
+            model.sha256.as_deref(),
+            Some("84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6")
         );
     }
 
@@ -1843,6 +1860,8 @@ mod tests {
             "deepseek-v4-flash-preview",
             "muse-glimmer",
             "muse-glimmer:fast",
+            "ornith-1.5:35b-a3b",
+            "ornith-1.5:35b-a3b-mq4r",
         ] {
             let (_, entry) = registry
                 .model(tag)
@@ -1868,6 +1887,30 @@ mod tests {
                 }
             }
         }
+
+        // Both Ornith 1.5 artifacts share the release contract:
+        // default/general/coding xhigh, instruct none, and no named
+        // thinking_budget (absence = uncapped).
+        for tag in ["ornith-1.5:35b-a3b", "ornith-1.5:35b-a3b-mq4r"] {
+            let (_, ornith) = registry
+                .model(tag)
+                .unwrap_or_else(|| panic!("{tag} must exist"));
+            let ornith_rs = ornith.recommended_settings.as_ref().unwrap();
+            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(
+                ornith_rs.thinking_budget.is_none(),
+                "{tag} effort-native: absence means uncapped"
+            );
+            let ornith_general = ornith.sampling_profile("general").unwrap();
+            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(ornith_general.thinking_budget.is_none());
+            let ornith_coding = ornith.sampling_profile("coding").unwrap();
+            assert_eq!(ornith_coding.reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(ornith_coding.thinking_budget.is_none());
+            let ornith_instruct = ornith.sampling_profile("instruct").unwrap();
+            assert_eq!(ornith_instruct.reasoning_effort.as_deref(), Some("none"));
+            assert!(ornith_instruct.thinking_budget.is_none());
+        }
     }
 
     #[test]
@@ -1886,10 +1929,15 @@ mod tests {
             // Muse Glimmer product SKUs
             r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"xhigh"}}},"aliases":{}}"#,
             r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer:fast":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"max"}}},"aliases":{}}"#,
+            // Ornith 1.5 product + legacy family spellings
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith-1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"uncapped"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"med"}}},"aliases":{}}"#,
             // Effort-native sampling_profiles also rejected
             r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"xhigh","thinking_budget":"high"}}}},"aliases":{}}"#,
             r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"low"}}}},"aliases":{}}"#,
             r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"uncapped"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith-1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"high"}}}},"aliases":{}}"#,
         ];
         for raw in cases {
             let err = RegistryV1::parse(raw, "network/cache")
@@ -1963,7 +2011,8 @@ mod tests {
                 "qwen3.8:27b-draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}},
                 "qwen3.8:27b-dflash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}},
                 "deepseek-v4-flash:draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"xhigh"}},
-                "muse-glimmer:draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"med"}}
+                "muse-glimmer:draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"med"}},
+                "ornith-1.5:35b-a3b-draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}}
             },
             "aliases":{}
         }"#;

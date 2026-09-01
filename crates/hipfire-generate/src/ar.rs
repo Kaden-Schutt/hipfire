@@ -1300,6 +1300,8 @@ pub fn generate(
                 messages_history,
                 stop,
                 ep_sampling,
+                enable_thinking,
+                reasoning_effort,
             );
             return;
         }
@@ -1324,6 +1326,8 @@ pub fn generate(
                 messages_history,
                 stop,
                 ep_sampling,
+                enable_thinking,
+                reasoning_effort,
             );
             return;
         }

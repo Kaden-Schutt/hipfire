@@ -239,9 +239,9 @@ model's contract still accepts the named-cap route):
 - Mode, effort, and cap are independent. Setting `reasoning_effort=low` does
   **not** invent a think-token cap; setting `thinking_budget=high` does **not**
   change effort.
-- **Effort-native** models (Qwen3.8, DeepSeek V4, Muse Glimmer) have **no**
-  registry or built-in think-token cap by default. Qwen3.8 accepts the explicit
-  integer cap through its validated continuation path. DeepSeek V4 and Muse
+- **Effort-native** models (Qwen3.8, Ornith 1.5, DeepSeek V4, Muse Glimmer) have **no**
+  registry or built-in think-token cap by default. Qwen3.8 and Ornith 1.5 accept the
+  explicit integer cap through the validated Qwen continuation path. DeepSeek V4 and Muse
   Glimmer expose effort but no parent-defined independent think-token cap, so
   integer and named cap fields are dropped with a visible warning.
 - Registry cards may keep intentional `reasoning_effort` defaults. Omitting a
@@ -259,7 +259,8 @@ model's contract still accepts the named-cap route):
 
 | Family | Mode | Effort | Cap |
 |---|---|---|---|
-| **Qwen3.8** | `enable_thinking=false` → native empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`) | Positive `max_think_tokens` force-closes; 0/absent uncapped. Named `thinking_budget` dropped+warned |
+| **Qwen3.8** | `enable_thinking=false` → native empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`); system-turn semantic prompt steering only — **not** a budget | Positive `max_think_tokens` force-closes; 0/absent uncapped. Named `thinking_budget` dropped+warned |
+| **Ornith 1.5** | same Qwen on/off (`enable_thinking=false` → empty closed think) | Qwen3.8-compatible `low` \| `medium` \| `xhigh` semantic prompt steering (default `xhigh`; medium unsteered; **not** a budget reinterpretation) | Same Qwen integer continuation cap as Qwen3.8; 0/absent uncapped. Named `thinking_budget` dropped+warned |
 | **Qwen3.6** (non-effort-native template) | same on/off | Effort **dropped+warned** — never converted to a cap. Set `thinking_budget` or `max_think_tokens` explicitly if you want a limit | Named preset or integer as requested |
 | **DeepSeek V4** | `thinking.type` enabled/disabled (default on) | `low` \| `high` \| `max`; aliases `medium`/`xhigh`→`high`. | No parent-defined independent cap; integer/named cap fields dropped+warned |
 | **Gemma4** | Boolean thinking; official default **off**; Plain/Gemma channel framing | No native effort — unsupported effort/cap dropped+warned | Unsupported; dropped+warned |

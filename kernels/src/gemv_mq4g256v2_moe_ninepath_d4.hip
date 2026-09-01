@@ -66,9 +66,19 @@
 //
 // Requirements: down_k == 512 (2 groups), down_m % RPB == 0,
 // blockDim == 256 (8 warps × 32).
+//
+// Kernel-name / RPB macros: defaults keep the incumbent exported symbol and
+// RPB=16. Candidate modules redefine HIPFIRE_MQ4V2_NINEPATH_KERNEL and
+// HIPFIRE_MQ4V2_NINEPATH_RPB before including this TU (e.g. RPB=8 gfx1100).
+#ifndef HIPFIRE_MQ4V2_NINEPATH_KERNEL
+#define HIPFIRE_MQ4V2_NINEPATH_KERNEL gemv_mq4g256v2_moe_ninepath_d4
+#endif
+#ifndef HIPFIRE_MQ4V2_NINEPATH_RPB
+#define HIPFIRE_MQ4V2_NINEPATH_RPB 16
+#endif
 
 __launch_bounds__(256, 4)
-extern "C" __global__ void gemv_mq4g256v2_moe_ninepath_d4(
+extern "C" __global__ void HIPFIRE_MQ4V2_NINEPATH_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
     const int* __restrict__ topk_indices,                // [8]
     const float* __restrict__ topk_weights,              // [8]
@@ -76,7 +86,7 @@ extern "C" __global__ void gemv_mq4g256v2_moe_ninepath_d4(
     float* __restrict__ out,                             // [down_m] accumulated
     int down_m, int down_k
 ) {
-    constexpr int RPB = 16;
+    constexpr int RPB = HIPFIRE_MQ4V2_NINEPATH_RPB;
     __shared__ float act_s[8][512];
     __shared__ float part[8][RPB];
     const int tid = threadIdx.x;

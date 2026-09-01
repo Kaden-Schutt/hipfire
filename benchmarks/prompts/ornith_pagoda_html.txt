@@ -1,0 +1,7 @@
+Make a creative, elaborate, colorful and detailed voxel art scene of a pagoda in a beautiful garden.
+It should have these :
+- trees
+- cherry blossoms
+- use your creativity to add other details
+# MAKE NO MISTAKES
+Give me a single HTML file.

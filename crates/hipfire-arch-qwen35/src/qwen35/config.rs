@@ -1360,6 +1360,35 @@ mod tests {
     }
 
     #[test]
+    fn dense_tp_local_config_keeps_global_dim_layers_vocab() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("qwen3.8 dense shape");
+        for tp in 2..=5 {
+            let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride).unwrap();
+            let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+            for (rank, layout) in layouts.iter().enumerate() {
+                let local = local_dense_tp_config(&cfg, layout);
+                assert_eq!(local.dim, cfg.dim, "tp={tp} rank={rank}");
+                assert_eq!(local.n_layers, cfg.n_layers, "tp={tp} rank={rank}");
+                assert_eq!(local.vocab_size, cfg.vocab_size, "tp={tp} rank={rank}");
+            }
+        }
+    }
+
+    #[test]
     fn dense_tp_layouts_qwen38_tp3_exact() {
         use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
         let inner = serde_json::json!({
