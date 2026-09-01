@@ -1088,7 +1088,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
-        | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+        | "gated_norm_mq_rotate_gfx1151"
+        | "gated_norm_mq_rotate_gfx1201" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1096,7 +1097,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "qwen35_fa_prep_gfx1100" | "qwen36_27b_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => {
+        "qwen35_fa_prep_gfx1100"
+        | "qwen36_27b_fa_prep_gfx1100"
+        | "qwen35_fa_prep_gfx1151"
+        | "qwen35_fa_prep_gfx1201" => {
             Some(vec![
                 read(0),
                 write(8),
@@ -1199,7 +1203,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "attention_flash_q8_0_tile" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
-        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => Some(vec![
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201" => Some(vec![
             read(0),
             write(8),
             read(16),
@@ -1559,11 +1564,14 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
+        | "gated_norm_mq_rotate_gfx1201"
         | "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
+        | "qwen35_fa_prep_gfx1201"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
@@ -5524,9 +5532,11 @@ mod tests {
         "gated_norm_mq_rotate_gfx1100",
         "gated_norm_mq_rotate_k6144_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
+        "gated_norm_mq_rotate_gfx1201",
         "qwen35_fa_prep_gfx1100",
         "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
+        "qwen35_fa_prep_gfx1201",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -5578,6 +5588,7 @@ mod tests {
         "attention_flash_q8_0_reduce",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
         "gemv_hfq4g256_multirow_r4",
