@@ -494,6 +494,14 @@ pub fn validate_moe_step_schedule(
                 ))
             }
         };
+    if let RouterPlan::SoftmaxTopK { k_top, .. } = route {
+        if *k_top != 8 {
+            return Err(DispatchError::Hip(format!(
+                "generic MoE softmax route requires k_top=8, got {k_top}"
+            )));
+        }
+    }
+
 
     experts.validate()?;
     route.validate_against(experts.n_experts(), batch_size)?;
@@ -541,10 +549,10 @@ pub fn validate_moe_step_schedule(
             experts.dtype()
         )));
     }
-    validate_step_tensors(steps, experts, batch_size, hidden)?;
     validate_collectives(
         collectives,
         combine_index,
+        batch_size,
         hidden,
         experts.collective_kind(),
     )?;
@@ -1147,9 +1155,13 @@ fn validate_step_tensors(
 fn validate_collectives(
     collectives: &[StepCollective],
     combine_index: usize,
+    batch_size: usize,
     hidden: usize,
     expected_kind: Option<DimKind>,
 ) -> Result<(), DispatchError> {
+    let element_count = batch_size
+        .checked_mul(hidden)
+        .ok_or_else(|| DispatchError::Hip("MoE collective element count overflows".into()))?;
     let mut reduction = None;
     for (index, collective) in collectives.iter().enumerate() {
         let StepCollective::AllReduce {
@@ -1172,7 +1184,7 @@ fn validate_collectives(
                 "MoE collective axis {kind:?} does not match owner axis {expected_kind:?}"
             )));
         }
-        if *dim != hidden || group.len() < 2 || *rank >= group.len() {
+        if *dim != element_count || group.len() < 2 || *rank >= group.len() {
             return Err(DispatchError::Hip(
                 "MoE collective rank/group/output dimension is invalid".into(),
             ));
@@ -1768,15 +1780,21 @@ static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
 static MOE: std::sync::LazyLock<MoeFamily> = std::sync::LazyLock::new(MoeFamily::new);
 
+fn reject_unsealed_moe(steps: &[Step]) -> Result<(), DispatchError> {
+    if steps.iter().any(is_moe_step) {
+        return Err(DispatchError::Hip(
+            "unsealed MoE schedules require execute_sealed_steps or execute_sealed_steps_mesh".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn execute_steps(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     steps: &[Step],
 ) -> Result<(), DispatchError> {
-    if steps.iter().any(is_moe_step) {
-        let collectives = vec![StepCollective::None; steps.len()];
-        validate_moe_step_schedule(steps, &collectives)?;
-    }
+    reject_unsealed_moe(steps)?;
     execute_steps_inner(gpu, ctx, steps)
 }
 
@@ -2803,5 +2821,18 @@ mod tests {
             keys.contains(&KernelKey::FusedGateUpQ8_0),
             "FusedGateUpQ8_0 missing from FUSED_TABLE"
         );
+    }
+
+    #[test]
+    fn unsealed_moe_schedule_is_rejected_before_gpu_execution() {
+        let route = GpuTensor::null_for_test();
+        let plan = RouterPlan::Precomputed {
+            topk_indices: &route,
+            topk_weights: &route,
+            k_top: 1,
+        };
+        let steps = [Step::MoeRoute { plan }];
+        let error = reject_unsealed_moe(&steps).expect_err("MoE must use a sealed executor path");
+        assert!(error.to_string().contains("unsealed MoE schedules"));
     }
 }

@@ -1154,6 +1154,23 @@ mod tests {
         entries
     }
 
+    fn grouped_manifest_for(parallelism: ExpertParallelism) -> Vec<WeightEntry> {
+        let mut entries = manifest_for(parallelism);
+        entries[0].logical_shape = vec![4, 8];
+        entries[1].logical_shape[0] = 8;
+        entries[2].logical_shape[0] = 8;
+        if matches!(parallelism, ExpertParallelism::ExpertParallel) {
+            for entry in &mut entries[1..=2] {
+                entry.policy = ShardPolicy::ExpertSharded {
+                    n_experts: 8,
+                    assign: ExpertAssign::Stride,
+                };
+            }
+        }
+        entries
+    }
+
+
     fn separate_manifest() -> Vec<WeightEntry> {
         let mut entries = manifest();
         entries[1].name = "experts.gate".into();
@@ -1203,6 +1220,13 @@ mod tests {
         }
     }
 
+    fn grouped_spec(execution: &str, parallelism: ExpertParallelism) -> ExpertGroupSpec {
+        let mut value = spec(execution, parallelism);
+        value.n_experts = 8;
+        value
+    }
+
+
     fn tensor_with_bytes(shape: Vec<usize>, dtype: DType, bytes: usize) -> GpuTensor {
         let mut tensor = GpuTensor::null_for_test();
         tensor.buf = unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), bytes) };
@@ -1238,16 +1262,26 @@ mod tests {
         parallelism: ExpertParallelism,
         mesh: &DeviceMesh,
     ) -> ExpertPlan {
-        let mut plan = ExpertPlan::from_manifest(
-            &spec(execution, parallelism),
-            &manifest_for(parallelism),
-            mesh,
-        )
-        .expect("test expert plan");
+        let (group_spec, group_manifest) = if execution == "grouped_quantized" {
+            (
+                grouped_spec(execution, parallelism),
+                grouped_manifest_for(parallelism),
+            )
+        } else {
+            (spec(execution, parallelism), manifest_for(parallelism))
+        };
+        let mut plan =
+            ExpertPlan::from_manifest(&group_spec, &group_manifest, mesh).expect("test expert plan");
         let group_size = plan.group_size();
+        let pointer_slots = plan.n_experts().checked_mul(2).expect("test pointer slots");
         for rank in 0..group_size {
-            plan.commit_rank_tables(rank, table(vec![8]), table(vec![8]), None)
-                .expect("commit rank tables");
+            plan.commit_rank_tables(
+                rank,
+                table(vec![pointer_slots]),
+                table(vec![pointer_slots]),
+                None,
+            )
+            .expect("commit rank tables");
         }
         let placements = plan.placements().to_vec();
         let mut load = plan.begin_load();
@@ -1278,21 +1312,21 @@ mod tests {
 
     fn grouped_tensors() -> GroupedTensors {
         GroupedTensors {
-            scores: tensor(vec![2, 4]),
-            indices: tensor(vec![2, 2]),
-            weights: tensor(vec![2, 2]),
-            counts: raw_i32(4),
-            offsets: raw_i32(5),
-            sorted: raw_i32(8),
-            tiles: raw_i32(2),
-            inverse: raw_i32(4),
+            scores: tensor(vec![2, 8]),
+            indices: tensor(vec![2, 8]),
+            weights: tensor(vec![2, 8]),
+            counts: raw_i32(8),
+            offsets: raw_i32(9),
+            sorted: raw_i32(16),
+            tiles: raw_i32(4),
+            inverse: raw_i32(16),
             x: tensor(vec![2, 64]),
-            grouped_gate: tensor(vec![8, 128]),
-            gate_batch: tensor(vec![4, 64]),
-            up_batch: tensor(vec![4, 64]),
-            rot_batch: tensor(vec![4, 64]),
-            grouped_down: tensor(vec![8, 64]),
-            down_x: tensor(vec![4, 64]),
+            grouped_gate: tensor(vec![16, 128]),
+            gate_batch: tensor(vec![16, 64]),
+            up_batch: tensor(vec![16, 64]),
+            rot_batch: tensor(vec![16, 64]),
+            grouped_down: tensor(vec![16, 64]),
+            down_x: tensor(vec![16, 64]),
             out: tensor(vec![2, 64]),
         }
     }
@@ -1307,7 +1341,7 @@ mod tests {
                     scores: &tensors.scores,
                     topk_indices: &tensors.indices,
                     topk_weights: &tensors.weights,
-                    k_top: 2,
+                    k_top: 8,
                     normalize: true,
                 },
             },
@@ -1318,9 +1352,9 @@ mod tests {
                 sorted_slot_index: &tensors.sorted,
                 expert_tile_ids: &tensors.tiles,
                 inverse_perm: &tensors.inverse,
-                total_slots: 4,
-                n_experts: 4,
-                m_total_max: 8,
+                total_slots: 16,
+                n_experts: 8,
+                m_total_max: 16,
                 block_m: 4,
             },
             Step::GroupedMoeGemm {
@@ -1332,9 +1366,9 @@ mod tests {
                 expert_tile_ids: &tensors.tiles,
                 x: &tensors.x,
                 y: &tensors.grouped_gate,
-                m_total: 8,
+                m_total: 16,
                 batch_size: 2,
-                k_top: 2,
+                k_top: 8,
             },
             Step::MoeGateUpUnscatter {
                 y_grouped: &tensors.grouped_gate,
@@ -1342,8 +1376,8 @@ mod tests {
                 gate_batch: &tensors.gate_batch,
                 up_batch: &tensors.up_batch,
                 inter: 64,
-                k_top: 2,
-                m_total: 8,
+                k_top: 8,
+                m_total: 16,
             },
             Step::MoeActivation {
                 variant: MoeActivationVariant::SiluMul,
@@ -1351,7 +1385,7 @@ mod tests {
                 up: &tensors.up_batch,
                 rot_out: &tensors.rot_batch,
                 inter: 64,
-                rows: 4,
+                rows: 16,
             },
             Step::GroupedMoeGemm {
                 experts,
@@ -1360,16 +1394,16 @@ mod tests {
                 expert_tile_ids: &tensors.tiles,
                 x: &tensors.rot_batch,
                 y: &tensors.grouped_down,
-                m_total: 8,
+                m_total: 16,
                 batch_size: 2,
-                k_top: 2,
+                k_top: 8,
             },
             Step::MoeCombine {
                 down_out: &tensors.grouped_down,
                 topk_weights: &tensors.weights,
                 out: &tensors.out,
                 hidden: 64,
-                k_top: 2,
+                k_top: 8,
                 batch_size: 2,
                 inverse_perm: Some(&tensors.inverse),
             },
@@ -1378,7 +1412,6 @@ mod tests {
 
     fn indexed_steps<'a>(
         experts: &'a MoeExpertRef<'a>,
-        scores: &'a GpuTensor,
         indices: &'a GpuTensor,
         weights: &'a GpuTensor,
         x: &'a GpuTensor,
@@ -1390,12 +1423,10 @@ mod tests {
     ) -> Vec<Step<'a>> {
         vec![
             Step::MoeRoute {
-                plan: RouterPlan::SoftmaxTopK {
-                    scores,
+                plan: RouterPlan::Precomputed {
                     topk_indices: indices,
                     topk_weights: weights,
                     k_top: 2,
-                    normalize: true,
                 },
             },
             Step::IndexedMoeGemv {
@@ -1472,6 +1503,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn grouped_parallel_collective_covers_every_batched_output_element() {
+        let mesh = mesh_ep();
+        let plan = resident_plan(
+            "grouped_quantized",
+            ExpertParallelism::ExpertParallel,
+            &mesh,
+        );
+        let experts = plan.bind_expert_ref(0).unwrap();
+        let tensors = grouped_tensors();
+        let family = MoeFamily::new();
+
+        let mut short = vec![StepCollective::None; 7];
+        short[6] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
+        let error = match family.seal_steps(
+            ExpertExecutionPlan::GroupedQuantized,
+            grouped_steps(&experts, &tensors),
+            short,
+        ) {
+            Ok(_) => panic!("batched grouped output must not reduce only one row"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("output dimension"));
+
+        let mut full = vec![StepCollective::None; 7];
+        full[6] = StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
+        let schedule = family
+            .seal_steps(
+                ExpertExecutionPlan::GroupedQuantized,
+                grouped_steps(&experts, &tensors),
+                full,
+            )
+            .expect("collective must cover batch_size * hidden elements");
+        assert!(matches!(
+            &schedule.collectives()[6],
+            StepCollective::AllReduce { dim: 128, .. }
+        ));
+    }
+
+
+    #[test]
+    fn sealing_rejects_non_k8_softmax_routes() {
+        let mesh = DeviceMesh::single().unwrap();
+        let plan = resident_plan("grouped_quantized", ExpertParallelism::Single, &mesh);
+        let experts = plan.bind_expert_ref(0).unwrap();
+        let tensors = grouped_tensors();
+        let mut steps = grouped_steps(&experts, &tensors);
+        steps[0] = Step::MoeRoute {
+            plan: RouterPlan::SoftmaxTopK {
+                scores: &tensors.scores,
+                topk_indices: &tensors.indices,
+                topk_weights: &tensors.weights,
+                k_top: 2,
+                normalize: true,
+            },
+        };
+        let error = match MoeFamily::new().seal_steps(
+            ExpertExecutionPlan::GroupedQuantized,
+            steps,
+            vec![StepCollective::None; 7],
+        ) {
+            Ok(_) => panic!("generic softmax routing is only executable at k_top=8"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("k_top=8"));
+    }
     #[test]
     fn stride_assignment_and_named_group_are_deterministic() {
         let plan = ExpertPlan::from_manifest(
@@ -1583,7 +1680,8 @@ mod tests {
         let tensors = grouped_tensors();
         let steps = grouped_steps(&experts, &tensors);
         let mut collectives = vec![StepCollective::None; 7];
-        collectives[6] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 1);
+        collectives[6] =
+            StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 1);
         let schedule = MoeFamily::new()
             .seal_steps(ExpertExecutionPlan::GroupedQuantized, steps, collectives)
             .expect("collective descriptor is locally typed");
@@ -1602,7 +1700,8 @@ mod tests {
         let plan = resident_plan("grouped_quantized", ExpertParallelism::Single, &mesh);
         let experts = plan.bind_expert_ref(0).unwrap();
         let mut tensors = grouped_tensors();
-        tensors.indices = tensor_with_bytes(vec![2, 2], DType::F32, 3 * DType::F32.size());
+        tensors.indices =
+            tensor_with_bytes(vec![2, 8], DType::F32, 15 * DType::F32.size());
         let steps = grouped_steps(&experts, &tensors);
         let error = match MoeFamily::new().seal_steps(
             ExpertExecutionPlan::GroupedQuantized,
@@ -1633,7 +1732,6 @@ mod tests {
         let indexed_experts = indexed_plan.bind_expert_ref(0).unwrap();
         let grouped_experts = grouped_plan.bind_expert_ref(1).unwrap();
 
-        let indexed_scores = tensor(vec![4]);
         let indexed_indices = tensor(vec![2]);
         let indexed_weights = tensor(vec![2]);
         let indexed_x = tensor(vec![64]);
@@ -1647,7 +1745,6 @@ mod tests {
                 ExpertExecutionPlan::IndexedQuantized,
                 indexed_steps(
                     &indexed_experts,
-                    &indexed_scores,
                     &indexed_indices,
                     &indexed_weights,
                     &indexed_x,
@@ -1674,7 +1771,7 @@ mod tests {
                 {
                     let mut collectives = vec![StepCollective::None; 7];
                     collectives[6] =
-                        StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 1);
+                        StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 1);
                     collectives
                 },
             )
@@ -1702,8 +1799,10 @@ mod tests {
         let family = MoeFamily::new();
 
         let mut duplicate = vec![StepCollective::None; 7];
-        duplicate[5] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
-        duplicate[6] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
+        duplicate[5] =
+            StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
+        duplicate[6] =
+            StepCollective::all_reduce(DimKind::Ep, 128, vec![0, 1], mesh.epoch(), 0);
         let error = match family.seal_steps(
             ExpertExecutionPlan::GroupedQuantized,
             grouped_steps(&experts, &tensors),
@@ -1712,6 +1811,7 @@ mod tests {
             Ok(_) => panic!("a routed reduction cannot appear twice"),
             Err(error) => error,
         };
+
         assert!(error.to_string().contains("attached to combine"));
 
         let error = match family.seal_steps(
@@ -1723,6 +1823,36 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("collective count"));
+    }
+
+    #[test]
+    fn single_plan_accepts_nonzero_pipeline_stage_device() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let mut staged_manifest = manifest_for(ExpertParallelism::Single);
+        for entry in &mut staged_manifest {
+            entry.layer = Some(1);
+        }
+        let mut staged_spec = spec("indexed_quantized", ExpertParallelism::Single);
+        staged_spec.layer = Some(1);
+        let mut plan =
+            ExpertPlan::from_manifest(&staged_spec, &staged_manifest, &mesh).unwrap();
+        assert_eq!(plan.group_devices(), &[1]);
+
+        for rank in 0..plan.group_size() {
+            plan.commit_rank_tables(rank, table(vec![8]), table(vec![8]), None)
+                .unwrap();
+        }
+        let placements = plan.placements().to_vec();
+        let mut load = plan.begin_load();
+        for placement in placements {
+            load.reserve(placement).unwrap();
+        }
+        load.commit();
+
+        let experts = plan.bind_expert_ref(0).unwrap();
+        assert_eq!(experts.owner_rank(), 0);
+        assert_eq!(experts.group_devices(), &[1]);
+        assert_eq!(experts.owned(), &[0, 1, 2, 3]);
     }
     #[test]
     fn per_expert_fallback_is_refused_at_plan_boundary() {

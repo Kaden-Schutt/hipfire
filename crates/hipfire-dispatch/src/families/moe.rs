@@ -505,7 +505,6 @@ impl<'a> MoeExpertRef<'a> {
         if self.collective_kind.is_none()
             && (self.owner_rank != 0
                 || self.group_devices.len() != 1
-                || self.group_devices.first().copied() != Some(0)
                 || self.owned.len() != self.n_experts
                 || !self
                     .owned
