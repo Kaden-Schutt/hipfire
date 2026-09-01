@@ -3,24 +3,29 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
 
@@ -74,6 +79,108 @@ pub(crate) fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to Q4_K format (144 bytes per 256 elements, 0.5625 B/w).
 /// GGML-compatible block layout: f16 d + f16 dmin + 12B packed scales + 128B nibbles.
 /// This produces blocks that work with the existing gemv_q4k kernel.
+
+/// Port of llama.cpp's `make_qkx2_quants` (ggml-quants.c:799).
+///
+/// Returns `(scale, the_min)` for one sub-block, where dequantization is
+/// `w = scale * q - the_min` — the same convention `dequantize_row_q4_K` uses
+/// (`y = d1*q - m1`).
+///
+/// WHY THIS RATHER THAN MIN/MAX. Plain min/max picks the scale that makes the
+/// extremes representable, which is not the scale that minimises error: one
+/// outlier stretches the grid and every other weight pays for it. This searches
+/// `nstep` candidate scales around the min/max one and, for each, solves the
+/// weighted least-squares fit for (scale, min) given the resulting integer
+/// levels, keeping whichever candidate actually has the lowest error.
+///
+/// Measured on Maple's lm_head: min/max gives relative L2 0.0799, this gives
+/// 0.0731 — the same 0.0731 DeepGrove's published Q4_K head achieves. The
+/// layout was already GGML-compatible; only the encoder was weaker.
+///
+/// `weights` are llama.cpp's importance weights `sqrt(mean(x^2)) + |x|`, which
+/// bias the fit toward larger-magnitude entries.
+#[allow(clippy::too_many_arguments)]
+fn make_qkx2_quants(
+    x: &[f32],
+    weights: &[f32],
+    nmax: i32,
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+) -> (f32, f32) {
+    let n = x.len();
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    // The grid is anchored at or below zero, so an all-positive block still
+    // encodes zero exactly.
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        return (0.0, -min);
+    }
+
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut laux = vec![0i32; n];
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let l = (iscale * (x[i] - min)).round() as i32;
+        let l = l.clamp(0, nmax);
+        let diff = scale * l as f32 + min - x[i];
+        best_error += weights[i] * diff * diff;
+    }
+    if nstep < 1 {
+        return (scale, -min);
+    }
+
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let l = ((iscale * (x[i] - min)).round() as i32).clamp(0, nmax);
+            laux[i] = l;
+            let w = weights[i];
+            sum_l += w * l as f32;
+            sum_l2 += w * (l * l) as f32;
+            sum_xl += w * l as f32 * x[i];
+        }
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale * laux[i] as f32 + this_min - x[i];
+                cur_error += weights[i] * diff * diff;
+            }
+            if cur_error < best_error {
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
 pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
     let super_block_size = 256;
     let block_bytes = 144;
@@ -98,11 +205,17 @@ pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
             }
             let group = &f32_data[start..end];
 
-            let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let range = max_val - min_val;
-            sub_scales[sb] = if range > 0.0 { range / 15.0 } else { 0.0 };
-            sub_mins[sb] = min_val;
+            // llama.cpp's importance weights: sqrt(mean(x^2)) + |x|.
+            let sum_x2: f32 = group.iter().map(|v| v * v).sum();
+            let av_x = (sum_x2 / group.len() as f32).sqrt();
+            let w: Vec<f32> = group.iter().map(|v| av_x + v.abs()).collect();
+            // Same parameters Q4_K uses at ggml-quants.c:1476
+            // (nmax=15, rmin=-1.0, rdelta=0.1, nstep=20, use_mad=false).
+            let (scale, the_min) = make_qkx2_quants(group, &w, 15, -1.0, 0.1, 20);
+            sub_scales[sb] = scale;
+            // The rest of this function stores the SIGNED min and negates it
+            // when packing, so convert back from llama.cpp's positive the_min.
+            sub_mins[sb] = -the_min;
         }
 
         // Find super-block d and dmin that best represent the sub-block scales/mins

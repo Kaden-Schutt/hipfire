@@ -76,7 +76,7 @@ pub(crate) struct QuantizeArgs {
     /// 161.8 tok/s) and 15% smaller (4.25 vs 5.0 bpw). Existing .hfq files with
     /// a qt=30 head still LOAD; only producing new ones is removed.
     #[arg(long, value_name = "MODE", default_value = "q8",
-          value_parser = ["bf16", "q8", "mq4v2"])]
+          value_parser = ["bf16", "q8", "mq4v2", "q4k"])]
     pub head_quant: String,
 
     /// Override the architecture ID stamped into the HFQ header.

@@ -143,6 +143,9 @@ pub(crate) fn maple_dtype_for_quant_type(qt: u8) -> Result<DType, String> {
         2 => DType::F32,
         16 => DType::BF16,
         3 => DType::Q8_0,
+        // qt=4 arrives from `--head-quant q4k`. GGML-compatible Q4_K and
+        // UNROTATED — no FWHT seed contract, unlike qt=30/44.
+        4 => DType::Q4K,
         13 => DType::MQ4G256,
         15 => DType::MQ6G256,
         19 => DType::MQ2G256Lloyd,

@@ -71,6 +71,14 @@ pub(crate) enum MapleHeadQuant {
     /// SMALLER footprint than qt=30 (4.25 vs 5.0 bpw), so it is the natural
     /// candidate if the mq4 head's accuracy cost is what rules it out.
     Mq4V2,
+    /// GGML-compatible **Q4_K** (qt=4), 144 B per 256 weights = 4.5 bpw.
+    /// Unrotated, and the finest-grained 4-bit carrier available: a separate
+    /// scale AND min per 32-weight sub-block (8 per 256), with the sub-block
+    /// meta itself 6-bit quantized. Measured on the real lm_head, relative L2
+    /// error by granularity: 0.118 at 1 scale/256 (qt=30 class), 0.106 at 2
+    /// (qt=44), 0.080 at 8 (this). This is the exact carrier DeepGrove ship in
+    /// their own llama.cpp example, so it is the like-for-like comparison.
+    Q4K,
 }
 
 impl std::str::FromStr for MapleHeadQuant {
@@ -81,8 +89,9 @@ impl std::str::FromStr for MapleHeadQuant {
             "q8" | "q8_0" | "q8f16" => Ok(Self::Q8),
             "mq4" | "mq4-lloyd" | "mq4g256lloyd" => Ok(Self::Mq4),
             "mq4v2" | "mq4-v2" | "mq4g256v2" => Ok(Self::Mq4V2),
+            "q4k" | "q4_k" | "q4km" => Ok(Self::Q4K),
             other => Err(format!(
-                "unknown --head-quant {other:?} (expected bf16, q8, mq4 or mq4v2)"
+                "unknown --head-quant {other:?} (expected bf16, q8, mq4v2 or q4k)"
             )),
         }
     }
@@ -96,6 +105,7 @@ impl MapleHeadQuant {
             Self::Q8 => "q8",
             Self::Mq4 => "mq4",
             Self::Mq4V2 => "mq4v2",
+            Self::Q4K => "q4k",
         }
     }
 }
@@ -199,6 +209,17 @@ pub(crate) fn pack_maple_head(
                 QuantType::MQ4G256V2,
                 256,
             ))
+        }
+        MapleHeadQuant::Q4K => {
+            if k % 256 != 0 {
+                return Err(format!(
+                    "lm_head K={k} is not a multiple of 256 (Q4_K super-block)"
+                ));
+            }
+            // UNROTATED, unlike qt=30/44: Q4_K carries its own per-32 scales
+            // and has no FWHT convention, so there are no seeds to keep in
+            // sync with `ensure_mq_signs` here.
+            Ok((crate::quant_q4::quantize_q4k(vals), QuantType::Q4K, 256))
         }
     }
 }
