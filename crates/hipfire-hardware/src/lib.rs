@@ -2067,6 +2067,41 @@ fn preflight_vram_with_opts(
 mod tests {
     use super::*;
 
+    static VISIBILITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct VisibilityEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        hip: Option<std::ffi::OsString>,
+        rocr: Option<std::ffi::OsString>,
+    }
+
+    impl VisibilityEnvGuard {
+        fn acquire() -> Self {
+            let lock = VISIBILITY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self {
+                _lock: lock,
+                hip: std::env::var_os(hipfire_config::HIP_VISIBLE_DEVICES),
+                rocr: std::env::var_os(hipfire_config::ROCR_VISIBLE_DEVICES),
+            }
+        }
+    }
+
+    impl Drop for VisibilityEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in [
+                (hipfire_config::HIP_VISIBLE_DEVICES, self.hip.take()),
+                (hipfire_config::ROCR_VISIBLE_DEVICES, self.rocr.take()),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn uniform_split_basic() {
         assert_eq!(uniform_split_counts(2, 24), vec![12, 12]);
@@ -2240,6 +2275,7 @@ mod tests {
 
     #[test]
     fn resolver_lowers_with_applied_visibility_proof() {
+        let _env = VisibilityEnvGuard::acquire();
         // Simulate successful visibility application: physical 2,3 -> logical 0,1
         let vis = hipfire_config::DeviceVisibility {
             rocr: "2,3".into(),
@@ -2263,6 +2299,7 @@ mod tests {
 
     #[test]
     fn resolver_rejects_empty_and_malformed_lists() {
+        let _env = VisibilityEnvGuard::acquire();
         let cases = [
             Some("".to_string()),
             Some(",".to_string()),
@@ -2301,6 +2338,9 @@ mod tests {
 
     #[test]
     fn resolver_rejects_stale_visibility_proof() {
+        let _env = VisibilityEnvGuard::acquire();
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
         // Physical 2,3 but visibility proof is stale (doesn't match env or rocr)
         let vis = hipfire_config::DeviceVisibility {
             rocr: "2,3".into(),
