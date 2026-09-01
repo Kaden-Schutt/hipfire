@@ -691,6 +691,38 @@ pub struct MapleState {
     pub b_act_f16: GpuTensor, // [max_b × k_top × moe_inter] F16
 }
 
+/// Tile size the DECODE attention will actually use, for sizing
+/// `flash_partials`.
+///
+/// This used to be a hardcoded `128`, which is only correct on architectures
+/// whose default tile IS 128. `q8_flash_tile_size` returns **32 on gfx1100**
+/// (RDNA3), so the decode kernel there computes 4x as many tiles as a
+/// 128-derived allocation assumes, and indexes
+/// `partials + (h * max_tiles + tile_id) * (2 + head_dim)` against them.
+///
+/// It did not overflow, because the trailing `FLASH_PREFILL_SUBBATCH` factor
+/// left 64x of slack that absorbed the 4x — but that reduced the real margin
+/// on RDNA3 to 16x for a reason nothing in the code stated, and it made this a
+/// FOURTH independent copy of tile-size logic. `launch_asym_flash_batched`
+/// carries a comment about "the corruption bug three independent copies of
+/// this exact logic caused"; deriving the value is how that stops recurring.
+///
+/// `HIPFIRE_Q8_FLASH_TILE` is honoured by `q8_flash_tile_size`, so an operator
+/// override is now reflected in the allocation too rather than silently eating
+/// the slack.
+fn flash_partial_tile(gpu: &Gpu, cfg: &MapleConfig) -> usize {
+    rdna_compute::attention::q8_flash_tile_size(
+        &gpu.arch,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        // Shape-only: the tile policy reads max_seq solely to recognise one
+        // certified gfx1151 replay shape (max_seq == 2048), which Maple is not.
+        cfg.max_position_embeddings,
+    )
+    .max(1)
+}
+
 impl MapleState {
     pub fn new(gpu: &mut Gpu, cfg: &MapleConfig) -> Result<Self, String> {
         let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
@@ -799,7 +831,7 @@ impl MapleState {
             flash_partials: alloc(
                 gpu,
                 cfg.num_attention_heads
-                    * max_seq.div_ceil(128)
+                    * max_seq.div_ceil(flash_partial_tile(gpu, cfg))
                     * (2 + cfg.head_dim)
                     * FLASH_PREFILL_SUBBATCH,
                 "flash_partials",
