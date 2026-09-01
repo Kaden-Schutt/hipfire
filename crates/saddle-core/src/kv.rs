@@ -1784,6 +1784,10 @@ impl KvCache {
         // invariant (the legacy qwen35 literals hardcoded quant_q4 = false).
         // Release classify() output is unchanged either way (asym is matched
         // before q4), so this is a true no-op for kernel selection.
+        // BF16 is a distinct flat tier (maple): it is `quantized:true` with
+        // empty `k_scales` and no other quant flag, so without `!quant_bf16`
+        // it would ALSO report quant_q4, giving two true tier flags and
+        // tripping the same debug_assert on every Maple BF16 dispatch.
         self.quantized
             && !self.quant_hfq4
             && !self.quant_q8
@@ -1791,6 +1795,7 @@ impl KvCache {
             && !self.quant_asym4
             && !self.quant_asym3
             && !self.quant_asym2
+            && !self.quant_bf16
             && self.k_scales.is_empty()
     }
 
@@ -4474,5 +4479,183 @@ mod vmm_layout_tests {
                 );
             }
         }
+    }
+}
+
+/// BF16 tier projection / plan regression (debug-build).
+///
+/// Maple's BF16 cache sets `quantized=true` with empty `k_scales` and
+/// `quant_bf16=true` — the exact shape that the legacy Q4 residual
+/// `quantized && !tier && k_scales.is_empty()` would also match.
+/// Without the `!quant_bf16` exclusion the cache reports TWO true tier flags
+/// (`bf16` + `q4`), which trips `hipfire-dispatch::families::kv_tier::classify`'s
+/// `debug_assert!(count <= 1)` on every Maple BF16 attention dispatch.
+/// These tests mirror that assertion without taking a dispatch dependency, so
+/// a future regression is caught here even in GPU-free CI.
+#[cfg(test)]
+mod bf16_tier_projection_tests {
+    use super::*;
+
+    fn stub(
+        quantized: bool,
+        quant_q8: bool,
+        quant_hfq4: bool,
+        quant_int8: bool,
+        quant_asym4: bool,
+        quant_asym3: bool,
+        quant_asym2: bool,
+        quant_fwht: bool,
+        quant_bf16: bool,
+        k_scales_empty: bool,
+    ) -> KvCache {
+        KvCache {
+            k_gpu: Vec::new(),
+            v_gpu: Vec::new(),
+            k_scales: if k_scales_empty {
+                Vec::new()
+            } else {
+                // non-empty sentinel: one dummy 1-element tensor avoids needing Gpu
+                vec![GpuTensor {
+                    buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), 0) },
+                    shape: vec![1],
+                    dtype: DType::F32,
+                }]
+            },
+            v_scales: Vec::new(),
+            kv_dim: 0,
+            max_seq: 0,
+            physical_cap: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            quantized,
+            quant_q8,
+            quant_int8,
+            quant_hfq4,
+            quant_asym4,
+            quant_asym3,
+            quant_asym2,
+            quant_fwht,
+            quant_bf16,
+            v_mode: VMode::Q8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: Vec::new(),
+            compact_offset: 0,
+        }
+    }
+
+    /// Mirrors `hipfire_dispatch::families::kv_tier::classify`'s at-most-one check,
+    /// using the two derived predicates exactly as `KvCacheExt::{k_tier,tier_inputs}`
+    /// do: `quant_q4 = quant_q4_residual()`, `quant_hfq8 = is_hfq8_kv()`.
+    fn tier_count(cache: &KvCache) -> usize {
+        let flags = [
+            cache.quant_asym4,
+            cache.quant_asym3,
+            cache.quant_asym2,
+            cache.quant_q8,
+            cache.quant_hfq4,
+            cache.quant_q4_residual(),
+            cache.quant_int8,
+            cache.is_hfq8_kv(),
+            cache.quant_bf16,
+        ];
+        flags.iter().filter(|&&b| b).count()
+    }
+
+    #[test]
+    fn bf16_projection_is_exclusive_q4_false_bf16_true() {
+        // Maple BF16: quantized true, empty scales, bf16 true, no other tier.
+        let bf16 = stub(
+            true, false, false, false, false, false, false, false, true, true,
+        );
+        assert!(
+            !bf16.quant_q4_residual(),
+            "BF16 must NOT report legacy Q4 residual"
+        );
+        assert!(bf16.quant_bf16, "BF16 flag must be true");
+        assert!(!bf16.is_hfq8_kv(), "BF16 must not report HFQ8");
+        assert_eq!(
+            tier_count(&bf16),
+            1,
+            "BF16 must classify as exactly one tier (bf16)"
+        );
+        // The dispatch crate's `classify` debug_assert would trip if count > 1.
+        // Mirror that guard so GPU-free CI catches the same regression.
+        debug_assert!(
+            tier_count(&bf16) <= 1,
+            "at most one KV storage tier flag should be set (BF16)"
+        );
+    }
+
+    #[test]
+    fn q4_residual_still_reports_q4_only() {
+        // LLaMA legacy Q4: quantized true, empty scales, no named tier, no bf16.
+        let q4 = stub(
+            true, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(q4.quant_q4_residual(), "legacy Q4 must report q4 residual");
+        assert!(!q4.quant_bf16);
+        assert!(!q4.is_hfq8_kv());
+        assert_eq!(
+            tier_count(&q4),
+            1,
+            "Q4 must classify as exactly one tier (q4)"
+        );
+        debug_assert!(tier_count(&q4) <= 1, "at most one tier (Q4)");
+    }
+
+    #[test]
+    fn q8_projection_is_exclusive_q4_false() {
+        // Q8: quantized true, q8 true, empty scales, no bf16. Must not also be Q4.
+        let q8 = stub(
+            true, true, false, false, false, false, false, false, false, true,
+        );
+        assert!(
+            !q8.quant_q4_residual(),
+            "Q8 must NOT report legacy Q4 residual"
+        );
+        assert!(!q8.quant_bf16);
+        assert!(!q8.is_hfq8_kv());
+        assert!(q8.quant_q8);
+        assert_eq!(
+            tier_count(&q8),
+            1,
+            "Q8 must classify as exactly one tier (q8)"
+        );
+        debug_assert!(tier_count(&q8) <= 1, "at most one tier (Q8)");
+    }
+
+    #[test]
+    fn asym_and_hfq_variants_remain_exclusive() {
+        // Asym3 (qwen35 default) was the original motivator for the asym exclusion;
+        // ensure the new bf16 exclusion didn't reintroduce overlap.
+        let asym3 = stub(
+            true, false, false, false, false, true, false, false, false, true,
+        );
+        assert!(
+            !asym3.quant_q4_residual(),
+            "asym3 must NOT report Q4 residual"
+        );
+        assert_eq!(tier_count(&asym3), 1);
+
+        // HFQ8 has non-empty k_scales and is its own tier.
+        let hfq8 = stub(
+            true, false, false, false, false, false, false, false, false, false,
+        );
+        assert!(hfq8.is_hfq8_kv(), "hfq8 with scales must report hfq8");
+        assert!(
+            !hfq8.quant_q4_residual(),
+            "hfq8 must NOT report Q4 (scales non-empty)"
+        );
+        assert_eq!(tier_count(&hfq8), 1);
+
+        // F32: quantized false => no tier at all (KTier::F32).
+        let f32_cache = stub(
+            false, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(!f32_cache.quant_q4_residual());
+        assert!(!f32_cache.is_hfq8_kv());
+        assert_eq!(tier_count(&f32_cache), 0, "F32 must classify as zero tiers");
     }
 }

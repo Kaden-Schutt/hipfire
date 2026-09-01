@@ -356,9 +356,7 @@ impl RegistryV1 {
                 self.schema_version
             )));
         }
-        if self.generated_at.trim().is_empty() {
-            return Err(fail("generated_at is empty".into()));
-        }
+        validate_generated_at(&self.generated_at).map_err(fail)?;
         if self.models.is_empty() {
             return Err(fail("model catalog is empty".into()));
         }
@@ -456,6 +454,86 @@ fn validate_digest(digest: Option<&str>, label: &str) -> std::result::Result<(),
         }
     }
     Ok(())
+}
+
+fn validate_generated_at(ts: &str) -> std::result::Result<(), String> {
+    // Strict normalized RFC3339 UTC: YYYY-MM-DDTHH:MM:SSZ (20 bytes).
+    // Lexical order equals chronological order only in this normalized form,
+    // which is what `prefer_bundled_if_newer` relies on. Reject any
+    // non-normalized representation (offsets, fractional seconds, whitespace,
+    // lowercase, etc.) and validate calendar ranges so malformed strings
+    // cannot invert precedence via lexical comparison.
+    if ts.len() != 20 {
+        return Err(format!(
+            "generated_at '{}' is not strict RFC3339 UTC (expected YYYY-MM-DDTHH:MM:SSZ)",
+            ts
+        ));
+    }
+    let b = ts.as_bytes();
+    if b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return Err(format!(
+            "generated_at '{}' is not strict RFC3339 UTC (expected YYYY-MM-DDTHH:MM:SSZ)",
+            ts
+        ));
+    }
+    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !b[i].is_ascii_digit() {
+            return Err(format!(
+                "generated_at '{}' is not strict RFC3339 UTC (expected YYYY-MM-DDTHH:MM:SSZ)",
+                ts
+            ));
+        }
+    }
+    let year = (b[0] - b'0') as u16 * 1000
+        + (b[1] - b'0') as u16 * 100
+        + (b[2] - b'0') as u16 * 10
+        + (b[3] - b'0') as u16;
+    let month = (b[5] - b'0') * 10 + (b[6] - b'0');
+    let day = (b[8] - b'0') * 10 + (b[9] - b'0');
+    let hour = (b[11] - b'0') * 10 + (b[12] - b'0');
+    let minute = (b[14] - b'0') * 10 + (b[15] - b'0');
+    let second = (b[17] - b'0') * 10 + (b[18] - b'0');
+    if month == 0 || month > 12 {
+        return Err(format!("generated_at '{}' has invalid month", ts));
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        return Err(format!("generated_at '{}' has invalid day", ts));
+    }
+    if hour > 23 {
+        return Err(format!("generated_at '{}' has invalid hour", ts));
+    }
+    if minute > 59 {
+        return Err(format!("generated_at '{}' has invalid minute", ts));
+    }
+    if second > 59 {
+        return Err(format!("generated_at '{}' has invalid second", ts));
+    }
+    Ok(())
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 fn is_effort_native_tag(tag: &str) -> bool {
@@ -772,7 +850,7 @@ mod tests {
     fn heads_sidecars_are_digest_validated() {
         let with_bad_head = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"m":{"repo":"r","file":"f.hfq","size_gb":1,"min_vram_gb":1,"desc":"d",
               "heads":{"q4k":{"file":"h.hfq","sha256":"not-a-sha"}}}},
             "aliases":{}
@@ -1078,7 +1156,7 @@ mod tests {
         // Original Qwen3 family (without .5/.6/.8) receives no automatic policy.
         let qwen3_raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"}},
             "aliases":{}
         }"#;
@@ -1288,7 +1366,7 @@ mod tests {
     fn malformed_entry_rejects_the_whole_registry() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"magic4"}},
             "aliases":{}
         }"#;
@@ -1299,7 +1377,7 @@ mod tests {
     fn tag_policy_pins_qwen_deepseek_and_glimmer_targets() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
                 "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
@@ -1469,7 +1547,7 @@ mod tests {
         // Old v1 JSON without the invented fields must still parse (deny_unknown_fields).
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"ok":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1486,7 +1564,7 @@ mod tests {
         // Invented wire fields must be rejected (no schema expansion).
         let bad = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_backend":"vmm"}},
             "aliases":{}
         }"#;
@@ -1496,14 +1574,14 @@ mod tests {
         );
         let bad2 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_max_seq":262144}},
             "aliases":{}
         }"#;
         assert!(RegistryV1::parse(bad2, "test").is_err());
         let bad3 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_max_tokens":81920}},
             "aliases":{}
         }"#;
@@ -1515,7 +1593,7 @@ mod tests {
         // Registry tag policy is a low-precedence layer; global/model/one-shot user config wins.
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1577,7 +1655,7 @@ mod tests {
         // Glimmer target override likewise wins (backend + max_seq).
         let raw2 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1633,7 +1711,7 @@ mod tests {
         // DeepSeek target override wins over 1M/384Ki policy.
         let raw3 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1687,7 +1765,7 @@ mod tests {
     fn dangling_aliases_are_dropped() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"ok":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{"good":"ok","bad":"missing"}
         }"#;
@@ -1710,7 +1788,7 @@ mod tests {
     fn sampling_profiles_resolve_per_mode_with_general_fallback() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"m":{
                 "repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x",
                 "recommended_settings":{"temperature":1.0,"presence_penalty":1.5},
@@ -1740,7 +1818,7 @@ mod tests {
     fn out_of_range_sampling_profile_rejects_the_whole_registry() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"m":{
                 "repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x",
                 "sampling_profiles":{"coding":{"temperature":9.0}}
@@ -1800,18 +1878,18 @@ mod tests {
         // bundled (network) or discards the cache entry (fresh/stale).
         let cases = [
             // Qwen3.8 product SKUs
-            r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
             // DeepSeek V4 Flash (also covers :mq2lloyd via family)
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"low","thinking_budget":"uncapped"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash-preview":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"med"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"low","thinking_budget":"uncapped"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash-preview":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"med"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}}},"aliases":{}}"#,
             // Muse Glimmer product SKUs
-            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"xhigh"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer:fast":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"max"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"xhigh"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer:fast":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"max"}}},"aliases":{}}"#,
             // Effort-native sampling_profiles also rejected
-            r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"xhigh","thinking_budget":"high"}}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"low"}}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"uncapped"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"xhigh","thinking_budget":"high"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"low"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"uncapped"}}}},"aliases":{}}"#,
         ];
         for raw in cases {
             let err = RegistryV1::parse(raw, "network/cache")
@@ -1824,7 +1902,7 @@ mod tests {
         }
         // A cache entry that violates the invariant is also rejected via
         // validate(), causing read_cache to return None and load() to fall back.
-        let stale_raw = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}}},"aliases":{}}"#;
+        let stale_raw = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}}},"aliases":{}}"#;
         let stale: RegistryV1 = serde_json::from_str(stale_raw).unwrap();
         assert!(
             stale.validate("registry cache").is_err(),
@@ -1837,23 +1915,23 @@ mod tests {
         // Mirrors hipfire-config/registry_gen enum allowlists: recognizable
         // invalid values are rejected with a clear error; malformed types
         // already fail via surrounding validation and are not re-tested here.
-        let invalid_effort = r#"{"schema_version":1,"generated_at":"now","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"turbo"}}},"aliases":{}}"#;
+        let invalid_effort = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"turbo"}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_effort, "test")
             .expect_err("invalid reasoning_effort must be rejected");
         assert!(err.to_string().contains("reasoning_effort"));
 
-        let invalid_effort_profile = r#"{"schema_version":1,"generated_at":"now","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"ultra"}}}},"aliases":{}}"#;
+        let invalid_effort_profile = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"ultra"}}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_effort_profile, "test")
             .expect_err("invalid profile effort must be rejected");
         assert!(err.to_string().contains("reasoning_effort"));
 
         // thinking_budget invalid on legacy (non-effort-native) model
-        let invalid_budget = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"yolo"}}},"aliases":{}}"#;
+        let invalid_budget = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"yolo"}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_budget, "test")
             .expect_err("invalid thinking_budget must be rejected");
         assert!(err.to_string().contains("thinking_budget"));
 
-        let invalid_budget_profile = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.6:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"superhigh"}}}},"aliases":{}}"#;
+        let invalid_budget_profile = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.6:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"superhigh"}}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_budget_profile, "test")
             .expect_err("invalid profile budget must be rejected");
         assert!(err.to_string().contains("thinking_budget"));
@@ -1865,7 +1943,7 @@ mod tests {
         // remain valid and pass validation for both top-level and profiles.
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"high"}},
                 "qwen3.5:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"med"},"coding":{"reasoning_effort":"max","thinking_budget":"max"}}},
@@ -1880,7 +1958,7 @@ mod tests {
         // also accept thinking_budget even when family would otherwise be native.
         let sidecars = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.8:27b-draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}},
                 "qwen3.8:27b-dflash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}},
