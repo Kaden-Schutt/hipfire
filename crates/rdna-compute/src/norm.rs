@@ -1019,6 +1019,12 @@ impl Gpu {
                 kernels::qwen36_27b_fa_prep_gfx1100_src(),
                 "qwen36_27b_fa_prep_gfx1100",
             )
+        } else if self.arch_caps.is_gfx1201() {
+            (
+                "qwen35_fa_prep_gfx1201",
+                kernels::QWEN35_FA_PREP_GFX1201_SRC,
+                "qwen35_fa_prep_gfx1201",
+            )
         } else if self.arch_caps.is_gfx1151() {
             (
                 "qwen35_fa_prep_gfx1151",

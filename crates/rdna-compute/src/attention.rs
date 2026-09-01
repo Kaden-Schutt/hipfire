@@ -6415,7 +6415,13 @@ impl Gpu {
         tile_size: usize,
         max_tiles: usize,
     ) -> HipResult<()> {
-        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+        let (module, src, kernel) = if self.arch_caps.is_gfx1201() {
+            (
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+            )
+        } else if self.arch_caps.is_gfx1151() {
             (
                 "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,

@@ -5551,6 +5551,16 @@ fn forward_lowered_enabled() -> bool {
 fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx1151()
 }
+/// Exact gfx1201 admission gate for the ported Qwen3.5 decode state fusions
+/// (gated-norm/MQ rotation, full-attention prep, gated MQ-rotate FA epilogue).
+/// Mirrors the gfx1151 seam: separate from broad capability checks so no
+/// neighboring architecture can inherit the gfx1201 schedules. The callers'
+/// shape checks bound admission to the official Ornith-1.5-35B-A3B MQV2R
+/// shape (hidden=2048, DeltaNet 32x128, full attention 16Q/2K, head_dim=256,
+/// n_rot=64, Q8 KV, decode T=1).
+fn gfx1201_state_fusions_enabled(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx1201()
+}
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
@@ -5632,7 +5642,8 @@ fn gated_norm_mq_rotate_enabled(
             != Some("0")
     });
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu)
+        || gfx1201_state_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
         || (gpu.arch_caps.is_gfx1100() && super::config::qwen36_27b_dense_shape(config, n_v_heads));
@@ -5664,7 +5675,8 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     });
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu)
+        || gfx1201_state_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gpu.arch_caps.is_gfx1100()
@@ -5692,7 +5704,8 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
             != Some("0")
     });
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu)
+        || gfx1201_state_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gpu.arch_caps.is_gfx1100()

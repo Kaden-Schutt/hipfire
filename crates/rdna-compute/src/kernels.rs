@@ -1123,6 +1123,14 @@ pub const GATED_NORM_MQ_ROTATE_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
 );
+/// Exact-gfx1201 32-head DeltaNet gated-norm/MQ rotation. The gfx1100 body is
+/// structurally valid on RDNA4 (wave32 ds_swizzle butterfly, two wave32s per
+/// workgroup, identical LDS handoff); only the module/entry symbol differs so
+/// stale gfx1100/gfx1151 HSACO caches cannot alias it.
+pub const GATED_NORM_MQ_ROTATE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1201\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
+);
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
@@ -5334,6 +5342,14 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC: &str = concat
     "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
 );
+/// Exact-gfx1201 gated MQ-rotate attention reduce epilogue. Same body as the
+/// gfx1100 sibling (portable reducer order, sigmoid gate, exact mq_rotate_x
+/// butterfly) under its own translation unit and entry symbol; the source
+/// uses only wave32 ds_swizzle/LDS constructs that compile on RDNA4.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
+);
 
 /// Turbo common header: shared definitions for turbo/givens kernels.
 pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
@@ -5591,6 +5607,16 @@ pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
+    include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+);
+/// Exact-gfx1201 16Q/2K full-attention preparation. The gfx1100 body
+/// (deinterleave + 256-thread rmsnorm_f32 shared-memory reduction + partial
+/// half-split RoPE per head) compiles unchanged on RDNA4; the distinct
+/// module/entry symbol keeps HSACO caches from aliasing the gfx1100/gfx1151
+/// builds.
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
 
@@ -7303,8 +7329,14 @@ mod dispatch_tests {
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC.starts_with(
             "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC.starts_with(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
+        ));
         assert!(GATED_NORM_MQ_ROTATE_GFX1151_SRC.starts_with(
             "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_GFX1201_SRC.starts_with(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1201"
         ));
         let k6144 = gated_norm_mq_rotate_k6144_gfx1100_src();
         assert!(k6144.starts_with(
@@ -7317,6 +7349,9 @@ mod dispatch_tests {
         #[cfg(feature = "deltanet")]
         assert!(QWEN35_FA_PREP_GFX1151_SRC
             .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151"));
+        #[cfg(feature = "deltanet")]
+        assert!(QWEN35_FA_PREP_GFX1201_SRC
+            .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201"));
         #[cfg(feature = "deltanet")]
         {
             let q24k4 = qwen36_27b_fa_prep_gfx1100_src();

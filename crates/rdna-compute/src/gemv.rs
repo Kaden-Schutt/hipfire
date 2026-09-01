@@ -3317,6 +3317,12 @@ impl Gpu {
                 kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
                 "gated_norm_mq_rotate_k6144_gfx1100",
             )
+        } else if self.arch_caps.is_gfx1201() {
+            (
+                "gated_norm_mq_rotate_gfx1201",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1201_SRC,
+                "gated_norm_mq_rotate_gfx1201",
+            )
         } else if self.arch_caps.is_gfx1151() {
             (
                 "gated_norm_mq_rotate_gfx1151",
