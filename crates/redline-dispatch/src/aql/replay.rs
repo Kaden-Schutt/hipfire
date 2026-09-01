@@ -587,20 +587,35 @@ impl SingleQueuePm4Ib {
         ))
     }
 
+    fn reset_timestamp_progress(&mut self) {
+        if let Some(timestamps) = self.timestamps.as_mut() {
+            timestamps.as_mut_bytes().fill(0);
+        }
+    }
+
+    fn timestamp_progress(&mut self) -> Option<(u64, u64)> {
+        let bytes = self.timestamps.as_mut()?.as_mut_bytes();
+        if bytes.len() < 16 {
+            return None;
+        }
+        let start = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let end = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().ok()?);
+        Some((start, end))
+    }
+
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
         // SAFETY: forwarded from this method's caller.
         unsafe { self.replay_and_wait_inner_checked() }.map_err(|(error, _)| error)
     }
 
-    unsafe fn replay_and_wait_inner_checked(
-        &mut self,
-    ) -> Result<(), (ReplayError, Quiescence)> {
+    unsafe fn replay_and_wait_inner_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
         if !self.usable {
             return Err((ReplayError::GraphInactive, Quiescence::Proven));
         }
         if self.in_flight {
             return Err((ReplayError::AlreadyInFlight, Quiescence::Proven));
         }
+        self.reset_timestamp_progress();
         self.completion.reset();
         if let Err(error) = self
             .queues
@@ -635,31 +650,38 @@ impl SingleQueuePm4Ib {
                 );
                 Ok(())
             }
-            Err(operation) => match self.queues.inactivate_all() {
-                Ok(()) => {
-                    apply_quiescence_transition(
-                        &mut self.in_flight,
-                        &mut self.usable,
-                        QuiescenceTransition::Cancelled,
+            Err(operation) => {
+                if let Some((start_tick, end_tick)) = self.timestamp_progress() {
+                    eprintln!(
+                        "HIPFIRE_REDLINE_PM4_PROGRESS start_tick={start_tick} end_tick={end_tick}"
                     );
-                    Err((operation.into(), Quiescence::Proven))
                 }
-                Err(teardown) => {
-                    apply_quiescence_transition(
-                        &mut self.in_flight,
-                        &mut self.usable,
-                        QuiescenceTransition::Failed,
-                    );
-                    Err((
-                        RuntimeError::OperationAndTeardown {
-                            operation: Box::new(operation),
-                            teardown: Box::new(teardown),
-                        }
-                        .into(),
-                        Quiescence::Unknown,
-                    ))
+                match self.queues.inactivate_all() {
+                    Ok(()) => {
+                        apply_quiescence_transition(
+                            &mut self.in_flight,
+                            &mut self.usable,
+                            QuiescenceTransition::Cancelled,
+                        );
+                        Err((operation.into(), Quiescence::Proven))
+                    }
+                    Err(teardown) => {
+                        apply_quiescence_transition(
+                            &mut self.in_flight,
+                            &mut self.usable,
+                            QuiescenceTransition::Failed,
+                        );
+                        Err((
+                            RuntimeError::OperationAndTeardown {
+                                operation: Box::new(operation),
+                                teardown: Box::new(teardown),
+                            }
+                            .into(),
+                            Quiescence::Unknown,
+                        ))
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -3511,9 +3533,18 @@ mod tests {
                 Quiescence::Proven
             }
         }
-        assert_eq!(quiescence_for(QuiescenceTransition::Completed), Quiescence::Proven);
-        assert_eq!(quiescence_for(QuiescenceTransition::Cancelled), Quiescence::Proven);
-        assert_eq!(quiescence_for(QuiescenceTransition::Failed), Quiescence::Unknown);
+        assert_eq!(
+            quiescence_for(QuiescenceTransition::Completed),
+            Quiescence::Proven
+        );
+        assert_eq!(
+            quiescence_for(QuiescenceTransition::Cancelled),
+            Quiescence::Proven
+        );
+        assert_eq!(
+            quiescence_for(QuiescenceTransition::Failed),
+            Quiescence::Unknown
+        );
     }
 
     #[test]
