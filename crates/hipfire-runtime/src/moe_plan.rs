@@ -1158,16 +1158,15 @@ mod tests {
         let mut entries = manifest();
         entries[1].name = "experts.gate".into();
         entries[1].logical_shape = vec![4, 64, 64];
+        entries[1].policy = ShardPolicy::Replicate;
         entries[2].name = "experts.down".into();
+        entries[2].policy = ShardPolicy::Replicate;
         entries.push(WeightEntry::layer(
             "experts.up",
             0,
             vec![4, 64, 64],
             DType::MQ4G256,
-            ShardPolicy::ExpertSharded {
-                n_experts: 4,
-                assign: ExpertAssign::Stride,
-            },
+            ShardPolicy::Replicate,
         ));
         entries
     }
@@ -1359,7 +1358,7 @@ mod tests {
                 which: MoeProj::DownExpanded,
                 sorted_slot_index: &tensors.sorted,
                 expert_tile_ids: &tensors.tiles,
-                x: &tensors.down_x,
+                x: &tensors.rot_batch,
                 y: &tensors.grouped_down,
                 m_total: 8,
                 batch_size: 2,
@@ -1605,13 +1604,14 @@ mod tests {
         let mut tensors = grouped_tensors();
         tensors.indices = tensor_with_bytes(vec![2, 2], DType::F32, 3 * DType::F32.size());
         let steps = grouped_steps(&experts, &tensors);
-        let error = MoeFamily::new()
-            .seal_steps(
-                ExpertExecutionPlan::GroupedQuantized,
-                steps,
-                vec![StepCollective::None; 7],
-            )
-            .expect_err("logical shape must not stand in for physical capacity");
+        let error = match MoeFamily::new().seal_steps(
+            ExpertExecutionPlan::GroupedQuantized,
+            steps,
+            vec![StepCollective::None; 7],
+        ) {
+            Ok(_) => panic!("logical shape must not stand in for physical capacity"),
+            Err(error) => error,
+        };
         assert!(error
             .to_string()
             .contains("insufficient logical/physical capacity"));
@@ -1704,22 +1704,24 @@ mod tests {
         let mut duplicate = vec![StepCollective::None; 7];
         duplicate[5] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
         duplicate[6] = StepCollective::all_reduce(DimKind::Ep, 64, vec![0, 1], mesh.epoch(), 0);
-        let error = family
-            .seal_steps(
-                ExpertExecutionPlan::GroupedQuantized,
-                grouped_steps(&experts, &tensors),
-                duplicate,
-            )
-            .expect_err("a routed reduction cannot appear twice");
+        let error = match family.seal_steps(
+            ExpertExecutionPlan::GroupedQuantized,
+            grouped_steps(&experts, &tensors),
+            duplicate,
+        ) {
+            Ok(_) => panic!("a routed reduction cannot appear twice"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("attached to combine"));
 
-        let error = family
-            .seal_steps(
-                ExpertExecutionPlan::GroupedQuantized,
-                grouped_steps(&experts, &tensors),
-                vec![StepCollective::None; 7],
-            )
-            .expect_err("parallel owner must not silently use identity reduction");
+        let error = match family.seal_steps(
+            ExpertExecutionPlan::GroupedQuantized,
+            grouped_steps(&experts, &tensors),
+            vec![StepCollective::None; 7],
+        ) {
+            Ok(_) => panic!("parallel owner must not silently use identity reduction"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("collective count"));
     }
     #[test]
