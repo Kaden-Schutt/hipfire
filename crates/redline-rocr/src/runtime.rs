@@ -1565,15 +1565,6 @@ impl QueueSet {
         }
         Ok(())
     }
-    fn renotify_pending(&self) -> Result<u32, RuntimeError> {
-        let mut notifications = 0_u32;
-        for queue in &self.queues {
-            if queue.renotify_pending()? {
-                notifications = notifications.saturating_add(1);
-            }
-        }
-        Ok(notifications)
-    }
 
     pub fn wait_signal(
         &self,
@@ -1617,7 +1608,11 @@ impl QueueSet {
                 });
             }
             if elapsed >= next_renotify {
-                renotify_attempts = renotify_attempts.saturating_add(self.renotify_pending()?);
+                for queue in &self.queues {
+                    if queue.renotify_pending()? {
+                        renotify_attempts = renotify_attempts.saturating_add(1);
+                    }
+                }
                 next_renotify = elapsed.saturating_add(QUEUE_RENOTIFY_INTERVAL);
             }
             bounded_poll_pause(&mut polls);
@@ -1634,31 +1629,17 @@ impl QueueSet {
     ) -> Result<(), RuntimeError> {
         let started = Instant::now();
         let mut polls = 0_u32;
-        let mut next_renotify = QUEUE_RENOTIFY_INTERVAL;
-        let mut renotify_attempts = 0_u32;
         loop {
             self.check_faults()?;
             if signals.iter().all(CompletionSignal::is_complete) {
-                if renotify_attempts != 0 {
-                    eprintln!(
-                        "HIPFIRE_REDLINE_QUEUE_RENOTIFY_RECOVERED attempts={} elapsed_us={}",
-                        renotify_attempts,
-                        started.elapsed().as_micros(),
-                    );
-                }
                 return Ok(());
             }
-            let elapsed = started.elapsed();
-            if elapsed >= timeout {
+            if started.elapsed() >= timeout {
                 let signal = signals
                     .iter()
                     .find(|signal| !signal.is_complete())
                     .map_or(0, |signal| signal.raw().0);
                 return Err(RuntimeError::SignalTimeout { signal, timeout });
-            }
-            if elapsed >= next_renotify {
-                renotify_attempts = renotify_attempts.saturating_add(self.renotify_pending()?);
-                next_renotify = elapsed.saturating_add(QUEUE_RENOTIFY_INTERVAL);
             }
             bounded_poll_pause(&mut polls);
         }
@@ -1676,7 +1657,6 @@ impl QueueSet {
         let started = Instant::now();
         let mut polls = 0_u32;
         let mut report = QueueDepthReport::new(self.queue_ids());
-        let mut next_renotify = QUEUE_RENOTIFY_INTERVAL;
         loop {
             self.check_faults()?;
             report.observe(self.queues.iter().map(AqlQueue::depth_sample));
@@ -1689,11 +1669,6 @@ impl QueueSet {
                     signal: signal.raw().0,
                     timeout,
                 });
-            }
-            let elapsed = started.elapsed();
-            if elapsed >= next_renotify {
-                self.renotify_pending()?;
-                next_renotify = elapsed.saturating_add(QUEUE_RENOTIFY_INTERVAL);
             }
             bounded_poll_pause(&mut polls);
         }
