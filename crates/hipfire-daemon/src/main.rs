@@ -678,8 +678,8 @@ impl DaemonLoadState<'_> {
                 }
             }
         } else {
-            hipfire_loader::ensure_vmm_ready_for_load(self.gpu)
-                .map_err(DaemonLoadOperationError::Internal)
+            // Prepare already validated VMM before staging candidate allocations.
+            Ok(())
         }
     }
 
