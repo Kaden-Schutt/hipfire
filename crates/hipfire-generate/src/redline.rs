@@ -3208,6 +3208,11 @@ pub fn handle_redline_shadow(
         .unwrap_or(1) as usize;
     let position =
         |iteration: usize| context.saturating_add(iteration.saturating_mul(position_step));
+    let replay_only = pm4
+        && msg
+            .get("replay_only")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
     if model.as_ref().is_some_and(|loaded| {
         loaded.state.as_ref().is_some_and(|s| {
             (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
@@ -3326,6 +3331,20 @@ pub fn handle_redline_shadow(
             return;
         }
     };
+    if replay_only {
+        let response = serde_json::json!({
+            "type": "redline_shadow_pm4",
+            "replay_only": true,
+            "context_tokens": context,
+            "iterations": iterations,
+            "position_step": position_step,
+            "aql_host_us": aql_host_us,
+            "aql_gpu_us": aql_gpu_us,
+        });
+        let _ = writeln!(stdout, "{response}");
+        let _ = stdout.flush();
+        return;
+    }
 
     let blob_result = (|| -> Result<RedlineQwenSnapshot, String> {
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);

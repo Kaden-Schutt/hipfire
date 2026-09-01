@@ -227,6 +227,11 @@ def main():
         help="position increment per shadow replay; 0 isolates queue lifetime from context growth",
     )
     parser.add_argument(
+        "--shadow-replay-only",
+        action="store_true",
+        help="run only retained PM4 shadow replays, without HIP/blob parity arms",
+    )
+    parser.add_argument(
         "--state-quant",
         choices=("q8", "fp32", "q4"),
         help=(
@@ -544,31 +549,42 @@ def main():
                     "context_tokens": args.decode_context,
                     "iterations": args.shadow_iterations,
                     "position_step": args.shadow_position_step,
+                    "replay_only": args.shadow_replay_only,
                 }
             )
             shadow = report["aql_shadow"]
-            frame_values = [
-                shadow.get(arm, {}).get("gdn_frame")
-                for arm in ("hip", "aql", "blob")
-            ]
-            frame_present = any(frame is not None for frame in frame_values)
-            frame_exact = not frame_present or (
-                all(frame is not None for frame in frame_values)
-                and frame_values[0] == frame_values[1] == frame_values[2]
-            )
-            shadow["gdn_frame_exact"] = frame_exact
-            shadow_pass = (
-                bool(shadow["bit_exact"])
-                and bool(shadow["blob_bit_exact"])
-                and frame_exact
-            )
-            print(
-                f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
-                f"exact={shadow_pass} gdn_frame_exact={frame_exact} "
-                f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
-                f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
-                flush=True,
-            )
+            if args.shadow_replay_only:
+                shadow_pass = bool(shadow.get("replay_only"))
+                print(
+                    f"shadow: backend=pm4_ib replay_only=true "
+                    f"iterations={shadow.get('iterations')} "
+                    f"position_step={shadow.get('position_step')} "
+                    f"host_us={shadow.get('aql_host_us'):.1f}",
+                    flush=True,
+                )
+            else:
+                frame_values = [
+                    shadow.get(arm, {}).get("gdn_frame")
+                    for arm in ("hip", "aql", "blob")
+                ]
+                frame_present = any(frame is not None for frame in frame_values)
+                frame_exact = not frame_present or (
+                    all(frame is not None for frame in frame_values)
+                    and frame_values[0] == frame_values[1] == frame_values[2]
+                )
+                shadow["gdn_frame_exact"] = frame_exact
+                shadow_pass = (
+                    bool(shadow["bit_exact"])
+                    and bool(shadow["blob_bit_exact"])
+                    and frame_exact
+                )
+                print(
+                    f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
+                    f"exact={shadow_pass} gdn_frame_exact={frame_exact} "
+                    f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
+                    f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
+                    flush=True,
+                )
         else:
             report["prefix_shadow"] = daemon.request(
                 {
