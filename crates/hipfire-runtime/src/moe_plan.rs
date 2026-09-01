@@ -313,6 +313,9 @@ impl ExpertPlan {
             self.shape.expert_k,
             owned,
             collective_kind,
+            rank,
+            &self.group_devices,
+            self.mesh_epoch,
         );
         view.validate()
             .map_err(|error| ExpertPlanError::new(error.to_string()))?;
@@ -457,11 +460,26 @@ fn validate_spec(spec: &ExpertGroupSpec, mesh: &DeviceMesh) -> Result<(), Expert
             spec.group
         )));
     }
-    let group_size = match spec.parallelism {
-        ExpertParallelism::Single => 1,
-        ExpertParallelism::TensorParallel => mesh.size_of(DimKind::Tp),
-        ExpertParallelism::ExpertParallel => mesh.size_of(DimKind::Ep),
+    let required_axis = match spec.parallelism {
+        ExpertParallelism::Single => None,
+        ExpertParallelism::TensorParallel => Some(DimKind::Tp),
+        ExpertParallelism::ExpertParallel => Some(DimKind::Ep),
     };
+    let group_size = required_axis.map_or(1, |kind| mesh.size_of(kind));
+    if let Some(kind) = required_axis {
+        if !mesh.axes().iter().any(|axis| axis.kind == kind) {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' requires a named {:?} mesh axis",
+                spec.group, kind
+            )));
+        }
+        if group_size < 2 {
+            return Err(ExpertPlanError::new(format!(
+                "expert group '{}' parallel mesh group must have at least two ranks",
+                spec.group
+            )));
+        }
+    }
     if group_size == 0 {
         return Err(ExpertPlanError::new("expert group resolved to zero ranks"));
     }
@@ -1002,8 +1020,8 @@ mod tests {
             &mesh_ep(),
         )
         .unwrap();
-        let gate = table(vec![4]);
-        let down = table(vec![4]);
+        let gate = table(vec![8]);
+        let down = table(vec![8]);
         let view = plan.bind_expert_ref(1, &gate, &down, None).unwrap();
         assert_eq!(view.owned(), &[1, 3]);
         assert_eq!(view.n_experts(), 4);

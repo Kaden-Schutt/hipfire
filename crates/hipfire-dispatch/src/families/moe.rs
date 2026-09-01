@@ -17,8 +17,8 @@
 //! end-to-end from the call site through every inner GEMV. Scratch stays model-owned.
 //! Grouped-GEMM prefill is a future arm (gated on `ShapeInfo.batch_size`).
 
-use rdna_compute::DType;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_hardware::MeshEpoch;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GivensRef, WeightRef};
@@ -78,7 +78,6 @@ impl<'a> RouterPlan<'a> {
         }
     }
 
-
     pub fn route_buffers(&self) -> (&'a GpuTensor, &'a GpuTensor) {
         match self {
             Self::SoftmaxTopK {
@@ -115,11 +114,35 @@ impl<'a> RouterPlan<'a> {
                 self.k_top()
             )));
         }
+        if !self.normalizes() {
+            return Err(DispatchError::Hip(
+                "generic MoE route requires normalized top-k weights".into(),
+            ));
+        }
         let (indices, weights) = self.route_buffers();
         if indices.dtype != DType::F32 || weights.dtype != DType::F32 {
             return Err(DispatchError::Hip(
                 "MoE route indices and weights must use F32 storage".into(),
             ));
+        }
+        if indices.shape != weights.shape {
+            return Err(DispatchError::Hip(
+                "MoE route index/weight shapes must match".into(),
+            ));
+        }
+        let route_shape_ok = match indices.shape.as_slice() {
+            [k] => batch_size == 1 && *k == self.k_top(),
+            [batch, k] => *batch == batch_size && *k == self.k_top(),
+            _ => false,
+        };
+        if !route_shape_ok {
+            return Err(DispatchError::Hip(format!(
+                "MoE route index/weight shape must be [k_top] for batch=1 or [batch,k_top], \
+                 got indices={:?}, weights={:?}, batch={batch_size}, k_top={}",
+                indices.shape,
+                weights.shape,
+                self.k_top()
+            )));
         }
         let expected_slots = batch_size
             .checked_mul(self.k_top())
@@ -129,22 +152,14 @@ impl<'a> RouterPlan<'a> {
                 "MoE route buffers have insufficient capacity for {expected_slots} slots"
             )));
         }
-        if !matches!(indices.shape.as_slice(), [_] | [_, _]) {
-            return Err(DispatchError::Hip(
-                "MoE route index shape must be [K] or [B,K]".into(),
-            ));
-        }
-        if indices.shape.last() != Some(&self.k_top())
-            || weights.shape.last() != Some(&self.k_top())
-        {
-            return Err(DispatchError::Hip(
-                "MoE route index/weight shape must end in k_top".into(),
-            ));
-        }
         if let Self::SoftmaxTopK { scores, .. } = self {
+            let score_shape_ok = match scores.shape.as_slice() {
+                [experts] => batch_size == 1 && *experts == n_experts,
+                [batch, experts] => *batch == batch_size && *experts == n_experts,
+                _ => false,
+            };
             if scores.dtype != DType::F32
-                || scores.shape.last() != Some(&n_experts)
-                || !matches!(scores.shape.len(), 1 | 2)
+                || !score_shape_ok
                 || scores.numel() < batch_size.saturating_mul(n_experts)
             {
                 return Err(DispatchError::Hip(format!(
@@ -200,6 +215,9 @@ pub struct MoeExpertRef<'a> {
     expert_k: usize,
     owned: &'a [usize],
     collective_kind: Option<hipfire_hardware::DimKind>,
+    owner_rank: usize,
+    group_devices: &'a [usize],
+    mesh_epoch: MeshEpoch,
 }
 impl<'a> MoeExpertRef<'a> {
     /// Bind a pointer-table view to metadata already resolved by an owner.
@@ -209,6 +227,7 @@ impl<'a> MoeExpertRef<'a> {
     /// canonical values from its sealed plan; no family receives an allocator
     /// or a `WeightStore` representation.
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_resolved(
         gate_up_ptrs: &'a GpuTensor,
         down_ptrs: &'a GpuTensor,
@@ -219,6 +238,9 @@ impl<'a> MoeExpertRef<'a> {
         expert_k: usize,
         owned: &'a [usize],
         collective_kind: Option<hipfire_hardware::DimKind>,
+        owner_rank: usize,
+        group_devices: &'a [usize],
+        mesh_epoch: MeshEpoch,
     ) -> Self {
         Self {
             gate_up_ptrs,
@@ -230,6 +252,9 @@ impl<'a> MoeExpertRef<'a> {
             expert_k,
             owned,
             collective_kind,
+            owner_rank,
+            group_devices,
+            mesh_epoch,
         }
     }
 
@@ -269,6 +294,18 @@ impl<'a> MoeExpertRef<'a> {
         self.collective_kind
     }
 
+    pub fn owner_rank(&self) -> usize {
+        self.owner_rank
+    }
+
+    pub fn group_devices(&self) -> &'a [usize] {
+        self.group_devices
+    }
+
+    pub fn mesh_epoch(&self) -> MeshEpoch {
+        self.mesh_epoch
+    }
+
     /// Validate the dimensions shared by the fused gate/up and down kernels.
     /// Gate/up is `[2*expert_m, expert_k]`; down is `[expert_k, expert_m]`.
     pub fn validate(&self) -> Result<(), DispatchError> {
@@ -282,20 +319,64 @@ impl<'a> MoeExpertRef<'a> {
                 "MoeExpertRef: expert dimensions must be nonzero".into(),
             ));
         }
-        if self.gate_up_ptrs.numel() < self.n_experts
-            || self.down_ptrs.numel() < self.n_experts
+        let pointer_slots = self
+            .n_experts
+            .checked_mul(2)
+            .ok_or_else(|| DispatchError::Hip("MoeExpertRef: pointer-table size overflows".into()))?;
+        if self.gate_up_ptrs.dtype != DType::F32
+            || self.down_ptrs.dtype != DType::F32
+            || self.gate_up_ptrs.shape.as_slice() != [pointer_slots]
+            || self.down_ptrs.shape.as_slice() != [pointer_slots]
         {
             return Err(DispatchError::Hip(format!(
-                "MoeExpertRef: pointer-table capacity is too small for {} experts",
+                "MoeExpertRef: pointer tables must be F32 [2*{}]",
                 self.n_experts
             )));
         }
         if let Some(dummy) = self.dummy_gate_up {
-            if dummy.numel() == 0 {
+            if dummy.dtype != DType::F32 || dummy.numel() == 0 {
                 return Err(DispatchError::Hip(
-                    "MoeExpertRef: dummy gate/up table is empty".into(),
+                    "MoeExpertRef: dummy gate/up table is invalid".into(),
                 ));
             }
+        }
+        if self.group_devices.is_empty() || self.owner_rank >= self.group_devices.len() {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: owner rank is outside its mesh group".into(),
+            ));
+        }
+        if self.group_devices.iter().enumerate().any(|(index, device)| {
+            self.group_devices[..index].contains(device)
+        }) {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: mesh group contains duplicate devices".into(),
+            ));
+        }
+        if self.collective_kind.is_none()
+            && (self.owner_rank != 0
+                || self.group_devices.len() != 1
+                || self.group_devices.first().copied() != Some(0)
+                || self.owned.len() != self.n_experts
+                || !self
+                    .owned
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .all(|(expert, global_id)| expert == global_id))
+        {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: single-device owner view is not canonical".into(),
+            ));
+        }
+        if self.collective_kind.is_some() && self.group_devices.len() < 2 {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: parallel owner view requires at least two ranks".into(),
+            ));
+        }
+        if self.owned.is_empty() {
+            return Err(DispatchError::Hip(
+                "MoeExpertRef: owner view has no experts".into(),
+            ));
         }
         let mut previous = None;
         for &expert in self.owned {
@@ -305,9 +386,9 @@ impl<'a> MoeExpertRef<'a> {
                     self.n_experts
                 )));
             }
-            if previous == Some(expert) {
+            if previous.is_some_and(|previous| expert <= previous) {
                 return Err(DispatchError::Hip(format!(
-                    "MoeExpertRef: duplicate owned expert {expert}"
+                    "MoeExpertRef: owned experts are not strictly ordered at {expert}"
                 )));
             }
             previous = Some(expert);
@@ -1540,10 +1621,9 @@ impl MoeFamily {
         gpus: &mut hipfire_hardware::Gpus,
         mesh: &hipfire_hardware::DeviceMesh,
         ctx: &DispatchCtx,
-        rank_steps: &[&[crate::pipeline::steps::Step<'a>]],
-        collectives: &[crate::pipeline::steps::StepCollective],
+        schedules: &[&crate::pipeline::steps::SealedMoeSchedule<'a>],
     ) -> Result<(), DispatchError> {
-        crate::pipeline::steps::execute_steps_mesh(gpus, mesh, ctx, rank_steps, collectives)
+        crate::pipeline::steps::execute_sealed_steps_mesh(gpus, mesh, ctx, schedules)
     }
 
     /// Resolve the best kernel key for the given MoE variant.
@@ -1848,9 +1928,11 @@ mod tests {
     #[test]
     fn expert_ref_rejects_shape_and_owner_mismatch() {
         let mut gate_ptrs = GpuTensor::null_for_test();
-        gate_ptrs.shape = vec![4];
+        gate_ptrs.shape = vec![8];
         let mut down_ptrs = GpuTensor::null_for_test();
-        down_ptrs.shape = vec![4];
+        down_ptrs.shape = vec![8];
+        let mesh = hipfire_hardware::DeviceMesh::rect(&[(hipfire_hardware::DimKind::Ep, 2)])
+            .unwrap();
         let experts = MoeExpertRef::from_resolved(
             &gate_ptrs,
             &down_ptrs,
@@ -1861,6 +1943,9 @@ mod tests {
             128,
             &[0, 2],
             Some(hipfire_hardware::DimKind::Ep),
+            0,
+            &[0, 1],
+            mesh.epoch(),
         );
         experts
             .validate_projection_shapes(&[128, 128], &[128, 64])
@@ -1878,6 +1963,9 @@ mod tests {
             128,
             &[4],
             Some(hipfire_hardware::DimKind::Ep),
+            0,
+            &[0, 1],
+            mesh.epoch(),
         );
         assert!(unknown.validate().is_err());
     }

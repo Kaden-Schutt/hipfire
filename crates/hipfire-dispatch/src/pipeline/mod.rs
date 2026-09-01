@@ -11,7 +11,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::{LazyLock, OnceLock};
 
 pub use steps::{
-    execute_steps, execute_steps_mesh, FusedPattern, GemvInput, SealedMoeSchedule, Step,
+    execute_sealed_steps_mesh, execute_steps, FusedPattern, GemvInput, SealedMoeSchedule, Step,
     StepCollective,
 };
 
