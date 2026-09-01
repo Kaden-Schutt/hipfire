@@ -1805,7 +1805,8 @@
         "top_k": 20,
         "min_p": 0.0,
         "presence_penalty": 0.0,
-        "repeat_penalty": 1.0
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1814,7 +1815,8 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
         },
         "coding": {
           "temperature": 0.6,
@@ -1822,7 +1824,8 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
         },
         "instruct": {
           "temperature": 0.6,
@@ -1830,10 +1833,11 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "none"
         }
       },
-      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE.",
+      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap.",
       "sha256": "f329b497eb8684d889c184a0dcf1388ab6171f99a1c72052d7e2a3bee4f5934b",
       "size_bytes": 19020296510,
       "arch_id": 6,
@@ -1859,7 +1863,8 @@
         "top_k": 20,
         "min_p": 0.0,
         "presence_penalty": 0.0,
-        "repeat_penalty": 1.0
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1868,7 +1873,8 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
         },
         "coding": {
           "temperature": 0.6,
@@ -1876,7 +1882,8 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
         },
         "instruct": {
           "temperature": 0.6,
@@ -1884,10 +1891,11 @@
           "top_k": 20,
           "min_p": 0.0,
           "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "none"
         }
       },
-      "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card.",
+      "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap.",
       "arch_id": 6,
       "quant": "mq4r"
     }

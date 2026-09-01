@@ -176,9 +176,10 @@ map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
 - Malformed types and out-of-range integers remain hard request errors.
 - Effort is **never** converted into a token cap (including on Qwen3.6 and other
   non-effort-native templates).
-- Qwen3.8 defaults to an uncapped think span unless the request sets a positive
-  integer cap. DeepSeek V4 and Muse Glimmer expose semantic effort but no
-  independent parent-defined cap; cap fields are dropped+warned.
+- Qwen3.8 and Ornith 1.5 default to an uncapped think span unless the request sets a
+  positive integer cap (semantic effort stays independent of that cap). DeepSeek V4 and
+  Muse Glimmer expose semantic effort but no independent parent-defined cap; cap fields
+  are dropped+warned.
 
 **Examples:**
 
@@ -195,6 +196,13 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "model": "qwen3.8:27b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
   "reasoning_effort": "medium"
+}'
+
+# Ornith 1.5 — Qwen3.8-compatible semantic effort (default xhigh; still uncapped unless max_think_tokens)
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "ornith-1.5:35b-a3b",
+  "messages": [{"role": "user", "content": "plan a refactor"}],
+  "reasoning_effort": "low"
 }'
 
 # Qwen3.6 — no native effort: effort is dropped+warned; set an explicit cap if wanted
@@ -230,7 +238,8 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
 
 | Family | Mode | Effort | Cap |
 |---|---|---|---|
-| Qwen3.8 | `enable_thinking=false` → empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`) | Integer only; named budget dropped |
+| Qwen3.8 | `enable_thinking=false` → empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`; semantic prompt only) | Integer only; named budget dropped |
+| Ornith 1.5 | same Qwen on/off | Qwen3.8-compatible `low` \| `medium` \| `xhigh` (default `xhigh`; not a budget) | Integer only; named budget dropped |
 | Qwen3.6 | on/off | Dropped+warned (never → cap) | Named preset or integer if set |
 | DeepSeek V4 | `thinking.type` enabled/disabled (default on) | `low` \| `high` \| `max` (`medium`/`xhigh`→`high`) | Integer only; default uncapped |
 | Gemma4 | Boolean; default **off** | Dropped+warned | Dropped+warned unless explicit engine integer |
