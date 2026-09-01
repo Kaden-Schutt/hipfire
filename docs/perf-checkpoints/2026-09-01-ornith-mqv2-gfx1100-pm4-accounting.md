@@ -38,6 +38,8 @@ The guaranteed outcome was attribution with zero default behavior change. A comp
 | Decode context | 128 |
 | PM4 policy | one queue, `static` register policy, resource waits, required-only acquires, GCR trim on |
 
+The report contract is single-IB: if the exact accounting flag is combined with a multi-queue PM4 configuration, preparation fails closed instead of silently bypassing accounting.
+
 Accounting is opt-in with `HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING=1`. It runs after terminal-idle encoding and before retained graph creation, logs one deterministic report, and is dropped. The unset path does not perform the diagnostic walk.
 
 Both controlled arms used:

@@ -3222,6 +3222,18 @@ fn pm4_stream_accounting_enabled() -> bool {
         == Some("1")
 }
 
+fn validate_pm4_stream_accounting_queue_count(
+    stream_accounting: bool,
+    queue_count: usize,
+) -> Result<(), String> {
+    if stream_accounting && queue_count != 1 {
+        return Err(format!(
+            "HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING requires one PM4 queue, got {queue_count}"
+        ));
+    }
+    Ok(())
+}
+
 /// Entry sentinel used when a SET_SH_REG feeds dispatch 0 (no previous kernel).
 const PM4_STREAM_ENTRY_TRANSITION: &str = "<entry>";
 
@@ -4740,6 +4752,8 @@ impl ReplayController {
         } else {
             1
         };
+        let stream_accounting = pm4_stream_accounting_enabled();
+        validate_pm4_stream_accounting_queue_count(stream_accounting, queue_limit)?;
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
@@ -4891,7 +4905,6 @@ impl ReplayController {
                 commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
             }
             let command_dwords = commands.len_dwords();
-            let stream_accounting = pm4_stream_accounting_enabled();
             if reorder_window.is_some() {
                 eprintln!(
                     "[redline] single-IB schedule stats arch={}: \
@@ -8929,6 +8942,15 @@ mod tests {
             ("kernel_a".to_owned(), "kernel_b".to_owned())
         );
         assert!(pm4_set_sh_transition(&reordered, &recorded, 3).is_err());
+    }
+
+    #[test]
+    fn pm4_stream_accounting_rejects_multi_queue_lowering() {
+        assert!(validate_pm4_stream_accounting_queue_count(false, 2).is_ok());
+        assert!(validate_pm4_stream_accounting_queue_count(true, 1).is_ok());
+        let error = validate_pm4_stream_accounting_queue_count(true, 2).unwrap_err();
+        assert!(error.contains("requires one PM4 queue"));
+        assert!(error.contains('2'));
     }
 
     #[test]
