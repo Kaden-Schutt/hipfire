@@ -172,22 +172,14 @@ fn classify_qwen35(src: &ModelSource) -> Result<ModelVariant, String> {
         _ => unreachable!("arch_id was checked above"),
     };
 
-    let has_vision_config = config.get("vision_config").is_some();
     let has_vision_tensor = source_has_tensor(src, "model.visual.patch_embed.proj.weight");
-    let model_type_is_vl = config_model_type(&config)
-        .map(|model_type| model_type.to_ascii_lowercase().contains("vl"))
-        .unwrap_or(false);
 
-    // Qwen3.5-VL may share arch id 5 or 6 with text checkpoints. A vision
-    // marker without the actual tower is malformed and must fail closed
-    // rather than silently turning into a dense text model.
-    if has_vision_config || has_vision_tensor || model_type_is_vl {
-        if !has_vision_tensor {
-            return Err(
-                "qwen35: vision metadata/model type present but the vision tensor is missing"
-                    .into(),
-            );
-        }
+    // Vision capability is payload-driven, not metadata-driven. Text-only
+    // exports legitimately retain the parent VL config/model_type after the
+    // tower is stripped (including the Qwen3.8 MQV2 XT trunk). Only an actual
+    // tower tensor opts the load into the vision variant; otherwise keep the
+    // text backbone and allocate no vision weights.
+    if has_vision_tensor {
         return Ok(match backbone {
             ModelVariant::Qwen35Dense => ModelVariant::Qwen35DenseVl,
             ModelVariant::Qwen35Moe => ModelVariant::Qwen35MoeVl,
@@ -2827,6 +2819,24 @@ mod qwen35_classification_tests {
         assert_eq!(dense, ModelVariant::Qwen35DenseVl);
         assert_eq!(moe, ModelVariant::Qwen35MoeVl);
         assert_ne!(dense, moe);
+    }
+
+    #[test]
+    fn qwen35_vl_metadata_without_tower_routes_text_backbone() {
+        let dense = classify_fixture(
+            5,
+            r#"{"config":{"model_type":"qwen3_5_vl","num_experts":0,"vision_config":{}}}"#,
+            false,
+        )
+        .unwrap();
+        let moe = classify_fixture(
+            6,
+            r#"{"config":{"model_type":"qwen3_5_vl_moe","num_experts":8,"vision_config":{}}}"#,
+            false,
+        )
+        .unwrap();
+        assert_eq!(dense, ModelVariant::Qwen35Dense);
+        assert_eq!(moe, ModelVariant::Qwen35Moe);
     }
 
     #[test]
