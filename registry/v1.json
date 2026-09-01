@@ -349,6 +349,18 @@
       "size_gb": 6.5,
       "min_vram_gb": 12,
       "default_kv_mode": "bf16",
+      "heads": {
+        "q4k": {
+          "file": "maple-head-q4k.hfq",
+          "sha256": "deff26e9dfaddfc521f10037e00deae40fb4011fb14db3b10eb166928d7ec795",
+          "size_bytes": 188137472
+        },
+        "bf16": {
+          "file": "maple-head-bf16.hfq",
+          "sha256": "94cde3ad60d380a753f1223882682662643e49faed217df5b4db03e0a17f3e8b",
+          "size_bytes": 635437056
+        }
+      },
       "sampling": {
         "temperature": 1.0,
         "top_p": 0.95
