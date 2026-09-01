@@ -23,6 +23,8 @@ Current scope:
 - gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - gfx1201 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - gfx1100/gfx1201 F32-Q/Asym3-FWHT-K/Q8-V causal GQA at head dimension 256;
+- gfx1100/gfx1201 F32-Q/Asym4-Givens-K/Q8-V causal GQA at head dimension 256;
+- gfx1100/gfx1201 F32-Q/Asym4-FWHT-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cell vector-decodes both packed caches into F16, invokes the CK D256
@@ -35,6 +37,10 @@ plus both transform tables. The D256 Givens and FWHT cells transform Q and
 decode packed K and Q8 V into caller-owned F16 staging before invoking CK.
 D512 remains `recognized-no-cell`: its layout is validated but no capability
 is published. This keeps each unimplemented packed loader fail-closed.
+Asym4-Givens and Asym4-FWHT also have independent format IDs and packed-loader
+contracts. D256 K uses `4 + D/2` bytes per head, Q8 V uses `(D/32) * 34`,
+Givens requires `D/2` transform elements, and FWHT4+Q8-V requires 128. Both
+loaders stage through the same caller-owned dense workspace before CK.
 Packed staging currently requires contiguous `[row, head, dim]` Q and output;
 the ABI validator rejects non-contiguous element strides rather than ignoring them.
 The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
@@ -112,6 +118,8 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
 | F32/Asym3-Givens/Q8 GQA D256, causal | `6.110966e-05` | `1.009769e-05` |
 | F32/Asym3-FWHT/Q8 GQA D256, causal | `7.408857e-05` | `1.015317e-05` |
+| F32/Asym4-Givens/Q8 GQA D256, causal | `5.862117e-05` | `1.000180e-05` |
+| F32/Asym4-FWHT/Q8 GQA D256, causal | `6.847084e-05` | `1.012444e-05` |
 
 ## Optional Rust loader
 

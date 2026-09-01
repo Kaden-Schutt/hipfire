@@ -7,6 +7,7 @@
 //! Per-architecture generation bodies lifted verbatim from `crates/hipfire-daemon/src/main.rs`
 //! (wave 5 / D3). See `lib.rs` for layering rationale.
 
+use crate::ar::emit_active_route_error;
 use base64::Engine;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
@@ -14,14 +15,10 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{
-    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token,
-    emit_visible_token, write_error,
-};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
-    active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
-    ClientTerminalDecision,
+    active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision,
 };
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
@@ -32,23 +29,24 @@ use std::any::Any;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
-
-// ── Local verbatim copies of daemon-shared helpers ───────────────────────────
-// `free_checkpoints` and `emit_committed_event` are shared across all generate
-// paths in the daemon (25 and 18 call sites). They cannot live in
-// `hipfire-engine` (the former touches `hipfire_arch_qwen35::speculative::DeltaNetSnapshot`,
-// an arch type) and the generate crate cannot depend back on the daemon.
-// This local copy keeps the moved VL bodies byte-identical without introducing a
-// circular dependency. The daemon retains its own identical copy.
-
-fn free_checkpoints(
-    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    gpu: &mut rdna_compute::Gpu,
+fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
 ) {
-    for (_, snap) in cks.drain(..) {
-        snap.free_gpu(gpu);
-    }
+    emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
 }
+fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    crate::ar::emit_active_route_error(stdout, Some(id), message, "internal", false, false);
+}
+
+// ── Local copy of the daemon-shared emission helper ──────────────────────────
+// `emit_committed_event` is shared across all generate paths in the daemon,
+// but the generate crate cannot depend back on the daemon. Keeping this tiny
+// copy here avoids introducing a circular dependency.
 
 fn emit_committed_event(
     stdout: &mut (impl std::io::Write + ?Sized),
@@ -181,46 +179,57 @@ pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engag
     }
 }
 
-pub(crate) fn vl_cold_reset_uncommitted(
+#[allow(clippy::too_many_arguments)]
+fn vl_reset_live(
     gpu: &mut rdna_compute::Gpu,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-) {
-    for s in &dn.s_matrices {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.s_scales {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.conv_states {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.s_ef_residual {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    kv.compact_offset = 0;
-    if let Some(ad) = kv_adaptive.as_mut() {
-        if !ad.is_poisoned() {
-            ad.reset_with_cache(gpu, kv);
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
+) -> crate::common::RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+        dn.reset(gpu)
+            .map_err(|e| format!("VL recurrent reset: {e}"))?;
+        kv.compact_offset = 0;
+        if let Some(ad) = kv_adaptive.as_mut() {
+            if !ad.is_poisoned() {
+                ad.reset_with_cache(gpu, kv);
+            }
         }
-    }
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    free_checkpoints(prefill_checkpoints, gpu);
+        Ok(())
+    };
+    let spec = speculator
+        .as_deref_mut()
+        .map(|spec| spec as &mut dyn Speculator);
+    crate::common::production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        spec,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vl_adaptive_downshift_fail_closed(
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     gpu: &mut rdna_compute::Gpu,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
-    dn: &qwen35::DeltaNetState,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
     stdout: &mut std::io::Stdout,
     id: &str,
     phase: &str,
@@ -244,9 +253,7 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
                 "[adaptive-kv] maybe_downshift error @ pos {} ({}): {:?} — poisoning model",
                 committed, phase, e
             );
-            // maybe_downshift already poisons on partial failure; cold-reset
-            // leaves poison sticky (reset_with_cache skipped when poisoned).
-            vl_cold_reset_uncommitted(
+            let ep = vl_reset_live(
                 gpu,
                 dn,
                 kv,
@@ -254,31 +261,42 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
                 seq_pos,
                 conversation_tokens,
                 prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                speculator,
             );
-            write_error(
+            crate::common::emit_fail_closed_error(
                 stdout,
-                id,
+                Some(id),
                 &format!("adaptive KV transition failed during {phase}: {e}"),
+                "gpu",
+                true,
+                &ep,
             );
             true
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vl_forward_fail(
     stdout: &mut std::io::Stdout,
     id: &str,
     phase: &str,
     err: impl std::fmt::Display,
     gpu: &mut rdna_compute::Gpu,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
 ) {
-    vl_cold_reset_uncommitted(
+    let message = format!("VL {phase}: {err}");
+    let ep = vl_reset_live(
         gpu,
         dn,
         kv,
@@ -286,8 +304,11 @@ pub(crate) fn vl_forward_fail(
         seq_pos,
         conversation_tokens,
         prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        speculator,
     );
-    write_error(stdout, id, &format!("VL {phase}: {err}"));
+    crate::common::emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
 }
 
 pub(crate) fn build_vl_mrope_ctx(
@@ -391,6 +412,57 @@ pub(crate) fn build_vl_mrope_ctx(
         built.rope_delta,
     ))
 }
+#[allow(clippy::too_many_arguments)]
+fn dots_reset_live(
+    target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
+    gpu: &mut rdna_compute::Gpu,
+) -> crate::common::RollbackEpilogue {
+    let spec = speculator
+        .as_deref_mut()
+        .map(|spec| spec as &mut dyn Speculator);
+    crate::common::production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        target_reset,
+        spec,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn dots_reset_state_live(
+    state: &mut hipfire_arch_qwen2::qwen2::Qwen2State,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
+    gpu: &mut rdna_compute::Gpu,
+) -> crate::common::RollbackEpilogue {
+    let mut target_reset = |_: &mut rdna_compute::Gpu| {
+        state.reset();
+        Ok(())
+    };
+    dots_reset_live(
+        &mut target_reset,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        speculator,
+        gpu,
+    )
+}
 
 pub fn generate_vl(
     m: &mut LoadedModel,
@@ -404,7 +476,6 @@ pub fn generate_vl(
     // image turns after the encoder finished ("no response bytes", wedged
     // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
     // this since the e99583afa-class fixes.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
     // started_in_think mirrors the ChatFrame builder's own conditions: the
     // `<think>` opener lands in the prompt only for AssistantPrefix::OpenThink
     // AND a tokenizer that carries the special token (the builder falls back
@@ -417,7 +488,12 @@ pub fn generate_vl(
         .tokenizer
         .as_ref()
         .is_some_and(|t| t.special_token_id("<think>").is_some());
-    emit_gen_start(stdout, params.id, started_in_think, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::QwenAr,
+        stdout,
+        params.id,
+        started_in_think,
+    );
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -566,58 +642,36 @@ pub fn generate_vl(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset.
-        if let Some(s) = m.speculator.as_mut() {
-            if let Err(e) = s.reset(gpu) {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("vision context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-        }
-        // VL is qwen35-vl (arch 5/8); its recurrent state lives in the bundle
-        // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
+        let reset = match m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
         }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
+            Some(bundle) => vl_reset_live(
+                gpu,
+                &mut bundle.dn_state,
+                &mut bundle.kv_cache,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            ),
+            None => crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some("VL bundle missing during context reset".to_string()),
+            },
+        };
+        if !reset.rolled_back {
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "vision context reset failed",
+                "gpu",
+                true,
+                &reset,
+            );
+            return;
         }
     }
 
@@ -747,11 +801,7 @@ pub fn generate_vl(
     ) {
         Ok(v) => v,
         Err(e) => {
-            vl_forward_fail(
-                stdout,
-                id,
-                "vision_forward",
-                e,
+            let ep = vl_reset_live(
                 gpu,
                 dn,
                 kv,
@@ -759,6 +809,17 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("VL vision_forward: {e}"),
+                "gpu",
+                true,
+                &ep,
             );
             return;
         }
@@ -792,15 +853,22 @@ pub fn generate_vl(
     // transition errors are request-scoped (no panic, no later token emit).
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
-        // Client-cancel poll. The encoder phase before this loop cannot be
-        // interrupted mid-kernel, so prefill's first iteration is where an
-        // abort signalled during vision_forward takes effect. The terminal
-        // MUST be the canonical cancelled pair: falling through to the done
-        // handshake on an aborted attempt strands the serve admission guard
-        // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
-        // every mid-encode disconnect before these polls existed).
+        // The encoder phase cannot be interrupted mid-kernel.  Poll before
+        // the first token and reset before publishing the cancellation pair.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            let ep = vl_reset_live(
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         if token == image_pad_id && visual_idx < n_visual_tokens {
@@ -820,6 +888,9 @@ pub fn generate_vl(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
                 );
                 return;
             }
@@ -839,6 +910,9 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
             );
             return;
         }
@@ -865,22 +939,25 @@ pub fn generate_vl(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        &mut m.speculator,
                     );
                     return;
                 }
             }
         }
-        // Adaptive KV: downshift BETWEEN prefill tokens the moment the
-        // start-tier buffer fills so a long multi-chunk visual+text prompt
-        // cannot overflow current-stride capacity before decode begins.
         if vl_adaptive_downshift_fail_closed(
             &mut m.kv_adaptive,
             &mut m.seq_pos,
             gpu,
-            kv,
             dn,
+            kv,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
             stdout,
             id,
             "vl-prefill",
@@ -890,16 +967,17 @@ pub fn generate_vl(
     }
 
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
-
-    // Adaptive KV: post-prefill catch-up before first sample/decode write.
     if vl_adaptive_downshift_fail_closed(
         &mut m.kv_adaptive,
         &mut m.seq_pos,
         gpu,
-        kv,
         dn,
+        kv,
         &mut m.conversation_tokens,
         &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+        &mut m.speculator,
         stdout,
         id,
         "vl-post-prefill",
@@ -942,6 +1020,9 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
             );
             return;
         }
@@ -1005,7 +1086,19 @@ pub fn generate_vl(
         // conversation_tokens) is reclaimed by the next dispatch's
         // non-zero-seq_pos reset, matching the dots.ocr cancel path.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = vl_reset_live(
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
@@ -1029,6 +1122,9 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
             );
             return;
         }
@@ -1055,6 +1151,9 @@ pub fn generate_vl(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        &mut m.speculator,
                     );
                     return;
                 }
@@ -1064,10 +1163,13 @@ pub fn generate_vl(
             &mut m.kv_adaptive,
             &mut m.seq_pos,
             gpu,
-            kv,
             dn,
+            kv,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
             stdout,
             id,
             "vl-decode",
@@ -1130,6 +1232,9 @@ pub fn generate_vl(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
                 );
                 return;
             }
@@ -1185,6 +1290,9 @@ pub fn generate_vl(
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                &mut m.speculator,
                             );
                             return;
                         }
@@ -1211,6 +1319,9 @@ pub fn generate_vl(
                                         &mut m.seq_pos,
                                         &mut m.conversation_tokens,
                                         &mut m.prefill_checkpoints,
+                                        &mut m.dflash_checkpoints,
+                                        &mut m.asst_turn_cache,
+                                        &mut m.speculator,
                                     );
                                     return;
                                 }
@@ -1220,10 +1331,13 @@ pub fn generate_vl(
                             &mut m.kv_adaptive,
                             &mut m.seq_pos,
                             gpu,
-                            kv,
                             dn,
+                            kv,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            &mut m.speculator,
                             stdout,
                             id,
                             "vl-think-close",
@@ -1287,6 +1401,9 @@ pub fn generate_vl(
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                &mut m.speculator,
                             );
                             return;
                         }
@@ -1328,6 +1445,9 @@ pub fn generate_vl(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
                 );
                 return;
             }
@@ -1354,6 +1474,9 @@ pub fn generate_vl(
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            &mut m.speculator,
                         );
                         return;
                     }
@@ -1363,10 +1486,13 @@ pub fn generate_vl(
                 &mut m.kv_adaptive,
                 &mut m.seq_pos,
                 gpu,
-                kv,
                 dn,
+                kv,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
                 stdout,
                 id,
                 "vl-trailer",
@@ -1378,7 +1504,19 @@ pub fn generate_vl(
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        let ep = vl_reset_live(
+            gpu,
+            dn,
+            kv,
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
     // Flush any trailing partial think marker as ordinary text in its
@@ -1416,9 +1554,23 @@ pub fn generate_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = vl_reset_live(
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         }
     }
 }
@@ -1431,11 +1583,11 @@ pub fn generate_vl_dots_ocr(
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
     // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::DotsOcr,
         stdout,
         params.id,
         false,
-        crate::common::gen_start_contract_version_for_arch(m.arch_id),
     );
     let t0 = Instant::now();
     let GenerateVLParams {
@@ -1497,12 +1649,44 @@ pub fn generate_vl_dots_ocr(
 
     let max_seq = m.max_seq;
 
-    // 2. Model state (disjoint field borrows of `m`).
-    let tokenizer = m.tokenizer.as_ref().unwrap();
+    // 2. Resolve the text configuration and build the prompt before taking
+    // any mutable model borrow.  The reset below is the loader-owned boundary
+    // for every Dots OCR turn.
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
-    // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
+    let prompt_ids = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual)
+    };
+    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
+        write_error(stdout, id, &format!(
+            "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+            prompt_ids.len(), max_tokens, max_seq));
+        return;
+    }
+    if check_abort(id) {
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
+        return;
+    }
+    if let Err(error) = m.reset_context(gpu) {
+        crate::common::emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "dots.ocr context reset failed",
+            "gpu",
+            true,
+            &crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some(error),
+            },
+        );
+        return;
+    }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    // Weights/state via raw pointers to allow owned config while keeping
+    // disjoint borrows.  The loader reset above has already released all
+    // previous request state.
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
         match m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
@@ -1512,18 +1696,6 @@ pub fn generate_vl_dots_ocr(
         };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
-    // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
-    let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
-    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
-        write_error(stdout, id, &format!(
-            "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
-            prompt_ids.len(), max_tokens, max_seq));
-        return;
-    }
-    if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
-        return;
-    }
 
     // 4. Vision encoder → merged visual tokens.
     let patch_cols = img.patches.len() / n_patches;
@@ -1546,7 +1718,7 @@ pub fn generate_vl_dots_ocr(
         Ok(Some(t)) => t,
         Ok(None) => {
             let _ = gpu.free_tensor(patches_gpu);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            crate::ar::emit_active_route_cancel(stdout, id, 0);
             return;
         }
         Err(e) => {
@@ -1591,7 +1763,6 @@ pub fn generate_vl_dots_ocr(
     // and run it through the batched prefill in one pass. Only the ~215
     // text positions need a GPU embedding lookup; the 4880 visual rows are
     // already host-resident in `merged`.
-    state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
@@ -1610,7 +1781,17 @@ pub fn generate_vl_dots_ocr(
     for (pos, &token) in prompt_ids.iter().enumerate() {
         if check_abort(id) {
             let _ = gpu.free_tensor(emb_scratch);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         if token == dots_ocr::IMGPAD_ID {
@@ -1647,29 +1828,75 @@ pub fn generate_vl_dots_ocr(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
     if let Some(e) = embed_err {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr prefill embed build failed: {e}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr batched prefill failed: {e:?}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -1719,7 +1946,24 @@ pub fn generate_vl_dots_ocr(
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("dots.ocr argmax failed: {e:?}"),
+                "gpu",
+                true,
+                &ep,
+            );
             return;
         }
     };
@@ -1735,7 +1979,17 @@ pub fn generate_vl_dots_ocr(
 
     while generated < max_tokens {
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         if eos_set.contains(&next) {
@@ -1768,14 +2022,41 @@ pub fn generate_vl_dots_ocr(
         match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                let ep = dots_reset_state_live(
+                    state,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
+                    gpu,
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("dots.ocr decode failed: {e:?}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
                 return;
             }
         }
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
 
@@ -1809,9 +2090,21 @@ pub fn generate_vl_dots_ocr(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         }
     }
 }
@@ -1848,6 +2141,11 @@ pub fn decode_vl_dots_ocr_ngram(
         t0,
         prefill_tokens,
         prefill_s,
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
     );
     m.state = Some(Box::new(bundle));
     m.speculator = Some(spec);
@@ -1864,6 +2162,11 @@ pub fn run_dots_ocr_ngram_loop(
     t0: Instant,
     prefill_tokens: usize,
     prefill_s: f64,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
 ) {
     let eos_set: Vec<u32> = if bundle.config.text.eos_token_ids.is_empty() {
         vec![bundle.config.text.eos_token_id]
@@ -1891,13 +2194,44 @@ pub fn run_dots_ocr_ngram_loop(
     ) {
         Ok(PrefillOutcome::Ready { first_token }) => first_token,
         Ok(PrefillOutcome::Aborted) => {
-            // Client cancel during n-gram prefill: cancel lifecycle only
-            // (no success done / commit_ready).
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr spec prefill: {e}"));
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("dots.ocr spec prefill: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
             return;
         }
     };
@@ -1963,7 +2297,20 @@ pub fn run_dots_ocr_ngram_loop(
         // rule as the prefill-cancel site above). The caller restores
         // bundle/spec state on return; the next request resets at prefill.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         // Context-overflow guard (matches generate_spec): one window writes up
@@ -1977,8 +2324,28 @@ pub fn run_dots_ocr_ngram_loop(
         ) {
             Ok(s) => s,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));
-                break;
+                let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                    hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+                };
+                let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                    seq_pos,
+                    conversation_tokens,
+                    prefill_checkpoints,
+                    dflash_checkpoints,
+                    asst_turn_cache,
+                    gpu,
+                    &mut reset_target,
+                    Some(spec),
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("dots.ocr spec_step: {e}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
+                return;
             }
         };
         spec_cycles += 1;
@@ -2029,8 +2396,25 @@ pub fn run_dots_ocr_ngram_loop(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        }
     }
 }
 
@@ -2045,17 +2429,43 @@ pub fn generate_dots_ocr_text(
     top_p: f32,
     max_tokens: usize,
 ) {
+    crate::ar::emit_generation_start(crate::ar::GenerationRoute::DotsOcr, stdout, id, false);
     let _ = (temp, top_p); // greedy decode for now; sampling left for future work
     let t0 = Instant::now();
 
     let max_seq = m.max_seq;
-
-    // Model state (disjoint field borrows of `m`).
-    let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
-    // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
+    let prompt_ids = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        tokenizer.encode(prompt)
+    };
+    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
+        write_error(stdout, id, &format!(
+            "dots.ocr text request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+            prompt_ids.len(), max_tokens, max_seq));
+        return;
+    }
+    if check_abort(id) {
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
+        return;
+    }
+    if let Err(error) = m.reset_context(gpu) {
+        crate::common::emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "dots.ocr text context reset failed",
+            "gpu",
+            true,
+            &crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some(error),
+            },
+        );
+        return;
+    }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
         match m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
@@ -2065,18 +2475,6 @@ pub fn generate_dots_ocr_text(
         };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
-    // Tokenize the text prompt directly (no image tokens).
-    let prompt_ids = tokenizer.encode(prompt);
-    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
-        write_error(stdout, id, &format!(
-            "dots.ocr text request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
-            prompt_ids.len(), max_tokens, max_seq));
-        return;
-    }
-
-    // Prefill: build the [seq × dim] embedding matrix via per-token
-    // embedding lookup dispatch, then run through batched prefill.
-    state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
@@ -2114,20 +2512,46 @@ pub fn generate_dots_ocr_text(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if let Some(e) = embed_err {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr prefill embed build failed: {e}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr batched prefill failed: {e:?}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
@@ -2143,7 +2567,24 @@ pub fn generate_dots_ocr_text(
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("dots.ocr argmax failed: {e:?}"),
+                "gpu",
+                true,
+                &ep,
+            );
             return;
         }
     };
@@ -2153,6 +2594,20 @@ pub fn generate_dots_ocr_text(
     let mut generated = 0usize;
 
     while generated < max_tokens {
+        if check_abort(id) {
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+            return;
+        }
         if eos_set.contains(&next) {
             break;
         }
@@ -2183,7 +2638,24 @@ pub fn generate_dots_ocr_text(
         match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                let ep = dots_reset_state_live(
+                    state,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
+                    gpu,
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("dots.ocr decode failed: {e:?}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
                 return;
             }
         }
@@ -2219,8 +2691,22 @@ pub fn generate_dots_ocr_text(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        }
     }
 }
 
@@ -2562,6 +3048,7 @@ pub fn generate_lfm2_vl(
         seed,
         ..
     } = *params;
+    crate::ar::emit_generation_start(crate::ar::GenerationRoute::LfmAr, stdout, id, false);
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -2587,11 +3074,6 @@ pub fn generate_lfm2_vl(
             return;
         }
     };
-
-    // Stream contract opener BEFORE any GPU work or event emission — the
-    // HTTP gate rejects a `token` that arrives without gen_start first.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
 
     // Full-turn clock: preprocess + tower encode + prefill + decode. The
     // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
@@ -2731,23 +3213,45 @@ pub fn generate_lfm2_vl(
         return;
     }
 
-    // Cross-conversation cold reset (mirrors dense::generate_lfm2moe).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    // Cross-conversation cold reset through the common LFM attestation adapter.
+    // Every non-success exit after this point must reset first and publish one
+    // terminal reflecting the rollback outcome. A failed reset itself is
+    // fail-closed: no token stream has been emitted yet, so the single error
+    // terminal carries rolled_back=false and its context.
+    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+    if !ep.rolled_back {
+        crate::common::emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "LFM2 session reset failed before prefill",
+            "gpu",
+            true,
+            &ep,
+        );
+        return;
+    }
 
     // ── Vision encode → projected [n_visual, hidden] rows ──
     let visual_tokens = match m.lfm2_vision() {
         Some((_, vw)) => lfm2vl::vision_forward(gpu, vw, &vision_cfg, &prepared),
         None => {
-            write_error(stdout, id, "model has no vision encoder");
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "model has no vision encoder",
+                "internal",
+                false,
+                &ep,
+            );
             return;
         }
     };
     let visual_tokens = match visual_tokens {
         Ok(v) => v,
         Err(e) => {
-            write_error(stdout, id, &e);
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(stdout, Some(id), &e, "gpu", true, &ep);
             return;
         }
     };
@@ -2758,15 +3262,19 @@ pub fn generate_lfm2_vl(
     // the tower share tokens_for_grid, but the splice must not trust that
     // by accident.
     if visual_tokens.len() != n_visual_tokens * vision_cfg.out_hidden_size {
-        write_error(
+        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!(
                 "vision/projector row mismatch: {} floats for {} tokens × {} dims",
                 visual_tokens.len(),
                 n_visual_tokens,
                 vision_cfg.out_hidden_size
             ),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
@@ -2786,8 +3294,13 @@ pub fn generate_lfm2_vl(
     };
 
     // ── Prefill with visual embeddings spliced at placeholder positions ──
+    // Every exit is fail-closed: the live bundle borrow is released before
+    // the common adapter attests the rollback, then exactly one terminal
+    // reflecting that attestation is published.
     let mut last_logits: Vec<f32> = Vec::new();
     let prefill_t0 = Instant::now();
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
     {
         let b = m.lfm2moe_mut().unwrap();
         let cfg_t = &b.config;
@@ -2798,17 +3311,8 @@ pub fn generate_lfm2_vl(
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_ids {
             if check_abort(id) {
-                // Client-cancel poll (mirrors the generate_vl hardening on
-                // feat/qwen35-vl): the vision-encode phase before this loop
-                // cannot be interrupted mid-kernel, so prefill is where an
-                // abort signalled during the tower takes effect. Emit the
-                // canonical cancelled pair and return — breaking out here
-                // would fall through to the decode loop relying on its
-                // top-of-loop abort check to avoid sampling empty logits,
-                // and would push the full prompt into conversation_tokens
-                // against a partially-filled KV.
-                emit_qwen_ar_cancelled(stdout, id, 0);
-                return;
+                prefill_aborted = true;
+                break;
             }
             let res = if tok == image_token_id && vis_idx < n_visual_tokens {
                 let emb = &visual_tokens[vis_idx * dim..(vis_idx + 1) * dim];
@@ -2824,12 +3328,22 @@ pub fn generate_lfm2_vl(
             match res {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
-                    write_error(stdout, id, &format!("lfm2-vl prefill failed: {e:?}"));
-                    return;
+                    prefill_err = Some(format!("lfm2-vl prefill failed: {e:?}"));
+                    break;
                 }
             }
             position += 1;
         }
+    }
+    if let Some(msg) = prefill_err {
+        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        crate::common::emit_fail_closed_error(stdout, Some(id), &msg, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
@@ -2844,10 +3358,12 @@ pub fn generate_lfm2_vl(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut decode_err: Option<String> = None;
     loop {
         if check_abort(id) {
-            eprintln!("[daemon/vl-lfm2] aborted mid-decode");
-            break;
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
         }
         if generated_count >= max_tokens {
             break;
@@ -2876,7 +3392,9 @@ pub fn generate_lfm2_vl(
         generated_count += 1;
 
         if check_abort(id) {
-            break;
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
         }
         let step = {
             let b = m.lfm2moe_mut().unwrap();
@@ -2893,10 +3411,15 @@ pub fn generate_lfm2_vl(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                write_error(stdout, id, &format!("lfm2-vl decode failed: {e:?}"));
-                return;
+                decode_err = Some(format!("lfm2-vl decode failed: {e:?}"));
+                break;
             }
         }
+    }
+    if let Some(msg) = decode_err {
+        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        crate::common::emit_fail_closed_error(stdout, Some(id), &msg, "gpu", true, &ep);
+        return;
     }
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
 
@@ -2905,12 +3428,13 @@ pub fn generate_lfm2_vl(
     // `await_client_terminal_commit` would block forever waiting for a
     // commit that can never arrive and wedge the single slot (the exact
     // failure recorded in the 2026-08-27 serve ledger). Emits the CANONICAL
-    // cancelled-terminal pair via `emit_qwen_ar_cancelled` (wire `aborted` +
-    // `aborted_done`) — serve's stream reader only releases an HTTP handler
-    // on the recognized terminal dialect, so a raw custom event here would
-    // hold the admission guard forever.
+    // cancelled-terminal pair via the attested adapter — serve's stream
+    // reader only releases an HTTP handler on the recognized terminal
+    // dialect, so a raw custom event here would hold the admission guard
+    // forever.
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated_count);
+        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         return;
     }
 
@@ -2931,12 +3455,468 @@ pub fn generate_lfm2_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             // Same release contract as the post-loop latch: the terminal pair
             // must be the recognized wire dialect or serve holds its
-            // admission guard forever.
-            emit_qwen_ar_cancelled(stdout, id, generated_count);
+            // admission guard forever. Attest rollback first.
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         }
+    }
+}
+
+#[cfg(test)]
+mod lfm2_vl_lifecycle_tests {
+    use crate::ar::{generation_route_adapter, GenerationRoute};
+    use crate::common::{
+        emit_fail_closed_error, emit_spec_cancel_after_rollback, RollbackEpilogue,
+    };
+    use hipfire_engine::terminal::{
+        activate_terminal_control, clear_terminal_control, set_active_attempt_id,
+    };
+    use std::sync::{Mutex, OnceLock};
+
+    fn terminal_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn parse_lines(buf: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(buf)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    fn with_lfm_route<F: FnOnce(&mut Vec<u8>)>(
+        id: &str,
+        attempt: u64,
+        f: F,
+    ) -> Vec<serde_json::Value> {
+        let _guard = terminal_lock();
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        set_active_attempt_id(attempt);
+        // GenerationRoute::LfmAr adapter is installed by emit_generation_start in production;
+        // for unit tests we set it explicitly so the attested helpers route through the same adapter.
+        crate::ar::set_generation_route(GenerationRoute::LfmAr);
+        let mut out = Vec::new();
+        // Ensure gen_start is claimed so the terminal can be published — mirrors production order
+        // where every non-success LFM exit occurs after gen_start.
+        crate::ar::emit_generation_start(GenerationRoute::LfmAr, &mut out, id, false);
+        let start_len = out.len();
+        f(&mut out);
+        let lines = parse_lines(&out);
+        // Gen_start is present; return only terminals after it so assertions count exactly one semantic owner.
+        // Keep helper to validate that gen_start was not duplicated or lost.
+        assert_eq!(
+            lines
+                .first()
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("gen_start"),
+            "LFM route must emit gen_start first"
+        );
+        let tail = parse_lines(&out[start_len..]);
+        clear_terminal_control();
+        set_active_attempt_id(0);
+        tail
+    }
+
+    #[test]
+    fn initial_reset_failure_publishes_one_fail_closed_error() {
+        let id = "lfm-vl-initial-reset";
+        let tail = with_lfm_route(id, 11, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some(
+                    "LFM2 session reset failed before prefill: device_synchronize: HipError(42)"
+                        .to_string(),
+                ),
+            };
+            emit_fail_closed_error(
+                out,
+                Some(id),
+                "LFM2 session reset failed before prefill",
+                "gpu",
+                true,
+                &ep,
+            );
+        });
+        assert_eq!(
+            tail.len(),
+            1,
+            "initial reset failure must publish exactly one terminal"
+        );
+        let err = &tail[0];
+        assert_eq!(err.get("type").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(
+            err.get("rolled_back").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(
+            err.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("device_synchronize"),
+            "fail-closed error must carry rollback context: {err:?}"
+        );
+    }
+
+    #[test]
+    fn initial_reset_failure_with_attested_rollback_still_fail_closed_but_rolled_back_true() {
+        // Defensive: if the adapter ever reports rolled_back true for an initial failure, the error still carries rolled_back=true.
+        let id = "lfm-vl-initial-reset-ok";
+        let tail = with_lfm_route(id, 12, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_fail_closed_error(
+                out,
+                Some(id),
+                "LFM2 session reset failed before prefill",
+                "gpu",
+                true,
+                &ep,
+            );
+        });
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].get("type").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(
+            tail[0].get("rolled_back").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn partial_prefill_abort_attested_publishes_single_cancel_pair() {
+        let id = "lfm-vl-prefill-abort";
+        let tail = with_lfm_route(id, 13, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_spec_cancel_after_rollback(out, id, 0, &ep);
+        });
+        // Cancel via the LFM adapter is the fold-compatible aborted + done pair — exactly one semantic owner.
+        let types: Vec<_> = tail
+            .iter()
+            .filter_map(|v| v.get("type").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            types.contains(&"aborted"),
+            "attested cancel must emit aborted: {types:?}"
+        );
+        // The done is the second line of the pair; count aborted + error as semantic owners.
+        let aborted = types.iter().filter(|&&t| t == "aborted").count();
+        let done = types.iter().filter(|&&t| t == "done").count();
+        let error = types.iter().filter(|&&t| t == "error").count();
+        assert_eq!(aborted, 1, "exactly one aborted: {types:?}");
+        assert_eq!(error, 0, "attested abort must not emit error: {types:?}");
+        // done is present as the commit's second record (fold keeps aborted+done as one owner)
+        assert!(done <= 1, "at most one done with aborted: {types:?}");
+    }
+
+    #[test]
+    fn partial_prefill_abort_unattested_publishes_one_fail_closed_error() {
+        let id = "lfm-vl-prefill-abort-fail";
+        let tail = with_lfm_route(id, 14, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("device_synchronize: HipError(99)".to_string()),
+            };
+            emit_spec_cancel_after_rollback(out, id, 0, &ep);
+        });
+        assert_eq!(
+            tail.len(),
+            1,
+            "unattested abort must publish exactly one terminal"
+        );
+        assert_eq!(tail[0].get("type").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(
+            tail[0].get("rolled_back").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(
+            tail[0]
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("fail-closed"),
+            "unattested cancel must be fail-closed: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn forward_error_prefill_publishes_one_fail_closed_error_reflecting_rollback() {
+        let id = "lfm-vl-forward-prefill";
+        // Attested rollback: error with rolled_back true
+        let tail_ok = with_lfm_route(id, 15, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_fail_closed_error(
+                out,
+                Some(id),
+                "lfm2-vl prefill failed: HipError(1)",
+                "gpu",
+                true,
+                &ep,
+            );
+        });
+        assert_eq!(tail_ok.len(), 1);
+        assert_eq!(
+            tail_ok[0].get("rolled_back").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // Unattested: error with context, rolled_back false
+        let tail_fail = with_lfm_route(id, 16, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("Architecture: VL recurrent reset: HipError(2); GraphsAndSynchronize: device_synchronize: HipError(3)".to_string()),
+            };
+            emit_fail_closed_error(
+                out,
+                Some(id),
+                "lfm2-vl prefill failed: HipError(1)",
+                "gpu",
+                true,
+                &ep,
+            );
+        });
+        assert_eq!(tail_fail.len(), 1);
+        assert_eq!(
+            tail_fail[0].get("rolled_back").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(tail_fail[0]
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Architecture"));
+    }
+
+    #[test]
+    fn forward_error_decode_publishes_one_fail_closed_error() {
+        let id = "lfm-vl-forward-decode";
+        let tail = with_lfm_route(id, 17, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_fail_closed_error(
+                out,
+                Some(id),
+                "lfm2-vl decode failed: HipError(7)",
+                "gpu",
+                true,
+                &ep,
+            );
+        });
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].get("type").and_then(|v| v.as_str()), Some("error"));
+        // No second terminal — exactly once.
+        assert_eq!(
+            tail.iter()
+                .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("done"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn post_decode_abort_attested_publishes_single_cancel() {
+        let id = "lfm-vl-post-decode-abort";
+        let tail = with_lfm_route(id, 18, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_spec_cancel_after_rollback(out, id, 42, &ep);
+        });
+        let types: Vec<_> = tail
+            .iter()
+            .filter_map(|v| v.get("type").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            types.contains(&"aborted"),
+            "post-decode attested abort must emit aborted"
+        );
+        assert_eq!(
+            tail.iter()
+                .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("error"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn post_decode_abort_unattested_is_fail_closed_error() {
+        let id = "lfm-vl-post-decode-abort-fail";
+        let tail = with_lfm_route(id, 19, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("GraphsAndSynchronize: device_synchronize: HipError(5)".to_string()),
+            };
+            emit_spec_cancel_after_rollback(out, id, 5, &ep);
+        });
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].get("type").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(
+            tail[0].get("rolled_back").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn handshake_abort_attested_publishes_single_cancel() {
+        let id = "lfm-vl-handshake-abort";
+        let tail = with_lfm_route(id, 20, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_spec_cancel_after_rollback(out, id, 7, &ep);
+        });
+        let types: Vec<_> = tail
+            .iter()
+            .filter_map(|v| v.get("type").and_then(|v| v.as_str()))
+            .collect();
+        assert!(types.contains(&"aborted"));
+        // Handshake abort must not leak a second terminal after the pair.
+        assert!(types.iter().filter(|&&t| t == "aborted").count() == 1);
+    }
+
+    #[test]
+    fn handshake_abort_unattested_is_fail_closed() {
+        let id = "lfm-vl-handshake-abort-fail";
+        let tail = with_lfm_route(id, 21, |out| {
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("Checkpoints: free".to_string()),
+            };
+            emit_spec_cancel_after_rollback(out, id, 7, &ep);
+        });
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].get("type").and_then(|v| v.as_str()), Some("error"));
+    }
+
+    #[test]
+    fn every_lfm_non_success_exit_is_exactly_one_terminal() {
+        let _guard = terminal_lock();
+        // Cross-cut: initial-reset, prefill-abort, forward-error, post-decode-abort, handshake-abort
+        // must each be exactly one semantic terminal, and a second claim is rejected.
+        let id = "lfm-vl-exactly-once";
+        let attempt = 22;
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        set_active_attempt_id(attempt);
+        crate::ar::set_generation_route(GenerationRoute::LfmAr);
+        let mut out = Vec::new();
+        crate::ar::emit_generation_start(GenerationRoute::LfmAr, &mut out, id, false);
+        let adapter = generation_route_adapter(GenerationRoute::LfmAr).unwrap();
+        let start_lines = parse_lines(&out);
+        assert_eq!(start_lines.len(), 1);
+        // First terminal wins.
+        let ep_ok = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_spec_cancel_after_rollback(&mut out, id, 0, &ep_ok);
+        let after_first = parse_lines(&out);
+        // Subsequent fail-closed error must be suppressed by the exactly-once latch.
+        let ep_fail = RollbackEpilogue {
+            rolled_back: false,
+            context: Some("late".to_string()),
+        };
+        emit_fail_closed_error(&mut out, Some(id), "late error", "gpu", true, &ep_fail);
+        // Also try a second cancel via the adapter directly — must be ignored.
+        let mut late = Vec::new();
+        adapter.emit_terminal(&mut late, id, attempt, crate::ar::RouteTerminal::Cancel);
+        out.extend(late);
+        let final_lines = parse_lines(&out);
+        // Only one semantic owner after gen_start: the first cancel's aborted(+done) counts as one.
+        let tail = &final_lines[start_lines.len()..];
+        let aborted = tail
+            .iter()
+            .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("aborted"))
+            .count();
+        let done = tail
+            .iter()
+            .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("done"))
+            .count();
+        let error = tail
+            .iter()
+            .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("error"))
+            .count();
+        // aborted+done is one owner, error would be a second — must be 1 owner total.
+        let owners = if aborted == 1 { 1 } else { error };
+        assert_eq!(owners, 1, "LFM non-success must be exactly one terminal, got aborted={aborted} done={done} error={error}");
+        assert_eq!(
+            final_lines.len(),
+            after_first.len(),
+            "late terminals must be suppressed"
+        );
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn terminal_claim_requires_exact_request_and_attempt() {
+        let _guard = terminal_lock();
+        // Stale or mismatched (request_id, attempt_id) must not claim a terminal.
+        let id = "lfm-vl-claim-key";
+        let attempt = 30;
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        set_active_attempt_id(attempt);
+        crate::ar::set_generation_route(GenerationRoute::LfmAr);
+        let mut out = Vec::new();
+        crate::ar::emit_generation_start(GenerationRoute::LfmAr, &mut out, id, false);
+        let adapter = generation_route_adapter(GenerationRoute::LfmAr).unwrap();
+        // Correct key succeeds.
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_spec_cancel_after_rollback(&mut out, id, 1, &ep);
+        let after_correct = out.clone();
+        // Stale attempt id — must be rejected (no new bytes).
+        let mut stale = Vec::new();
+        adapter.emit_terminal(
+            &mut stale,
+            id,
+            attempt + 1,
+            crate::ar::RouteTerminal::Cancel,
+        );
+        // Wrong request id — must be rejected.
+        let mut wrong_id = Vec::new();
+        adapter.emit_terminal(
+            &mut wrong_id,
+            "other-id",
+            attempt,
+            crate::ar::RouteTerminal::Error,
+        );
+        assert!(stale.is_empty(), "stale attempt must not claim terminal");
+        assert!(
+            wrong_id.is_empty(),
+            "wrong request_id must not claim terminal"
+        );
+        // Exactly-once latch still holds — second correct claim is also rejected.
+        let mut second = Vec::new();
+        adapter.emit_terminal(&mut second, id, attempt, crate::ar::RouteTerminal::Done);
+        assert!(
+            second.is_empty(),
+            "second claim after terminal must be suppressed"
+        );
+        // Original output unchanged.
+        assert_eq!(out, after_correct);
+        clear_terminal_control();
+        set_active_attempt_id(0);
     }
 }

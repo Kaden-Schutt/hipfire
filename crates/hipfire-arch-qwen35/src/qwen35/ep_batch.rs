@@ -50,13 +50,13 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::weight_gemv_prerotated;
 use hipfire_runtime::llama::weight_gemv_swiglu_residual;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::DType;
 use rdna_compute::GpuTensor;
 
@@ -836,7 +836,7 @@ pub fn validate_ep_batch_compatibility(
     let requested_bytes = usize::try_from(requested_bytes_u64)
         .map_err(|_| HipError::new(0, "peer requested bytes overflow usize"))?;
     let peer_bytes_per_rank =
-        hipfire_runtime::multi_gpu::peer_reduce_scratch_bytes_per_rank(4, requested_bytes)
+        hipfire_hardware::peer_reduce_scratch_bytes_per_rank(4, requested_bytes)
             .ok_or_else(|| HipError::new(0, "peer per-rank projection overflow"))?;
     let per_rank_total = per_rank_decode
         .checked_add(per_rank_seed_pbs)
@@ -926,7 +926,7 @@ pub struct Qwen35DecodeBatchEpState {
     dim: usize,
     norm_eps: f32,
     expert_to_rank: Box<[u8]>,
-    peer_lease: Option<hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+    peer_lease: Option<hipfire_hardware::PeerReduceScratchLease>,
 }
 
 /// Transactional ownership guard for `Qwen35DecodeBatchEpState::new`.
@@ -938,7 +938,7 @@ struct EpBatchBuildGuard {
     seed_pbs: Vec<Option<PrefillBatchScratch>>,
     seed_partials: Vec<Option<GpuTensor>>,
     scratches: Vec<Option<Qwen35Scratch>>,
-    lease: Option<hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+    lease: Option<hipfire_hardware::PeerReduceScratchLease>,
 }
 
 impl EpBatchBuildGuard {
@@ -967,7 +967,7 @@ impl EpBatchBuildGuard {
     fn set_scratch(&mut self, idx: usize, v: Qwen35Scratch) {
         self.scratches[idx] = Some(v);
     }
-    fn set_lease(&mut self, lease: hipfire_runtime::multi_gpu::PeerReduceScratchLease) {
+    fn set_lease(&mut self, lease: hipfire_hardware::PeerReduceScratchLease) {
         self.lease = Some(lease);
     }
     /// Rollback on owning devices, attempting every free, preserving init error plus first cleanup error.
@@ -1044,7 +1044,7 @@ impl EpBatchBuildGuard {
         Vec<PrefillBatchScratch>,
         Vec<GpuTensor>,
         Vec<Qwen35Scratch>,
-        Option<hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+        Option<hipfire_hardware::PeerReduceScratchLease>,
     ) {
         let ranks = self
             .ranks
@@ -2170,6 +2170,7 @@ pub fn forward_ep(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let pos_i32 = pos as i32;
+    let group: Vec<usize> = (0..n).collect();
 
     // 1. Embed token + write pos on each rank (replicated; deterministic, since
     //    weights are byte-identical replicas → s.x is bit-identical per rank).
@@ -2236,6 +2237,7 @@ pub fn forward_ep(
             gpus,
             binds.as_mut_slice(),
             partials,
+            &group,
             &program,
             dim,
         )
@@ -2354,6 +2356,7 @@ pub fn forward_prefill_batch_ep(
         return Ok(());
     }
     let dim = config.dim;
+    let group: Vec<usize> = (0..n_rank).collect();
     // Per-call contract: one window must fit max_batch. Long prompts are driven
     // by calling this repeatedly with advancing start_pos + persistent kv/dn
     // (KV + DeltaNet state accumulate in place across calls, identical to the
@@ -2452,15 +2455,17 @@ pub fn forward_prefill_batch_ep(
             t_chunk += t_c.elapsed().as_secs_f64() * 1000.0;
         }
 
-        // 3. All-reduce the routed partials, add into each rank's residual.
+        // 3. All-reduce the routed partials over the full EP group, then add
+        // the reduced result into each rank's residual.
         if is_moe && !ep_skip_ar {
             let t_a = std::time::Instant::now();
-            let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+            let refs: Vec<&hip_bridge::DeviceBuffer> =
+                partials.iter().map(|partial| &partial.buf).collect();
             if ep_peer_ar {
-                gpus.all_reduce_sum_f32_peer(&refs, n * dim)
+                gpus.all_reduce_sum_f32_peer(&group, &refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             } else {
-                gpus.all_reduce_sum_f32(&refs, n * dim)
+                gpus.all_reduce_sum_f32(&group, &refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             }
             if ep_timing {

@@ -1481,7 +1481,9 @@ pub fn ensure_request_capacity(
     Ok(scratch_grew || cache_grew)
 }
 
-pub(crate) fn refresh_compressor_cache_shard_tables(states: &mut [DeepseekV4State]) -> Result<(), String> {
+pub(crate) fn refresh_compressor_cache_shard_tables(
+    states: &mut [DeepseekV4State],
+) -> Result<(), String> {
     let world = states.len();
     if !matches!(world, 3 | 4) {
         return Err(format!(
@@ -12875,7 +12877,7 @@ pub fn forward_prefill_batch_chunked(
 /// rank enters the next stage with bit-identical residual streams.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep_prefill_batch_chunked(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],

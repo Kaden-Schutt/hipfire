@@ -247,6 +247,27 @@ pub struct DsparkWeights {
     pub d2t: Option<Vec<u32>>,
 }
 
+impl DsparkWeights {
+    /// Explicitly release every owned GPU tensor. GPU buffers deliberately
+    /// have no global `Drop`; constructors and rollback paths call this
+    /// method while the owning device is still available.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for tensor in [
+            self.main_proj,
+            self.main_norm,
+            self.markov_w1,
+            self.markov_w2,
+            self.confidence_proj,
+            self.confidence_bias,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 /// The arch-specific seam: draft one window's block given the assembled
 /// multi-slot context, returning the per-slot post-final-norm hidden (`x_head`).
 ///
@@ -739,6 +760,43 @@ pub fn noise_block_ids(cfg: &DsparkConfig, seed: u32) -> Vec<u32> {
     ids
 }
 
+struct RunHeadsStaging {
+    normed: Option<GpuTensor>,
+    normed_rot: Option<GpuTensor>,
+    logits: Option<GpuTensor>,
+    x_f16: Option<GpuTensor>,
+    chain: Option<GpuTensor>,
+    argmax_scratch: Option<GpuTensor>,
+    conf_batch: Option<GpuTensor>,
+    concat: Option<GpuTensor>,
+    emb: Option<GpuTensor>,
+    bias: Option<GpuTensor>,
+    emb_rot: Option<GpuTensor>,
+}
+
+impl RunHeadsStaging {
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        for tensor in [
+            self.normed.take(),
+            self.normed_rot.take(),
+            self.logits.take(),
+            self.x_f16.take(),
+            self.chain.take(),
+            self.argmax_scratch.take(),
+            self.conf_batch.take(),
+            self.concat.take(),
+            self.emb.take(),
+            self.bias.take(),
+            self.emb_rot.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 /// Run the DSpark head pipeline over a completed `x_head` block:
 /// 1. lm-head GEMV: `rmsnorm(x_head, stage_norm)` → optional FWHT → batched
 ///    `lm_head` GEMV → `logits[block, vocab]` (resident on GPU).
@@ -793,256 +851,241 @@ pub fn run_heads(
 
     // ── lm-head GEMV: rmsnorm(x_head, stage_norm) → [optional FWHT] → batched GEMV ──
     //
-    // `stage_norm` is the per-stage final norm supplied by the caller
-    // (deepseek4: `mtp_final_norm`; qwen3: drafter `norm`).
-    let normed = gpu
-        .alloc_tensor(&[block, hidden], DType::F32)
-        .map_err(|e| format!("run_heads alloc normed: {e:?}"))?;
-    let rms_norm_eps = cfg.rms_norm_eps;
-    gpu.rmsnorm_batched(x_head, stage_norm, &normed, block, hidden, rms_norm_eps)
-        .map_err(|e| format!("run_heads final rmsnorm: {e:?}"))?;
-
-    let normed_rot = if weight_needs_fwht(lm_head) {
-        let r = gpu
-            .alloc_tensor(&[block, hidden], DType::F32)
-            .map_err(|e| format!("run_heads alloc normed_rot: {e:?}"))?;
-        gpu.rotate_x_mq_batched(&normed, &r, hidden, block)
-            .map_err(|e| format!("run_heads rotate head input: {e:?}"))?;
-        Some(r)
-    } else {
-        None
+    // Every temporary GPU allocation is published to this staging owner before
+    // the next fallible operation. The owner is drained on both success and
+    // error because `GpuTensor` deliberately has no global `Drop`.
+    let mut staged = RunHeadsStaging {
+        normed: None,
+        normed_rot: None,
+        logits: None,
+        x_f16: None,
+        chain: None,
+        argmax_scratch: None,
+        conf_batch: None,
+        concat: None,
+        emb: None,
+        bias: None,
+        emb_rot: None,
     };
-    let logits_dev = gpu
-        .alloc_tensor(&[block, vocab], DType::F32)
-        .map_err(|e| format!("run_heads alloc logits: {e:?}"))?;
-    let x_f16 = gpu
-        .alloc_tensor(&[block * hidden], DType::F16)
-        .map_err(|e| format!("run_heads alloc x_f16: {e:?}"))?;
-    gemv_auto_batched_wmma(
-        gpu,
-        lm_head,
-        normed_rot.as_ref().unwrap_or(&normed),
-        &normed,
-        &logits_dev,
-        vocab,
-        hidden,
-        block,
-        Some(&x_f16),
-    )?;
-    if let Some(r) = normed_rot {
-        let _ = gpu.free_tensor(r);
-    }
-    let _ = gpu.free_tensor(x_f16);
-    // `normed` is kept alive until after the loop: the confidence head
-    // reads normed[i] per slot (modeling.py uses once-normed hidden for confidence).
-    // `logits_dev` stays resident: the markov loop adds each slot's bias
-    // and argmaxes ON-GPU. Both freed after the loop.
+    let result = (|| -> Result<DraftResult, String> {
+        staged.normed = Some(
+            gpu.alloc_tensor(&[block, hidden], DType::F32)
+                .map_err(|e| format!("run_heads alloc normed: {e:?}"))?,
+        );
+        let normed = staged.normed.as_ref().expect("staged normed");
+        let rms_norm_eps = cfg.rms_norm_eps;
+        gpu.rmsnorm_batched(x_head, stage_norm, normed, block, hidden, rms_norm_eps)
+            .map_err(|e| format!("run_heads final rmsnorm: {e:?}"))?;
 
-    // ── Sequential markov in-block sampling (greedy) ─────────────────────
-    // out_ids[0] = prev_token; out_ids[i+1] = argmax(logits[i] + markov_bias).
-    let mut out_ids = vec![prev_token; block + 1];
+        if weight_needs_fwht(lm_head) {
+            staged.normed_rot = Some(
+                gpu.alloc_tensor(&[block, hidden], DType::F32)
+                    .map_err(|e| format!("run_heads alloc normed_rot: {e:?}"))?,
+            );
+            gpu.rotate_x_mq_batched(
+                staged.normed.as_ref().expect("staged normed"),
+                staged.normed_rot.as_ref().expect("staged normed_rot"),
+                hidden,
+                block,
+            )
+            .map_err(|e| format!("run_heads rotate head input: {e:?}"))?;
+        }
+        staged.logits = Some(
+            gpu.alloc_tensor(&[block, vocab], DType::F32)
+                .map_err(|e| format!("run_heads alloc logits: {e:?}"))?,
+        );
+        staged.x_f16 = Some(
+            gpu.alloc_tensor(&[block * hidden], DType::F16)
+                .map_err(|e| format!("run_heads alloc x_f16: {e:?}"))?,
+        );
+        let normed = staged.normed.as_ref().expect("staged normed");
+        let head_input = staged.normed_rot.as_ref().unwrap_or(normed);
+        gemv_auto_batched_wmma(
+            gpu,
+            lm_head,
+            head_input,
+            normed,
+            staged.logits.as_ref().expect("staged logits"),
+            vocab,
+            hidden,
+            block,
+            staged.x_f16.as_ref(),
+        )?;
 
-    // Device-resident token chain: when markov_w1 supports a device-token-indexed
-    // lookup, keep the whole sequential loop on the GPU — the previous slot's
-    // argmax lands in `chain[i+1]` (via `argmax_token_chain_f32`) and the next
-    // embed reads `chain[i]` straight from device memory. This removes the
-    // per-slot embed D2H+H2D and per-slot argmax D2H (each ~free on UMA, but a
-    // full pipeline drain on a discrete-VRAM GPU); the block's token ids come
-    // back in a single D2H after the loop. `chain` is a 4-byte-per-elem F32-typed
-    // buffer holding i32 ids (same convention as qwen35's `mtp_token_chain`);
-    // `argmax_scratch` is the throwaway index sink `argmax_token_chain_f32` also
-    // writes. `None` ⇒ host-token fallback (byte-identical).
-    // Reduced-vocab (d2t Some) forces the host path: each argmax is a DRAFT id
-    // that must be d2t-remapped to a TARGET id before it can index the
-    // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
-    let chain_bufs: Option<(GpuTensor, GpuTensor)> =
+        // ── Sequential markov in-block sampling (greedy) ─────────────────
+        // out_ids[0] = prev_token; out_ids[i+1] = argmax(logits[i] + markov_bias).
+        let mut out_ids = vec![prev_token; block + 1];
+
+        // Device-resident token chain: when markov_w1 supports a
+        // device-token-indexed lookup, keep the sequential loop on the GPU.
+        // Reduced-vocab drafters force the host path so the DRAFT id can be
+        // remapped to a TARGET id before the next markov lookup.
         if markov_w1_device_embeddable(markov_w1) && weights.d2t.is_none() {
-            let chain = gpu
-                .alloc_tensor(&[block + 1], DType::F32)
-                .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
+            staged.chain = Some(
+                gpu.alloc_tensor(&[block + 1], DType::F32)
+                    .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?,
+            );
             let seed_i32 = prev_token as i32;
             let seed_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
             gpu.hip
-                .memcpy_htod(&chain.buf, seed_bytes)
+                .memcpy_htod(
+                    &staged.chain.as_ref().expect("staged chain").buf,
+                    seed_bytes,
+                )
                 .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
-            let argmax_scratch = gpu
-                .alloc_tensor(&[1], DType::F32)
-                .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
-            Some((chain, argmax_scratch))
-        } else {
-            None
-        };
-
-    // Confidence head buffers (ON GPU per slot inside the loop):
-    // `conf_batch[block]` holds the per-slot confidence logit.
-    // `concat_dev` stages `[x_head[i] ++ markov_embed[i]]` for the 1-row
-    // `confidence_proj` gemv. Downloaded once after the loop (block floats).
-    let proj_in = hidden + markov_rank;
-    let conf_batch = gpu
-        .alloc_tensor(&[block], DType::F32)
-        .map_err(|e| format!("run_heads alloc conf_batch: {e:?}"))?;
-    let concat_dev = gpu
-        .alloc_tensor(&[proj_in], DType::F32)
-        .map_err(|e| format!("run_heads alloc conf concat: {e:?}"))?;
-    // Reusable device scratch for the markov embedding.
-    let emb_dev = gpu
-        .alloc_tensor(&[markov_rank], DType::F32)
-        .map_err(|e| format!("run_heads alloc markov emb: {e:?}"))?;
-    let bias_dev = gpu
-        .alloc_tensor(&[vocab], DType::F32)
-        .map_err(|e| format!("run_heads alloc markov bias: {e:?}"))?;
-    let emb_rot = if weight_needs_fwht(markov_w2) {
-        Some(
-            gpu.alloc_tensor(&[markov_rank], DType::F32)
-                .map_err(|e| format!("run_heads alloc markov emb rot: {e:?}"))?,
-        )
-    } else {
-        None
-    };
-    for i in 0..block {
-        // markov_w1 lookup → emb_dev [markov_rank] (unrotated). Device chain reads
-        // the previous slot's token id straight from GPU (`chain[i]`); the host
-        // fallback uses the argmax'd host id (`out_ids[i]`).
-        if let Some((chain, _)) = chain_bufs.as_ref() {
-            let token_slot = chain.sub_offset(i, 1);
-            dspark_embed_one_device(gpu, markov_w1, &emb_dev, &token_slot, markov_rank)?;
-        } else {
-            dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
+            staged.argmax_scratch = Some(
+                gpu.alloc_tensor(&[1], DType::F32)
+                    .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?,
+            );
         }
 
-        // Confidence slot i ON GPU: stage [hidden_i ++ markov_embed[i]] then
-        // a 1-row `confidence_proj` gemv → conf_batch[i]. Uses the UNROTATED
-        // emb_dev (matches the reference which dotted the raw markov embed).
-        // `hidden_i` is arch-specific: qwen3 uses `normed[i]` (once-normed,
-        // matching modeling.py's predict_confidence_step input = self.norm(hidden));
-        // deepseek4 uses raw `x_head[i]` (pre-norm, byte-identical to task-5 baseline).
-        if cfg.enable_confidence {
-            if let Some(confidence_proj) = weights.confidence_proj.as_ref() {
-                let xh_i = if cfg.confidence_uses_normed {
-                    normed.sub_offset(i * hidden, hidden)
-                } else {
-                    x_head.sub_offset(i * hidden, hidden)
-                };
-                let c_hidden = concat_dev.sub_offset(0, hidden);
-                let c_markov = concat_dev.sub_offset(hidden, markov_rank);
-                gpu.memcpy_dtod_auto(&c_hidden.buf, &xh_i.buf, hidden * 4)
-                    .map_err(|e| format!("run_heads conf stage x_head {i}: {e:?}"))?;
-                gpu.memcpy_dtod_auto(&c_markov.buf, &emb_dev.buf, markov_rank * 4)
-                    .map_err(|e| format!("run_heads conf stage emb {i}: {e:?}"))?;
-                let conf_i = conf_batch.sub_offset(i, 1);
-                gemv_auto(
-                    gpu,
-                    confidence_proj,
-                    &concat_dev,
-                    &concat_dev,
-                    &conf_i,
-                    1,
-                    proj_in,
-                )?;
-                // Add optional bias (qwen3 has a [1] bias; deepseek4 has None).
-                if let Some(bias) = weights.confidence_bias.as_ref() {
-                    gpu.add_inplace_f32(&conf_i, bias)
-                        .map_err(|e| format!("run_heads conf bias add {i}: {e:?}"))?;
+        // Confidence head buffers (ON GPU per slot inside the loop).
+        let proj_in = hidden + markov_rank;
+        staged.conf_batch = Some(
+            gpu.alloc_tensor(&[block], DType::F32)
+                .map_err(|e| format!("run_heads alloc conf_batch: {e:?}"))?,
+        );
+        staged.concat = Some(
+            gpu.alloc_tensor(&[proj_in], DType::F32)
+                .map_err(|e| format!("run_heads alloc conf concat: {e:?}"))?,
+        );
+        staged.emb = Some(
+            gpu.alloc_tensor(&[markov_rank], DType::F32)
+                .map_err(|e| format!("run_heads alloc markov emb: {e:?}"))?,
+        );
+        staged.bias = Some(
+            gpu.alloc_tensor(&[vocab], DType::F32)
+                .map_err(|e| format!("run_heads alloc markov bias: {e:?}"))?,
+        );
+        if weight_needs_fwht(markov_w2) {
+            staged.emb_rot = Some(
+                gpu.alloc_tensor(&[markov_rank], DType::F32)
+                    .map_err(|e| format!("run_heads alloc markov emb rot: {e:?}"))?,
+            );
+        }
+
+        let normed = staged.normed.as_ref().expect("staged normed");
+        let logits_dev = staged.logits.as_ref().expect("staged logits");
+        let conf_batch = staged.conf_batch.as_ref().expect("staged conf_batch");
+        let concat_dev = staged.concat.as_ref().expect("staged concat");
+        let emb_dev = staged.emb.as_ref().expect("staged emb");
+        let bias_dev = staged.bias.as_ref().expect("staged bias");
+        for i in 0..block {
+            // markov_w1 lookup → emb_dev [markov_rank] (unrotated).
+            if let Some(chain) = staged.chain.as_ref() {
+                let token_slot = chain.sub_offset(i, 1);
+                dspark_embed_one_device(gpu, markov_w1, emb_dev, &token_slot, markov_rank)?;
+            } else {
+                dspark_embed_one(gpu, markov_w1, emb_dev, out_ids[i], markov_rank)?;
+            }
+
+            // Confidence uses the unrotated markov embedding and either the
+            // once-normed or raw hidden according to the sidecar contract.
+            if cfg.enable_confidence {
+                if let Some(confidence_proj) = weights.confidence_proj.as_ref() {
+                    let xh_i = if cfg.confidence_uses_normed {
+                        normed.sub_offset(i * hidden, hidden)
+                    } else {
+                        x_head.sub_offset(i * hidden, hidden)
+                    };
+                    let c_hidden = concat_dev.sub_offset(0, hidden);
+                    let c_markov = concat_dev.sub_offset(hidden, markov_rank);
+                    gpu.memcpy_dtod_auto(&c_hidden.buf, &xh_i.buf, hidden * 4)
+                        .map_err(|e| format!("run_heads conf stage x_head {i}: {e:?}"))?;
+                    gpu.memcpy_dtod_auto(&c_markov.buf, &emb_dev.buf, markov_rank * 4)
+                        .map_err(|e| format!("run_heads conf stage emb {i}: {e:?}"))?;
+                    let conf_i = conf_batch.sub_offset(i, 1);
+                    gemv_auto(
+                        gpu,
+                        confidence_proj,
+                        concat_dev,
+                        concat_dev,
+                        &conf_i,
+                        1,
+                        proj_in,
+                    )?;
+                    if let Some(bias) = weights.confidence_bias.as_ref() {
+                        gpu.add_inplace_f32(&conf_i, bias)
+                            .map_err(|e| format!("run_heads conf bias add {i}: {e:?}"))?;
+                    }
                 }
+            }
+
+            // bias = markov_w2 @ emb; then add it to the corresponding logits
+            // row and argmax the next token.
+            let x_for_w2 = if let Some(rot) = staged.emb_rot.as_ref() {
+                gpu.rotate_x_mq(emb_dev, rot, markov_rank)
+                    .map_err(|e| format!("run_heads rotate markov emb {i}: {e:?}"))?;
+                rot
+            } else {
+                emb_dev
+            };
+            gemv_auto(
+                gpu,
+                markov_w2,
+                x_for_w2,
+                emb_dev,
+                bias_dev,
+                vocab,
+                markov_rank,
+            )?;
+            let row = logits_dev.sub_offset(i * vocab, vocab);
+            gpu.add_inplace_f32(&row, bias_dev)
+                .map_err(|e| format!("run_heads markov bias add {i}: {e:?}"))?;
+            if let (Some(chain), Some(argmax_scratch)) =
+                (staged.chain.as_ref(), staged.argmax_scratch.as_ref())
+            {
+                gpu.argmax_token_chain_f32(&row, argmax_scratch, chain, None, vocab, i + 1)
+                    .map_err(|e| format!("run_heads markov argmax chain {i}: {e:?}"))?;
+            } else {
+                let draft_id = gpu
+                    .argmax_f32(&row, vocab)
+                    .map_err(|e| format!("run_heads markov argmax {i}: {e:?}"))?;
+                out_ids[i + 1] = match weights.d2t.as_ref() {
+                    Some(d2t) => d2t.get(draft_id as usize).copied().unwrap_or(draft_id),
+                    None => draft_id,
+                };
             }
         }
 
-        // bias = markov_w2 @ emb  ([vocab, markov_rank] · [markov_rank]).
-        let x_for_w2 = if let Some(r) = emb_rot.as_ref() {
-            gpu.rotate_x_mq(&emb_dev, r, markov_rank)
-                .map_err(|e| format!("run_heads rotate markov emb {i}: {e:?}"))?;
-            r
-        } else {
-            &emb_dev
-        };
-        gemv_auto(
-            gpu,
-            markov_w2,
-            x_for_w2,
-            &emb_dev,
-            &bias_dev,
-            vocab,
-            markov_rank,
-        )?;
-        // logits[i] += bias, then argmax — both ON-GPU.
-        let row = logits_dev.sub_offset(i * vocab, vocab);
-        gpu.add_inplace_f32(&row, &bias_dev)
-            .map_err(|e| format!("run_heads markov bias add {i}: {e:?}"))?;
-        if let Some((chain, argmax_scratch)) = chain_bufs.as_ref() {
-            // argmax → chain[i+1] (device), feeding the next slot's embed without
-            // a host round-trip. `argmax_token_chain_f32`'s reduction is identical
-            // to `argmax_f32` (strict `>`, lowest-index tie-break).
-            gpu.argmax_token_chain_f32(&row, argmax_scratch, chain, None, vocab, i + 1)
-                .map_err(|e| format!("run_heads markov argmax chain {i}: {e:?}"))?;
-        } else {
-            let draft_id = gpu
-                .argmax_f32(&row, vocab)
-                .map_err(|e| format!("run_heads markov argmax {i}: {e:?}"))?;
-            // Reduced-vocab: argmax is a DRAFT id over `vocab` (=draft_vocab_size)
-            // logits; map it to a target token id so it feeds the full-vocab markov
-            // chain (out_ids[i] indexes markov_w1 over target vocab) and verify.
-            // Shared vocab (d2t None) passes through unchanged.
-            out_ids[i + 1] = match weights.d2t.as_ref() {
-                Some(d2t) => d2t.get(draft_id as usize).copied().unwrap_or(draft_id),
-                None => draft_id,
+        if let Some(chain) = staged.chain.as_ref() {
+            let mut ids_i32 = vec![0i32; block + 1];
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(ids_i32.as_mut_ptr() as *mut u8, (block + 1) * 4)
             };
+            gpu.hip
+                .memcpy_dtoh(bytes, &chain.buf)
+                .map_err(|e| format!("run_heads d2h token chain: {e:?}"))?;
+            for i in 1..=block {
+                out_ids[i] = ids_i32[i] as u32;
+            }
         }
-    }
-    // Device chain: pull the whole block's token ids back in one D2H (vs one per
-    // slot in the host path).
-    if let Some((chain, _)) = chain_bufs.as_ref() {
-        let mut ids_i32 = vec![0i32; block + 1];
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(ids_i32.as_mut_ptr() as *mut u8, (block + 1) * 4)
-        };
-        gpu.hip
-            .memcpy_dtoh(bytes, &chain.buf)
-            .map_err(|e| format!("run_heads d2h token chain: {e:?}"))?;
-        for i in 1..=block {
-            out_ids[i] = ids_i32[i] as u32;
-        }
-    }
-    let _ = gpu.free_tensor(emb_dev);
-    let _ = gpu.free_tensor(bias_dev);
-    let _ = gpu.free_tensor(logits_dev);
-    let _ = gpu.free_tensor(normed);
-    if let Some(r) = emb_rot {
-        let _ = gpu.free_tensor(r);
-    }
-    if let Some((chain, argmax_scratch)) = chain_bufs {
-        let _ = gpu.free_tensor(chain);
-        let _ = gpu.free_tensor(argmax_scratch);
-    }
 
-    // ── Confidence download ───────────────────────────────────────────────
-    // When confidence is disabled, return +inf so downstream truncation
-    // is a no-op. When enabled, download the `block` raw confidence LOGITS
-    // (pre-sigmoid). The caller (`DsparkDrafter::mtp_step`) applies
-    // `sigmoid(c)` itself when comparing against `conf_threshold`, matching
-    // the `Deepseek4DsparkDrafter` convention: confidence stores raw logits,
-    // sigmoid is applied at the truncation site.
-    let confidence = if cfg.enable_confidence && weights.confidence_proj.is_some() {
-        let mut raw = vec![0.0f32; block];
-        {
+        // Confidence download. The caller applies sigmoid at the truncation
+        // site; disabled confidence is represented by +infinity.
+        let confidence = if cfg.enable_confidence && weights.confidence_proj.is_some() {
+            let mut raw = vec![0.0f32; block];
             let bytes: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, block * 4) };
             gpu.hip
-                .memcpy_dtoh(bytes, &conf_batch.buf)
+                .memcpy_dtoh(
+                    bytes,
+                    &staged.conf_batch.as_ref().expect("staged conf_batch").buf,
+                )
                 .map_err(|e| format!("run_heads d2h confidence: {e:?}"))?;
-        }
-        raw
-    } else {
-        vec![f32::INFINITY; block]
-    };
-    let _ = gpu.free_tensor(conf_batch);
-    let _ = gpu.free_tensor(concat_dev);
-
-    Ok(DraftResult {
-        tokens: out_ids[1..=block].to_vec(),
-        logits: Vec::new(),
-        confidence,
-    })
+            raw
+        } else {
+            vec![f32::INFINITY; block]
+        };
+        Ok(DraftResult {
+            tokens: out_ids[1..=block].to_vec(),
+            logits: Vec::new(),
+            confidence,
+        })
+    })();
+    staged.free_gpu(gpu);
+    result
 }
 
 // ── Generic DsparkDrafter ─────────────────────────────────────────────────────
@@ -1085,14 +1128,20 @@ fn upload_f32(gpu: &mut Gpu, v: &[f32]) -> Result<GpuTensor, String> {
 /// `capture_seed_main_hidden` entirely.
 pub struct DsparkDrafter {
     body: Box<dyn DsparkBody>,
+    /// DSpark sidecar globals. Ownership is explicit because some target
+    /// adapters pass shallow aliases while others transfer the sidecar out of
+    /// the target bundle.
     weights: DsparkWeights,
+    owns_weights: bool,
     /// Per-stage final norm fed to [`run_heads`].
     stage_norm: GpuTensor,
+    owns_stage_norm: bool,
     /// lm-head weight fed to [`run_heads`].
     lm_head: GpuTensor,
-    conf_threshold: f32,
+    owns_lm_head: bool,
     block: usize,
     ctx_capacity: usize,
+    conf_threshold: f32,
     /// Whether the target supports distribution-preserving sampled verify
     /// ([`SpecTarget::verify_block_sampled_capture_gpu`]). Set per-arch at build
     /// time (llama/qwen3: true; deepseek4: false until its sampled head lands).
@@ -1668,16 +1717,41 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        if let Some(dev) = self.main_hidden_dev {
+        let DsparkDrafter {
+            body,
+            weights,
+            owns_weights,
+            stage_norm,
+            owns_stage_norm,
+            lm_head,
+            owns_lm_head,
+            main_hidden_dev,
+            verify_capture_dev,
+            verify_scratch,
+            ..
+        } = *self;
+        if let Some(dev) = main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
-        if let Some(dev) = self.verify_capture_dev {
+        if let Some(dev) = verify_capture_dev {
             let _ = gpu.free_tensor(dev);
         }
-        if let Some(scratch) = self.verify_scratch {
+        if let Some(scratch) = verify_scratch {
             scratch.free(gpu);
         }
-        self.body.free(gpu);
+        // The body owns any aliased stage norm/lm-head buffers. Free these
+        // explicit transfer owners only when the builder says they are
+        // independent allocations.
+        if owns_stage_norm {
+            let _ = gpu.free_tensor(stage_norm);
+        }
+        if owns_lm_head {
+            let _ = gpu.free_tensor(lm_head);
+        }
+        body.free(gpu);
+        if owns_weights {
+            weights.free_gpu(gpu);
+        }
     }
 
     fn k(&self) -> usize {
@@ -1722,6 +1796,9 @@ pub fn build_dspark_speculator(
     weights: DsparkWeights,
     stage_norm: GpuTensor,
     lm_head: GpuTensor,
+    owns_weights: bool,
+    owns_stage_norm: bool,
+    owns_lm_head: bool,
     block: usize,
     ctx_capacity: usize,
     conf_threshold: f32,
@@ -1751,8 +1828,11 @@ pub fn build_dspark_speculator(
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
         weights,
+        owns_weights,
         stage_norm,
+        owns_stage_norm,
         lm_head,
+        owns_lm_head,
         conf_threshold,
         supports_temp,
         temp: 0.0,

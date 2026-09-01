@@ -134,7 +134,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         },
     };
     const DOTS_OCR: ResetCoreCoverage = ResetCoreCoverage {
-        arch: "dots-ocr",
+        arch: "dots_ocr",
         recurrent_or_conv: true,
         s_ef_residual: true,
         kv_or_aux_caches: true,
@@ -143,7 +143,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         adaptive: false,
         host_position_and_conversation: true,
         eligibility: RetryResetEligibility::Ineligible {
-            reason: "dots-ocr not a serve-hardening retry candidate yet",
+            reason: "dots_ocr not a serve-hardening retry candidate yet",
         },
     };
     const MINIMAX: ResetCoreCoverage = ResetCoreCoverage {
@@ -244,6 +244,14 @@ pub fn is_retry_reset_eligible(arch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Return whether an [`ArchModel`](crate::arch_model::ArchModel) key has an
+/// explicit reset-coverage row. Reset dispatch uses this fail-closed check
+/// before invoking the model-owned reset hook, so a newly registered model
+/// cannot silently bypass the lifecycle inventory.
+pub fn has_reset_coverage(arch_key: &str) -> bool {
+    reset_coverage_for(arch_key).is_some()
+}
+
 /// Routes that accept `test_fault_after_prefill` under `serve-fault-inject`.
 ///
 /// Only qwen35 has a local GPU fixture + full snapshot/hash surface today.
@@ -307,7 +315,7 @@ mod tests {
         for arch in [
             "qwen2",
             "cohere2moe",
-            "dots-ocr",
+            "dots_ocr",
             "minimax",
             "lfm2moe",
             "gemma4",
@@ -424,7 +432,7 @@ mod tests {
                 0 | 1 => Some("llama"),
                 5 | 6 => Some("qwen35"),
                 7 => Some("qwen2"),
-                8 => Some("dots-ocr"),
+                8 => Some("dots_ocr"),
                 9 => Some("deepseek4"),
                 10 => Some("minimax"),
                 11 => Some("lfm2moe"),

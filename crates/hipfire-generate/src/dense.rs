@@ -57,15 +57,11 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    write_error_envelope(
-        stdout,
-        id,
-        message,
-        class,
-        retryable,
-        rolled_back,
-        active_attempt_id(),
-    );
+    crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+}
+fn emit_error_with_id(stdout: &mut impl std::io::Write, id: &str, message: impl std::fmt::Display) {
+    let message = message.to_string();
+    crate::ar::emit_active_route_error(stdout, Some(id), &message, "internal", false, false);
 }
 
 /// Speculative wire terminal after `Deepseek4Emit::finish` + length known.
@@ -157,27 +153,30 @@ pub fn ds4_ar_client_abort(
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
     speculator: &mut Option<Box<dyn Speculator>>,
     gpu: &mut rdna_compute::Gpu,
     state: &mut deepseek4::DeepseekV4State,
     completion_tokens: usize,
 ) {
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    state.reset();
-    state.zero_decode_caches(gpu);
-    free_checkpoints(prefill_checkpoints, gpu);
-    free_checkpoints(dflash_checkpoints, gpu);
-    let spec_reset = if let Some(s) = speculator.as_mut() {
-        s.reset(gpu).map_err(|e| format!("spec.reset: {e}"))
-    } else {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+        state.reset();
+        state.zero_decode_caches(gpu);
         Ok(())
     };
-    fail_closed_invalidate_graphs_and_replay(gpu);
-    let epilogue = fail_closed_epilogue_after_sync(spec_reset, fail_closed_device_sync(gpu));
-    if epilogue.rolled_back {
-        gpu.replay.begin_replay_observation_window();
-    }
+    let spec = speculator
+        .as_deref_mut()
+        .map(|spec| spec as &mut dyn Speculator);
+    let epilogue = production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        spec,
+    );
     emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 
@@ -357,12 +356,10 @@ pub fn generate_deepseek4_spec(
         return;
     }
 
-    // spec_k: env chain → 2 (the deepseek4-specific default; see generate_deepseek4).
-    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
-        .unwrap_or(2);
+    // Model metadata is the single load-message source; the legacy
+    // DeepSeek's compatibility override is folded into LoadedModel::mtp_k at
+    // load time; generation consumes that immutable per-model value.
+    let spec_k = m.mtp_k;
 
     // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length
     // guard, step-back exact). Pure decision; the GPU teardown is applied below.
@@ -480,11 +477,11 @@ pub fn generate_deepseek4_spec(
     // (prompt_frame.rs): NonThink renders `<｜Assistant｜></think>`, so the model
     // begins in visible-answer mode; High/Max render the `<think>` open-token,
     // so it begins inside the reasoning span.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::Deepseek4Spec,
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
     );
     let prompt_tokens_total = prompt_ids.len();
     let run = match crate::qwen::generate_spec(
@@ -671,7 +668,7 @@ pub fn generate_deepseek4_spec(
                     run.streamed_tokens.clone(),
                 );
             }
-            emit_staged_terminal_done(stdout, &pending_done);
+            crate::ar::emit_active_route_done(stdout, id, &pending_done);
             // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
             eprintln!(
                 "[req {id}] drafter={drafter} tau={tau:.2} tok/s={tok_s:.1} decode ({} tok, {} windows, accept={accept_pct:.0}%)",
@@ -914,29 +911,34 @@ pub fn generate_deepseek4(
     }
 
     if lcp == 0 {
-        // Cache miss — start a fresh conversation in V4F's state.
-        state.reset();
-        // reset() only rewinds n_tokens; the position-indexed decode caches
-        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
-        // turn's residue, which bleeds into this fresh conversation's forward
-        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
-        // unreliable" symptom). Zero them so a fresh conversation reproduces a
-        // freshly-launched daemon's clean, deterministic state.
-        state.zero_decode_caches(gpu);
-        m.conversation_tokens.clear();
-        // Tear down the captured V4F decode hipGraph alongside the
-        // state, same rationale as the daemon's `"reset"` handler:
-        // a fresh-context turn invalidates every device-buffer pointer
-        // and host scalar the captured graph baked in at capture time
-        // (state.attn_state_buf slot/n_valid/k_active values derived
-        // from the prior n_tokens, compressor ring/commit slots, etc.).
-        // Without this, the warmup-then-replay state machine fires
-        // warmup on the first decode (because `state.reset()` clears
-        // `ar_forward_warmed_up`), then immediately replays the STALE
-        // graph on the second decode and crashes with the same
-        // "download logits (graph path): illegal memory access" we
-        // saw on multi-turn pi sessions before the explicit-reset fix.
-        gpu.invalidate_graph_state();
+        // Cache miss — use the shared live rollback owner so the DSA state,
+        // host mirror, checkpoint rings, graph, and synchronization move
+        // together. Partial LCP reuse remains the only warm path.
+        let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+            state.reset();
+            state.zero_decode_caches(gpu);
+            Ok(())
+        };
+        let ep = reset_live_bundle(
+            &mut reset_target,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "deepseek4 prompt-cache miss reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
     }
     let start_pos: u32 = lcp as u32;
 
@@ -1029,6 +1031,7 @@ pub fn generate_deepseek4(
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
             &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
             &mut m.speculator,
             gpu,
             state,
@@ -1184,13 +1187,12 @@ pub fn generate_deepseek4(
         // stream with "stream must begin with gen_start; got token before
         // contract latch". Placed after prefill and grammar setup but before
         // the first `sample_token`, so no token can outrun it.
-        emit_gen_start(
+        crate::ar::emit_generation_start(
+            crate::ar::GenerationRoute::Deepseek4Ar,
             stdout,
             id,
             !matches!(think_mode, ThinkMode::NonThink),
-            ds4_gen_start_contract_version(),
         );
-
         // Apply mask to the prefill-returned logits before the first
         // sample (matcher is in `Out` here so this is a no-op, but the
         // codepath stays uniform).
@@ -1240,6 +1242,7 @@ pub fn generate_deepseek4(
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
                     &mut m.speculator,
                     gpu,
                     state,
@@ -1310,6 +1313,7 @@ pub fn generate_deepseek4(
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
                 &mut m.speculator,
                 gpu,
                 state,
@@ -1382,6 +1386,7 @@ pub fn generate_deepseek4(
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
                 &mut m.speculator,
                 gpu,
                 state,
@@ -1444,7 +1449,7 @@ pub fn generate_deepseek4(
                 cached_seq,
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done(stdout, id, &pending_done);
         // Per-request debug summary: this request ran autoregressive (no drafter),
         // e.g. spec disabled or a temp path the loaded drafter can't verify. Making
         // the AR fall-through visible is the point — a "stall" is often just AR.
@@ -1462,27 +1467,47 @@ pub fn ds4_heterogeneous_client_abort(
 ) {
     *seq_pos = 0;
     conversation_tokens.clear();
-    let reset = model.reset_for_request_attested();
-    match reset {
-        Ok(()) => {
-            eprintln!(
-                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
-            );
-            let (aborted, done) =
-                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
-            let _ = writeln!(stdout, "{aborted}");
-            let _ = writeln!(stdout, "{done}");
-            let _ = stdout.flush();
-        }
-        Err(error) => emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("client cancelled; heterogeneous rollback failed: {error}"),
-            "runtime",
-            false,
-            false,
-        ),
+    let epilogue = match model.reset_for_request_attested() {
+        Ok(()) => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Err(error) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(format!("heterogeneous rollback failed: {error}")),
+        },
+    };
+    if epilogue.rolled_back {
+        eprintln!(
+            "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
+        );
     }
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
+}
+
+/// Reset a live family bundle through the shared lifecycle owner.  The
+/// architecture bundle is already borrowed by the caller, so host fields are
+/// supplied as disjoint references and the bundle reset is a thin adapter.
+fn reset_live_bundle(
+    bundle_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    production_fail_closed_rollback_live_with_extras(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        bundle_reset,
+        None,
+        ResetExtras::none(),
+    )
 }
 #[allow(clippy::too_many_arguments)]
 pub fn generate_deepseek4_heterogeneous(
@@ -1604,11 +1629,11 @@ pub fn generate_deepseek4_heterogeneous(
         (logits, prefill_t0.elapsed().as_millis())
     };
 
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::Deepseek4Ar,
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
     );
     let top_k = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
         .ok()
@@ -1759,7 +1784,7 @@ pub fn generate_deepseek4_heterogeneous(
     m.conversation_tokens.clear();
     m.conversation_tokens.extend_from_slice(&prompt_ids);
     m.conversation_tokens.extend_from_slice(&emitted_tokens);
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done(stdout, id, &pending_done);
     eprintln!(
         "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
     );
@@ -2030,8 +2055,12 @@ pub fn generate_gemma4(
     // StreamContractGate fail-closes on any event preceding `gen_start`, so
     // without this the first `token` is rejected, the client aborts, and the
     // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Unknown),
+        stdout,
+        id,
+        false,
+    );
     let Some(bundle) = m
         .state
         .as_mut()
@@ -2143,9 +2172,30 @@ pub fn generate_gemma4(
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
-        bundle.state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let mut reset_target = |_: &mut rdna_compute::Gpu| {
+            bundle.state.reset();
+            Ok(())
+        };
+        let ep = reset_live_bundle(
+            &mut reset_target,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Gemma4 context reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
     }
     // Hard refusal: even from a cold cache the prompt alone must fit (KV
     // writes at pos >= max_seq would be out of bounds).
@@ -2412,24 +2462,45 @@ pub fn generate_gemma4(
         } else {
             0.0
         };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
-            id,
-            generated_count,
-            tok_s,
-            prompt_ids.len(),
-            prefill_ms,
-            prefill_tok_s,
-            tok_s,
-            ttft_ms,
-            total_ms,
-            rounds,
-            tau,
-            draft_len,
-            active_attempt_id(),
-        );
-        let _ = stdout.flush();
+        let pending_done = serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": (tok_s * 100.0).round() / 100.0,
+            "prefill_tokens": prompt_ids.len(),
+            "prefill_ms": prefill_ms,
+            "prefill_tok_s": (prefill_tok_s * 100.0).round() / 100.0,
+            "decode_tok_s": (tok_s * 100.0).round() / 100.0,
+            "ttft_ms": (ttft_ms * 1000.0).round() / 1000.0,
+            "total_ms": total_ms,
+            "spec": "gemma4_eagle",
+            "rounds": rounds,
+            "tau": (tau * 1000.0).round() / 1000.0,
+            "draft_len": draft_len,
+            "attempt_id": active_attempt_id(),
+        });
+        match await_client_terminal_commit(stdout, id, &pending_done) {
+            ClientTerminalDecision::Commit => {
+                crate::ar::emit_active_route_done(stdout, id, &pending_done);
+            }
+            ClientTerminalDecision::Abort => {
+                let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                    bundle.state.reset();
+                    Ok(())
+                };
+                let epilogue = production_fail_closed_rollback_live_with_target(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    &mut reset_target,
+                    None,
+                );
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &epilogue);
+            }
+        }
         return;
     }
 
@@ -2540,21 +2611,41 @@ pub fn generate_gemma4(
     };
     let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
     let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
-        id,
-        generated_count,
-        tok_s,
-        prompt_ids.len(),
-        prefill_ms,
-        prefill_tok_s,
-        tok_s,
-        ttft_ms,
-        total_ms,
-        active_attempt_id(),
-    );
-    let _ = stdout.flush();
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": prefill_ms,
+        "prefill_tok_s": (prefill_tok_s * 100.0).round() / 100.0,
+        "decode_tok_s": (tok_s * 100.0).round() / 100.0,
+        "ttft_ms": (ttft_ms * 1000.0).round() / 1000.0,
+        "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                bundle.state.reset();
+                Ok(())
+            };
+            let epilogue = production_fail_closed_rollback_live_with_target(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                None,
+            );
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &epilogue);
+        }
+    }
 }
 /// Muse Glimmer dense text (arch_id=14) eager AR path.
 ///
@@ -3466,6 +3557,7 @@ pub fn reconcile_glimmer_mirror(
     bundle: &mut hipfire_loader::MuseGlimmerBundle,
     conversation_tokens: &mut Vec<u32>,
     seq_pos: &mut usize,
+    gpu: &mut rdna_compute::Gpu,
 ) -> GlimmerMirrorReconcile {
     let mirror_len = conversation_tokens.len();
     let n_tokens = bundle.state.n_tokens;
@@ -3492,8 +3584,15 @@ pub fn reconcile_glimmer_mirror(
                         n_tokens,
                     }
                 }
-                Err(_) => {
-                    bundle.reset_session_state();
+                Err(error) => {
+                    // LCP rewind is the only partial-reuse path. If it cannot
+                    // land, use the ArchModel lifecycle hook rather than a
+                    // second direct cold-reset body.
+                    eprintln!(
+                        "[glimmer-cache] rewind_session_to({new_len}) failed; resetting via ArchModel: {error}"
+                    );
+                    let _ =
+                        hipfire_runtime::arch_model::ArchModel::reset_session_state(bundle, gpu);
                     conversation_tokens.clear();
                     *seq_pos = 0;
                     GlimmerMirrorReconcile::Reset
@@ -3504,6 +3603,33 @@ pub fn reconcile_glimmer_mirror(
     debug_assert_eq!(conversation_tokens.len(), bundle.state.n_tokens);
     debug_assert_eq!(*seq_pos, bundle.state.n_tokens);
     result
+}
+
+/// Reset a live Glimmer turn through the shared rollback owner. The
+/// architecture bundle is already borrowed by the generation loop, so this
+/// thin adapter supplies its ArchModel reset while the host fields remain
+/// disjoint references.
+fn reset_glimmer_live(
+    bundle: &mut hipfire_loader::MuseGlimmerBundle,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+        hipfire_runtime::arch_model::ArchModel::reset_session_state(bundle, gpu)
+    };
+    reset_live_bundle(
+        &mut reset_target,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+    )
 }
 
 pub fn normalize_glimmer_tool_arguments(
@@ -3702,7 +3828,6 @@ pub fn parse_glimmer_atem(
     }
     Ok(calls)
 }
-
 /// Run the engine's two-phase terminal handshake for arch 14 and release the turn.
 ///
 /// The wire contract is `commit_ready` -> client `commit` -> a byte-identical `done`
@@ -3718,31 +3843,17 @@ pub fn parse_glimmer_atem(
 /// (assistant-turn cache store). On abort the caller MUST fail-closed reset, because the mirror
 /// and KV are mid-turn and no later turn may reuse them.
 pub fn glimmer_commit_terminal(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut impl std::io::Write,
     id: &str,
     pending_done: &serde_json::Value,
-    generated: usize,
+    _generated: usize,
 ) -> bool {
     match await_client_terminal_commit(stdout, id, pending_done) {
         ClientTerminalDecision::Commit => {
-            emit_staged_terminal_done(stdout, pending_done);
+            crate::ar::emit_active_route_done(stdout, id, pending_done);
             true
         }
-        ClientTerminalDecision::Abort => {
-            let attempt_id = active_attempt_id();
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id)
-            );
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted_done(id, generated, attempt_id)
-            );
-            let _ = stdout.flush();
-            false
-        }
+        ClientTerminalDecision::Abort => false,
     }
 }
 
@@ -4201,11 +4312,17 @@ pub fn generate_muse_glimmer(
     //
     // `gen_start` then `error` with no tokens in between is a legal sequence; latching early
     // costs nothing and makes every arch-14 failure routable.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::GlimmerAr),
+        stdout,
+        id,
+        false,
+    );
 
     if m.tokenizer.is_none() {
-        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        let message = "tokenizer not loaded";
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
     // Contract: MuseGlimmerBundle(bundle) — see cross-agent contract.
@@ -4214,11 +4331,10 @@ pub fn generate_muse_glimmer(
     let Some(bundle) = m.state.as_mut().and_then(|s| {
         (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::MuseGlimmerBundle>()
     }) else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "muse_glimmer bundle missing on arch_id=14 generate (expected MuseGlimmerBundle)",
-        );
+        let message =
+            "muse_glimmer bundle missing on arch_id=14 generate (expected MuseGlimmerBundle)";
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     };
 
@@ -4286,7 +4402,24 @@ pub fn generate_muse_glimmer(
                 let prepared = match prepare_glimmer_onyx_history(raw_slice) {
                     Ok(p) => p,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("glimmer history prep failed: {e}"));
+                        let message = format!("glimmer history prep failed: {e}");
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            &message,
+                            "validation",
+                            false,
+                            &ep,
+                        );
                         return;
                     }
                 };
@@ -4383,7 +4516,17 @@ pub fn generate_muse_glimmer(
     };
 
     if prompt_ids.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        let message = "empty prompt after tokenize";
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
 
@@ -4441,23 +4584,45 @@ pub fn generate_muse_glimmer(
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
-        bundle.reset_session_state();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        m.asst_turn_cache.clear();
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Glimmer context reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
     }
     // Hard refusal: even from a cold cache the prompt alone must fit (KV
     // writes at pos >= max_seq would be out of bounds).
     let cache_cap = bundle.state.max_seq;
     if prompt_ids.len() >= cache_cap {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "muse_glimmer prompt is {} tokens but max_seq is {cache_cap}",
-                prompt_ids.len()
-            ),
+        let message = format!(
+            "muse_glimmer prompt is {} tokens but max_seq is {cache_cap}",
+            prompt_ids.len()
         );
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
 
@@ -4478,10 +4643,15 @@ pub fn generate_muse_glimmer(
             // the CLI keeps the session warm. Cold-reset here or the opt-out
             // path becomes the very double-write the cache was added to avoid.
             if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
-                bundle.reset_session_state();
-                m.conversation_tokens.clear();
-                m.seq_pos = 0;
-                m.asst_turn_cache.clear();
+                let _ = reset_glimmer_live(
+                    bundle,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
             }
             (prompt_ids.clone(), 0u32)
         } else {
@@ -4525,10 +4695,26 @@ pub fn generate_muse_glimmer(
                             "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
                         );
                     }
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
+                    let ep = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    if !ep.rolled_back {
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            &format!("Glimmer prompt-cache rewind reset failed: {e}"),
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        return;
+                    }
                     (prompt_ids.clone(), 0u32)
                 } else {
                     m.conversation_tokens.truncate(lcp);
@@ -4540,10 +4726,26 @@ pub fn generate_muse_glimmer(
                 // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
                 // (identical prompt re-sent), plus candidate rejected by capture.
                 if bundle.state.n_tokens > 0 || prior_len > 0 {
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
+                    let ep = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    if !ep.rolled_back {
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            "Glimmer prompt-cache miss reset failed",
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        return;
+                    }
                 }
                 (prompt_ids.clone(), 0u32)
             }
@@ -4586,25 +4788,34 @@ pub fn generate_muse_glimmer(
         match prefill_result {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
+                let message = format!("muse_glimmer prefill failed: {e:?}");
                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                if device_capture {
-                    // Device prefill mutates target KV + capture transaction; length-only
-                    // reconcile is not enough — leave zero reusable session state.
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
-                } else {
-                    let _ = reconcile_glimmer_mirror(
-                        bundle,
-                        &mut m.conversation_tokens,
-                        &mut m.seq_pos,
-                    );
-                }
+                let ep = reset_glimmer_live(
+                    bundle,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
+    }
+    if check_abort(id) {
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
@@ -4778,6 +4989,20 @@ pub fn generate_muse_glimmer(
         let mut windows: usize = 0;
         if !skip_spec_loop {
             loop {
+                if check_abort(id) {
+                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                    let ep = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                    return;
+                }
                 let t_window = std::time::Instant::now();
                 let do_window_timing =
                     std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
@@ -4828,16 +5053,17 @@ pub fn generate_muse_glimmer(
                                 .copy_from_slice(&v[..hidden]);
                         }
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("glimmer drafter noise embed row {i}: {e}"),
-                            );
-                            let _ = reconcile_glimmer_mirror(
+                            let message = format!("glimmer drafter noise embed row {i}: {e}");
+                            let ep = reset_glimmer_live(
                                 bundle,
-                                &mut m.conversation_tokens,
                                 &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -4885,29 +5111,36 @@ pub fn generate_muse_glimmer(
                 let history_end = match history_end {
                     Ok(h) => h,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, e.clone());
+                        let message = e.clone();
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        // Capture/log integrity errors (incl. poisoned transaction) leave no reusable state.
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                 };
                 if history_end != cur_pos as usize {
-                    emit_error_with_id(
-                    stdout,
-                    id,
-                    format!(
+                    let message = format!(
                         "glimmer-spec: target history end {history_end} != cur_pos {cur_pos} (capture hole)"
-                    ),
-                );
+                    );
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
+                    let ep = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
                 let ctx_len = (cur_pos as usize).min(ctx_cap);
@@ -4925,16 +5158,18 @@ pub fn generate_muse_glimmer(
                     let log = match bundle.state.target_hidden_log() {
                         Some(l) => l,
                         None => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                "glimmer-spec: device hidden log missing at draft",
-                            );
+                            let message = "glimmer-spec: device hidden log missing at draft";
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let ep = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     };
@@ -4981,21 +5216,18 @@ pub fn generate_muse_glimmer(
                         .as_deref()
                         != Some("1");
                     if fatal {
-                        emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
-                        let es = format!("{e}");
-                        if es.contains("poisoned") || es.contains("session requires reset") {
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                        } else {
-                            let _ = reconcile_glimmer_mirror(
-                                bundle,
-                                &mut m.conversation_tokens,
-                                &mut m.seq_pos,
-                            );
-                        }
+                        let message = format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}");
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                     eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
@@ -5056,17 +5288,18 @@ pub fn generate_muse_glimmer(
                             }
                         }
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer decode failed: {e:?}"),
-                            );
+                            let message = format!("muse_glimmer decode failed: {e:?}");
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            // Capture-aware: fail closed — no length-only reconcile after target decode failure.
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let ep = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5162,12 +5395,17 @@ pub fn generate_muse_glimmer(
                     Ok(p) => p,
                     Err(e) => {
                         gpu.free_tensor(hidden_for_draft).ok();
-                        emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
-                        let _ = reconcile_glimmer_mirror(
+                        let message = format!("glimmer drafter lm_head: {e}");
+                        let ep = reset_glimmer_live(
                             bundle,
-                            &mut m.conversation_tokens,
                             &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
                         );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                 };
@@ -5203,16 +5441,25 @@ pub fn generate_muse_glimmer(
                         ) {
                             Ok(p) => p,
                             Err(e) => {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!("muse_glimmer verify failed: {e:?}"),
-                                );
+                                let message = format!("muse_glimmer verify failed: {e:?}");
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                bundle.reset_session_state();
-                                m.conversation_tokens.clear();
-                                m.asst_turn_cache.clear();
-                                m.seq_pos = 0;
+                                let ep = reset_glimmer_live(
+                                    bundle,
+                                    &mut m.seq_pos,
+                                    &mut m.conversation_tokens,
+                                    &mut m.prefill_checkpoints,
+                                    &mut m.dflash_checkpoints,
+                                    &mut m.asst_turn_cache,
+                                    gpu,
+                                );
+                                emit_fail_closed_error(
+                                    stdout,
+                                    Some(id),
+                                    &message,
+                                    "gpu",
+                                    true,
+                                    &ep,
+                                );
                                 return;
                             }
                         }
@@ -5230,15 +5477,23 @@ pub fn generate_muse_glimmer(
                         ) {
                             Ok(p) => p,
                             Err(e) => {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!("muse_glimmer verify failed: {e:?}"),
-                                );
-                                let _ = reconcile_glimmer_mirror(
+                                let message = format!("muse_glimmer verify failed: {e:?}");
+                                let ep = reset_glimmer_live(
                                     bundle,
-                                    &mut m.conversation_tokens,
                                     &mut m.seq_pos,
+                                    &mut m.conversation_tokens,
+                                    &mut m.prefill_checkpoints,
+                                    &mut m.dflash_checkpoints,
+                                    &mut m.asst_turn_cache,
+                                    gpu,
+                                );
+                                emit_fail_closed_error(
+                                    stdout,
+                                    Some(id),
+                                    &message,
+                                    "gpu",
+                                    true,
+                                    &ep,
                                 );
                                 return;
                             }
@@ -5256,16 +5511,18 @@ pub fn generate_muse_glimmer(
                     ) {
                         Ok(p) => p,
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer verify failed: {e:?}"),
-                            );
+                            let message = format!("muse_glimmer verify failed: {e:?}");
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let ep = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5283,16 +5540,17 @@ pub fn generate_muse_glimmer(
                     ) {
                         Ok(p) => p,
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer verify failed: {e:?}"),
-                            );
-                            let _ = reconcile_glimmer_mirror(
+                            let message = format!("muse_glimmer verify failed: {e:?}");
+                            let ep = reset_glimmer_live(
                                 bundle,
-                                &mut m.conversation_tokens,
                                 &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5452,33 +5710,38 @@ pub fn generate_muse_glimmer(
                         gpu,
                         keep_rows,
                     ) {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("muse_glimmer commit_device_verify_capture failed: {e}"),
-                        );
+                        let message =
+                            format!("muse_glimmer commit_device_verify_capture failed: {e}");
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                 }
                 let commit_end = window_start_cur_pos + keep_rows;
                 if let Err(e) = bundle.rewind_session_to(commit_end) {
-                    emit_error_with_id(
-                        stdout,
-                        id,
-                        format!(
-                            "muse_glimmer rewind_session_to({commit_end}) after verify failed: {e}"
-                        ),
+                    let message = format!(
+                        "muse_glimmer rewind_session_to({commit_end}) after verify failed: {e}"
                     );
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
+                    let ep = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
                 cur_pos = commit_end as u32;
@@ -5495,16 +5758,19 @@ pub fn generate_muse_glimmer(
                 let mut probe_kind = GlimmerProfitProbeKind::None;
                 if full_window && profit_guard.enabled() && !profit_guard.is_retired() {
                     if let Err(e) = gpu.hip.device_synchronize() {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("muse_glimmer profit guard synchronization failed: {e:?}"),
-                        );
+                        let message =
+                            format!("muse_glimmer profit guard synchronization failed: {e:?}");
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                     // t_after_verify covers draft+verify from t_window start.
@@ -5528,18 +5794,27 @@ pub fn generate_muse_glimmer(
                         Ok((pred, new_rng)) => {
                             gpu_rng = new_rng;
                             if let Err(e) = gpu.hip.device_synchronize() {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!(
-                                        "muse_glimmer profit probe synchronization failed: {e:?}"
-                                    ),
+                                let message = format!(
+                                    "muse_glimmer profit probe synchronization failed: {e:?}"
                                 );
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                bundle.reset_session_state();
-                                m.conversation_tokens.clear();
-                                m.asst_turn_cache.clear();
-                                m.seq_pos = 0;
+                                let ep = reset_glimmer_live(
+                                    bundle,
+                                    &mut m.seq_pos,
+                                    &mut m.conversation_tokens,
+                                    &mut m.prefill_checkpoints,
+                                    &mut m.dflash_checkpoints,
+                                    &mut m.asst_turn_cache,
+                                    gpu,
+                                );
+                                emit_fail_closed_error(
+                                    stdout,
+                                    Some(id),
+                                    &message,
+                                    "gpu",
+                                    true,
+                                    &ep,
+                                );
                                 return;
                             }
                             let probe_ns = probe_t0.elapsed().as_nanos();
@@ -5607,16 +5882,18 @@ pub fn generate_muse_glimmer(
                             }
                         }
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer profit probe decode failed: {e:?}"),
-                            );
+                            let message = format!("muse_glimmer profit probe decode failed: {e:?}");
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let ep = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5672,6 +5949,20 @@ pub fn generate_muse_glimmer(
         };
 
         loop {
+            if check_abort(id) {
+                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                let ep = reset_glimmer_live(
+                    bundle,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
             if generated_count >= max_tokens {
                 break;
             }
@@ -5748,13 +6039,18 @@ pub fn generate_muse_glimmer(
                     next_tok = sampled;
                 }
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
+                    let message = format!("muse_glimmer decode failed: {e:?}");
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    let _ = reconcile_glimmer_mirror(
+                    let ep = reset_glimmer_live(
                         bundle,
-                        &mut m.conversation_tokens,
                         &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
                     );
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
             }
@@ -5812,7 +6108,7 @@ pub fn generate_muse_glimmer(
             }
         }
     }
-    let _ = reconcile_glimmer_mirror(bundle, &mut m.conversation_tokens, &mut m.seq_pos);
+    let _ = reconcile_glimmer_mirror(bundle, &mut m.conversation_tokens, &mut m.seq_pos, gpu);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -5902,11 +6198,17 @@ pub fn generate_muse_glimmer(
             );
         }
     } else {
-        // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
-        bundle.reset_session_state();
-        m.conversation_tokens.clear();
-        m.asst_turn_cache.clear();
-        m.seq_pos = 0;
+        // Abort: reset first, then emit cancellation after attestation (fail-closed if reset fails).
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
     }
 }
 pub fn generate_lfm2moe(
@@ -6100,8 +6402,12 @@ pub fn generate_lfm2moe(
     // This was the root cause of the 3-minute hang on native `hipfire serve`
     // for LFM2.5-230M/350M (direct `infer_lfm2moe` bypasses the gate and was
     // coherent). Mirrors the DS4 fix `e99583afa` and Qwen's `emit_gen_start`.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::LfmAr),
+        stdout,
+        id,
+        false,
+    );
 
     // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
     // prior design only reset on capacity overflow, so every request APPENDED to
@@ -6116,9 +6422,18 @@ pub fn generate_lfm2moe(
     // prompt each turn; it now does so from position 0 with no stale KV. A
     // continuing conversation re-prefills its whole history from the prompt, so
     // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    let ep = production_fail_closed_rollback(m, gpu, None, None);
+    if !ep.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "LFM2 session reset failed before prefill",
+            "gpu",
+            true,
+            &ep,
+        );
+        return;
+    }
 
     let t0 = Instant::now();
 
@@ -6264,7 +6579,9 @@ pub fn generate_lfm2moe(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
@@ -6453,9 +6770,18 @@ pub fn generate_minimax(
             (state.n_tokens, state.max_seq)
         };
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
-        m.minimax_mut().unwrap().state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "MiniMax context reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
 
         // O2b-2 capacity guard (minimax single): the reset above recovers a
         // grown multi-turn conversation, but a SINGLE prompt larger than the
@@ -6528,9 +6854,18 @@ pub fn generate_minimax(
                 prompt_ids[lcp..].to_vec()
             } else {
                 if prior_len > 0 {
-                    m.minimax_mut().unwrap().state.reset();
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
+                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    if !ep.rolled_back {
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            "MiniMax prompt-cache reset failed",
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        return;
+                    }
                 }
                 prompt_ids.clone()
             }
@@ -6543,6 +6878,8 @@ pub fn generate_minimax(
     // push to `m.conversation_tokens` in the same scope. The LAST forward's
     // logits are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
     {
         let b = m.minimax_mut().unwrap();
         let cfg = &b.config;
@@ -6566,15 +6903,15 @@ pub fn generate_minimax(
             // MiniMax-M2 (256 experts/top-8). Shorter prompts fall to the
             // indexed path inside forward_batch (below the grouped gate).
             for chunk in prefill_ids.chunks(512) {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("minimax batch prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_err = Some(format!("minimax batch prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 pos += chunk.len();
@@ -6582,16 +6919,30 @@ pub fn generate_minimax(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                        return;
+                        prefill_err = Some(format!("minimax prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
+    }
+    if let Some(message) = prefill_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
@@ -6630,6 +6981,11 @@ pub fn generate_minimax(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -6656,6 +7012,12 @@ pub fn generate_minimax(
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         // Advance one step on the freshly sampled token.
         let step = {
             let b = m.minimax_mut().unwrap();
@@ -6671,10 +7033,19 @@ pub fn generate_minimax(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
+                let message = format!("minimax decode failed: {e:?}");
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
+    }
+
+    // Abort latched between loop exit and commit must not proceed to handshake.
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
     }
 
     m.seq_pos = m.minimax().unwrap().state.n_tokens;
@@ -6696,8 +7067,13 @@ pub fn generate_minimax(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
@@ -6897,18 +7273,30 @@ pub fn generate_cohere2moe(
             prompt_ids.len(),
             max_seq,
         );
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
-                prompt_ids.len(),
-                max_seq
-            ),
-        );
-        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Cohere2-MoE prompt reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+        } else {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
+                    prompt_ids.len(),
+                    max_seq
+                ),
+                "context_length",
+                false,
+                true,
+            );
+        }
         return;
     }
     // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
@@ -6936,7 +7324,11 @@ pub fn generate_cohere2moe(
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                prior_len,
+                prompt_ids.len(),
+                lcp,
+                cache_hit,
+                cache_hit && partial,
                 m.cohere2moe().unwrap().state.n_tokens,
             );
         }
@@ -6952,9 +7344,18 @@ pub fn generate_cohere2moe(
             prompt_ids[lcp..].to_vec()
         } else {
             if prior_len > 0 {
-                let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                if !ep.rolled_back {
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        "Cohere2-MoE prompt-cache reset failed",
+                        "gpu",
+                        true,
+                        &ep,
+                    );
+                    return;
+                }
             }
             prompt_ids.clone()
         }
@@ -6970,6 +7371,8 @@ pub fn generate_cohere2moe(
     // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
     // The LAST forward's logits predict the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
     {
         let b = m.cohere2moe_mut().unwrap();
         let cfg = &b.config;
@@ -6978,6 +7381,10 @@ pub fn generate_cohere2moe(
         if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
             let mut i = 0;
             while i < prefill_ids.len() {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 let end = (i + 256).min(prefill_ids.len());
                 let start_pos = state.n_tokens;
                 match cohere2moe::forward::forward_batch(
@@ -6990,12 +7397,8 @@ pub fn generate_cohere2moe(
                 ) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("cohere2moe batched prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_err = Some(format!("cohere2moe batched prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 i = end;
@@ -7003,16 +7406,30 @@ pub fn generate_cohere2moe(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
-                        return;
+                        prefill_err = Some(format!("cohere2moe prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
+    }
+    if let Some(message) = prefill_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
@@ -7155,6 +7572,11 @@ pub fn generate_cohere2moe(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -7330,6 +7752,12 @@ pub fn generate_cohere2moe(
             }
         }
 
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         // Advance one step on the freshly sampled token (plain eager decode —
         // no hipGraph variant on this arch yet).
         let step = {
@@ -7343,10 +7771,18 @@ pub fn generate_cohere2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
+                let message = format!("cohere2moe decode failed: {e:?}");
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
+    }
+
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
     }
 
     m.seq_pos = m.cohere2moe().unwrap().state.n_tokens;
@@ -7427,8 +7863,13 @@ pub fn generate_cohere2moe(
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_tool_calls);
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
@@ -7461,65 +7902,48 @@ pub fn generate_qwen2(
     _repeat_penalty: f32,
     _repeat_window: usize,
 ) {
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "tokenizer not loaded",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let state_ref = match m.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
-    }) {
-        Some(b) => b,
-        _ => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "qwen2 state missing on arch_id=7 generate",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let cfg = &state_ref.config;
-    let weights = &state_ref.weights;
-    let state = &mut state_ref.state;
+    crate::ar::emit_generation_start(crate::ar::GenerationRoute::Qwen2Ar, stdout, id, false);
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     // Apply the model's chat template (if present) so instruct-tuned qwen2
     // models receive properly-framed ChatML input. Falls back to raw encoding
     // when no template is loaded (e.g. base/pre-train weights).
-    let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: _system_prompt,
-            user: prompt,
-            enable_thinking: true,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort: None,
-        };
-        match frame.render() {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode");
-                tokenizer.encode(prompt)
+    let prompt_ids = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        if let Some(template) = m.chat_template.as_ref() {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: _system_prompt,
+                user: prompt,
+                enable_thinking: true,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            match frame.render() {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode"
+                    );
+                    tokenizer.encode(prompt)
+                }
             }
+        } else {
+            tokenizer.encode(prompt)
         }
-    } else {
-        tokenizer.encode(prompt)
     };
     if prompt_ids.is_empty() {
         emit_active_attempt_error(
@@ -7536,19 +7960,36 @@ pub fn generate_qwen2(
 
     // Capacity guard. No eviction on arch_id=7 yet — reset state when
     // the requested run would overflow the KV budget.
-    if state
-        .next_pos
+    let (next_pos, state_max_seq) =
+        match m.state.as_ref().and_then(|s| {
+            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => (b.state.next_pos, b.state.max_seq),
+            None => unreachable!("qwen2 state disappeared during capacity validation"),
+        };
+    if next_pos
         .saturating_add(prompt_ids.len())
         .saturating_add(max_tokens)
-        > state.max_seq
+        > state_max_seq
     {
         eprintln!(
-            "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
-            state.next_pos, state.max_seq,
+            "[daemon] arch_id=7 context full ({next_pos}/{state_max_seq}) — resetting Qwen2 state",
         );
-        state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let reset = m.reset_context(gpu);
+        if let Err(error) = reset {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "qwen2 context reset failed",
+                "gpu",
+                true,
+                &RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some(error),
+                },
+            );
+            return;
+        }
 
         // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
         // recovers a grown multi-turn conversation, but a SINGLE prompt larger
@@ -7557,15 +7998,14 @@ pub fn generate_qwen2(
         // the reset, if prompt + generation still overflows, emit a clean error.
         // saturating_add: an adversarially huge max_tokens must not wrap usize
         // and slip under the cap.
-        if prompt_ids.len().saturating_add(max_tokens) > state.max_seq {
-            let cap = state.max_seq;
+        if prompt_ids.len().saturating_add(max_tokens) > state_max_seq {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
-                &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
+                &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, state_max_seq),
                 "context_length",
                 false,
-                false
+                true,
             );
             let _ = stdout.flush();
             return;
@@ -7574,16 +8014,39 @@ pub fn generate_qwen2(
 
     let t0 = Instant::now();
 
-    // Prefill: forward_step per prompt token. The last call leaves
-    // logits in state.logits — these are the predictions for the
-    // first generated token.
-    for &tok in &prompt_ids {
-        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
+    {
+        let state_ref = match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => b,
+            _ => unreachable!("qwen2 state disappeared after capacity validation"),
+        };
+        let cfg = &state_ref.config;
+        let weights = &state_ref.weights;
+        let state = &mut state_ref.state;
+        for &tok in &prompt_ids {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
+            if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
+                prefill_err = Some(format!("qwen2 prefill failed: {e:?}"));
+                break;
+            }
+            m.conversation_tokens.push(tok);
         }
-        m.conversation_tokens.push(tok);
+    }
+    if let Some(message) = prefill_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     let prefill_ms = t0.elapsed().as_millis();
 
@@ -7592,54 +8055,101 @@ pub fn generate_qwen2(
     // final logits; each subsequent token requires another
     // forward_step.
     let mut generated_count: usize = 0;
-    let eos_set: &[u32] = &cfg.eos_token_ids;
+    let mut decode_err: Option<String> = None;
+    let mut decode_aborted = false;
     let decode_t0 = Instant::now();
-    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
-        Ok(t) => t,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
-        }
-    };
-
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        if eos_set.contains(&next_tok) {
-            break;
-        }
-        // Emit text fragment for this token. Tokenizer.decode handles
-        // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. Build through
-        // serde_json so `id` (user-supplied) and `frag` (arbitrary
-        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
-        // the JSONL line.
-        let frag = tokenizer.decode(&[next_tok]);
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+    let mut next_tok: u32 = 0;
+    let mut decode_eos: Vec<u32> = Vec::new();
+    let mut decode_vocab: usize = 0;
+    {
+        let state_ref = match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => b,
+            _ => unreachable!("qwen2 state disappeared before decode"),
+        };
+        let cfg = &state_ref.config;
+        let weights = &state_ref.weights;
+        decode_eos = cfg.eos_token_ids.clone();
+        decode_vocab = cfg.vocab_size;
+        let state = &mut state_ref.state;
+        match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
-                let _ = stdout.flush();
-                return;
+                decode_err = Some(format!("argmax failed: {e:?}"));
             }
         }
-    }
+        if decode_err.is_none() {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            loop {
+                if check_abort(id) {
+                    decode_aborted = true;
+                    break;
+                }
+                if generated_count >= max_tokens {
+                    break;
+                }
+                if decode_eos.contains(&next_tok) {
+                    break;
+                }
+                // Emit text fragment for this token. Tokenizer.decode handles
+                // BPE byte-fragment reassembly; for special tokens that decode
+                // to an empty string we still advance the loop. Build through
+                // serde_json so `id` (user-supplied) and `frag` (arbitrary
+                // UTF-8 with possible `"` / `\` / control chars) can't corrupt
+                // the JSONL line.
+                let frag = tokenizer.decode(&[next_tok]);
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                    "attempt_id": active_attempt_id(),
+                });
+                let _ = writeln!(stdout, "{}", envelope);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(next_tok);
+                generated_count += 1;
 
+                if check_abort(id) {
+                    decode_aborted = true;
+                    break;
+                }
+
+                match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+                    Ok(t) => next_tok = t,
+                    Err(e) => {
+                        decode_err = Some(format!("forward_step_greedy failed: {e:?}"));
+                        break;
+                    }
+                }
+            }
+            // Capture final next_pos while still borrowed
+            let _final_pos = state.next_pos;
+            // work around borrow checker: need to move final_pos out
+            // We'll set m.seq_pos after block via re-borrow
+        }
+    }
+    // Handle decode errors/aborts after releasing live borrow
+    if let Some(message) = decode_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if decode_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
+    }
     // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
-    m.seq_pos = state.next_pos;
+    {
+        let state_ref = match m.state.as_ref().and_then(|s| {
+            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => b,
+            _ => unreachable!("qwen2 state disappeared after decode"),
+        };
+        m.seq_pos = state_ref.state.next_pos;
+    }
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -7657,9 +8167,19 @@ pub fn generate_qwen2(
         "total_ms": total_ms,
         "attempt_id": active_attempt_id(),
     });
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
+    }
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 
@@ -7796,6 +8316,30 @@ impl MapleThoughtRouter {
         close_injected
     }
 }
+/// Reset Maple's pure-attention state through the shared rollback owner.
+/// Maple has no speculative or eviction state, but keeping its architecture
+/// reset behind this adapter makes failure/cancel paths clear the same host,
+/// checkpoint, graph, and synchronization surfaces as every other family.
+fn reset_maple_live(
+    state: &mut hipfire_arch_maple::MapleState,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| state.reset(gpu);
+    reset_live_bundle(
+        &mut reset_target,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn generate_maple(
@@ -7819,6 +8363,12 @@ pub fn generate_maple(
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
         None => {
+            crate::ar::emit_generation_start(
+                crate::ar::GenerationRoute::MapleAr,
+                stdout,
+                id,
+                false,
+            );
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -7836,6 +8386,12 @@ pub fn generate_maple(
     }) {
         Some(b) => b,
         _ => {
+            crate::ar::emit_generation_start(
+                crate::ar::GenerationRoute::MapleAr,
+                stdout,
+                id,
+                false,
+            );
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -7859,6 +8415,7 @@ pub fn generate_maple(
     // Mirrors the gemm_hfq6g256_moe_grouped_wmma guard that previously
     // panicked on gfx1151.
     if !gpu.arch_caps.has_wmma_w32() && !gpu.arch_caps.has_wmma_w32_gfx12() {
+        crate::ar::emit_generation_start(crate::ar::GenerationRoute::MapleAr, stdout, id, false);
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -7886,6 +8443,7 @@ pub fn generate_maple(
     // session that prompted this work, invented a `str_replace_editor` call).
     // Refuse instead, with a message that names the fix.
     if tools.is_some_and(|t| !t.is_empty()) && m.chat_template.is_none() {
+        crate::ar::emit_generation_start(crate::ar::GenerationRoute::MapleAr, stdout, id, false);
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8024,6 +8582,12 @@ pub fn generate_maple(
         ))
     };
     if prompt_ids.is_empty() {
+        crate::ar::emit_generation_start(
+            crate::ar::GenerationRoute::MapleAr,
+            stdout,
+            id,
+            primed_think,
+        );
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8041,13 +8605,32 @@ pub fn generate_maple(
     // it would only let an unrelated request's tokens leak into this one (the
     // "Zebedee" leak in the fn doc). Reset first, then size-check against a
     // known-empty cache so the check is about this turn alone.
-    if let Err(e) = state.reset(gpu) {
-        emit_error_with_id(stdout, id, format!("maple state reset failed: {e}"));
-        let _ = stdout.flush();
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::MapleAr,
+        stdout,
+        id,
+        primed_think,
+    );
+    let ep = reset_maple_live(
+        state,
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+        gpu,
+    );
+    if !ep.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "maple state reset failed",
+            "gpu",
+            true,
+            &ep,
+        );
         return;
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
 
     // Capacity guard. No eviction on arch_id=15, and the cache is empty, so a
     // turn that still does not fit cannot be rescued — prefilling it would
@@ -8101,8 +8684,17 @@ pub fn generate_maple(
             ) {
                 Ok(l) => logits = l,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("maple batched prefill failed: {e}"));
-                    let _ = stdout.flush();
+                    let ep = reset_maple_live(
+                        state,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    let message = format!("maple batched prefill failed: {e}");
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
             }
@@ -8119,8 +8711,17 @@ pub fn generate_maple(
             ) {
                 Ok(l) => logits = l,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("maple prefill failed: {e}"));
-                    let _ = stdout.flush();
+                    let ep = reset_maple_live(
+                        state,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    let message = format!("maple prefill failed: {e}");
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
             }
@@ -8131,6 +8732,19 @@ pub fn generate_maple(
     }
     let t_prefill = Instant::now();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    if check_abort(id) {
+        let ep = reset_maple_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
 
     // Open the wire contract before any token can reach the client. The CLI's
     // stream latch (`StreamContractError::PreStartEvent`) fail-closes on ANY
@@ -8166,12 +8780,6 @@ pub fn generate_maple(
     //     answer text: observed live on the first `.mq2lloydu` run, where the
     //     model's "The user wants me to write a hello world in Zig…" reasoning
     //     was returned as `content` with `reasoning_content` empty.
-    emit_gen_start(
-        stdout,
-        id,
-        primed_think,
-        crate::common::gen_start_contract_version_for_arch(15),
-    );
 
     // Decode. Greedy argmax over the CPU-side logits `forward_batch` /
     // `decode_step` return — there is no `gpu.argmax_f32` step on this path
@@ -8204,6 +8812,19 @@ pub fn generate_maple(
     let mut bytes_emitted: usize = 0;
 
     loop {
+        if check_abort(id) {
+            let ep = reset_maple_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+            );
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -8271,8 +8892,17 @@ pub fn generate_maple(
                 next_tok = maple_argmax(&l, cfg.vocab_size);
             }
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("maple decode_step failed: {e}"));
-                let _ = stdout.flush();
+                let ep = reset_maple_live(
+                    state,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
+                let message = format!("maple decode_step failed: {e}");
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
@@ -8360,8 +8990,21 @@ pub fn generate_maple(
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = reset_maple_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+            );
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 

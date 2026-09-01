@@ -7,12 +7,13 @@
 //!
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime --example gpus_smoke
 
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use rdna_compute::{DType, Gpu};
 
 fn main() {
     println!("── Gpus::init_uniform(2, 24) ─────────────────────────────");
-    let mut gpus = Gpus::init_uniform(2, 24).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, 2, 24).expect("init_uniform");
     assert_eq!(gpus.devices.len(), 2);
     assert_eq!(gpus.layer_to_device.len(), 24);
     assert_eq!(gpus.band_starts, vec![0, 12]);
@@ -97,7 +98,7 @@ fn main() {
     println!("\n── Gpus::single back-compat ──────────────────────────────");
     drop(gpus); // release dev 0/1 before re-init for single
     let solo = Gpu::init_with_device(0).expect("init solo");
-    let single = Gpus::single(solo, 24);
+    let single = Gpus::single(&device_opts, solo, 24);
     assert_eq!(single.devices.len(), 1);
     assert_eq!(single.layer_to_device, vec![0u8; 24]);
     assert_eq!(single.output_device, 0);

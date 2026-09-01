@@ -11,7 +11,7 @@
 //! a model-throughput claim.
 
 use hip_bridge::DeviceBuffer;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use std::time::Instant;
 
 const RANKS: usize = 4;
@@ -120,7 +120,8 @@ fn main() {
     let samples = env_usize("HIPFIRE_DS4_OWNER_WORKER_SAMPLES", 100);
     assert!(samples > 0, "samples must be nonzero");
 
-    let mut gpus = Gpus::init_uniform(RANKS, RANKS).expect("init four GPUs");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, RANKS, RANKS).expect("init four GPUs");
     assert_eq!(gpus.devices.len(), RANKS, "requires exactly four GPUs");
     for (rank, gpu) in gpus.devices.iter().enumerate() {
         assert_eq!(

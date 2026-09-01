@@ -8,6 +8,7 @@ members = [
     "crates/hipfire-generate",
     "crates/radiowave",
     "crates/hipfire-runtime",
+    "crates/hipfire-hardware",
     "crates/hipfire-arch-qwen35",
     "crates/hipfire-pflash",
     "crates/hipfire-arch-qwen35-vl",

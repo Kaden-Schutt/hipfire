@@ -358,6 +358,9 @@ pub struct StreamParser {
     /// Cached longest marker length (in bytes) we might still be inside,
     /// used as the "hold-back" window in Normal state. Computed once.
     normal_holdback: usize,
+    /// End-of-stream has been claimed. A finalized parser is inert until
+    /// the caller constructs a fresh turn parser.
+    finished: bool,
 }
 
 impl Default for StreamParser {
@@ -373,6 +376,7 @@ impl StreamParser {
             state: State::Normal,
             buf: String::new(),
             normal_holdback: holdback,
+            finished: false,
         }
     }
 
@@ -390,11 +394,17 @@ impl StreamParser {
             state: State::InThink,
             buf: String::new(),
             normal_holdback: holdback,
+            finished: false,
         }
     }
 
     /// Feed a chunk of decoded text. May emit zero, one, or many events.
+    /// Input after [`Self::finish`] is ignored so no late output can cross
+    /// the terminal boundary.
     pub fn feed(&mut self, chunk: &str) -> Vec<StreamEvent> {
+        if self.finished {
+            return Vec::new();
+        }
         self.buf.push_str(chunk);
         let mut events = Vec::new();
         loop {
@@ -413,7 +423,12 @@ impl StreamParser {
     /// - Unclosed `<｜DSML｜tool_calls>` **fails closed**: emits
     ///   [`StreamEvent::Malformed`] and never reconstructs the open
     ///   marker + body as visible [`StreamEvent::Token`] text.
-    pub fn finish(mut self) -> Vec<StreamEvent> {
+    /// - Repeated calls are inert, preserving exactly-once finalization.
+    pub fn finish(&mut self) -> Vec<StreamEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
         let mut events = Vec::new();
         match self.state {
             State::Normal => {
@@ -993,6 +1008,17 @@ mod tests {
             detail.is_some_and(|d| d.contains("unclosed") && d.contains("tool_calls")),
             "expected Malformed detail, events={events:?}"
         );
+    }
+    #[test]
+    fn finish_is_idempotent_and_blocks_late_tokens() {
+        let mut p = StreamParser::new();
+        let first = p.feed("answer");
+        let tail = p.finish();
+        let finished_len = first.len() + tail.len();
+        assert!(!tail.is_empty());
+        assert!(p.finish().is_empty());
+        assert!(p.feed("late").is_empty());
+        assert_eq!(first.len() + tail.len(), finished_len);
     }
 
     #[test]

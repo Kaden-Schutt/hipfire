@@ -5,14 +5,13 @@
 use crate::config_cache;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
-    Deepseek4Bindings, OloraSchedule, apply_tail_rope, apply_tail_rope_batched, attn_stub, ds4_superop, ffn_routed, ffn_stub,
-    gemv_auto, hc_attn_mix, hc_ffn_mix, kv_joint, mhc_pre, q_lora,
-    weight_needs_fwht, precompute_attn_state_batched, precompute_positions_batched,
+    apply_tail_rope, apply_tail_rope_batched, attn_stub, ds4_superop, ffn_routed, ffn_stub,
+    gemv_auto, hc_attn_mix, hc_ffn_mix, kv_joint, mhc_pre, precompute_attn_state_batched,
+    precompute_positions_batched, q_lora, weight_needs_fwht, Deepseek4Bindings, OloraSchedule,
 };
 use crate::forward::{
-    attention_block_batched_swa_only, ffn_batched, gemv_auto_batched_wmma,
-    hc_attn_mix_batched, hc_ffn_mix_batched, kv_joint_batched, mhc_pre_batched,
-    q_lora_batched,
+    attention_block_batched_swa_only, ffn_batched, gemv_auto_batched_wmma, hc_attn_mix_batched,
+    hc_ffn_mix_batched, kv_joint_batched, mhc_pre_batched, q_lora_batched,
 };
 use hipfire_dispatch::pipeline::superop::SuperOpKind;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -526,7 +525,7 @@ fn mtp_head(
 /// all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_forward_ep(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
@@ -550,7 +549,7 @@ pub fn mtp_forward_ep(
     assert_eq!(h_n_per_rank.len(), n, "mtp_forward_ep: h_n_per_rank len");
     let hidden = cfg.hidden_size;
     let mtp_layer_idx = cfg.num_hidden_layers;
-
+    let group: Vec<usize> = (0..n).collect();
     // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated. attn_stub
     //    reads state.n_tokens for the MTP-layer SWA ring slot → set it to
     //    `position` per rank (matches spec_decode's bookkeeping).
@@ -592,6 +591,7 @@ pub fn mtp_forward_ep(
             gpus,
             binds.as_mut_slice(),
             partials,
+            &group,
             &program,
             hidden,
         )
@@ -914,4 +914,3 @@ pub fn mtp_forward_batched(
 
     Ok(())
 }
-

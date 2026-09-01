@@ -10,10 +10,12 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }

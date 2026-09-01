@@ -26,6 +26,34 @@ use hip_bridge::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+mod mesh;
+pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind, MeshEpoch, MeshError};
+
+/// Device-resolution knobs supplied by the resolved process/runtime config
+/// when constructing a [`Gpus`] owner.
+///
+/// `devices` is the original `hardware.devices` physical selector list when
+/// `visibility` is `None`, and must be validated without lowering. Only
+/// when `visibility` is `Some` — proof that
+/// `hipfire_config::apply_device_visibility` was successfully applied to the
+/// current process and the environment reflects it — does
+/// `resolve_device_ids` lower the physical selectors `2,3` to logical
+/// `0,1`. Direct/example callers that do not apply visibility preserve
+/// validated physical IDs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceResolveOpts {
+    pub tp_use_rccl: Option<bool>,
+    pub devices: Option<String>,
+    pub allow_mixed_arch: bool,
+    pub uniform_vram_tolerance_gb: Option<f32>,
+    /// Proof that device visibility was successfully applied to the current
+    /// process. When `Some`, `devices` (physical ROCr selectors) are lowered
+    /// to logical `0..N-1`; when `None`, physical IDs are preserved.
+    /// The proof must match the current process environment
+    /// (`HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES`).
+    pub visibility: Option<hipfire_config::DeviceVisibility>,
+}
+
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
 /// after the async peer copy; `Gpus::wait_boundary` makes the dst stream
@@ -114,9 +142,12 @@ pub struct Gpus {
     /// RCCL communicators (one per rank), lazily initialized on the first
     /// `all_reduce_sum_*` call. Declared BEFORE `devices` so `Drop` tears
     /// down comms (via `ncclCommDestroy`) before the underlying HIP
-    /// devices, which RCCL relies on. `None` means RCCL hasn't been used
-    /// or `HIPFIRE_TP_USE_RCCL=0` forced the opt-out.
+    /// devices, which RCCL relies on. `None` means RCCL hasn't been used.
     rccl_comms: Option<RcclComms>,
+    /// Resolved at construction from the process/runtime config. Keeping this
+    /// decision on the owner prevents a later environment mutation from
+    /// changing the collective route.
+    use_rccl: bool,
     pub devices: Vec<Gpu>,
     /// Per-layer device id, length = n_layers.
     pub layer_to_device: Vec<u8>,
@@ -170,7 +201,11 @@ impl Gpus {
     /// uniformly: max-min ≤ 1 layer per band. Pre-flight VRAM check enforces
     /// arch match and bounded VRAM delta (override
     /// `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB`, default 2 GiB).
-    pub fn init_uniform(n_devices: usize, n_layers: usize) -> HipResult<Self> {
+    pub fn init_uniform(
+        opts: &DeviceResolveOpts,
+        n_devices: usize,
+        n_layers: usize,
+    ) -> HipResult<Self> {
         if n_devices == 0 {
             return Err(HipError::new(0, "init_uniform: n_devices must be >= 1"));
         }
@@ -183,18 +218,15 @@ impl Gpus {
                 ),
             ));
         }
-        let device_ids = resolve_device_ids(n_devices)?;
+        let device_ids = resolve_device_ids(n_devices, opts)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true, opts)?;
         let per_device = uniform_split_counts(n_devices, n_layers);
-        Self::from_parts(devices, per_device, n_layers)
+        Self::from_parts(devices, per_device, n_layers, opts)
     }
-
-    /// Explicit escape hatch for asymmetric VRAM / hand-tuned splits.
-    /// Keeps arch-mismatch and per-device bind/free pre-flight checks, but
     /// skips the uniform VRAM-delta gate. `per_device` length determines
     /// `n_devices`; sum determines `n_layers`.
-    pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
+    pub fn init_layers(opts: &DeviceResolveOpts, per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
         if n_devices == 0 {
             return Err(HipError::new(
@@ -209,20 +241,22 @@ impl Gpus {
             ));
         }
         let n_layers: usize = per_device.iter().sum();
-        let device_ids = resolve_device_ids(n_devices)?;
+        let device_ids = resolve_device_ids(n_devices, opts)?;
         let devices = construct_devices(&device_ids)?;
         // init_layers is the documented escape hatch for asymmetric VRAM
         // splits — the caller has declared the per-device counts, so skip
         // the VRAM-delta check (which would otherwise reject 32 GB MI50 +
         // 12 GB 6700 XT pairs out of the box). Arch-mismatch + per-device
         // bind+free probe still run.
-        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ false)?;
-        Self::from_parts(devices, per_device.to_vec(), n_layers)
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ false, opts)?;
+        Self::from_parts(devices, per_device.to_vec(), n_layers, opts)
     }
 
-    /// Reserved for v1.1 — automatic VRAM-weighted band assignment. For v1
-    /// use `init_layers(...)` with hand-computed counts.
-    pub fn init_vram_weighted(_n_devices: usize, _n_layers: usize) -> HipResult<Self> {
+    pub fn init_vram_weighted(
+        _opts: &DeviceResolveOpts,
+        _n_devices: usize,
+        _n_layers: usize,
+    ) -> HipResult<Self> {
         Err(HipError::new(
             0,
             "init_vram_weighted: scheduled for v1.1; use init_layers(per_device) instead",
@@ -231,9 +265,10 @@ impl Gpus {
 
     /// PP=1 back-compat path: wrap an existing single `Gpu` into a `Gpus`
     /// with all layers on dev 0. `output_device = 0`.
-    pub fn single(gpu: Gpu, n_layers: usize) -> Self {
+    pub fn single(opts: &DeviceResolveOpts, gpu: Gpu, n_layers: usize) -> Self {
         Self {
             rccl_comms: None,
+            use_rccl: opts.tp_use_rccl.unwrap_or(true),
             devices: vec![gpu],
             layer_to_device: vec![0; n_layers],
             band_starts: vec![0],
@@ -272,16 +307,16 @@ impl Gpus {
     /// only validates the device count. Pre-flight runs the arch-match +
     /// VRAM-delta gate (TP ranks are identical cards, so the uniform delta
     /// check applies).
-    pub fn init_tp(tp_size: usize, n_layers: usize) -> HipResult<Self> {
+    pub fn init_tp(opts: &DeviceResolveOpts, tp_size: usize, n_layers: usize) -> HipResult<Self> {
         if tp_size == 0 {
             return Err(HipError::new(0, "init_tp: tp_size must be >= 1"));
         }
         if n_layers == 0 {
             return Err(HipError::new(0, "init_tp: n_layers must be >= 1"));
         }
-        let device_ids = resolve_device_ids(tp_size)?;
+        let device_ids = resolve_device_ids(tp_size, opts)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true, opts)?;
         let band_starts = tp_band_starts(tp_size, n_layers);
 
         // PP=1 TP topology: every device runs every layer. Encode the layer
@@ -289,6 +324,7 @@ impl Gpus {
         // owning empty bands.
         Ok(Self {
             rccl_comms: None,
+            use_rccl: opts.tp_use_rccl.unwrap_or(true),
             devices,
             layer_to_device: vec![0u8; n_layers],
             band_starts,
@@ -803,23 +839,27 @@ impl Gpus {
         for rank in 0..n {
             devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
         }
-        for destination in 0..n {
+        for (destination, device) in devices.iter_mut().enumerate() {
             let peers: Vec<&DeviceBuffer> = (0..n)
                 .filter(|&source| source != destination)
                 .map(|source| &signals[source])
                 .collect();
             if n == 3 {
-                devices[destination].tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
+                device.tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
             } else {
-                devices[destination]
-                    .tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
+                device.tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
             }
         }
         self.tp_graph_capture_epoch += 1;
         Ok(())
     }
 
-    fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
+    fn from_parts(
+        devices: Vec<Gpu>,
+        per_device: Vec<usize>,
+        n_layers: usize,
+        opts: &DeviceResolveOpts,
+    ) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
         let n_devices = devices.len();
@@ -835,6 +875,7 @@ impl Gpus {
         }
         Ok(Self {
             rccl_comms: None,
+            use_rccl: opts.tp_use_rccl.unwrap_or(true),
             devices,
             layer_to_device,
             band_starts,
@@ -856,22 +897,16 @@ impl Gpus {
         })
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Tensor-parallel collectives (RCCL-backed). See
-    // docs/plans/multi-gpu-tp-a3b.md §3.3 and the comm baseline at
-    // docs/investigations/2026-05-28-tp-comm-baseline-hiptrx.md.
-    // ──────────────────────────────────────────────────────────────────
-
     /// Lazily initialize RCCL communicators across all devices owned by
     /// this `Gpus`. Cached for process lifetime; subsequent calls are
-    /// no-ops. `HIPFIRE_TP_USE_RCCL=0` short-circuits with a clear
+    /// no-ops. A resolved `tp_use_rccl=false` short-circuits with a clear
     /// error so callers can fall through to a host-driven path (not
     /// yet implemented — Stage 2 follow-up).
     pub fn ensure_rccl(&mut self) -> HipResult<()> {
         if self.rccl_comms.is_some() {
             return Ok(());
         }
-        if matches!(crate::config::get().tp_use_rccl, Some(false)) {
+        if !self.use_rccl {
             return Err(HipError::new(
                 0,
                 "ensure_rccl: HIPFIRE_TP_USE_RCCL=0 — RCCL path opted out. \
@@ -896,71 +931,73 @@ impl Gpus {
         Ok(())
     }
 
-    /// All-reduce-sum of f32 buffers across all ranks. `buffers[r]` must
-    /// be a device pointer on `devices[r]` holding `count` f32 elements;
-    /// after this call, each buffer holds the element-wise sum across
-    /// all ranks. In-place (send == recv) — saves a memcpy and matches
-    /// how the TP forward path uses the result.
+    /// All-reduce-sum of f32 buffers across a participating device group.
+    /// `buffers[k]` must be a device pointer on `self.devices[group[k]]`
+    /// holding `count` f32 elements; after this call, every group buffer
+    /// holds the element-wise sum. In-place (send == recv).
     ///
-    /// Requires each device to have an `active_stream` set (the stream
-    /// the collective runs on). Synchronization is the caller's
-    /// responsibility: this call enqueues the collective and returns
-    /// immediately; the buffers are valid only after a subsequent
-    /// `stream_synchronize` (or a downstream dispatch that's already
-    /// ordered behind the same stream).
-    pub fn all_reduce_sum_f32(&mut self, buffers: &[&DeviceBuffer], count: usize) -> HipResult<()> {
-        if buffers.len() != self.devices.len() {
+    /// The RCCL communicator is owned by this entire `Gpus` set, so this
+    /// implementation accepts only the full ordered group `0..n`. Use
+    /// [`Self::all_reduce_sum_f32_peer`] for genuine subgroup reductions.
+    /// Synchronization remains the caller's responsibility.
+    pub fn all_reduce_sum_f32(
+        &mut self,
+        group: &[usize],
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        if buffers.len() != group.len() {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32: buffers.len()={} != n_devices={}",
+                    "all_reduce_sum_f32: buffers.len()={} != group.len()={}",
                     buffers.len(),
-                    self.devices.len()
+                    group.len()
                 ),
             ));
         }
-        // Single-rank (TP=1) degenerate case: the all-reduce-sum over one
-        // buffer is the identity — the buffer already holds the only rank's
-        // partial. Short-circuit so the TP=1 EP path is a pure single-GPU
-        // reference that exercises the full EP executor WITHOUT requiring
-        // librccl (a 1-rank communicator would also work, but skipping it
-        // keeps TP=1 dependency-free and the parity baseline trivially exact).
-        if self.devices.len() == 1 {
+        let n = self.devices.len();
+        if group.len() != n || !group.iter().copied().eq(0..n) {
+            return Err(HipError::new(
+                0,
+                "all_reduce_sum_f32 (RCCL): sub-group reduction needs ncclCommSplit \
+                 (Phase 5b); use all_reduce_sum_f32_peer for sub-groups.",
+            ));
+        }
+        // Single-rank (TP=1) all-reduce is the identity and does not require
+        // librccl.
+        if n == 1 {
             return Ok(());
         }
         self.ensure_rccl()?;
 
-        // Borrow-check note: `self.rccl_comms.as_ref()` projects through
-        // a single field, leaving `self.devices` independently
-        // borrow-able for the per-rank stream lookup below.
         let rccl = self.rccl_comms.as_ref().expect("ensure_rccl populated it");
-
         rccl.group_start()
             .map_err(|e| HipError::new(0, &format!("ncclGroupStart: {e}")))?;
-        for (r, buf) in buffers.iter().enumerate() {
-            let dev = &self.devices[r];
+        for (rank, buf) in buffers.iter().enumerate() {
+            let dev = &self.devices[rank];
             dev.bind_thread()?;
             let stream = dev.active_stream.as_ref().ok_or_else(|| {
                 HipError::new(
                     0,
                     &format!(
-                        "all_reduce_sum_f32: device {r} has no active_stream — \
-                         set `gpus.devices[r].active_stream = Some(stream)` before calling.",
+                        "all_reduce_sum_f32: device {rank} has no active_stream — \
+                         set `gpus.devices[{rank}].active_stream = Some(stream)` before calling.",
                     ),
                 )
             })?;
             // SAFETY: `buf` is a live device buffer of `count` f32 on device
-            // `r`, and `stream` is that device's active stream.
+            // `rank`, and `stream` is that device's active stream.
             unsafe {
                 rccl.all_reduce_sum_f32(
-                    r,
+                    rank,
                     buf.as_ptr() as *const f32,
                     buf.as_ptr() as *mut f32,
                     count,
                     stream.raw_ptr(),
                 )
             }
-            .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={r}: {e}")))?;
+            .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={rank}: {e}")))?;
         }
         rccl.group_end()
             .map_err(|e| HipError::new(0, &format!("ncclGroupEnd: {e}")))?;
@@ -1026,8 +1063,13 @@ impl Gpus {
         }
         // D2H: synchronize producer stream, then download into row's prefix.
         // Preserve first error immediately — no partial-success claim.
-        for r in 0..n {
-            let dev = &self.devices[r];
+        for (r, ((dev, buffer), row)) in self
+            .devices
+            .iter()
+            .zip(buffers.iter())
+            .zip(self.host_ar_tmp.iter_mut())
+            .enumerate()
+        {
             dev.bind_thread()?;
             let stream = dev.active_stream.as_ref().ok_or_else(|| {
                 HipError::new(
@@ -1043,10 +1085,10 @@ impl Gpus {
             // (bytes) lie within the Vec's initialized length. The derived
             // `[u8]` slice is exactly `bytes` and is bounded to that prefix.
             let dst: &mut [u8] = unsafe {
-                let ptr = self.host_ar_tmp[r].as_mut_ptr() as *mut u8;
+                let ptr = row.as_mut_ptr() as *mut u8;
                 std::slice::from_raw_parts_mut(ptr, bytes)
             };
-            dev.hip.memcpy_dtoh(dst, buffers[r])?;
+            dev.hip.memcpy_dtoh(dst, buffer)?;
         }
         // Exact left-associated reduction into row 0: rank0+rank1+...
         Self::host_reduce_rows(&mut self.host_ar_tmp, count);
@@ -1056,10 +1098,9 @@ impl Gpus {
             let ptr = self.host_ar_tmp[0].as_ptr() as *const u8;
             std::slice::from_raw_parts(ptr, bytes)
         };
-        for r in 0..n {
-            let dev = &self.devices[r];
+        for (dev, buffer) in self.devices.iter().zip(buffers.iter()) {
             dev.bind_thread()?;
-            dev.hip.memcpy_htod(buffers[r], src)?;
+            dev.hip.memcpy_htod(buffer, src)?;
         }
         Ok(())
     }
@@ -1435,23 +1476,15 @@ impl Gpus {
         Ok(())
     }
 
-    /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
-    /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
-    /// e.g. hiptrx 4× gfx1201), `ncclAllReduce` costs ~40 ms/call for these
-    /// small/medium messages regardless of NCCL_PROTO/CHANNELS/BUFFSIZE/
-    /// SOCKET_IFNAME, while this path is ~1 ms. Used by EP prefill and TP; EP
-    /// decode's tiny per-token reduce stays on RCCL (already fast). PP never
-    /// all-reduces (it uses `boundary_copy` point-to-point).
+    /// All-reduce-sum of f32 buffers across a participating device group via
+    /// direct peer copies and local adds, bypassing RCCL.
     ///
-    /// Algorithm (N-rank, race-free): **phase 1** copies every OTHER rank's
-    /// ORIGINAL buffer into a local temp (all reads, no writes); a barrier
-    /// (`wait_boundary`); **phase 2** adds the peer temps into the local buffer.
-    /// All-reads-before-writes ⇒ no cross-device read/write race. `n==1` is the
-    /// identity (no-op). Requires peer access (caller's `enable_peer_all`) for
-    /// the fast P2P path; without it `boundary_copy` host-stages (slower but
-    /// correct). In-place: `buffers[r]` is both input and output.
+    /// `group` lists global device IDs and `buffers[k]` belongs to
+    /// `self.devices[group[k]]`. Unlike the RCCL path this is genuinely
+    /// subgroup-capable, which is required for composed TP×EP meshes.
     pub fn all_reduce_sum_f32_peer(
         &mut self,
+        group: &[usize],
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
@@ -1464,56 +1497,75 @@ impl Gpus {
                 "all_reduce_sum_f32_peer: peer scratch is leased — use leased API or release lease",
             ));
         }
+        let g = group.len();
         let n = self.devices.len();
-        if buffers.len() != n {
+        if buffers.len() != g {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}",
+                    "all_reduce_sum_f32_peer: buffers.len()={} != group.len()={g}",
                     buffers.len()
                 ),
             ));
         }
-        if n == 1 {
+        for (index, &device) in group.iter().enumerate() {
+            if device >= n || group[..index].contains(&device) {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "all_reduce_sum_f32_peer: group contains invalid or duplicate device {device}"
+                    ),
+                ));
+            }
+        }
+        if g <= 1 {
             return Ok(());
         }
-        let bytes = count * 4;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, "all_reduce_sum_f32_peer: count overflow"))?;
         self.ensure_peer_ar_tmp(bytes)?;
+
         // Phase 1: read every peer's ORIGINAL buffer into a local temp.
-        let mut evts = Vec::with_capacity(n * (n - 1));
-        for r in 0..n {
-            let mut slot = 0usize;
-            for j in 0..n {
-                if j == r {
+        let mut events = Vec::with_capacity(g * (g - 1));
+        for (k, &device_k) in group.iter().enumerate() {
+            let mut slot = 0;
+            for (m, &device_m) in group.iter().enumerate() {
+                if m == k {
                     continue;
                 }
-                let evt =
-                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
-                evts.push(evt);
+                let event = self.boundary_copy(
+                    device_m,
+                    device_k,
+                    buffers[m],
+                    &self.peer_ar_tmp[device_k][slot],
+                    bytes,
+                )?;
+                events.push(event);
                 slot += 1;
             }
         }
-        for evt in evts {
-            self.wait_boundary(evt)?;
+        for event in events {
+            self.wait_boundary(event)?;
         }
 
-        // Phase 2: add the peer temps into each rank's buffer.
-        for r in 0..n {
+        // Phase 2: add peer temps into each rank's buffer.
+        for (k, &device_k) in group.iter().enumerate() {
             let dst = GpuTensor {
-                buf: unsafe { buffers[r].alias() },
+                buf: unsafe { buffers[k].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            let srcs: Vec<GpuTensor> = (0..n - 1)
+            let srcs: Vec<GpuTensor> = (0..g - 1)
                 .map(|slot| GpuTensor {
-                    buf: unsafe { self.peer_ar_tmp[r][slot].alias() },
+                    buf: unsafe { self.peer_ar_tmp[device_k][slot].alias() },
                     shape: vec![count],
                     dtype: DType::F32,
                 })
                 .collect();
-            self.devices[r].bind_thread()?;
+            self.devices[device_k].bind_thread()?;
             for src in &srcs {
-                self.devices[r].add_inplace_f32(&dst, src)?;
+                self.devices[device_k].add_inplace_f32(&dst, src)?;
             }
         }
         Ok(())
@@ -1642,11 +1694,11 @@ impl Gpus {
         self.ensure_peer_ar_tmp(bytes)?;
 
         let mut gather_events = Vec::with_capacity(n - 1);
-        for rank in 1..n {
+        for (rank, partial) in partials.iter().enumerate().take(n).skip(1) {
             gather_events.push(self.boundary_copy(
                 rank,
                 0,
-                partials[rank],
+                partial,
                 &self.peer_ar_tmp[0][rank - 1],
                 bytes,
             )?);
@@ -1792,11 +1844,11 @@ impl Gpus {
         }
         // Gather N-1 peers into rank-0 lease scratch, never allocating.
         let mut gather_events = Vec::with_capacity(n - 1);
-        for rank in 1..n {
+        for (rank, buffer) in buffers.iter().enumerate().take(n).skip(1) {
             gather_events.push(self.boundary_copy(
                 rank,
                 0,
-                buffers[rank],
+                buffer,
                 &self.peer_lease_buffers[0][rank - 1],
                 bytes,
             )?);
@@ -1845,30 +1897,103 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Resolve logical device IDs after the physical `hardware.devices` list has
-/// been installed as `ROCR_VISIBLE_DEVICES` and HIP has received the matching
-/// post-filter logical IDs. When unset, take the first `n_devices` visible IDs.
-fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    if let Some(ref s) = crate::config::get().devices {
-        let ids: Vec<i32> = s
-            .split(',')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|p| p.parse::<i32>())
-            .collect::<Result<_, _>>()
-            .map_err(|e| HipError::new(0, &format!("hardware.devices parse: {e}")))?;
-        if ids.len() < n_devices {
+/// Resolve logical device IDs from `hardware.devices`, lowering physical
+/// selectors `2,3` to logical `0,1` only when `opts.visibility` proves that
+/// `apply_device_visibility` was successfully applied to the current process.
+/// Without proof, validated physical IDs are preserved. Empty or malformed
+/// lists (empty entries, non-numeric, negative) fail closed. When unset,
+/// the first `n_devices` visible IDs are used.
+fn resolve_device_ids(n_devices: usize, opts: &DeviceResolveOpts) -> HipResult<Vec<i32>> {
+    if let Some(value) = &opts.devices {
+        if value.trim().is_empty() {
+            return Err(HipError::new(0, "hardware.devices: empty device list"));
+        }
+        // Strict split: empty entries (e.g. "2,,3" or "2, ") fail, not normalize.
+        let parts: Vec<&str> = value.split(',').collect();
+        let mut parsed_physical = Vec::with_capacity(parts.len());
+        for part in parts {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return Err(HipError::new(
+                    0,
+                    "hardware.devices: empty entry in device list",
+                ));
+            }
+            let id: i32 = trimmed
+                .parse()
+                .map_err(|error| HipError::new(0, &format!("hardware.devices parse: {error}")))?;
+            if id < 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("hardware.devices: negative device id {id}"),
+                ));
+            }
+            parsed_physical.push(id);
+        }
+        if parsed_physical.len() < n_devices {
             return Err(HipError::new(
                 0,
                 &format!(
                     "hardware.devices exposes {} ids but n_devices = {n_devices}",
-                    ids.len(),
+                    parsed_physical.len()
                 ),
             ));
         }
-        return Ok(ids[..n_devices].to_vec());
+        if let Some(vis) = &opts.visibility {
+            // Proof must match current process environment.
+            let hip_env = std::env::var(hipfire_config::HIP_VISIBLE_DEVICES).unwrap_or_default();
+            let rocr_env = std::env::var(hipfire_config::ROCR_VISIBLE_DEVICES).unwrap_or_default();
+            if hip_env != vis.hip || rocr_env != vis.rocr {
+                return Err(HipError::new(
+                    0,
+                    "hardware.devices: visibility proof does not match current process environment — visibility was not successfully applied",
+                ));
+            }
+            let normalized_rocr = parsed_physical
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if vis.rocr != normalized_rocr {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "hardware.devices: visibility rocr {:?} does not match requested physical list {:?}",
+                        vis.rocr, normalized_rocr
+                    ),
+                ));
+            }
+            let expected_hip = (0..parsed_physical.len())
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if vis.hip != expected_hip {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "hardware.devices: visibility hip {:?} must be logical 0..N-1 {:?}",
+                        vis.hip, expected_hip
+                    ),
+                ));
+            }
+            // Proof valid — lower to logical 0..N-1.
+            return (0..n_devices)
+                .map(|id| {
+                    i32::try_from(id).map_err(|_| {
+                        HipError::new(0, "hardware.devices logical ID exceeds HIP range")
+                    })
+                })
+                .collect();
+        }
+        // No proof — preserve validated physical IDs.
+        return Ok(parsed_physical[..n_devices].to_vec());
     }
-    Ok((0..n_devices as i32).collect())
+    (0..n_devices)
+        .map(|id| {
+            i32::try_from(id)
+                .map_err(|_| HipError::new(0, "hardware.devices logical ID exceeds HIP range"))
+        })
+        .collect()
 }
 
 fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
@@ -1879,23 +2004,26 @@ fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
     Ok(devices)
 }
 
-fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResult<()> {
+fn preflight_vram_with_opts(
+    devices: &[Gpu],
+    check_vram_delta: bool,
+    opts: &DeviceResolveOpts,
+) -> HipResult<()> {
     if devices.is_empty() {
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
-    let allow_mixed = crate::config::get().allow_mixed_arch;
     let mut frees = Vec::with_capacity(devices.len());
-    for d in devices {
-        if d.arch != arch0 {
-            if allow_mixed {
+    for device in devices {
+        if device.arch != arch0 {
+            if opts.allow_mixed_arch {
                 eprintln!(
                     "preflight_vram: mixed-arch detected — dev 0 is {arch0}, dev {} is {}. \
                      Proceeding because HIPFIRE_ALLOW_MIXED_ARCH=1. \
                      Per-arch JIT cache will be populated on first run; boundary_copy uses \
                      hipMemcpyPeer / hipMemcpyPeerAsync which fall through to host-staging \
                      if peer access is unsupported by the pair (correctness holds either way).",
-                    d.device_id, d.arch,
+                    device.device_id, device.arch,
                 );
             } else {
                 return Err(HipError::new(
@@ -1903,13 +2031,13 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
                     &format!(
                         "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
                          Mixed-arch is not supported by default; set HIPFIRE_ALLOW_MIXED_ARCH=1 to override.",
-                        d.device_id, d.arch,
+                        device.device_id, device.arch,
                     ),
                 ));
             }
         }
-        d.bind_thread()?;
-        let (free, _total) = d.hip.get_vram_info()?;
+        device.bind_thread()?;
+        let (free, _total) = device.hip.get_vram_info()?;
         frees.push(free);
     }
     if !check_vram_delta {
@@ -1918,17 +2046,17 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = crate::config::get()
+    let tolerance_gb = opts
         .uniform_vram_tolerance_gb
-        .map(|t| t as f64)
+        .map(|value| value as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
-    if delta_gb > tol_gb {
+    if delta_gb > tolerance_gb {
         return Err(HipError::new(
             0,
             &format!(
                 "preflight_vram: VRAM delta {:.1} GiB exceeds tolerance {:.1} GiB. \
                  Override via HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB or use init_layers().",
-                delta_gb, tol_gb,
+                delta_gb, tolerance_gb,
             ),
         ));
     }
@@ -2084,5 +2212,117 @@ mod tests {
         let mut rows3 = vec![vec![5.0_f32, 6.0], vec![7.0, 8.0]];
         Gpus::host_reduce_rows(&mut rows3, 0);
         assert_eq!(rows3[0], vec![5.0, 6.0]);
+    }
+    #[test]
+    fn resolver_consumes_post_visibility_logical_ids_without_aliasing() {
+        let opts = DeviceResolveOpts {
+            devices: Some("0,1".into()),
+            ..DeviceResolveOpts::default()
+        };
+        assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn resolver_preserves_physical_without_visibility() {
+        let opts = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            ..DeviceResolveOpts::default()
+        };
+        // No visibility proof — physical IDs preserved, not lowered to 0,1
+        assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![2, 3]);
+        // Single device 2 without visibility should stay 2
+        let opts2 = DeviceResolveOpts {
+            devices: Some("2".into()),
+            ..DeviceResolveOpts::default()
+        };
+        assert_eq!(resolve_device_ids(1, &opts2).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn resolver_lowers_with_applied_visibility_proof() {
+        // Simulate successful visibility application: physical 2,3 -> logical 0,1
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        // Install env vars to prove visibility was applied to current process
+        std::env::set_var(hipfire_config::HIP_VISIBLE_DEVICES, &vis.hip);
+        std::env::set_var(hipfire_config::ROCR_VISIBLE_DEVICES, &vis.rocr);
+        let opts = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            visibility: Some(vis.clone()),
+            ..DeviceResolveOpts::default()
+        };
+        assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![0, 1]);
+        // Even if physical is 2,3 but n_devices=1, lower to 0
+        assert_eq!(resolve_device_ids(1, &opts).unwrap(), vec![0]);
+        // Cleanup
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
+    }
+
+    #[test]
+    fn resolver_rejects_empty_and_malformed_lists() {
+        let cases = [
+            Some("".to_string()),
+            Some(",".to_string()),
+            Some("2,,3".to_string()),
+            Some("2, ".to_string()),
+            Some(",1".to_string()),
+            Some("2,3,".to_string()),
+        ];
+        for devices in cases {
+            let opts = DeviceResolveOpts {
+                devices: devices.clone(),
+                ..DeviceResolveOpts::default()
+            };
+            assert!(
+                resolve_device_ids(2, &opts).is_err(),
+                "malformed {:?} must fail, not normalize",
+                devices
+            );
+        }
+        // Also with visibility proof, malformed must still fail
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        std::env::set_var(hipfire_config::HIP_VISIBLE_DEVICES, &vis.hip);
+        std::env::set_var(hipfire_config::ROCR_VISIBLE_DEVICES, &vis.rocr);
+        let opts = DeviceResolveOpts {
+            devices: Some("2,,3".into()),
+            visibility: Some(vis),
+            ..DeviceResolveOpts::default()
+        };
+        assert!(resolve_device_ids(2, &opts).is_err());
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
+    }
+
+    #[test]
+    fn resolver_rejects_stale_visibility_proof() {
+        // Physical 2,3 but visibility proof is stale (doesn't match env or rocr)
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        // No env vars set — proof stale
+        let opts = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            visibility: Some(vis.clone()),
+            ..DeviceResolveOpts::default()
+        };
+        assert!(resolve_device_ids(2, &opts).is_err());
+        // Env vars set but mismatched rocr
+        std::env::set_var(hipfire_config::HIP_VISIBLE_DEVICES, "0,1");
+        std::env::set_var(hipfire_config::ROCR_VISIBLE_DEVICES, "0,1"); // wrong rocr
+        let opts2 = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            visibility: Some(vis),
+            ..DeviceResolveOpts::default()
+        };
+        assert!(resolve_device_ids(2, &opts2).is_err());
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
     }
 }

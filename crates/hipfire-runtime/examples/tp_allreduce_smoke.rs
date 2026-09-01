@@ -15,7 +15,7 @@
 //   HIP_VISIBLE_DEVICES=0,1 HIPFIRE_TP_BENCH_N=2 cargo run ... (TP=2)
 
 use hip_bridge::DeviceBuffer;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use std::time::Instant;
 
 const SIZES_BYTES: &[usize] = &[4 * 1024, 32 * 1024, 128 * 1024, 512 * 1024];
@@ -37,7 +37,8 @@ fn main() {
 
     // n_layers placeholder — init_uniform requires n_layers >= n_devices.
     // The TP path doesn't care about layer-to-device; we just need devices.
-    let mut gpus = Gpus::init_uniform(n_ranks, n_ranks).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, n_ranks, n_ranks).expect("init_uniform");
     let peer_ok = gpus.enable_peer_all().expect("enable_peer_all");
     if !peer_ok {
         eprintln!("WARN: peer access incomplete (host-staging fallback applies)");
@@ -82,7 +83,8 @@ fn main() {
         }
 
         let refs: Vec<&DeviceBuffer> = buffers.iter().collect();
-        gpus.all_reduce_sum_f32(&refs, count)
+        let group: Vec<usize> = (0..refs.len()).collect();
+        gpus.all_reduce_sum_f32(&group, &refs, count)
             .expect("all_reduce_sum_f32");
 
         // Sync all rank streams before readback.
@@ -132,9 +134,10 @@ fn main() {
     for &bytes in SIZES_BYTES {
         let count = bytes / std::mem::size_of::<f32>();
         let refs: Vec<&DeviceBuffer> = buffers.iter().collect();
+        let group: Vec<usize> = (0..refs.len()).collect();
 
         for _ in 0..warmup {
-            gpus.all_reduce_sum_f32(&refs, count)
+            gpus.all_reduce_sum_f32(&group, &refs, count)
                 .expect("all_reduce warm");
             for dev in &gpus.devices {
                 dev.bind_thread().expect("bind");
@@ -147,7 +150,8 @@ fn main() {
         let mut samples = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            gpus.all_reduce_sum_f32(&refs, count).expect("all_reduce");
+            gpus.all_reduce_sum_f32(&group, &refs, count)
+                .expect("all_reduce");
             for dev in &gpus.devices {
                 dev.bind_thread().expect("bind");
                 dev.hip

@@ -5,13 +5,16 @@
 use crate::config_cache;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
-    Deepseek4Bindings, compressor_cache_uses_vmm, ds4_lower_program, final_norm_and_head,
-    init_residual_streams, refresh_compressor_cache_shard_tables,
+    compressor_cache_uses_vmm, ds4_lower_program, final_norm_and_head, init_residual_streams,
+    refresh_compressor_cache_shard_tables, Deepseek4Bindings,
 };
-use crate::forward::{precompute_positions, precompute_token_id, update_attn_state_host, update_pos_array_host, update_token_id_host, ensure_compressor_capacity};
+use crate::forward::{
+    ensure_compressor_capacity, precompute_positions, precompute_token_id, update_attn_state_host,
+    update_pos_array_host, update_token_id_host,
+};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{self, SuperOpKind};
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use rdna_compute::{Gpu, GpuTensor};
 
 // ───────────────────────── Ship 6 substrate-EP (DeepSeek-V4) ─────────────────
@@ -41,7 +44,7 @@ use rdna_compute::{Gpu, GpuTensor};
 /// access enabled for the fast peer-direct all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
@@ -116,7 +119,7 @@ pub fn forward_ep(
 
 #[allow(clippy::too_many_arguments)]
 fn forward_ep_tp_graph_body(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
@@ -125,6 +128,7 @@ fn forward_ep_tp_graph_body(
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
+    let group: Vec<usize> = (0..n).collect();
     let program = ds4_lower_program();
     let skip_ffn = config_cache::skip_ffn();
     for layer_idx in 0..cfg.num_hidden_layers {
@@ -144,6 +148,7 @@ fn forward_ep_tp_graph_body(
             gpus,
             bindings.as_mut_slice(),
             partials,
+            &group,
             &program,
             cfg.hidden_size,
         )
@@ -161,7 +166,7 @@ fn forward_ep_tp_graph_body(
     )
 }
 
-fn sync_ep_ranks(gpus: &mut hipfire_runtime::multi_gpu::Gpus, label: &str) -> Result<(), String> {
+fn sync_ep_ranks(gpus: &mut hipfire_hardware::Gpus, label: &str) -> Result<(), String> {
     for rank in 0..gpus.devices.len() {
         gpus.devices[rank]
             .bind_thread()
@@ -176,7 +181,7 @@ fn sync_ep_ranks(gpus: &mut hipfire_runtime::multi_gpu::Gpus, label: &str) -> Re
 
 #[allow(clippy::too_many_arguments)]
 fn forward_ep_tp_graph(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
@@ -324,7 +329,7 @@ fn forward_ep_tp_graph(
 
 #[allow(clippy::too_many_arguments)]
 fn forward_ep_direct(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
@@ -381,6 +386,7 @@ fn forward_ep_direct(
         .unwrap_or(false);
     let t_layers = std::time::Instant::now();
     let program = ds4_lower_program();
+    let group: Vec<usize> = (0..n).collect();
     for l in 0..cfg.num_hidden_layers {
         {
             let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
@@ -399,6 +405,7 @@ fn forward_ep_direct(
                 gpus,
                 binds.as_mut_slice(),
                 partials,
+                &group,
                 &program,
                 hidden,
             )
@@ -528,4 +535,3 @@ fn forward_ep_direct(
     }
     Ok(())
 }
-

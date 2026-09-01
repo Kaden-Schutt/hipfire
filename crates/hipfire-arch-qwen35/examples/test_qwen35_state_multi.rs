@@ -16,10 +16,10 @@
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35ScratchSet, StateQuant};
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::multi_gpu::Gpus;
 use std::path::Path;
 
 fn main() {
@@ -31,7 +31,8 @@ fn main() {
         config.n_layers, config.head_dim, config.n_kv_heads, config.vocab_size,
     );
 
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let n_dev = gpus.devices.len();
     let out_dev = gpus.output_device;
     println!(

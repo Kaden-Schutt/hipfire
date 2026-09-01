@@ -21,6 +21,7 @@ use crate::deepseek4::{
     DeepseekV4LayerWeights, DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights,
     DsparkConfig, DsparkWeights,
 };
+use hipfire_runtime::loader_api::LoadFaultStage;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeepseekV4HeterogeneousProjection {
@@ -1071,13 +1072,12 @@ impl Architecture for DeepseekV4 {
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
         DeepseekV4Config::from_hfq(hfq)
     }
-
     fn load_weights(
         hfq: &mut HfqFile,
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None)?.into_single())
+        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None, None)?.into_single())
     }
 
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
@@ -1086,6 +1086,21 @@ impl Architecture for DeepseekV4 {
 }
 
 impl DeepseekV4 {
+    /// Loader entry with an explicit lifecycle fault hook. Normal architecture
+    /// callers use the trait method above, which passes no fault.
+    #[doc(hidden)]
+    pub fn load_weights_with_fault(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        lifecycle_fault: Option<LoadFaultStage>,
+    ) -> Result<DeepseekV4Weights, String> {
+        Ok(
+            Self::load_weights_inner(hfq, cfg, gpu, None, None, None, lifecycle_fault)?
+                .into_single(),
+        )
+    }
+
     /// Exact byte projection for the base MQ2R split before either device is
     /// allowed to allocate. It mirrors the upload contract: F16 norms/biases
     /// expand to F32, the scalar head-HC scale remains host-side, routed
@@ -1469,7 +1484,10 @@ impl DeepseekV4 {
         shard: &hipfire_runtime::tp_shard::ShardConfig,
         rank: usize,
     ) -> Result<DeepseekV4Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None)?.into_single())
+        Ok(
+            Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None, None)?
+                .into_single(),
+        )
     }
 
     /// Load the fixed MQ2R artifact directly onto its two exact device owners:
@@ -1502,7 +1520,7 @@ impl DeepseekV4 {
                     .into(),
             );
         }
-        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), None)?
+        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), None, None)?
             .into_heterogeneous()
     }
 
@@ -1525,8 +1543,16 @@ impl DeepseekV4 {
                 "deepseek4 heterogeneous fault harness requires the exact admitted G2 route".into(),
             );
         }
-        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), Some(fault))?
-            .into_heterogeneous()
+        Self::load_weights_inner(
+            hfq,
+            cfg,
+            dense_gpu,
+            None,
+            Some(routed_gpu),
+            Some(fault),
+            None,
+        )?
+        .into_heterogeneous()
     }
 
     fn load_weights_inner(
@@ -1536,6 +1562,7 @@ impl DeepseekV4 {
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
         mut routed_gpu: Option<&mut Gpu>,
         heterogeneous_fault: Option<DeepseekV4HeterogeneousFault>,
+        lifecycle_fault: Option<LoadFaultStage>,
     ) -> Result<DeepseekV4WeightStaging, String> {
         // Model identity and route identity are intentionally separate.
         // `.mq2r` fixes the exact P3 tensor recipe on every architecture.
@@ -2527,7 +2554,8 @@ impl DeepseekV4 {
                     );
                 }
                 dspark_hfq.drop_mmap();
-                weights.dspark = Self::load_dspark(&dspark_hfq, gpu, cfg)?;
+                weights.dspark =
+                    Self::load_dspark_with_fault(&dspark_hfq, gpu, cfg, lifecycle_fault)?;
             }
         }
 
@@ -2678,6 +2706,16 @@ impl DeepseekV4 {
         gpu: &mut Gpu,
         cfg: &DeepseekV4Config,
     ) -> Result<Option<DsparkWeights>, String> {
+        Self::load_dspark_with_fault(source, gpu, cfg, None)
+    }
+
+    #[doc(hidden)]
+    pub fn load_dspark_with_fault(
+        source: &HfqFile,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        lifecycle_fault: Option<LoadFaultStage>,
+    ) -> Result<Option<DsparkWeights>, String> {
         let dspark_cfg = match DsparkConfig::from_metadata_json(&source.metadata_json) {
             Some(c) => c,
             None => return Ok(None),
@@ -2763,6 +2801,19 @@ impl DeepseekV4 {
                 )?);
             }
             stages.push(layer);
+        }
+        if lifecycle_fault == Some(LoadFaultStage::DsparkHead) {
+            // The trunk staging owner is live in the caller and every draft
+            // stage has reached publication before the head globals begin.
+            // Free the partially materialized draft stages before propagating
+            // the deterministic failure.
+            for layer in stages {
+                layer.free_gpu(gpu);
+            }
+            return Err(
+                "DSpark head: target-owner-published; draft-owner-published; injected failure"
+                    .to_string(),
+            );
         }
 
         // DSpark globals. main_proj/main_norm live on stage 0; the Markov

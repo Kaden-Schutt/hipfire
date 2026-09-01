@@ -1670,6 +1670,10 @@ impl WeightSource for LlamaHfqSource<'_> {
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
     }
+
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: LayerWeights) {
+        layer.free_gpu(gpu);
+    }
 }
 
 /// Load llama-family `model.embed_tokens.weight` and classify its embedding
@@ -1682,7 +1686,7 @@ fn load_embedding_llama(
     eprintln!("  loading token_embd...");
     let (info, data) = hfq
         .tensor_data("model.embed_tokens.weight")
-        .expect("embed_tokens not found");
+        .ok_or_else(|| HipError::new(0, "llama: embed_tokens not found"))?;
     // Q4K embeddings are llama-family-only (GGUF-derived). qwen2/qwen35 have no
     // Q4K embedding-lookup kernel — that is why the shared `load_embedding` /
     // `embed_classify` deliberately rejects qt 4 (rejecting at load gives a clean
@@ -1764,6 +1768,74 @@ pub fn load_weights_hfq(
     })
 }
 
+struct LayerLoadStaging {
+    attn_norm: Option<GpuTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    q_norm: Option<GpuTensor>,
+    k_norm: Option<GpuTensor>,
+    ffn_norm: Option<GpuTensor>,
+    w_gate: Option<WeightTensor>,
+    w_up: Option<WeightTensor>,
+    w_down: Option<WeightTensor>,
+}
+
+impl LayerLoadStaging {
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(tensor) = self.attn_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.wq.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wk.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wv.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wo.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = self.q_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.k_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.ffn_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.w_gate.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.w_up.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.w_down.take() {
+            weight.free_all(gpu);
+        }
+    }
+
+    fn into_layer(&mut self) -> LayerWeights {
+        LayerWeights {
+            attn_norm: self.attn_norm.take().expect("staged layer attn_norm"),
+            wq: self.wq.take().expect("staged layer wq"),
+            wk: self.wk.take().expect("staged layer wk"),
+            wv: self.wv.take().expect("staged layer wv"),
+            wo: self.wo.take().expect("staged layer wo"),
+            q_norm: self.q_norm.take(),
+            k_norm: self.k_norm.take(),
+            ffn_norm: self.ffn_norm.take().expect("staged layer ffn_norm"),
+            w_gate: self.w_gate.take().expect("staged layer w_gate"),
+            w_up: self.w_up.take().expect("staged layer w_up"),
+            w_down: self.w_down.take().expect("staged layer w_down"),
+        }
+    }
+}
+
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
 /// no DeltaNet). `q_out_dim`/`kv_dim` are passed in so the caller reuses the
 /// exact dims it already computes.
@@ -1774,28 +1846,40 @@ pub fn load_layer<B: WeightBackend>(
     kv_dim: usize,
     i: usize,
 ) -> HipResult<LayerWeights> {
-    b.set_layer(i);
-    Ok(LayerWeights {
-        attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
-        wq: b.proj("self_attn.q_proj", q_out_dim, config.dim)?,
-        wk: b.proj("self_attn.k_proj", kv_dim, config.dim)?,
-        wv: b.proj("self_attn.v_proj", kv_dim, config.dim)?,
-        wo: b.proj("self_attn.o_proj", config.dim, q_out_dim)?,
-        q_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        k_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-        w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
-        w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
-        w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
-    })
+    let mut staged = LayerLoadStaging {
+        attn_norm: None,
+        wq: None,
+        wk: None,
+        wv: None,
+        wo: None,
+        q_norm: None,
+        k_norm: None,
+        ffn_norm: None,
+        w_gate: None,
+        w_up: None,
+        w_down: None,
+    };
+    let result = (|| -> HipResult<LayerWeights> {
+        b.set_layer(i);
+        staged.attn_norm = Some(b.norm("input_layernorm.weight", &[config.dim])?);
+        staged.wq = Some(b.proj("self_attn.q_proj", q_out_dim, config.dim)?);
+        staged.wk = Some(b.proj("self_attn.k_proj", kv_dim, config.dim)?);
+        staged.wv = Some(b.proj("self_attn.v_proj", kv_dim, config.dim)?);
+        staged.wo = Some(b.proj("self_attn.o_proj", config.dim, q_out_dim)?);
+        if config.has_qk_norm {
+            staged.q_norm = Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?);
+            staged.k_norm = Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?);
+        }
+        staged.ffn_norm = Some(b.norm("post_attention_layernorm.weight", &[config.dim])?);
+        staged.w_gate = Some(b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?);
+        staged.w_up = Some(b.proj("mlp.up_proj", config.hidden_dim, config.dim)?);
+        staged.w_down = Some(b.proj("mlp.down_proj", config.dim, config.hidden_dim)?);
+        Ok(staged.into_layer())
+    })();
+    if result.is_err() {
+        staged.free_gpu(b.gpu_mut());
+    }
+    result
 }
 
 // ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────
@@ -1931,6 +2015,137 @@ fn paro_load_llama_norm_raw(
     gpu.upload_f32(&v, shape)
 }
 
+/// LLaMA-family ParoQuant source used by the shared whole-model transaction.
+struct LlamaParoSource<'a> {
+    source: &'a dyn crate::model_source::ModelSource,
+    cfg: &'a LlamaConfig,
+    group_size: u32,
+    krot: u8,
+}
+
+impl WeightSource for LlamaParoSource<'_> {
+    type Layer = LayerWeights;
+
+    fn n_layers(&self) -> usize {
+        self.cfg.n_layers
+    }
+
+    fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        if n_devices > 1 {
+            return Err(HipError::new(
+                0,
+                "ParoQuant LLaMA loading is single-GPU only",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        eprintln!("  loading token_embd (LLaMA/Qwen3 safetensors)...");
+        let (info, data) = self
+            .source
+            .tensor_data("model.embed_tokens.weight")
+            .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens not found"))?;
+        let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
+        let token_embd = gpu.upload_f32(&f32_data, &[self.cfg.vocab_size, self.cfg.dim])?;
+        Ok((token_embd, EmbeddingFormat::F32))
+    }
+
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
+        eprintln!("  loading output_norm...");
+        paro_load_llama_norm_raw(self.source, gpu, "norm.weight", &[self.cfg.dim])
+    }
+
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)> {
+        let source = self.source;
+        let cfg = self.cfg;
+        let group_size = self.group_size;
+        let krot = self.krot;
+        let has_separate = source.tensor_info("lm_head.weight").is_some();
+        resolve_lm_head(
+            gpu,
+            has_separate,
+            can_alias,
+            embd,
+            embd_fmt,
+            cfg.vocab_size,
+            cfg.dim,
+            |gpu| {
+                if source.tensor_info("lm_head.qweight").is_some() {
+                    load_paroquant_weight_from_source(
+                        source,
+                        gpu,
+                        "lm_head",
+                        cfg.vocab_size,
+                        cfg.dim,
+                        group_size,
+                        krot,
+                    )
+                } else {
+                    load_fp16_weight_tensor_from_source(
+                        source,
+                        gpu,
+                        "lm_head.weight",
+                        cfg.vocab_size,
+                        cfg.dim,
+                    )
+                }
+            },
+            |gpu| {
+                let (info, data) =
+                    source
+                        .tensor_data("model.embed_tokens.weight")
+                        .ok_or_else(|| {
+                            HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
+                        })?;
+                let f32_data =
+                    crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[cfg.vocab_size, cfg.dim])?;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F32,
+                    m: cfg.vocab_size,
+                    k: cfg.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            },
+        )
+    }
+
+    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+        let cfg = self.cfg;
+        let q_out_dim = cfg.n_heads * cfg.head_dim;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        eprintln!(
+            "  loading layer {layer_idx}/{} (ParoQuant LLaMA/Qwen3)...",
+            cfg.n_layers
+        );
+        let mut b = crate::weight_backend::ParoBackend {
+            source: self.source,
+            gpu,
+            mp: "model",
+            layer: layer_idx,
+            norm_bias: 0.0,
+        };
+        load_layer(&mut b, cfg, q_out_dim, kv_dim, layer_idx)
+    }
+
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: LayerWeights) {
+        layer.free_gpu(gpu);
+    }
+}
+
 /// Load LLaMA/Qwen3 weights from a safetensors model — ParoQuant/AWQ *or* raw
 /// unquantized FP. ParoQuant is a transparent layer: [`ParoBackend::proj`] tries
 /// the `.qweight` augmentors first and falls back to the raw `.weight`
@@ -1938,118 +2153,33 @@ fn paro_load_llama_norm_raw(
 /// `quantization_config` loads as plain FP. The `group_size`/`krot` below are
 /// only consumed by the quant path; raw checkpoints never read them.
 ///
-/// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
-/// (no `model.language_model.` prefix — that's Qwen3.5-specific).
 pub fn load_weights_paroquant_llama(
     source: &dyn crate::model_source::ModelSource,
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
-    // Raw (unquantized) checkpoints have no quantization_config; default the
-    // quant params (unused on the raw fallback path).
-    let (gs, kr) = source
+    let (group_size, krot) = source
         .quant_config()
         .map(|qc| (qc.group_size, qc.krot))
         .unwrap_or((128, 0));
-
-    // Embedding
-    eprintln!("  loading token_embd (LLaMA/Qwen3 safetensors)...");
-    let embd_name = "model.embed_tokens.weight";
-    let (embd_info, embd_data) = source
-        .tensor_data(embd_name)
-        .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens not found"))?;
-    // Handles F16/BF16/F32 (raw HF checkpoints are commonly BF16).
-    let f32_embd = crate::safetensors_source::source_bytes_to_f32_vec(&embd_info.dtype, embd_data);
-    let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
-    let embd_fmt = EmbeddingFormat::F32;
-
-    // Output norm
-    eprintln!("  loading output_norm...");
-    let output_norm = paro_load_llama_norm_raw(source, gpu, "norm.weight", &[config.dim])?;
-
-    // Output / lm_head (tied or separate) — alias the F32 embd buffer when tied.
-    let has_separate = source.tensor_info("lm_head.weight").is_some();
-    let (output, lm_head_aliases_embd) = resolve_lm_head(
-        gpu,
-        has_separate,
-        true, // load_weights_paroquant_llama is single-GPU only
-        &token_embd,
-        embd_fmt,
-        config.vocab_size,
-        config.dim,
-        |gpu| {
-            let lm_prefix = "lm_head";
-            if source
-                .tensor_info(&format!("{lm_prefix}.qweight"))
-                .is_some()
-            {
-                load_paroquant_weight_from_source(
-                    source,
-                    gpu,
-                    lm_prefix,
-                    config.vocab_size,
-                    config.dim,
-                    gs,
-                    kr,
-                )
-            } else {
-                load_fp16_weight_tensor_from_source(
-                    source,
-                    gpu,
-                    &format!("{lm_prefix}.weight"),
-                    config.vocab_size,
-                    config.dim,
-                )
-            }
-        },
-        |gpu| {
-            // Tied lm_head fallback: re-read the embedding as F32. Handles
-            // F16/BF16/F32 (raw HF checkpoints are commonly BF16) rather than
-            // the F16-only `reupload_f16_as_f32` (correct only for HFQ embeds).
-            let (info, td) = source.tensor_data(embd_name).ok_or_else(|| {
-                HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
-            })?;
-            let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, td);
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        },
-    )?;
-
-    // Layers — shared `load_layer` walk
-    let q_out_dim = config.n_heads * config.head_dim;
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    let mut layers = Vec::with_capacity(config.n_layers);
-    {
-        let mut b = crate::weight_backend::ParoBackend {
-            source,
-            gpu,
-            mp: "model",
-            layer: 0,
-            norm_bias: 0.0,
-        };
-        for i in 0..config.n_layers {
-            eprintln!(
-                "  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...",
-                config.n_layers
-            );
-            layers.push(load_layer(&mut b, config, q_out_dim, kv_dim, i)?);
-        }
-    }
-
+    let mut source = LlamaParoSource {
+        source,
+        cfg: config,
+        group_size,
+        krot,
+    };
+    let layout = crate::model_load::Layout::single(config.n_layers);
+    let LoadedWeights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers,
+        lm_head_aliases_embd,
+    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
     Ok(LlamaWeights {
         token_embd,
-        embd_format: embd_fmt,
+        embd_format,
         output_norm,
         output,
         layers,

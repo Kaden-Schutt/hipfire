@@ -11,8 +11,8 @@ use crate::kv_backend::{
     KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
 use crate::kv_mode::KvMode;
-use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
+use hipfire_hardware::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Model architecture type.
@@ -521,10 +521,12 @@ pub struct WeightTensor {
 }
 
 impl WeightTensor {
-    /// Free the weight buffer and any associated metadata (ParoQuant rotation,
-    /// AWQ sidecar) from GPU.
-    pub fn free_all(self, gpu: &mut Gpu) {
-        if let Some(paro) = self.paro {
+    fn free_metadata_parts(
+        gpu: &mut Gpu,
+        paro: Option<ParoRotation>,
+        awq_scale: Option<GpuTensor>,
+    ) {
+        if let Some(paro) = paro {
             // Aliased rotations point into shared per-layer sidecars; the owner
             // (e.g. MoeFfnWeights.paro_shared) frees them. Skip here.
             if !paro.is_alias {
@@ -533,10 +535,33 @@ impl WeightTensor {
                 let _ = gpu.free_tensor(paro.channel_scales);
             }
         }
-        if let Some(awq) = self.awq_scale {
+        if let Some(awq) = awq_scale {
             let _ = gpu.free_tensor(awq);
         }
-        let _ = gpu.free_tensor(self.buf);
+    }
+
+    /// Free only sidecar metadata, leaving the primary buffer untouched.
+    ///
+    /// Tied lm-head views share the embedding allocation, so rollback and
+    /// unload use this half of the teardown when `buf` is an alias.
+    pub fn free_metadata_only(self, gpu: &mut Gpu) {
+        let Self {
+            paro, awq_scale, ..
+        } = self;
+        Self::free_metadata_parts(gpu, paro, awq_scale);
+    }
+
+    /// Free the weight buffer and any associated metadata (ParoQuant rotation,
+    /// AWQ sidecar) from GPU.
+    pub fn free_all(self, gpu: &mut Gpu) {
+        let Self {
+            buf,
+            paro,
+            awq_scale,
+            ..
+        } = self;
+        Self::free_metadata_parts(gpu, paro, awq_scale);
+        let _ = gpu.free_tensor(buf);
     }
 }
 
@@ -677,31 +702,60 @@ pub struct LayerWeights {
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
 }
+impl LayerWeights {
+    /// Release every allocation owned by one completed LLaMA layer.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Self {
+            attn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            ffn_norm,
+            w_gate,
+            w_up,
+            w_down,
+        } = self;
+        let _ = gpu.free_tensor(attn_norm);
+        wq.free_all(gpu);
+        wk.free_all(gpu);
+        wv.free_all(gpu);
+        wo.free_all(gpu);
+        if let Some(tensor) = q_norm {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = k_norm {
+            let _ = gpu.free_tensor(tensor);
+        }
+        let _ = gpu.free_tensor(ffn_norm);
+        w_gate.free_all(gpu);
+        w_up.free_all(gpu);
+        w_down.free_all(gpu);
+    }
+}
 
 impl LlamaWeights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.token_embd);
-        let _ = gpu.free_tensor(self.output_norm);
-        if !self.lm_head_aliases_embd {
-            let _ = gpu.free_tensor(self.output.buf);
+        let Self {
+            token_embd,
+            output_norm,
+            output,
+            layers,
+            lm_head_aliases_embd,
+            ..
+        } = self;
+        let _ = gpu.free_tensor(token_embd);
+        let _ = gpu.free_tensor(output_norm);
+        if lm_head_aliases_embd {
+            output.free_metadata_only(gpu);
+        } else {
+            output.free_all(gpu);
         }
-        for l in self.layers {
-            let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
-            let _ = gpu.free_tensor(l.wk.buf);
-            let _ = gpu.free_tensor(l.wv.buf);
-            let _ = gpu.free_tensor(l.wo.buf);
-            if let Some(t) = l.q_norm {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(t) = l.k_norm {
-                let _ = gpu.free_tensor(t);
-            }
-            let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+        for layer in layers {
+            layer.free_gpu(gpu);
         }
     }
 }
@@ -5563,8 +5617,8 @@ pub use saddle_core::kv::{KvCache, KvDims, KvLayers, VMode};
 // `KvMode` and `KvBackend` are re-exported from their canonical modules
 // (`crate::kv_mode`, `crate::kv_backend`) which themselves re-export from
 // `saddle-core`; `llama.rs` does not need to re-export them directly.
-// `KvTarget` stays here because it depends on `crate::multi_gpu::Gpus`,
-// which is runtime-specific and must not leak into `saddle-core`.
+// `KvTarget` stays here because it depends on `hipfire_hardware::Gpus`,
+// which is hardware-specific and must not leak into `saddle-core`.
 
 pub enum KvTarget<'a> {
     /// pp == 1: one GPU. Sites 1–5.

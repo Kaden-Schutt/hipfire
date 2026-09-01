@@ -13,7 +13,7 @@
 //! replay rather than passing on a stale record from the prior replay.
 
 use hip_bridge::{DeviceBuffer, Graph, GraphExec};
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use rdna_compute::{DType, GpuTensor};
 
 const ELEMS: usize = 4_096;
@@ -40,7 +40,8 @@ fn main() {
         "stale-event screen requires at least two replays"
     );
 
-    let mut gpus = Gpus::init_uniform(ranks, ranks).expect("init TP GPUs");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, ranks, ranks).expect("init TP GPUs");
     assert_eq!(gpus.devices.len(), ranks, "wrong GPU count");
     for (rank, gpu) in gpus.devices.iter().enumerate() {
         assert_eq!(

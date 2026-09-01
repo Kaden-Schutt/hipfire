@@ -25,6 +25,7 @@ ep-fault-inject = []
 rdna-compute = { path = "../rdna-compute" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hip-bridge = { path = "../hip-bridge" }
 saddle-core = { path = "../saddle-core" }
 # Optional arch crate deps — feature-gated.

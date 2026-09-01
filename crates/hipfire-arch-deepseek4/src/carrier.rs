@@ -104,18 +104,20 @@ pub fn load_bundle(
             let mut config = <DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
-            let weights =
-                <DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            let weights = DeepseekV4::load_weights_with_fault(
+                &mut hfq,
+                &config,
+                ctx.gpu,
+                ctx.spec.lifecycle_fault,
+            )?;
             (config, weights)
         }
         ModelSource::Dir(source) => {
-            let mut config = crate::config_from_safetensors(&source).ok_or_else(|| {
-                "deepseek4: failed to parse config from safetensors".to_string()
-            })?;
+            let mut config = crate::config_from_safetensors(&source)
+                .ok_or_else(|| "deepseek4: failed to parse config from safetensors".to_string())?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
-            let weights =
-                DeepseekV4::load_weights_from_safetensors(&source, &config, ctx.gpu)?;
+            let weights = DeepseekV4::load_weights_from_safetensors(&source, &config, ctx.gpu)?;
             (config, weights)
         }
     };
@@ -134,12 +136,12 @@ pub fn load_bundle(
         ));
     }
     let mut state = DeepseekV4State::new(&config)?;
-    state.compressor_cache_dtype = if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16
-    {
-        rdna_compute::DType::F16
-    } else {
-        rdna_compute::DType::F32
-    };
+    state.compressor_cache_dtype =
+        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+            rdna_compute::DType::F16
+        } else {
+            rdna_compute::DType::F32
+        };
     let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())

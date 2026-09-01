@@ -849,8 +849,14 @@ pub struct EvictionCtx {
     pub k_compact: GpuTensor,
     pub v_compact: GpuTensor,
     pub retain_dev: GpuTensor,
-    /// Running count of evictions fired (useful for bench harnesses).
+    /// Running count of evictions fired (useful for bench harnesses). This is
+    /// intentionally model-lifetime telemetry, not request-local state: reset
+    /// and speculative rollback retain the policy/scratch owner.
     pub eviction_count: std::cell::Cell<usize>,
+    /// Number of request-state resets routed through the persistent owner.
+    /// This is lifetime telemetry; resetting a request must never replace the
+    /// policy/scratch allocation or clear its configured activation gate.
+    pub request_reset_count: std::cell::Cell<usize>,
     /// Optional adaptive-KV handoff gate. Closed means the cache is still in
     /// its adaptive phase and must not be scored or compacted yet.
     activation_gate: Option<Arc<AtomicBool>>,
@@ -914,7 +920,6 @@ impl EvictionCtx {
         let k_compact = gpu.zeros(&[(budget * widest_bpp + 3) / 4], DType::F32)?;
         let v_compact = gpu.zeros(&[(budget * q8_bpp + 3) / 4], DType::F32)?;
         let retain_dev = gpu.alloc_tensor(&[budget], DType::F32)?;
-
         Ok(Self {
             centers_dev,
             fa_layer_ids,
@@ -932,8 +937,51 @@ impl EvictionCtx {
             v_compact,
             retain_dev,
             eviction_count: std::cell::Cell::new(0),
+            request_reset_count: std::cell::Cell::new(0),
             activation_gate: None,
         })
+    }
+
+    /// CPU metadata-only owner used by dependent lifecycle tests. The null
+    /// tensors are never valid inputs to a HIP operation; this constructor is
+    /// intentionally limited to request-owner identity/reset assertions.
+    #[doc(hidden)]
+    pub fn for_test(budget: usize, beta: usize) -> Self {
+        let null = || GpuTensor::null_for_test();
+        Self {
+            centers_dev: null(),
+            fa_layer_ids: Vec::new(),
+            centers_per_layer: 0,
+            budget,
+            beta,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            n_rot: 0,
+            rope_theta: 0.0,
+            max_seq: budget.saturating_add(beta),
+            scores_buf: null(),
+            k_compact: null(),
+            v_compact: null(),
+            retain_dev: null(),
+            eviction_count: std::cell::Cell::new(0),
+            request_reset_count: std::cell::Cell::new(0),
+            activation_gate: None,
+        }
+    }
+
+    /// Clear request-local eviction bookkeeping while retaining this
+    /// model-owned policy and all of its reusable GPU scratch.
+    pub fn reset_request_state(&self, compact_offset: Option<&mut i32>) {
+        if let Some(offset) = compact_offset {
+            *offset = 0;
+        }
+        self.request_reset_count
+            .set(self.request_reset_count.get().saturating_add(1));
+    }
+
+    pub fn request_reset_count(&self) -> usize {
+        self.request_reset_count.get()
     }
 
     pub fn set_activation_gate(&mut self, gate: Arc<AtomicBool>) {

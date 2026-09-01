@@ -9,10 +9,10 @@ use super::config::LayerType;
 use super::config::Qwen35Config;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::screen_weight_tensor;
 use hipfire_runtime::MmqScreenable;
 use rdna_compute::DType;
@@ -1085,6 +1085,68 @@ fn free_weight_checked(gpu: &mut Gpu, w: WeightTensor) -> Option<HipError> {
     first
 }
 
+impl LayerWeights {
+    /// Release every allocation owned by one completed layer.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            LayerWeights::DeltaNet(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wqkv.free_all(gpu);
+                l.wz.free_all(gpu);
+                l.w_alpha.free_all(gpu);
+                l.w_beta.free_all(gpu);
+                let _ = gpu.free_tensor(l.a_log);
+                let _ = gpu.free_tensor(l.dt_bias);
+                let _ = gpu.free_tensor(l.conv_weight);
+                let _ = gpu.free_tensor(l.norm_weight);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                l.w_gate.free_all(gpu);
+                l.w_up.free_all(gpu);
+                l.w_down.free_all(gpu);
+            }
+            LayerWeights::FullAttn(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wq.free_all(gpu);
+                l.wk.free_all(gpu);
+                l.wv.free_all(gpu);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.q_norm);
+                let _ = gpu.free_tensor(l.k_norm);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                l.w_gate.free_all(gpu);
+                l.w_up.free_all(gpu);
+                l.w_down.free_all(gpu);
+            }
+            LayerWeights::DeltaNetMoe(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wqkv.free_all(gpu);
+                l.wz.free_all(gpu);
+                l.w_alpha.free_all(gpu);
+                l.w_beta.free_all(gpu);
+                let _ = gpu.free_tensor(l.a_log);
+                let _ = gpu.free_tensor(l.dt_bias);
+                let _ = gpu.free_tensor(l.conv_weight);
+                let _ = gpu.free_tensor(l.norm_weight);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                free_moe_ffn(gpu, l.ffn);
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wq.free_all(gpu);
+                l.wk.free_all(gpu);
+                l.wv.free_all(gpu);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.q_norm);
+                let _ = gpu.free_tensor(l.k_norm);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                free_moe_ffn(gpu, l.ffn);
+            }
+        }
+    }
+}
+
 pub struct Qwen35Weights {
     pub token_embd: GpuTensor,
     pub embd_format: EmbeddingFormat,
@@ -1123,62 +1185,7 @@ impl Qwen35Weights {
             self.output.free_all(gpu);
         }
         for layer in self.layers {
-            match layer {
-                LayerWeights::DeltaNet(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wqkv.free_all(gpu);
-                    l.wz.free_all(gpu);
-                    l.w_alpha.free_all(gpu);
-                    l.w_beta.free_all(gpu);
-                    let _ = gpu.free_tensor(l.a_log);
-                    let _ = gpu.free_tensor(l.dt_bias);
-                    let _ = gpu.free_tensor(l.conv_weight);
-                    let _ = gpu.free_tensor(l.norm_weight);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    l.w_gate.free_all(gpu);
-                    l.w_up.free_all(gpu);
-                    l.w_down.free_all(gpu);
-                }
-                LayerWeights::FullAttn(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wq.free_all(gpu);
-                    l.wk.free_all(gpu);
-                    l.wv.free_all(gpu);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.q_norm);
-                    let _ = gpu.free_tensor(l.k_norm);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    l.w_gate.free_all(gpu);
-                    l.w_up.free_all(gpu);
-                    l.w_down.free_all(gpu);
-                }
-                LayerWeights::DeltaNetMoe(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wqkv.free_all(gpu);
-                    l.wz.free_all(gpu);
-                    l.w_alpha.free_all(gpu);
-                    l.w_beta.free_all(gpu);
-                    let _ = gpu.free_tensor(l.a_log);
-                    let _ = gpu.free_tensor(l.dt_bias);
-                    let _ = gpu.free_tensor(l.conv_weight);
-                    let _ = gpu.free_tensor(l.norm_weight);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
-                }
-                LayerWeights::FullAttnMoe(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wq.free_all(gpu);
-                    l.wk.free_all(gpu);
-                    l.wv.free_all(gpu);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.q_norm);
-                    let _ = gpu.free_tensor(l.k_norm);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
-                }
-            }
+            layer.free_gpu(gpu);
         }
         // MAD-93 v0.1: in paged mode, the pager owns expert weight allocations
         // (the per-layer `free_moe_ffn` loops ran no-ops since `ffn.experts`
@@ -1206,63 +1213,7 @@ impl Qwen35Weights {
         self.output.free_all(&mut gpus.devices[out_dev]);
         for (i, layer) in self.layers.into_iter().enumerate() {
             let dev_idx = gpus.device_for_layer(i);
-            let gpu = &mut gpus.devices[dev_idx];
-            match layer {
-                LayerWeights::DeltaNet(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wqkv.free_all(gpu);
-                    l.wz.free_all(gpu);
-                    l.w_alpha.free_all(gpu);
-                    l.w_beta.free_all(gpu);
-                    let _ = gpu.free_tensor(l.a_log);
-                    let _ = gpu.free_tensor(l.dt_bias);
-                    let _ = gpu.free_tensor(l.conv_weight);
-                    let _ = gpu.free_tensor(l.norm_weight);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    l.w_gate.free_all(gpu);
-                    l.w_up.free_all(gpu);
-                    l.w_down.free_all(gpu);
-                }
-                LayerWeights::FullAttn(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wq.free_all(gpu);
-                    l.wk.free_all(gpu);
-                    l.wv.free_all(gpu);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.q_norm);
-                    let _ = gpu.free_tensor(l.k_norm);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    l.w_gate.free_all(gpu);
-                    l.w_up.free_all(gpu);
-                    l.w_down.free_all(gpu);
-                }
-                LayerWeights::DeltaNetMoe(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wqkv.free_all(gpu);
-                    l.wz.free_all(gpu);
-                    l.w_alpha.free_all(gpu);
-                    l.w_beta.free_all(gpu);
-                    let _ = gpu.free_tensor(l.a_log);
-                    let _ = gpu.free_tensor(l.dt_bias);
-                    let _ = gpu.free_tensor(l.conv_weight);
-                    let _ = gpu.free_tensor(l.norm_weight);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
-                }
-                LayerWeights::FullAttnMoe(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    l.wq.free_all(gpu);
-                    l.wk.free_all(gpu);
-                    l.wv.free_all(gpu);
-                    l.wo.free_all(gpu);
-                    let _ = gpu.free_tensor(l.q_norm);
-                    let _ = gpu.free_tensor(l.k_norm);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
-                }
-            }
+            layer.free_gpu(&mut gpus.devices[dev_idx]);
         }
     }
 }
@@ -1339,7 +1290,7 @@ impl MmqScreenable for Qwen35Weights {
     }
 }
 
-fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+pub(crate) fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     ffn.router.free_all(gpu);
     ffn.shared_expert_gate.free_all(gpu);
     ffn.shared_expert.gate.free_all(gpu);

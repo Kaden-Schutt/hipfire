@@ -51,6 +51,16 @@ use crate::common::*;
 use hipfire_pflash;
 use hipfire_runtime::prompt_frame;
 use rdna_compute;
+fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+}
 
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
 /// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
@@ -87,6 +97,12 @@ pub fn generate_ep(
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
 ) {
+    let ep_route = match m.arch_id {
+        9 => crate::ar::GenerationRoute::Deepseek4Ep,
+        10 => crate::ar::GenerationRoute::MiniMaxEp,
+        _ => crate::ar::GenerationRoute::QwenAr,
+    };
+    crate::ar::set_generation_route(ep_route);
     // ── Canonical multi-turn render via the arch's trained chat_template
     // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
     // conversation, live user last) → render_messages with `tools` threaded;
@@ -317,47 +333,28 @@ pub fn ep_serve_qwen35_dense_tp(
     }
 
     // This route replays the complete rendered conversation each request.
-    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
-        if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
-            for (rank, state) in dn_states.iter_mut().enumerate() {
-                let gpu = &mut gpus.devices[rank];
-                if let Err(e) = gpu.bind_thread() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP bind_thread rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                if let Err(e) = state.reset(gpu) {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP state reset rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                gpu.invalidate_graph_state();
-            }
-        }
+    // Reset through the shared EP owner so rank visitation, host history,
+    // adaptive/spec scratch, graph invalidation, and synchronization cannot
+    // drift from the cancellation path.
+    let reset = ep_reset_after_abort(m);
+    if !reset.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "dense TP turn reset failed before prefill",
+            "gpu",
+            true,
+            &reset,
+        );
+        return;
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
     // `primed_think` preserves Jinja enable_thinking semantics (render ended on
     // an open `<think>` primer). Tool requests fail closed before this route.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
         stdout,
         id,
         primed_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
 
     let t_prefill = Instant::now();
@@ -703,101 +700,18 @@ pub fn ep_emit_done(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
     }
 }
 
-/// Full EP route-complete abort reset: per-rank bind + cursor reset + decode
-/// cache zero + graph invalidate, then device_synchronize on every rank.
-/// `rolled_back` is true only when every bind/reset and synchronize succeeds.
+/// Full EP route-complete abort reset. The implementation lives in the shared
+/// lifecycle owner so explicit reset, EP cancellation, and generic rollback
+/// cannot diverge on rank visitation or terminal attestation.
 pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
-    let mut first_err: Option<String> = None;
-    if let Some(ep) = m.ep.as_mut() {
-        let EpState { gpus, inner } = ep;
-        match inner {
-            EpArch::Ds4 { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    if let Err(e) = g.bind_thread() {
-                        push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), e);
-                    }
-                    s.reset();
-                    s.zero_decode_caches(g);
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Minimax { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    if let Err(e) = g.bind_thread() {
-                        push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), e);
-                    }
-                    s.reset();
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Qwen35 { batch, .. } => {
-                if let Some(batch) = batch.as_mut() {
-                    if let Err(e) = batch.reset_all(gpus) {
-                        push_reset_err(&mut first_err, "qwen35 ep batch reset_all", e);
-                    }
-                }
-                for dev in &mut gpus.devices {
-                    dev.invalidate_graph_state();
-                }
-            }
-            EpArch::Qwen35DenseTp { dn_states, .. } => {
-                for (rank, state) in dn_states.iter_mut().enumerate() {
-                    let gpu = &mut gpus.devices[rank];
-                    if let Err(e) = gpu.bind_thread() {
-                        push_reset_err(
-                            &mut first_err,
-                            &format!("dense qwen TP rank{rank} bind_thread"),
-                            e,
-                        );
-                    }
-                    if let Err(e) = state.reset(gpu) {
-                        push_reset_err(
-                            &mut first_err,
-                            &format!("dense qwen TP rank{rank} state reset"),
-                            e,
-                        );
-                    }
-                    gpu.invalidate_graph_state();
-                }
-            }
-        }
-        for (rank, dev) in gpus.devices.iter_mut().enumerate() {
-            if let Err(e) = dev.bind_thread() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} sync bind_thread"),
-                    e,
-                );
-            }
-            if let Err(e) = dev.hip.device_synchronize() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} device_synchronize"),
-                    e,
-                );
-            }
-        }
-    }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if first_err.is_none() {
-        RollbackEpilogue {
-            rolled_back: true,
-            context: None,
-        }
-    } else {
-        RollbackEpilogue {
-            rolled_back: false,
-            context: first_err.or_else(|| Some("EP abort reset could not be attested".into())),
-        }
-    }
+    crate::common::ep_reset_after_abort(m)
 }
 
 /// EP cancel terminal: reset/sync first, then emit attempt-correlated
@@ -810,22 +724,9 @@ pub fn ep_emit_abort(
     completion_tokens: usize,
 ) {
     let epilogue = ep_reset_after_abort(m);
-    if !epilogue.rolled_back {
-        emit_fail_closed_error(
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed EP rollback could not be attested",
-            "validation",
-            false,
-            &epilogue,
-        );
-        return;
-    }
-    let attempt_id = active_attempt_id();
-    let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
-    let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
+    // The shared cancellation emitter claims the active attempt exactly once
+    // after the reset attestation; it is the sole writer of the aborted pair.
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -868,31 +769,21 @@ pub fn ep_serve_ds4(
     }
 
     // ── Cross-conversation reset (FIX: ds4 EP turn-to-turn contamination) ──
-    // ds4 EP replays the full prompt from position 0 every turn (no LCP reuse —
-    // see the capacity-guard comment above), so a CONTINUING conversation
-    // re-prefills its whole history straight from the prompt; nothing in the EP
-    // state is reusable across turns, so we reset unconditionally here. This is
-    // the EP analogue of the single-GPU cache-miss reset in generate_deepseek4:
-    // `reset()` alone only rewinds n_tokens — the position-indexed decode caches
-    // (SWA ring, compressed/full KV, indexer scratch) retain the PRIOR turn's
-    // residue and bleed into the next conversation (observed: turn 2 echoing
-    // turn 1's answer) unless explicitly zeroed. Do it per rank on its own
-    // device. Without this, ep_serve_ds4 only ever reset on abort (and even that
-    // path, ep_reset_after_abort, omitted zero_decode_caches).
-    if let Some(ep) = m.ep.as_mut() {
-        let EpState { gpus, inner } = ep;
-        if let EpArch::Ds4 { state, .. } = inner {
-            for (rank, s) in state.iter_mut().enumerate() {
-                let g = &mut gpus.devices[rank];
-                let _ = g.bind_thread();
-                s.reset();
-                s.zero_decode_caches(g);
-                g.invalidate_graph_state();
-            }
-        }
+    // DS4 EP replays the full prompt from position 0 on every turn. Use the
+    // same total EP reset as cancellation so compressed/SWA/indexer caches,
+    // host history, graphs, and every rank's device are covered.
+    let reset = ep_reset_after_abort(m);
+    if !reset.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "DS4 EP turn reset failed before prefill",
+            "gpu",
+            true,
+            &reset,
+        );
+        return;
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
 
     let mut parser = match think_mode {
         ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
@@ -971,7 +862,12 @@ pub fn ep_serve_ds4(
     // a bespoke decode loop, so unlike the single-device AR/spec paths it does
     // not inherit their emitter-side latch.  Open it after all early request
     // validation but before prefill/decode can produce a client event.
-    emit_ds4_ep_gen_start(stdout, id, think_mode);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ep),
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+    );
 
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
@@ -1329,7 +1225,7 @@ pub fn ep_serve_ds4(
         );
     }
 
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done(stdout, id, &pending_done);
     let _ = stdout.flush();
 }
 
@@ -2317,11 +2213,11 @@ pub fn generate_dflash(
     // Advertise semantic-v2 only when this turn's arch has a correlated
     // router-backed DFlash producer (qwen35 / qwen35-vl). Other arches still
     // use whole-output tool extraction and stay on legacy contract.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenDflash),
         stdout,
         id,
         started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
     let run = match generate_spec(
         m,
@@ -2602,7 +2498,7 @@ pub fn generate_dflash(
                         cached_seq,
                     );
                 }
-                emit_staged_terminal_done(stdout, &pending_done);
+                crate::ar::emit_active_route_done(stdout, id, &pending_done);
             }
         }
     } else {
@@ -2751,7 +2647,7 @@ pub fn generate_dflash(
                 },
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done(stdout, id, &pending_done);
     }
     let _ = stdout.flush();
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
@@ -4015,6 +3911,74 @@ pub fn attach_mtp_window_timings(
     }
 }
 
+/// One PP rollback adapter for Qwen3.5's split architecture state.
+///
+/// The host/checkpoint/spec/graph/synchronization lifecycle remains owned by
+/// [`production_fail_closed_rollback_live_with_extras`]. Only the disjoint
+/// Qwen35 bundle, per-device GPU collection, and layer-owner map are supplied
+/// here so the recurrent reset has one shared implementation.
+#[allow(clippy::too_many_arguments)]
+fn qwen35_pp_rollback(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    mut bundle: Option<&mut hipfire_arch_qwen35::Qwen35Bundle>,
+    mut gpus: Option<&mut hipfire_hardware::Gpus>,
+    layer_owner_map: Option<&[u8]>,
+) -> RollbackEpilogue {
+    let mut target_reset = |_: &mut rdna_compute::Gpu| {
+        let (Some(bundle), Some(gpus), Some(layer_owner_map)) =
+            (bundle.as_deref_mut(), gpus.as_deref_mut(), layer_owner_map)
+        else {
+            return Err("qwen35 PP rollback owners are incomplete".to_string());
+        };
+        reset_qwen35_recurrent_pp(bundle, gpus, layer_owner_map)
+    };
+    production_fail_closed_rollback_live_with_extras(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut target_reset,
+        None,
+        ResetExtras::none(),
+    )
+}
+
+/// Borrow the PP owners separately from the host fields before entering the
+/// shared rollback algorithm. Missing owners still go through the algorithm
+/// so host cleanup, graph invalidation, and synchronization are attested.
+fn qwen35_pp_rollback_model(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> RollbackEpilogue {
+    let (seq_pos, conversation_tokens, prefill_checkpoints, dflash_checkpoints, asst_turn_cache) = (
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+    );
+    let bundle = m.state.as_deref_mut().and_then(|state| {
+        (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    });
+    let gpus = m.pp_gpus.as_mut();
+    let layer_owner_map = m.pp_dn_la_to_device.as_deref();
+    qwen35_pp_rollback(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        bundle,
+        gpus,
+        layer_owner_map,
+    )
+}
+
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
 /// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
@@ -4057,8 +4021,17 @@ pub fn generate_multi(
     // byte-identical at temp>0.
     request_seed: u64,
 ) {
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route()
+            .unwrap_or(crate::ar::GenerationRoute::PipelineParallel),
+        stdout,
+        id,
+        false,
+    );
+    let prompt_est = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        tokenizer.encode(prompt).len() + 20
+    };
     if m.seq_pos
         .saturating_add(prompt_est)
         .saturating_add(max_tokens)
@@ -4068,78 +4041,21 @@ pub fn generate_multi(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here; covers both the
-        // pp>1 per-LA-device path and the single-GPU path.
-        if m.pp > 1 {
-            if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| {
-                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                }),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
+        let ep = qwen35_pp_rollback_model(m, gpu);
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "context-full PP reset failed",
+                "validation",
+                false,
+                &ep,
+            );
+            return;
         }
     }
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -4343,80 +4259,36 @@ pub fn generate_multi(
         .build_with_user_tokens(&q_tokens)
     };
 
-    // hunt3 H-A: under Jinja the full conversation (system + history) is
-    // re-rendered every turn, so turn 2+ must cold-reset BEFORE the budget guard
-    // + prefill — otherwise the full render appends to the prior turn's dirty
-    // KV / DeltaNet / checkpoint state (stale recurrent state → drift; the
-    // system prompt was also being silently dropped on turn 2+). Mirrors the
-    // `reset_pp_uncommitted_state!` semantics, written inline because that macro
-    // is defined later (after kv/dn/gpus are borrowed). Same shape as the
-    // context-full reset at the top of this fn and generate()'s `jinja_active &&
-    // seq_pos > 0` block.
+    // Under Jinja the full conversation is re-rendered every turn, so turn 2+
+    // must reset before the budget guard and prefill. Keep the reset in the
+    // same PP adapter used by all fail-closed paths.
     if try_jinja && m.seq_pos > 0 {
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
-        if m.pp > 1 {
-            if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| {
-                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                }),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
-        }) {
-            b.kv.compact_offset = 0;
+        let bundle = m.state.as_mut().and_then(|state| {
+            (state.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        });
+        let gpus = m.pp_gpus.as_mut();
+        let layer_owner_map = m.pp_dn_la_to_device.as_deref();
+        let ep = qwen35_pp_rollback(
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+            bundle,
+            gpus,
+            layer_owner_map,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Jinja PP turn reset failed",
+                "validation",
+                false,
+                &ep,
+            );
+            return;
         }
     }
 
@@ -4474,43 +4346,6 @@ pub fn generate_multi(
     let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();
     let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
-
-    macro_rules! reset_pp_uncommitted_state {
-        () => {{
-            m.seq_pos = 0;
-            m.conversation_tokens.clear();
-            free_checkpoints(&mut m.prefill_checkpoints, gpu);
-            free_checkpoints(&mut m.dflash_checkpoints, gpu);
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-            // but keeps single-GPU parity if EF is ever wired per-device.
-            for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            kv.compact_offset = 0;
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
-            }) {
-                b.kv.compact_offset = 0;
-            }
-        }};
-    }
 
     let dev_last = gpus.output_device;
     let vocab_size = config.vocab_size;
@@ -4583,27 +4418,37 @@ pub fn generate_multi(
         dn,
         scratch_set,
     ) {
-        // hunt3 M-A: a partial-band prefill failure leaves DeltaNet partially
-        // advanced; without resetting, the next cold turn prefills over dirty
-        // recurrent state (drift). Mirror both abort paths, which already reset.
-        reset_pp_uncommitted_state!();
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("forward_prefill_batch_multi: {}", e),
-            "validation",
-            false,
-            false,
+        // A partial-band prefill may have advanced recurrent state. The PP
+        // adapter resets it and owns the single fail-closed terminal.
+        let message = format!("forward_prefill_batch_multi: {}", e);
+        let ep = qwen35_pp_rollback(
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+            Some(&mut *b),
+            Some(&mut *gpus),
+            Some(dn_la_to_device.as_slice()),
         );
-        let _ = stdout.flush();
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
     m.seq_pos += new_tokens.len();
     m.conversation_tokens.extend_from_slice(&new_tokens);
-
     if check_abort(id) {
-        reset_pp_uncommitted_state!();
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        let ep = qwen35_pp_rollback(
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+            Some(&mut *b),
+            Some(&mut *gpus),
+            Some(dn_la_to_device.as_slice()),
+        );
         emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
@@ -4693,8 +4538,17 @@ pub fn generate_multi(
 
     while generated < max_tokens {
         if check_abort(id) {
-            reset_pp_uncommitted_state!();
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let ep = qwen35_pp_rollback(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                Some(&mut *b),
+                Some(&mut *gpus),
+                Some(dn_la_to_device.as_slice()),
+            );
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
@@ -4733,19 +4587,21 @@ pub fn generate_multi(
             dn,
             scratch_set,
         ) {
-            // hunt3 M-A: a decode-step failure leaves DeltaNet advanced past the
-            // (un-baked) conversation_tokens; reset so the next cold turn starts
-            // clean. Mirrors both abort paths.
-            reset_pp_uncommitted_state!();
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("forward_scratch_multi decode: {}", e),
-                "validation",
-                false,
-                false,
+            // A decode-step failure may leave DeltaNet advanced past the
+            // uncommitted conversation. Roll back once before the error.
+            let message = format!("forward_scratch_multi decode: {}", e);
+            let ep = qwen35_pp_rollback(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                Some(&mut *b),
+                Some(&mut *gpus),
+                Some(dn_la_to_device.as_slice()),
             );
-            let _ = stdout.flush();
+            emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
             return;
         }
         m.seq_pos += 1;
@@ -5178,12 +5034,21 @@ pub fn generate_multi(
     });
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
-        reset_pp_uncommitted_state!();
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        let ep = qwen35_pp_rollback(
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+            Some(&mut *b),
+            Some(&mut *gpus),
+            Some(dn_la_to_device.as_slice()),
+        );
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done(stdout, id, &pending_done);
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---

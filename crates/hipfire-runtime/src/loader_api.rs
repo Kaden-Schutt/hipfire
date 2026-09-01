@@ -103,6 +103,54 @@ pub struct LoadCtx<'a> {
 /// the per-mechanism signals (`dflash_mode`/`draft`, `mtp_mode`, and this), so
 /// `build_speculator`'s first-match cascade (dflash > mtp > n-gram) naturally
 /// yields the chosen mechanism without the loader needing a selector of its own.
+/// Deterministic lifecycle fault points used by the ignored G4 GPU campaigns.
+///
+/// This is an explicit per-load hook rather than an artifact-path convention:
+/// the loader reaches the named stage, publishes the prerequisite owner
+/// markers, and then returns the injected error. Normal callers leave it
+/// `None`, so production loading is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum LoadFaultStage {
+    /// Fail after DFlash target-verify scratch is allocated.
+    DflashTargetVerifyScratch,
+    /// Fail after all DSpark draft stages are uploaded, before the head stage.
+    DsparkHead,
+}
+
+impl LoadFaultStage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DflashTargetVerifyScratch => "DFlash target verify scratch",
+            Self::DsparkHead => "DSpark head",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadFaultPrerequisites {
+    pub target_owner_published: bool,
+    pub draft_owner_published: bool,
+}
+
+impl LoadFaultPrerequisites {
+    pub const fn marker(self) -> &'static str {
+        match (self.target_owner_published, self.draft_owner_published) {
+            (true, true) => "target-owner-published; draft-owner-published",
+            (true, false) => "target-owner-published; draft-owner-missing",
+            (false, true) => "target-owner-missing; draft-owner-published",
+            (false, false) => "target-owner-missing; draft-owner-missing",
+        }
+    }
+}
+
+/// Optional per-load deterministic fault stage. This field is hidden from
+/// ordinary configuration surfaces and is used only by lifecycle evidence.
+#[doc(hidden)]
+pub type LoadFault = Option<LoadFaultStage>;
+
+// The production config remains `Copy`: the stage selector is a small enum.
 #[derive(Clone, Copy, Default)]
 pub struct SpecLoadCfg {
     /// Enable the model-free n-gram drafter for this load. `None` = unspecified.
@@ -135,8 +183,13 @@ pub struct SpecLoadCfg {
     /// mechanism selected (skip load + build), `None` = `auto` (load if a
     /// bundled trailer or `.mtp` sidecar exists).
     pub mtp: Option<bool>,
-    /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
+    /// Resolved MTP draft width. The loader resolves generic and architecture-
+    /// specific precedence once, then generation consumes model metadata only.
     pub mtp_k: Option<usize>,
+    /// Optional deterministic fault stage for lifecycle evidence. Normal
+    /// production loads leave this unset.
+    #[doc(hidden)]
+    pub lifecycle_fault: LoadFault,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

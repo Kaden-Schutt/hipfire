@@ -13,9 +13,9 @@
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4
 
 use hipfire_arch_qwen35::qwen35;
-use hipfire_runtime::llama::KvCacheExt;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::llama::KvCacheExt;
 use std::path::Path;
 
 fn main() {
@@ -27,7 +27,8 @@ fn main() {
         config.n_layers, config.vocab_size, config.dim, config.hidden_dim,
     );
 
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let n = gpus.devices.len();
     let out_dev = gpus.output_device;
     println!(

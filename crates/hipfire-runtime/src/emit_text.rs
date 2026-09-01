@@ -60,6 +60,9 @@ pub struct ThinkOutputRouter {
     in_think: bool,
     pending: String,
     strip_answer_newlines: bool,
+    /// Once terminal output is finalized, no later bytes may cross the
+    /// client-visible boundary until a fresh router is constructed.
+    finished: bool,
 }
 
 impl ThinkOutputRouter {
@@ -71,9 +74,9 @@ impl ThinkOutputRouter {
             in_think: started_in_think,
             pending: String::new(),
             strip_answer_newlines: false,
+            finished: false,
         }
     }
-
     /// Whether the generated stream currently has an unclosed think span.
     pub fn in_think(&self) -> bool {
         self.in_think
@@ -82,7 +85,7 @@ impl ThinkOutputRouter {
     /// Route one UTF-8-safe text chunk into out without allocating an
     /// intermediate event vector. Existing entries in out are preserved.
     pub fn push_into(&mut self, text: &str, out: &mut Vec<ThinkRouteEvent>) {
-        if text.is_empty() {
+        if self.finished || text.is_empty() {
             return;
         }
         self.pending.push_str(text);
@@ -90,10 +93,14 @@ impl ThinkOutputRouter {
     }
 
     /// End-of-stream: classify a trailing partial marker as ordinary text.
-    /// The think state remains observable so callers can retain their existing
-    /// open-think fail-closed terminal policy.
+    /// The first call consumes the pending bytes; repeated calls and late
+    /// input are inert, preserving exactly-once terminal ownership.
     pub fn finish_into(&mut self, out: &mut Vec<ThinkRouteEvent>) {
+        if self.finished {
+            return;
+        }
         self.drain(true, out);
+        self.finished = true;
     }
 
     fn drain(&mut self, finish: bool, out: &mut Vec<ThinkRouteEvent>) {
@@ -1191,6 +1198,18 @@ mod tests {
         assert_eq!(reasoning, "reason</thi");
         assert!(open);
     }
+    #[test]
+    fn think_router_finish_is_idempotent_and_blocks_late_output() {
+        let mut router = ThinkOutputRouter::new(true);
+        let mut events = Vec::new();
+        router.push_into("reason</thi", &mut events);
+        router.finish_into(&mut events);
+        let first_len = events.len();
+        router.finish_into(&mut events);
+        router.push_into("nk>late", &mut events);
+        assert_eq!(events.len(), first_len);
+        assert!(router.in_think());
+    }
 
     // ── ToolOutputRouter ─────────────────────────────────────────────
 
@@ -1680,7 +1699,9 @@ mod tests {
     fn disabled_router_keeps_tool_like_text_visible_and_non_executable() {
         let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
         let mut router = ToolOutputRouter::disabled();
-        let events = router.push(text).expect("tool-free text must remain visible");
+        let events = router
+            .push(text)
+            .expect("tool-free text must remain visible");
         assert_eq!(events.len(), 1);
         match &events[0] {
             ToolRouteEvent::VisibleText(visible) => assert_eq!(visible.as_str(), text),

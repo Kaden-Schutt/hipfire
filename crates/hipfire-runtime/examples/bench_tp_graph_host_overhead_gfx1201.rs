@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 
 fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
     values.sort_by(f64::total_cmp);
@@ -16,7 +16,8 @@ fn main() {
     const WARMUPS: usize = 32;
     const REPEATS: usize = 512;
 
-    let gpus = Gpus::init_tp(RANKS, 43).expect("init exact gfx1201 TP4");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, RANKS, 43).expect("init exact gfx1201 TP4");
     assert!(
         gpus.devices
             .iter()

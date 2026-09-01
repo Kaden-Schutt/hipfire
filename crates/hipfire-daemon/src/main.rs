@@ -520,8 +520,12 @@ fn init_tracing() {
 
 fn install_process_config(config: hipfire_config::ProcessConfig) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
-    hipfire_config::apply_device_visibility(&config).map_err(|error| error.to_string())?;
-    let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&config);
+    let visibility =
+        hipfire_config::apply_device_visibility(&config).map_err(|error| error.to_string())?;
+    let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config_with_visibility(
+        &config,
+        visibility.clone(),
+    );
     hipfire_config::install_process_config(config)
         .map_err(|_| "process configuration was already initialized".to_owned())?;
     hipfire_runtime::config::init_with(runtime)
@@ -1353,6 +1357,7 @@ fn main() {
                         _ => None, // "auto" → loader default
                     },
                     mtp_k: Some(mtp_k),
+                    lifecycle_fault: None,
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
@@ -1759,9 +1764,11 @@ fn main() {
                         let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
                         let (dim, layers, vocab) = m.ack_dims();
 
-                        // Apply MTP config from load-message params.
+                        // `LoadedModel.mtp_k` is populated once by the loader
+                        // from this per-load SpecLoadCfg value. Keep policy
+                        // application here only for the mode string; generation
+                        // must read the stored model metadata, not re-resolve K.
                         m.mtp_mode = mtp_mode;
-                        m.mtp_k = mtp_k;
                         // Detect whether MTP weights are present in the loaded
                         // model. Used by mtp_mode=auto to decide whether to
                         // enable spec-decode at generate time. Three sources:
@@ -2508,100 +2515,28 @@ fn main() {
                     // Must mirror the "reset" command handler (line ~2098).
                     // VL runs on qwen35-vl (arch_id 5|6), dots-ocr (arch_id 8)
                     // and lfm2-vl (arch_id 11); other arch states are None
-                    // here — but clear them anyway for defense-in-depth in
-                    // case a future arch adds VL support.
                     if m.seq_pos > 0 {
-                        eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
-                        m.seq_pos = 0;
-                        m.conversation_tokens.clear();
-                        hipfire_generate::common::free_checkpoints(
-                            &mut m.prefill_checkpoints,
-                            &mut gpu,
+                        eprintln!(
+                            "[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation",
+                            m.seq_pos
                         );
-                        hipfire_generate::common::free_checkpoints(
-                            &mut m.dflash_checkpoints,
-                            &mut gpu,
+                        let ep = hipfire_generate::common::production_fail_closed_rollback(
+                            m, &mut gpu, None, None,
                         );
-                        // The DFlash checkpoint ring now lives inside the
-                        // speculator (m.dflash_checkpoints is vestigial/empty),
-                        // so free THAT ring on conversation reset too — else its
-                        // GPU snapshots persist until the next prefill-miss.
-                        if let Some(s) = m.speculator.as_mut() {
-                            if let Err(e) = s.reset(&mut gpu) {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("vision conversation reset failed: {e}"),
-                                    "gpu",
-                                    true,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
-                        // qwen35(-vl) recurrent state lives in the bundle
-                        // (qwen35 arch bundle, accessed via ArchModel). There is no
-                        // `LoadedModel.dn_state` — it was removed as vestigial
-                        // (always None); the live DeltaNet state is inside the
-                        // bundle. `m.kv_cache` is likewise vestigial on this path.
-                        if let Err(e) =
-                            hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu)
-                        {
+                        if !ep.rolled_back {
+                            let detail = ep
+                                .context
+                                .as_deref()
+                                .unwrap_or("rollback could not be attested");
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
                                 Some(id),
-                                &format!("vision recurrent reset failed: {e}"),
+                                &format!("vision conversation reset failed: {detail}"),
                                 "gpu",
                                 true,
                                 false,
                             );
                             continue;
-                        }
-                        if let Some(b) = m.llama_mut() {
-                            b.kv.compact_offset = 0;
-                        }
-                        if let Some(b) = m.dots_ocr_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.qwen2_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.deepseek4_mut() {
-                            b.state.reset();
-                        }
-                        // lfm2-vl (arch 11): KV + conv state live in the
-                        // lfm2moe bundle. generate_lfm2_vl cold-resets again
-                        // before its own prefill, so this arm is
-                        // defense-in-depth parity with the other VL arches —
-                        // without it a failed dispatch between guard and
-                        // generate body would leave stale state behind.
-                        if let Some(b) = m.lfm2moe_mut() {
-                            if let Err(e) = b.state.reset(&mut gpu) {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("vision lfm2moe reset failed: {e:?}"),
-                                    "gpu",
-                                    true,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
-                        if let Some(ad) = m.kv_adaptive.as_mut() {
-                            if let Some(s) = m.state.as_mut() {
-                                if s.arch_key() == "qwen35" {
-                                    if let Some(kv) = s.kv_cache_mut() {
-                                        ad.reset_with_cache(&mut gpu, kv);
-                                    } else {
-                                        ad.reset();
-                                    }
-                                } else {
-                                    ad.reset();
-                                }
-                            } else {
-                                ad.reset();
-                            }
                         }
                     }
                     if image_base64.is_some() && image.is_some() {
@@ -3634,20 +3569,29 @@ fn main() {
                 // cache-hot row repeatedly.
                 let synthetic: Vec<u32> = (0..n as u32).map(|i| 10 + (i % 1000)).collect();
 
-                // Reset state BEFORE timing so we're measuring cold prefill, not
-                // prefill-on-top-of-prior-state. qwen35 recurrent state lives in
-                // the bundle (qwen35 arch bundle, accessed via ArchModel);
-                // `LoadedModel.dn_state` was removed (was always None) — the live
-                // DeltaNet state is in the bundle.
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
-                if let Some(st) = m.state.as_mut() {
-                    let key = st.as_ref().arch_key();
-                    let _ = st.as_mut().reset_session_state(&mut gpu);
-                    if key == "deepseek4" {
-                        gpu.invalidate_graph_state();
-                    }
+                // Reset state BEFORE timing through the single lifecycle
+                // owner so stale recurrent/KV/spec/cache state cannot enter
+                // the measured prefill.
+                let reset = hipfire_generate::common::production_fail_closed_rollback(
+                    m, &mut gpu, None, None,
+                );
+                if !reset.rolled_back {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &format!(
+                            "bench_prefill reset failed: {}",
+                            reset
+                                .context
+                                .as_deref()
+                                .unwrap_or("rollback could not be attested")
+                        ),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
                 }
 
                 // Flush any residual GPU work so it doesn't bleed into the
@@ -3692,20 +3636,27 @@ fn main() {
                     Ok(None)
                 };
 
-                // Reset state AFTER measurement — we've written N KV slots and a
-                // DeltaNet state that the next real request must not inherit.
-                // qwen35 recurrent state lives in the bundle (qwen35 arch bundle,
-                // accessed via ArchModel); `LoadedModel.dn_state` was removed
-                // (was always None).
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
-                if let Some(st) = m.state.as_mut() {
-                    let key = st.as_ref().arch_key();
-                    let _ = st.as_mut().reset_session_state(&mut gpu);
-                    if key == "deepseek4" {
-                        gpu.invalidate_graph_state();
-                    }
+                // Reset state AFTER measurement through the same owner.
+                let reset = hipfire_generate::common::production_fail_closed_rollback(
+                    m, &mut gpu, None, None,
+                );
+                if !reset.rolled_back {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &format!(
+                            "bench_prefill reset failed: {}",
+                            reset
+                                .context
+                                .as_deref()
+                                .unwrap_or("rollback could not be attested")
+                        ),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
                 }
                 let capture_summary = match capture_summary {
                     Ok(summary) => summary,
@@ -3899,9 +3850,27 @@ fn main() {
                     continue;
                 }
 
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
+                let reset = hipfire_generate::common::production_fail_closed_rollback(
+                    m, &mut gpu, None, None,
+                );
+                if !reset.rolled_back {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &format!(
+                            "bench_decode reset failed: {}",
+                            reset
+                                .context
+                                .as_deref()
+                                .unwrap_or("rollback could not be attested")
+                        ),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
@@ -4015,9 +3984,27 @@ fn main() {
                     None
                 };
 
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
+                let reset = hipfire_generate::common::production_fail_closed_rollback(
+                    m, &mut gpu, None, None,
+                );
+                if !reset.rolled_back {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &format!(
+                            "bench_decode reset failed: {}",
+                            reset
+                                .context
+                                .as_deref()
+                                .unwrap_or("rollback could not be attested")
+                        ),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
 
                 if run_ok {
                     let tok_s = iterations as f64 / elapsed.max(f64::MIN_POSITIVE);
