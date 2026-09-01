@@ -22,10 +22,10 @@ substrate_clean_arch_refs   == 0
 required_features_daemon    == 0
 
 # --- ceilings ---
-# Raised for G3 manifest/load lifecycle handling: the daemon now restores an
-# intact model after wrong-device unload preflight instead of dropping its only
-# retry owner, and reports terminal teardown failures separately.
-daemon_lines                <= 4194
+# Raised for the union of G2 admitted-load prepare/commit and G3 retryable
+# unload restoration: source identity remains pinned while a refused teardown
+# keeps the prior model owner available for retry.
+daemon_lines                <= 4589
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

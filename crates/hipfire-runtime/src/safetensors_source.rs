@@ -105,7 +105,6 @@ impl SafetensorsSource {
             quantized = quant_config.is_some(),
             "opened safetensors model source"
         );
-
         Ok(Self {
             dir: dir.to_path_buf(),
             files,
@@ -116,10 +115,70 @@ impl SafetensorsSource {
             quant_config,
         })
     }
-
     /// Public accessor so `loader_api` doesn't need the `ModelSource` trait in scope.
     pub fn arch_id(&self) -> u32 {
         self.arch_id
+    }
+
+    /// Total bytes of all shard mmaps (retained, not a later path stat).
+    pub fn files_len(&self) -> u64 {
+        self.files.iter().map(|f| f.mmap.len() as u64).sum()
+    }
+
+    /// Canonical directory path captured at open. Used for TOCTOU verification
+    /// before any path-backed auxiliary reopen (tokenizer.json, chat_template).
+    pub fn canonical_dir(&self) -> std::io::Result<PathBuf> {
+        std::fs::canonicalize(&self.dir)
+    }
+
+    /// Directory device/inode for identity check (Unix; 0,0 on non-Unix).
+    pub fn dir_identity(&self) -> (u64, u64) {
+        match std::fs::metadata(&self.dir) {
+            Ok(md) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    (md.dev(), md.ino())
+                }
+                #[cfg(not(unix))]
+                {
+                    (0, 0)
+                }
+            }
+            Err(_) => (0, 0),
+        }
+    }
+
+    /// Verify that a path-backed auxiliary reopen still refers to the same
+    /// directory inode/canonical path captured at admission. This must be
+    /// called before any destructive owner teardown; failure leaves prior owner
+    /// intact per G2 admission contract.
+    pub fn verify_dir_identity(
+        &self,
+        expected_canonical: &Path,
+        expected_dev: u64,
+        expected_ino: u64,
+    ) -> Result<(), String> {
+        let current_canonical = std::fs::canonicalize(&self.dir).map_err(|e| {
+            format!("safetensors dir canonicalize failed (possible delete/replace): {e}")
+        })?;
+        if current_canonical != expected_canonical {
+            return Err(format!(
+                "safetensors dir identity mismatch: expected canonical {:?}, got {:?} — directory was replaced",
+                expected_canonical, current_canonical
+            ));
+        }
+        let (cur_dev, cur_ino) = self.dir_identity();
+        // On non-Unix (0,0) we only check canonical path.
+        if expected_dev != 0 || expected_ino != 0 {
+            if cur_dev != expected_dev || cur_ino != expected_ino {
+                return Err(format!(
+                    "safetensors dir inode mismatch: expected dev={} ino={}, got dev={} ino={} — directory was replaced",
+                    expected_dev, expected_ino, cur_dev, cur_ino
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

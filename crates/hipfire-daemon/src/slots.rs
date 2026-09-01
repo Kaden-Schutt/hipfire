@@ -39,6 +39,7 @@ use hipfire_engine::terminal::{
     CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::loader_api::ModelSource;
 use hipfire_runtime::prompt_frame::{
     AssistantPrefix, ChatFrame, JinjaChatFrame, Message, Role, ThinkMode,
 };
@@ -57,17 +58,57 @@ pub struct SlotBackend {
     vocab: usize,
     active: AtomicUsize,
 }
-
 impl SlotBackend {
-    /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
+    /// CPU preflight then GPU load. The path wrapper is retained for callers
+    /// outside the daemon admission boundary; daemon swaps use
+    /// [`Self::load_admitted`] to consume the already-open source.
     pub fn load(
         model_path: &str,
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
     ) -> Result<Self, String> {
-        // CPU preflight: open HFQ, arch, VL, config, tokenizer.
-        let preflight = cpu_preflight(model_path)?;
+        let source = ModelSource::from_path(model_path)?;
+        Self::load_source(
+            std::path::Path::new(model_path),
+            source,
+            n_slots,
+            cap_tokens,
+            prefill_chunk,
+        )
+    }
+
+    /// Consume a source admitted by the loader before daemon teardown.
+    ///
+    /// No path-based open, classification, or admission occurs here. The
+    /// source is carried into the slot engine's worker so a model swap has one
+    /// source lifecycle from admission through execution. Carrier, variant,
+    /// mesh, canonical path, identity and size are all derived from the token
+    /// — no separate contradictory raw path is accepted. EP paths must not
+    /// discard carrier authority (verified at loader entry).
+    pub fn load_admitted(
+        admitted: hipfire_loader::AdmittedLoad,
+        n_slots: usize,
+        cap_tokens: usize,
+        prefill_chunk: usize,
+    ) -> Result<Self, String> {
+        let canonical_path = admitted.canonical_path().to_path_buf();
+        // Verify path-backed auxiliary identity before any prior-owner teardown.
+        // Failure must leave prior owner intact — caller defers teardown until
+        // after this returns Ok.
+        admitted.verify_auxiliary_identity()?;
+        let (source, _admission, _carrier) = admitted.consume();
+        Self::load_source(&canonical_path, source, n_slots, cap_tokens, prefill_chunk)
+    }
+
+    fn load_source(
+        model_path: &std::path::Path,
+        source: ModelSource,
+        n_slots: usize,
+        cap_tokens: usize,
+        prefill_chunk: usize,
+    ) -> Result<Self, String> {
+        let preflight = cpu_preflight_source(&source)?;
         let arch_str = preflight.arch_str.clone();
         let dim = preflight.dim;
         let layers = preflight.layers;
@@ -79,7 +120,7 @@ impl SlotBackend {
         let cap_tokens = cap_tokens.max(1);
         let prefill_chunk = prefill_chunk.max(1).min(cap_tokens);
 
-        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn_with_source(
             hipfire_arch_qwen35::serve_engine::EngineConfig {
                 model_path: PathBuf::from(model_path),
                 n_slots,
@@ -88,6 +129,7 @@ impl SlotBackend {
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
             },
+            source,
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
 
@@ -97,8 +139,8 @@ impl SlotBackend {
             arch_str,
             dim,
             chat_template,
-            layers,
             vocab,
+            layers,
             active: AtomicUsize::new(0),
         })
     }
@@ -846,9 +888,13 @@ struct Preflight {
     chat_template: Option<String>,
 }
 
-fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
-    let hfq =
-        HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
+fn cpu_preflight_source(source: &ModelSource) -> Result<Preflight, String> {
+    let hfq = match source {
+        ModelSource::Hfq(hfq) => hfq,
+        ModelSource::Dir(_) => {
+            return Err("experimental multi-slot requires an HFQ source".to_string())
+        }
+    };
     validate_arch_id(hfq.arch_id)?;
     if is_vision_hfq(&hfq) {
         return Err("vision model not supported in experimental multi-slot".to_string());
@@ -917,19 +963,6 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
                     .to_string(),
             );
         }
-    }
-    let tp = msg
-        .get("params")
-        .and_then(|p| p.get("tp"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
-    let pp = msg
-        .get("params")
-        .and_then(|p| p.get("pp"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
-    if tp != 1 || pp != 1 {
-        return Some("experimental multi-slot requires pp=tp=1".to_string());
     }
     // The slot kernels currently own a fixed Q8 KV/state path and no
     // speculative or eviction sidecars. Refuse instead of silently ignoring
@@ -1317,13 +1350,13 @@ mod tests {
     }
 
     #[test]
-    fn load_caps_rejects_continuous_and_tp_pp() {
+    fn load_caps_keeps_topology_in_loader_admission() {
+        // PP/TP are source- and variant-aware policy decisions owned by the
+        // loader admission boundary, not this backend-local knob validator.
+        assert_eq!(validate_load_caps(&json!({"params": {"tp": 2}})), None);
+        assert_eq!(validate_load_caps(&json!({"params": {"pp": 2}})), None);
         let m = json!({"params": {"continuous_batch_size": 2}});
         assert!(validate_load_caps(&m).is_some());
-        let m2 = json!({"params": {"tp": 2}});
-        assert!(validate_load_caps(&m2).is_some());
-        let m3 = json!({"params": {"pp": 2}});
-        assert!(validate_load_caps(&m3).is_some());
         let m4 = json!({"params": {"draft": "some.hfq"}});
         assert!(validate_load_caps(&m4).is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});

@@ -84,7 +84,10 @@ use hipfire_generate::redline::{
 };
 mod slots;
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_loader::{
+    admit_load_with_source, AsstTurnCache, DimKind, EpArch, EpState, Eviction, LoadedModel,
+    ModelVariant, RawParallelism, SourceKind,
+};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecTarget, Speculator, StopReason,
@@ -447,6 +450,503 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 /// occupies `model` — that path tears down after successful new load.
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
+}
+
+/// Backend-local multi-slot capability checks that consume only the admitted
+/// source/variant/mesh. Raw PP/TP policy remains in loader admission.
+fn validate_multi_slot_admission(
+    admission: &hipfire_loader::LoadAdmission,
+) -> Option<&'static str> {
+    if admission.mesh().n_devices() != 1 {
+        return Some("experimental multi-slot requires a single-device admitted route");
+    }
+    if admission.source() != SourceKind::Hfq
+        || !matches!(
+            admission.variant(),
+            ModelVariant::Qwen35Dense | ModelVariant::Qwen35Moe
+        )
+    {
+        return Some("experimental multi-slot requires an HFQ text-only Qwen3.5 source");
+    }
+    None
+}
+#[derive(Debug)]
+enum DaemonLoadOperationError {
+    Validation(String),
+    Unsupported(String),
+    Internal(String),
+}
+
+#[derive(Debug)]
+enum DaemonLoadBoundaryError {
+    Admission(hipfire_loader::LoadAdmissionError),
+    Operation(DaemonLoadOperationError),
+}
+
+impl DaemonLoadBoundaryError {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Admission(_) => "unsupported",
+            Self::Operation(DaemonLoadOperationError::Validation(_)) => "validation",
+            Self::Operation(DaemonLoadOperationError::Unsupported(_)) => "unsupported",
+            Self::Operation(DaemonLoadOperationError::Internal(_)) => "internal",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Admission(error) => error.to_string(),
+            Self::Operation(DaemonLoadOperationError::Validation(error))
+            | Self::Operation(DaemonLoadOperationError::Unsupported(error))
+            | Self::Operation(DaemonLoadOperationError::Internal(error)) => error.clone(),
+        }
+    }
+}
+
+trait DaemonLoadOperations {
+    fn prepare_multi_slot(&mut self) -> Result<(), DaemonLoadOperationError>;
+    fn prepare_ordinary(&mut self, load_tp: usize) -> Result<(), DaemonLoadOperationError>;
+    fn commit_multi_slot(&mut self) -> Result<(), DaemonLoadOperationError>;
+    fn commit_ordinary(&mut self, load_tp: usize) -> Result<(), DaemonLoadOperationError>;
+}
+fn load_tp_for_admission(admission: &hipfire_loader::LoadAdmission) -> usize {
+    match admission.variant() {
+        ModelVariant::Qwen35Dense => admission.mesh().size_of(DimKind::Tp),
+        ModelVariant::Qwen35Moe | ModelVariant::Deepseek4 | ModelVariant::Minimax => {
+            admission.mesh().size_of(DimKind::Ep)
+        }
+        _ => 1,
+    }
+}
+
+/// Shared daemon load boundary. Admission is the first operation; the
+/// continuation only runs once source/variant/mesh policy has accepted the
+/// request. `admit` is injectable so production tests can force typed
+/// refusals without constructing GPU state.
+fn prepare_daemon_load_with<A, O>(
+    path: &str,
+    raw: RawParallelism,
+    experimental_multi_slot: bool,
+    msg: &serde_json::Value,
+    admit: A,
+    operations: &mut O,
+) -> Result<hipfire_loader::AdmittedLoad, DaemonLoadBoundaryError>
+where
+    A: FnOnce(
+        &str,
+        RawParallelism,
+    ) -> Result<hipfire_loader::AdmittedLoad, hipfire_loader::LoadAdmissionError>,
+    O: DaemonLoadOperations,
+{
+    let admitted = admit(path, raw).map_err(DaemonLoadBoundaryError::Admission)?;
+    if experimental_multi_slot {
+        if let Some(error) = validate_multi_slot_admission(admitted.admission()) {
+            return Err(DaemonLoadBoundaryError::Operation(
+                DaemonLoadOperationError::Unsupported(error.to_string()),
+            ));
+        }
+        if let Some(error) = slots::validate_load_caps(msg) {
+            return Err(DaemonLoadBoundaryError::Operation(
+                DaemonLoadOperationError::Validation(error),
+            ));
+        }
+        operations
+            .prepare_multi_slot()
+            .map_err(DaemonLoadBoundaryError::Operation)?;
+    } else {
+        operations
+            .prepare_ordinary(load_tp_for_admission(admitted.admission()))
+            .map_err(DaemonLoadBoundaryError::Operation)?;
+    }
+    Ok(admitted)
+}
+
+fn prepare_daemon_load<O: DaemonLoadOperations>(
+    path: &str,
+    raw: RawParallelism,
+    experimental_multi_slot: bool,
+    msg: &serde_json::Value,
+    operations: &mut O,
+) -> Result<hipfire_loader::AdmittedLoad, DaemonLoadBoundaryError> {
+    prepare_daemon_load_with(
+        path,
+        raw,
+        experimental_multi_slot,
+        msg,
+        admit_load_with_source,
+        operations,
+    )
+}
+/// Consume one admitted source at the daemon execution seam. The loader
+/// continuation receives ownership of the source and effective topology; it
+/// must not fall back to a path-based admission wrapper.
+fn execute_admitted_load_with<T, L>(
+    admitted: hipfire_loader::AdmittedLoad,
+    load: L,
+) -> Result<T, String>
+where
+    L: FnOnce(hipfire_loader::AdmittedLoad) -> Result<T, String>,
+{
+    load(admitted)
+}
+
+struct DaemonLoadState<'a> {
+    gpu: &'a mut rdna_compute::Gpu,
+    model: &'a mut Option<LoadedModel>,
+    pflash_state: &'a mut Option<hipfire_pflash::pflash::PflashState>,
+    pflash_cfg: &'a mut Option<hipfire_pflash::pflash::PflashConfig>,
+    pflash_drafter_gpu: &'a mut Option<rdna_compute::Gpu>,
+    slot_backend: &'a mut Option<std::sync::Arc<slots::SlotBackend>>,
+    batch_scheduler: &'a mut Option<ContinuousBatchScheduler>,
+    continuous_batch_size: &'a mut usize,
+    batch_poisoned: &'a mut Option<String>,
+}
+
+impl DaemonLoadState<'_> {
+    fn check_slot_not_active(&self) -> Result<(), DaemonLoadOperationError> {
+        if self
+            .slot_backend
+            .as_ref()
+            .is_some_and(|backend| backend.active_count() > 0)
+        {
+            return Err(DaemonLoadOperationError::Validation(
+                "load refused: slot requests active".to_string(),
+            ));
+        }
+        if let Some(slot) = self.slot_backend.as_ref() {
+            if std::sync::Arc::strong_count(slot) > 1 {
+                return Err(DaemonLoadOperationError::Validation(
+                    "load refused: slot requests active (Arc live)".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown_slot(&mut self) -> Result<(), DaemonLoadOperationError> {
+        if self
+            .slot_backend
+            .as_ref()
+            .is_some_and(|backend| backend.active_count() > 0)
+        {
+            return Err(DaemonLoadOperationError::Validation(
+                "load refused: slot requests active".to_string(),
+            ));
+        }
+        let Some(slot) = self.slot_backend.take() else {
+            return Ok(());
+        };
+        match std::sync::Arc::try_unwrap(slot) {
+            Err(slot) => {
+                *self.slot_backend = Some(slot);
+                Err(DaemonLoadOperationError::Validation(
+                    "load refused: slot requests active (Arc live)".to_string(),
+                ))
+            }
+            Ok(slot) => {
+                slot.shutdown()
+                    .map_err(DaemonLoadOperationError::Internal)?;
+                batch_clear_all_terminals();
+                Ok(())
+            }
+        }
+    }
+
+    fn unload_pflash(&mut self) {
+        if let Some(mut pflash) = self.pflash_state.take() {
+            if let Some(mut drafter_gpu) = self.pflash_drafter_gpu.take() {
+                drafter_gpu.bind_thread_or_warn();
+                pflash.unload_drafter(&mut drafter_gpu);
+                self.gpu.bind_thread_or_warn();
+            } else {
+                pflash.unload_drafter(self.gpu);
+            }
+        }
+        *self.pflash_cfg = None;
+    }
+
+    fn unload_model_or_check_vmm(&mut self) -> Result<(), DaemonLoadOperationError> {
+        if let Some(model) = self.model.take() {
+            match hipfire_loader::unload_model(model, self.gpu) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let reason = error.reason().to_owned();
+                    if let Some(restored) = error.into_model() {
+                        *self.model = Some(restored);
+                    }
+                    Err(DaemonLoadOperationError::Internal(reason))
+                }
+            }
+        } else {
+            hipfire_loader::ensure_vmm_ready_for_load(self.gpu)
+                .map_err(DaemonLoadOperationError::Internal)
+        }
+    }
+
+    fn ensure_vmm_ready_if_no_model(&mut self) -> Result<(), DaemonLoadOperationError> {
+        if self.model.is_none() {
+            hipfire_loader::ensure_vmm_ready_for_load(self.gpu)
+                .map_err(DaemonLoadOperationError::Internal)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn clear_batch_state(&mut self) {
+        *self.batch_scheduler = None;
+        *self.continuous_batch_size = 1;
+        *self.batch_poisoned = None;
+    }
+}
+
+impl DaemonLoadOperations for DaemonLoadState<'_> {
+    fn prepare_multi_slot(&mut self) -> Result<(), DaemonLoadOperationError> {
+        // Pre-load validation: fail before any destructive teardown so a
+        // subsequent auxiliary-identity mismatch leaves prior owner intact.
+        self.check_slot_not_active()?;
+        self.ensure_vmm_ready_if_no_model()?;
+        Ok(())
+    }
+
+    fn prepare_ordinary(&mut self, load_tp: usize) -> Result<(), DaemonLoadOperationError> {
+        self.check_slot_not_active()?;
+        if load_tp <= 1 {
+            self.ensure_vmm_ready_if_no_model()?;
+        }
+        Ok(())
+    }
+
+    fn commit_multi_slot(&mut self) -> Result<(), DaemonLoadOperationError> {
+        // Destructive teardown after successful admitted execution.
+        self.shutdown_slot()?;
+        self.unload_pflash();
+        self.unload_model_or_check_vmm()?;
+        self.clear_batch_state();
+        Ok(())
+    }
+
+    fn commit_ordinary(&mut self, load_tp: usize) -> Result<(), DaemonLoadOperationError> {
+        self.shutdown_slot()?;
+        if load_tp <= 1 {
+            self.unload_pflash();
+            self.unload_model_or_check_vmm()?;
+            self.clear_batch_state();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_boundary_tests {
+    use super::{
+        execute_admitted_load_with, prepare_daemon_load_with, DaemonLoadOperationError,
+        DaemonLoadOperations, DimKind, ModelVariant, RawParallelism, SourceKind,
+    };
+    use hipfire_loader::admit_load_with_source;
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct InjectedLoadOperations {
+        teardown: bool,
+        slot_shutdown: bool,
+        vmm_gpu_initialization: bool,
+        remap: bool,
+        carrier_entry: bool,
+        prior_owner: bool,
+    }
+
+    impl InjectedLoadOperations {
+        fn enter(&mut self) {
+            self.teardown = true;
+            self.slot_shutdown = true;
+            self.vmm_gpu_initialization = true;
+            self.remap = true;
+            self.carrier_entry = true;
+            self.prior_owner = false;
+        }
+    }
+
+    impl DaemonLoadOperations for InjectedLoadOperations {
+        fn prepare_multi_slot(&mut self) -> Result<(), DaemonLoadOperationError> {
+            self.teardown = true;
+            self.slot_shutdown = true;
+            self.vmm_gpu_initialization = true;
+            self.remap = true;
+            self.carrier_entry = true;
+            // prior_owner remains true — teardown is deferred until commit
+            Ok(())
+        }
+
+        fn prepare_ordinary(&mut self, _load_tp: usize) -> Result<(), DaemonLoadOperationError> {
+            self.teardown = true;
+            self.slot_shutdown = true;
+            self.vmm_gpu_initialization = true;
+            self.remap = true;
+            self.carrier_entry = true;
+            Ok(())
+        }
+
+        fn commit_multi_slot(&mut self) -> Result<(), DaemonLoadOperationError> {
+            self.enter();
+            Ok(())
+        }
+
+        fn commit_ordinary(&mut self, _load_tp: usize) -> Result<(), DaemonLoadOperationError> {
+            self.enter();
+            Ok(())
+        }
+    }
+    fn refusal(variant: ModelVariant, raw: RawParallelism) -> hipfire_loader::LoadAdmissionError {
+        hipfire_loader::LoadAdmissionError::Admission(hipfire_loader::AdmissionError::Unsupported {
+            source: SourceKind::Hfq,
+            variant,
+            requested: raw,
+            effective: raw,
+            owner: "CAP-001",
+            reason: "test-injected admission refusal",
+        })
+    }
+    fn dense_fixture_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire-daemon-admitted-{label}-{}.hfq",
+            std::process::id()
+        ))
+    }
+
+    fn write_dense_fixture(path: &std::path::Path) {
+        use std::io::Write;
+
+        let metadata = br#"{"config":{"num_experts":0}}"#;
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let index = 0u32.to_le_bytes();
+        let data_start = index_offset + index.len() as u64;
+        let data_offset = (data_start + 4095) & !4095;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&5u32.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![0u8; (data_offset - data_start) as usize])
+            .unwrap();
+        file.flush().unwrap();
+    }
+
+    #[test]
+    fn refused_daemon_entrypoints_do_not_enter_production_operations() {
+        let msg = serde_json::json!({});
+        for (name, raw, variant, experimental_multi_slot) in [
+            (
+                "ordinary",
+                RawParallelism::new(2, 1, 1),
+                ModelVariant::Gemma4,
+                false,
+            ),
+            (
+                "multi-slot",
+                RawParallelism::new(1, 1, 1),
+                ModelVariant::Qwen35Dense,
+                true,
+            ),
+        ] {
+            let mut operations = InjectedLoadOperations {
+                prior_owner: true,
+                ..Default::default()
+            };
+            let before = operations.clone();
+            let error = refusal(variant, raw);
+            let result = prepare_daemon_load_with(
+                &format!("injected-{name}"),
+                raw,
+                experimental_multi_slot,
+                &msg,
+                move |_, _| Err(error),
+                &mut operations,
+            );
+
+            assert!(result.is_err(), "{name} route unexpectedly admitted");
+            assert_eq!(
+                operations,
+                before,
+                "{name} route entered teardown, slot shutdown, VMM/GPU initialization, remap, carrier entry, or prior-owner operations before admission"
+            );
+        }
+    }
+    #[test]
+    fn rejected_multi_slot_backend_does_not_enter_production_operations() {
+        let msg = serde_json::json!({});
+        let path = dense_fixture_path("multi-slot-shape");
+        write_dense_fixture(&path);
+        let admitted =
+            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(2, 1, 1)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut operations = InjectedLoadOperations {
+            prior_owner: true,
+            ..Default::default()
+        };
+        let before = operations.clone();
+        let result = prepare_daemon_load_with(
+            path.to_str().unwrap(),
+            RawParallelism::new(2, 1, 1),
+            true,
+            &msg,
+            move |_, _| Ok(admitted),
+            &mut operations,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(operations, before);
+    }
+    #[test]
+    fn admitted_daemon_route_consumes_changed_source_without_second_admission() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let path = dense_fixture_path("downstream-refusal");
+        write_dense_fixture(&path);
+        let admitted =
+            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1)).unwrap();
+        let removed_path = path.clone();
+        let admission_calls = Rc::new(Cell::new(0usize));
+        let admission_calls_injected = Rc::clone(&admission_calls);
+        let mut operations = InjectedLoadOperations {
+            prior_owner: true,
+            ..Default::default()
+        };
+
+        let admitted = prepare_daemon_load_with(
+            path.to_str().unwrap(),
+            RawParallelism::new(1, 1, 1),
+            false,
+            &serde_json::json!({}),
+            move |_, _| {
+                admission_calls_injected.set(admission_calls_injected.get() + 1);
+                std::fs::remove_file(&removed_path).unwrap();
+                Ok(admitted)
+            },
+            &mut operations,
+        )
+        .unwrap();
+        assert_eq!(admission_calls.get(), 1);
+        assert!(operations.teardown);
+        assert!(operations.prior_owner);
+        let downstream_calls = Rc::new(Cell::new(0usize));
+        let downstream_calls_injected = Rc::clone(&downstream_calls);
+        let result: Result<(), String> = execute_admitted_load_with(admitted, |admitted| {
+            downstream_calls_injected.set(downstream_calls_injected.get() + 1);
+            assert!(!path.exists(), "downstream source mutation was not applied");
+            assert_eq!(admitted.source().arch_id(), Some(5));
+            Err("injected downstream source refusal".to_string())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(admission_calls.get(), 1);
+        assert_eq!(downstream_calls.get(), 1);
+        assert!(operations.prior_owner);
+    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -858,15 +1358,29 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                // FIX #1 (transactional EP load): the unload of the prior model
-                // is deferred for the EP (tp>1) path until AFTER the new load
-                // succeeds, so a partial EP load failure leaves the prior model
-                // intact (and load_model_ep's staging guard frees the partial
-                // ranks). For the single-GPU / pp path the prior model is
-                // unloaded eagerly here as before (load_model uses the daemon's
-                // `gpu` directly, so it can't be deferred without a major
-                // refactor). `tp` is parsed authoritatively below; peek it here.
-                let load_tp = msg
+                // Parse the model and raw axis fields before any prior-model
+                // teardown. The loader admission point owns source
+                // classification, legacy axis interpretation, composition,
+                // and effective mesh creation.
+                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                if path.is_empty() {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "load: missing model path",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                let pp = msg
+                    .get("params")
+                    .and_then(|p| p.get("pp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let tp = msg
                     .get("params")
                     .and_then(|p| p.get("tp"))
                     .and_then(|v| v.as_u64())
@@ -877,119 +1391,42 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if experimental_multi_slot {
-                    // Experimental slot backend is an alternate model owner, not a batch-mode switch.
-                    // Validate mutually exclusive knobs before any GPU work.
-                    if let Some(err) = slots::validate_load_caps(&msg) {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            &err,
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                    // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
-                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            "load refused: slot requests active",
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                    // Unload prior backends safely before loading the slot engine (exactly one weight copy).
-                    // Drop any prior slot backend only after active check.
-                    if let Some(slot) = slot_backend.take() {
-                        match std::sync::Arc::try_unwrap(slot) {
-                            Err(slot) => {
-                                slot_backend = Some(slot);
-                                emit_uncorrelated_error(
-                                    &mut stdout,
-                                    None,
-                                    "load refused: slot requests active (Arc live)",
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                let _ = stdout.flush();
-                                continue;
-                            }
-                            Ok(slot) => {
-                                if let Err(reason) = slot.shutdown() {
-                                    emit_uncorrelated_error(
-                                        &mut stdout,
-                                        None,
-                                        &format!("prior slot shutdown failed: {reason}"),
-                                        "internal",
-                                        false,
-                                        false,
-                                    );
-                                    let _ = stdout.flush();
-                                    continue;
-                                }
-                                batch_clear_all_terminals();
-                            }
-                        }
-                    }
-                    // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
-                    if let Some(mut pf) = pflash_state.take() {
-                        if let Some(mut dg) = pflash_drafter_gpu.take() {
-                            dg.bind_thread_or_warn();
-                            pf.unload_drafter(&mut dg);
-                            gpu.bind_thread_or_warn();
-                        } else {
-                            pf.unload_drafter(&mut gpu);
-                        }
-                    }
-                    pflash_cfg = None;
-                    if let Some(m) = model.take() {
-                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
-                            let reason = err.reason().to_owned();
-                            if let Some(restored) = err.into_model() {
-                                model.replace(restored);
-                            }
+                let admitted = {
+                    let mut operations = DaemonLoadState {
+                        gpu: &mut gpu,
+                        model: &mut model,
+                        pflash_state: &mut pflash_state,
+                        pflash_cfg: &mut pflash_cfg,
+                        pflash_drafter_gpu: &mut pflash_drafter_gpu,
+                        slot_backend: &mut slot_backend,
+                        batch_scheduler: &mut batch_scheduler,
+                        continuous_batch_size: &mut continuous_batch_size,
+                        batch_poisoned: &mut batch_poisoned,
+                    };
+                    match prepare_daemon_load(
+                        path,
+                        RawParallelism::new(pp, tp, 1),
+                        experimental_multi_slot,
+                        &msg,
+                        &mut operations,
+                    ) {
+                        Ok(admitted) => admitted,
+                        Err(error) => {
+                            let message = error.message();
                             emit_uncorrelated_error(
                                 &mut stdout,
                                 None,
-                                &format!("prior unload failed: {reason}"),
-                                "internal",
+                                &message,
+                                error.class(),
                                 false,
                                 false,
                             );
                             let _ = stdout.flush();
                             continue;
                         }
-                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
-                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
-                        let _ = stdout.flush();
-                        continue;
                     }
-                    // Continuous-batch state must be cleared — slot backend is not batched.
-                    batch_scheduler = None;
-                    continuous_batch_size = 1;
-                    batch_poisoned = None;
-
-                    let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                    if path.is_empty() {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            "load: missing model path",
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
+                };
+                if experimental_multi_slot {
                     let requested_max_seq = msg
                         .get("params")
                         .and_then(|p| p.get("max_seq"))
@@ -1012,8 +1449,45 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                    match execute_admitted_load_with(admitted, |admitted| {
+                        slots::SlotBackend::load_admitted(
+                            admitted,
+                            n_slots,
+                            cap_tokens,
+                            prefill_chunk,
+                        )
+                    }) {
                         Ok(backend) => {
+                            // Deferred commit: teardown prior owners only after
+                            // admitted execution succeeded. Failure leaves prior
+                            // owner intact and destroys the newly built backend.
+                            let commit_result = {
+                                let mut operations = DaemonLoadState {
+                                    gpu: &mut gpu,
+                                    model: &mut model,
+                                    pflash_state: &mut pflash_state,
+                                    pflash_cfg: &mut pflash_cfg,
+                                    pflash_drafter_gpu: &mut pflash_drafter_gpu,
+                                    slot_backend: &mut slot_backend,
+                                    batch_scheduler: &mut batch_scheduler,
+                                    continuous_batch_size: &mut continuous_batch_size,
+                                    batch_poisoned: &mut batch_poisoned,
+                                };
+                                operations.commit_multi_slot()
+                            };
+                            if let Err(e) = commit_result {
+                                let _ = backend.shutdown();
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &format!("load failed during commit: {e:?}"),
+                                    "internal",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();
                             let layers = backend.layers();
@@ -1024,7 +1498,6 @@ fn main() {
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
                             let ack = serde_json::json!({
                                 "type": "loaded",
-                                "arch": arch,
                                 "dim": dim,
                                 "layers": layers,
                                 "vocab": vocab,
@@ -1054,104 +1527,7 @@ fn main() {
                     }
                     continue;
                 }
-                // Ordinary load: refuse while slot requests active, otherwise checked shutdown
-                if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
-                    emit_uncorrelated_error(
-                        &mut stdout,
-                        None,
-                        "load refused: slot requests active",
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    continue;
-                }
-                if let Some(slot) = slot_backend.take() {
-                    match std::sync::Arc::try_unwrap(slot) {
-                        Err(slot) => {
-                            slot_backend = Some(slot);
-                            emit_uncorrelated_error(
-                                &mut stdout,
-                                None,
-                                "load refused: slot requests active (Arc live)",
-                                "validation",
-                                false,
-                                false,
-                            );
-                            let _ = stdout.flush();
-                            continue;
-                        }
-                        Ok(slot) => {
-                            if let Err(reason) = slot.shutdown() {
-                                emit_uncorrelated_error(
-                                    &mut stdout,
-                                    None,
-                                    &format!("prior slot shutdown failed: {reason}"),
-                                    "internal",
-                                    false,
-                                    false,
-                                );
-                                let _ = stdout.flush();
-                                continue;
-                            }
-                            batch_clear_all_terminals();
-                        }
-                    }
-                }
-                // Unload previous if any. PFlash drafter goes first so
-                // its tensors join the pool before unload_model drains
-                // it -- otherwise free_tensor would queue them into the
-                // pool just-emptied by drain_pool with no follow-up
-                // drain, leaving drafter VRAM resident across the next
-                // load (the explicit "unload" handler has the same
-                // ordering for the same reason).
-                //
-                // FIX (transactional pflash teardown): pflash_state is part of
-                // the PRIOR model (it holds that model's PFlash drafter). For
-                // the deferred tp>1 EP path it must NOT be torn down here —
-                // otherwise a partial EP load failure (whose FIX #1 deferral
-                // keeps `model` alive) would leave the surviving prior model
-                // stripped of its drafter. Defer it to the success branch
-                // alongside the deferred model unload. For load_tp <= 1 the
-                // prior model is unloaded eagerly, so tear pflash down here in
-                // the original order. (EP archs are ds4/minimax and refuse
-                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
-                // the outgoing model's drafter at the deferred site.)
-                if load_tp <= 1 {
-                    if let Some(mut pf) = pflash_state.take() {
-                        if let Some(mut dg) = pflash_drafter_gpu.take() {
-                            dg.bind_thread_or_warn();
-                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                            gpu.bind_thread_or_warn();
-                        } else {
-                            pf.unload_drafter(&mut gpu);
-                        }
-                    }
-                    pflash_cfg = None;
-                    if let Some(m) = model.take() {
-                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
-                            let reason = err.reason().to_owned();
-                            if let Some(restored) = err.into_model() {
-                                model.replace(restored);
-                            }
-                            emit_uncorrelated_error(
-                                &mut stdout,
-                                None,
-                                &format!("prior unload failed: {reason}"),
-                                "internal",
-                                false,
-                                false,
-                            );
-                            let _ = stdout.flush();
-                            continue;
-                        }
-                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
-                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                }
+                let load_tp = load_tp_for_admission(admitted.admission());
                 // EP path: when no live prior model remains (fresh daemon, or
                 // after deferred prior unload failed and left model=None with
                 // pending VMM), refuse to construct a new EP model until
@@ -1166,7 +1542,6 @@ fn main() {
                     }
                 }
 
-                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 // hunt3 H-D: clamp request-driven max_seq to the config ceiling
                 // (MAX_REQUESTED_SEQ = 1M). Without this an unvalidated 10M
                 // max_seq drives a multi-GB KV allocation and OOMs the daemon at
@@ -1546,40 +1921,21 @@ fn main() {
                         None
                     };
 
-                // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
-                // single-GPU (no behavior change). pp > 1 routes through
-                // Gpus + *_multi paths and refuses VL / DFlash / CASK /
-                // PFlash at load time. v1 supports Qwen3.5 dense + MoE
-                // only — see load_model_pp for the arch_id check.
-                let pp = msg
-                    .get("params")
-                    .and_then(|p| p.get("pp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                // Expert-parallel degree (EP, task #26). tp>1 shards routed
-                // experts across ranks via load_model_ep. Mutually exclusive
-                // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
-                let tp = msg
-                    .get("params")
-                    .and_then(|p| p.get("tp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                if tp > 1 && pp > 1 {
-                    emit_uncorrelated_error(&mut stdout, None, "tp (expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one.", "unsupported", false, false);
-                    let _ = stdout.flush();
-                    continue;
-                }
-                if tp > 1 && draft_path.is_some() {
+                // The source-aware admission above already rejected every
+                // zero degree and forbidden composition. It also selected the
+                // effective PP/TP/EP interpretation; no raw-axis policy branch
+                // is allowed below this boundary.
+                if load_tp > 1 && draft_path.is_some() {
                     emit_uncorrelated_error(&mut stdout, None, "EP serving (tp>1) does not support DFlash drafters in v1; reload without a draft.", "unsupported", false, false);
                     let _ = stdout.flush();
                     continue;
                 }
-                if tp > 1 && gemma4_drafter.is_some() {
+                if load_tp > 1 && gemma4_drafter.is_some() {
                     emit_uncorrelated_error(&mut stdout, None, "EP serving (tp>1) does not support the gemma4 EAGLE drafter; reload without params.drafter.", "unsupported", false, false);
                     let _ = stdout.flush();
                     continue;
                 }
-                if pp > 1 {
+                if admitted.mesh().has_axis(DimKind::Pp) {
                     if gemma4_drafter.is_some() {
                         emit_uncorrelated_error(&mut stdout, None, "gemma4 EAGLE spec-decode requires pp=1 (arch_id=13 has no pipeline-parallel path); reload without params.drafter.", "unsupported", false, false);
                         let _ = stdout.flush();
@@ -1638,7 +1994,7 @@ fn main() {
                         continue;
                     }
                 };
-                let loaded = if tp > 1 {
+                let loaded = if load_tp > 1 {
                     if deepseek4_experts_per_token.is_some() {
                         emit_uncorrelated_error(
                             &mut stdout,
@@ -1651,32 +2007,34 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    hipfire_loader::load_model_ep_with_kv_mode(
-                        path,
-                        max_seq,
-                        tp,
-                        kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
-                        state_quant_override.as_deref(),
-                    )
+                    execute_admitted_load_with(admitted, |admitted| {
+                        hipfire_loader::load_model_ep_with_kv_mode_admitted(
+                            admitted,
+                            max_seq,
+                            kv_mode_override.as_deref(),
+                            kv_backend_override.as_deref(),
+                            state_quant_override.as_deref(),
+                        )
+                    })
                 } else {
-                    hipfire_loader::load_model_with_gemma4_drafter(
-                        path,
-                        max_seq,
-                        deepseek4_experts_per_token,
-                        deepseek4_compute_placement,
-                        draft_path.as_deref(),
-                        gemma4_drafter.as_deref(),
-                        gemma4_draft_len,
-                        kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
-                        kv_adaptive_override.as_deref(),
-                        state_quant_override.as_deref(),
-                        &cask,
-                        pp,
-                        spec_cfg,
-                        &mut gpu,
-                    )
+                    execute_admitted_load_with(admitted, |admitted| {
+                        hipfire_loader::load_model_with_gemma4_drafter_admitted(
+                            admitted,
+                            max_seq,
+                            deepseek4_experts_per_token,
+                            deepseek4_compute_placement,
+                            draft_path.as_deref(),
+                            gemma4_drafter.as_deref(),
+                            gemma4_draft_len,
+                            kv_mode_override.as_deref(),
+                            kv_backend_override.as_deref(),
+                            kv_adaptive_override.as_deref(),
+                            state_quant_override.as_deref(),
+                            &cask,
+                            spec_cfg,
+                            &mut gpu,
+                        )
+                    })
                 };
                 match loaded {
                     Ok(mut m) => {
@@ -1694,6 +2052,32 @@ fn main() {
                         // state, and emit a hard error covering prior failure
                         // and any rollback failure.
                         if load_tp > 1 {
+                            // Deferred slot teardown for EP: ensure prior slot
+                            // backend is cleared before publishing EP model.
+                            // Failure leaves prior slot intact and rolls back new EP.
+                            let slot_commit = {
+                                let mut operations = DaemonLoadState {
+                                    gpu: &mut gpu,
+                                    model: &mut model,
+                                    pflash_state: &mut pflash_state,
+                                    pflash_cfg: &mut pflash_cfg,
+                                    pflash_drafter_gpu: &mut pflash_drafter_gpu,
+                                    slot_backend: &mut slot_backend,
+                                    batch_scheduler: &mut batch_scheduler,
+                                    continuous_batch_size: &mut continuous_batch_size,
+                                    batch_poisoned: &mut batch_poisoned,
+                                };
+                                operations.commit_ordinary(load_tp)
+                            };
+                            if let Err(e) = slot_commit {
+                                let _ = hipfire_loader::unload_model(m, &mut gpu);
+                                write_error(
+                                    &mut stdout,
+                                    "",
+                                    &format!("load failed during slot teardown: {e:?}"),
+                                );
+                                continue;
+                            }
                             if let Some(mut pf) = pflash_state.take() {
                                 if let Some(mut dg) = pflash_drafter_gpu.take() {
                                     dg.bind_thread_or_warn();
@@ -1741,6 +2125,34 @@ fn main() {
                                 let msg =
                                     ep_deferred_handoff_error_message(prior_err, rollback_err);
                                 write_error(&mut stdout, "", &msg);
+                                continue;
+                            }
+                        } else {
+                            // Deferred commit for ordinary (tp<=1): teardown prior
+                            // owners after successful admitted execution, before
+                            // publishing. Failure rolls back new model and leaves
+                            // prior intact.
+                            let commit_result = {
+                                let mut operations = DaemonLoadState {
+                                    gpu: &mut gpu,
+                                    model: &mut model,
+                                    pflash_state: &mut pflash_state,
+                                    pflash_cfg: &mut pflash_cfg,
+                                    pflash_drafter_gpu: &mut pflash_drafter_gpu,
+                                    slot_backend: &mut slot_backend,
+                                    batch_scheduler: &mut batch_scheduler,
+                                    continuous_batch_size: &mut continuous_batch_size,
+                                    batch_poisoned: &mut batch_poisoned,
+                                };
+                                operations.commit_ordinary(load_tp)
+                            };
+                            if let Err(e) = commit_result {
+                                let _ = hipfire_loader::unload_model(m, &mut gpu);
+                                write_error(
+                                    &mut stdout,
+                                    "",
+                                    &format!("load failed during commit: {e:?}"),
+                                );
                                 continue;
                             }
                         }
