@@ -30,9 +30,9 @@ fn fnv1a(ids: &[u32]) -> u64 {
 fn main() {
     use hipfire_arch_deepseek4::forward;
     use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
+    use hipfire_hardware::Gpus;
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::multi_gpu::Gpus;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     use rdna_compute::{DType, GpuTensor};
@@ -110,7 +110,8 @@ fn main() {
     drop(hfq0);
 
     // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_tp(&device_opts, tp, cfg.num_hidden_layers).expect("init_tp");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,

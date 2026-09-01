@@ -3,10 +3,10 @@
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, HfqSource, Layout, Qwen35Scratch, StateQuant,
 };
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
-use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use rdna_compute::Gpu;
@@ -147,8 +147,9 @@ fn run_tp(path: &str, seed: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
         .iter()
         .map(|l| qwen35::local_dense_tp_config(&global, l))
         .collect();
-    let mut gpus =
-        Gpus::init_tp(tp, global.n_layers).unwrap_or_else(|e| panic!("init tp{tp}: {e:?}"));
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_tp(&device_opts, tp, global.n_layers)
+        .unwrap_or_else(|e| panic!("init tp{tp}: {e:?}"));
     for gpu in &mut gpus.devices {
         gpu.bind_thread().unwrap();
         gpu.active_stream = Some(gpu.hip.stream_create().unwrap());

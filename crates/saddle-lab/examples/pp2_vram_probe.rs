@@ -13,10 +13,10 @@
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4 [max_seq=4096]
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet, StateQuant};
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::multi_gpu::Gpus;
 use std::path::Path;
 
 fn used_gb(gpus: &Gpus, baseline_free: &[(usize, usize)]) -> Vec<f64> {
@@ -60,7 +60,8 @@ fn main() {
         config.head_dim,
     );
 
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let baseline_free: Vec<(usize, usize)> = (0..gpus.devices.len())
         .map(|i| gpus.devices[i].hip.get_vram_info().unwrap_or((0, 0)))
         .collect();

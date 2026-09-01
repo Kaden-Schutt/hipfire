@@ -2556,7 +2556,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                     }
                 };
                 (
-                    &mut ep.gpus as *mut hipfire_runtime::multi_gpu::Gpus,
+                    &mut ep.gpus as *mut hipfire_hardware::Gpus,
                     config as *const qwen35::Qwen35Config,
                     weights as *const Vec<qwen35::Qwen35Weights>,
                     b,
@@ -2571,7 +2571,7 @@ pub fn drive_qwen35_ep_continuous_batch(
             _ => return Err(BatchDriveError::Gpu("EP batch: not Qwen35 EP".to_string())),
         }
     };
-    let gpus: &mut hipfire_runtime::multi_gpu::Gpus = unsafe { &mut *gpus_ptr };
+    let gpus: &mut hipfire_hardware::Gpus = unsafe { &mut *gpus_ptr };
     let config: &qwen35::Qwen35Config = unsafe { &*config_ptr };
     let weights: &Vec<qwen35::Qwen35Weights> = unsafe { &*weights_ptr };
     let batch_state: &mut qwen35::Qwen35DecodeBatchEpState = unsafe { &mut *batch_ptr };
@@ -2591,7 +2591,7 @@ pub fn drive_qwen35_ep_continuous_batch(
     // Track last attested receipt for evidence; must be from runtime, never load logs.
     let mut last_receipt: Option<qwen35::Qwen35EpBatchReceipt> = None;
     let fail_all = |sched: &mut ContinuousBatchScheduler,
-                    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+                    gpus: &mut hipfire_hardware::Gpus,
                     batch_state: &mut qwen35::Qwen35DecodeBatchEpState,
                     stdout: &mut std::io::Stdout,
                     reason: String|

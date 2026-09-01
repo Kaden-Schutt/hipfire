@@ -1126,6 +1126,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-ds4-parent",
+ "hipfire-hardware",
  "hipfire-reap",
  "hipfire-runtime",
  "libloading",
@@ -1195,6 +1196,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-runtime",
  "rdna-compute",
 ]
@@ -1219,6 +1221,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
@@ -1259,6 +1262,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
@@ -1382,6 +1386,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hipfire-hardware",
  "rdna-compute",
 ]
 
@@ -1446,6 +1451,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",
+ "hipfire-hardware",
  "hipfire-loader",
  "hipfire-pflash",
  "hipfire-runtime",
@@ -1454,6 +1460,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "hipfire-hardware"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "rdna-compute",
 ]
 
 [[package]]
@@ -1475,6 +1489,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
+ "hipfire-hardware",
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
@@ -1563,6 +1578,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-engine",
+ "hipfire-hardware",
  "hipfire-loader",
  "hipfire-pflash",
  "libc",
@@ -2902,6 +2918,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-engine",
+ "hipfire-hardware",
  "hipfire-loader",
  "hipfire-pflash",
  "hipfire-runtime",

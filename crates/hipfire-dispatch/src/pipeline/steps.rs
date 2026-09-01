@@ -4,15 +4,23 @@
 //! Op-list interpreter. Phase 2a: GEMV + a fused rmsnorm-rotate producer; empty
 //! fusion table (all per-op fallback).
 
+use hipfire_hardware::{DeviceMesh, DimKind, Gpus, MeshEpoch};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
+use crate::families::moe::{
+    ExpertExecutionPlan, MoeActivationVariant, MoeExpertRef, MoeFamily, MoeProj, MoeProtocolKind,
+    RouterPlan,
+};
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
+
+/// Routing policy is carried by `RouterPlan`; no standalone score activation
+/// can be inserted between route and expert phases.
 
 /// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
 pub enum GemvInput<'a> {
@@ -81,6 +89,76 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// Typed MoE route. Routing semantics (bias/hash/normalization) are
+    /// carried by the plan rather than reconstructed by the family.
+    MoeRoute { plan: RouterPlan<'a> },
+    /// Indexed routed expert projection. Every down projection is expanded;
+    /// the executor-owned `MoeCombine` is the only weighted reduction.
+    IndexedMoeGemv {
+        experts: &'a MoeExpertRef<'a>,
+        which: MoeProj<'a>,
+        topk_indices: &'a GpuTensor,
+        input: GemvInput<'a>,
+        out: &'a GpuTensor,
+        k_top: usize,
+        batch_size: usize,
+    },
+    /// Weighted combine for an expanded routed-down result. The executor
+    /// accepts exactly one combine for a routed chain.
+    MoeCombine {
+        down_out: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        out: &'a GpuTensor,
+        hidden: usize,
+        k_top: usize,
+        batch_size: usize,
+        inverse_perm: Option<&'a GpuTensor>,
+    },
+    /// Build the deterministic grouped-GEMM permutation for a prefill batch.
+    MoeScatter {
+        topk_indices: &'a GpuTensor,
+        expert_token_counts: &'a GpuTensor,
+        expert_offsets: &'a GpuTensor,
+        sorted_slot_index: &'a GpuTensor,
+        expert_tile_ids: &'a GpuTensor,
+        inverse_perm: &'a GpuTensor,
+        total_slots: usize,
+        n_experts: usize,
+        m_total_max: usize,
+        block_m: usize,
+    },
+    /// Grouped routed expert GEMM. Grouped down is always expanded; a
+    /// residual-fused grouped down is refused before any GPU work.
+    GroupedMoeGemm {
+        experts: &'a MoeExpertRef<'a>,
+        which: MoeProj<'a>,
+        sorted_slot_index: &'a GpuTensor,
+        expert_tile_ids: &'a GpuTensor,
+        x: &'a GpuTensor,
+        y: &'a GpuTensor,
+        m_total: usize,
+        batch_size: usize,
+        k_top: usize,
+    },
+    /// Deinterleave grouped gate/up output into per-slot gate and up tensors.
+    MoeGateUpUnscatter {
+        y_grouped: &'a GpuTensor,
+        sorted_slot_index: &'a GpuTensor,
+        gate_batch: &'a GpuTensor,
+        up_batch: &'a GpuTensor,
+        inter: usize,
+        k_top: usize,
+        m_total: usize,
+    },
+    /// Activation/rotation between routed gate/up and down.
+    MoeActivation {
+        variant: MoeActivationVariant,
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        rot_out: &'a GpuTensor,
+        inter: usize,
+        rows: usize,
+    },
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -93,7 +171,1066 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::Rope { .. } => PipelineOp::Rope,
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
+        Step::MoeRoute { .. } => PipelineOp::MoeRoute,
+        Step::IndexedMoeGemv { .. } => PipelineOp::IndexedMoeGemv,
+        Step::MoeCombine { .. } => PipelineOp::MoeCombine,
+        Step::MoeScatter { .. } => PipelineOp::MoeScatter,
+        Step::GroupedMoeGemm { .. } => PipelineOp::GroupedMoeGemm,
+        Step::MoeGateUpUnscatter { .. } => PipelineOp::MoeGateUpUnscatter,
+        Step::MoeActivation { .. } => PipelineOp::MoeActivation,
     }
+}
+
+/// Collective attached to one lock-step `Step` position. The descriptor is
+/// immutable schedule data: membership and mesh identity are supplied by the
+/// manifest/topology owner, never inferred by a family.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepCollective {
+    None,
+    AllReduce {
+        kind: DimKind,
+        dim: usize,
+        group: Vec<usize>,
+        mesh: MeshEpoch,
+        rank: usize,
+    },
+}
+
+impl StepCollective {
+    pub fn all_reduce(
+        kind: DimKind,
+        dim: usize,
+        group: Vec<usize>,
+        mesh: MeshEpoch,
+        rank: usize,
+    ) -> Self {
+        Self::AllReduce {
+            kind,
+            dim,
+            group,
+            mesh,
+            rank,
+        }
+    }
+}
+/// Pointer-free identity for one executable rank schedule. Mesh execution
+/// compares this value for every rank before launching any device work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoeExecutionSignature<'a> {
+    pub protocol: MoeProtocolKind,
+    pub execution: ExpertExecutionPlan,
+    pub router_identity: &'a str,
+    pub router_selection: crate::families::moe::RouterSelection,
+    pub k_top: usize,
+    pub normalize: bool,
+    pub expert_dtype: DType,
+    pub n_experts: usize,
+    pub expert_k: usize,
+    pub expert_m: usize,
+    pub batch_size: usize,
+    pub hidden: usize,
+    /// Canonical `(global expert, owner rank, local slot)` tuples for every
+    /// rank. Unlike pointer tables, this is safe to compare across devices.
+    pub ownership_partition: &'a [(usize, usize, usize)],
+}
+
+fn collective_count(collectives: &[StepCollective]) -> usize {
+    collectives
+        .iter()
+        .filter(|collective| matches!(collective, StepCollective::AllReduce { .. }))
+        .count()
+}
+
+/// Validate the complete grammar of an admitted typed MoE program before any
+/// GPU work. The two executable protocols are intentionally exact:
+///
+/// ```text
+/// indexed: route → gate/up → activation → down(expanded) → combine
+/// grouped: route → scatter → gate/up → unscatter → activation
+///          → down(expanded) → combine
+/// ```
+///
+/// Every routed operand is checked against the one route and expert view that
+/// owns it. This makes a hand-built family schedule fail closed instead of
+/// silently selecting a second policy or reduction.
+pub fn validate_moe_step_schedule(
+    steps: &[Step],
+    collectives: &[StepCollective],
+) -> Result<(), DispatchError> {
+    if steps.len() != collectives.len() {
+        return Err(DispatchError::Hip(format!(
+            "MoE schedule has {} steps but {} collective descriptors",
+            steps.len(),
+            collectives.len()
+        )));
+    }
+    if steps.is_empty() {
+        return Err(DispatchError::Hip("MoE schedule is empty".into()));
+    }
+
+    if let Some(Step::MoeRoute {
+        plan: RouterPlan::SoftmaxTopK { k_top, .. },
+    }) = steps.first()
+    {
+        if *k_top != 8 {
+            return Err(DispatchError::Hip(format!(
+                "generic MoE softmax route requires k_top=8, got {k_top}"
+            )));
+        }
+    }
+
+    let (protocol, route, experts, batch_size, combine_index, hidden, route_indices, route_weights) =
+        match steps {
+            [Step::MoeRoute { plan }, Step::IndexedMoeGemv {
+                experts,
+                which: MoeProj::GateUp { up_out },
+                topk_indices,
+                input: GemvInput::Prerotated(x),
+                out: gate,
+                k_top,
+                batch_size,
+            }, Step::MoeActivation {
+                variant,
+                gate: act_gate,
+                up,
+                rot_out,
+                inter,
+                rows,
+            }, Step::IndexedMoeGemv {
+                experts: down_experts,
+                which: MoeProj::DownExpanded,
+                topk_indices: down_indices,
+                input: GemvInput::Prerotated(down_input),
+                out: down_out,
+                k_top: down_k,
+                batch_size: down_batch,
+            }, Step::MoeCombine {
+                down_out: combine_down,
+                topk_weights,
+                out,
+                hidden,
+                k_top: combine_k,
+                batch_size: combine_batch,
+                inverse_perm,
+            }] => {
+                let expected_rows = batch_size
+                    .checked_mul(*k_top)
+                    .ok_or_else(|| DispatchError::Hip("indexed MoE row count overflows".into()))?;
+                if *batch_size != 1
+                    || *down_batch != 1
+                    || inverse_perm.is_some()
+                    || *k_top != plan.k_top()
+                    || *inter != (*experts).expert_m()
+                    || *rows != expected_rows
+                {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE grammar requires decode batch=1, normalized route, and no inverse permutation"
+                            .into(),
+                    ));
+                }
+                if *k_top != *down_k || *k_top != *combine_k || *batch_size != *combine_batch {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE route width/batch differs across phases".into(),
+                    ));
+                }
+                if !std::ptr::eq(*experts, *down_experts) {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE phases use different expert owner views".into(),
+                    ));
+                }
+                if !same_tensor(gate, act_gate)
+                    || !same_tensor(up_out, up)
+                    || !same_tensor(rot_out, down_input)
+                    || !same_tensor(down_out, combine_down)
+                {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE phase operands are not identity-linked".into(),
+                    ));
+                }
+                if !same_tensor(topk_indices, down_indices) {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE phases use different route-index buffers".into(),
+                    ));
+                }
+                (
+                    MoeProtocolKind::Indexed,
+                    plan,
+                    *experts,
+                    *batch_size,
+                    4usize,
+                    *hidden,
+                    topk_indices,
+                    topk_weights,
+                )
+            }
+            [Step::MoeRoute { plan }, Step::MoeScatter {
+                topk_indices,
+                expert_token_counts,
+                expert_offsets,
+                sorted_slot_index,
+                expert_tile_ids,
+                inverse_perm,
+                total_slots,
+                n_experts,
+                m_total_max,
+                block_m,
+            }, Step::GroupedMoeGemm {
+                experts,
+                which: MoeProj::GateUp { .. },
+                sorted_slot_index: gate_sorted,
+                expert_tile_ids: gate_tiles,
+                x: gate_x,
+                y: gate_y,
+                m_total: gate_m_total,
+                batch_size,
+                k_top,
+            }, Step::MoeGateUpUnscatter {
+                y_grouped,
+                sorted_slot_index: unscatter_sorted,
+                gate_batch,
+                up_batch,
+                inter,
+                k_top: unscatter_k,
+                m_total: unscatter_m_total,
+            }, Step::MoeActivation {
+                variant: _,
+                gate: act_gate,
+                up: act_up,
+                rot_out,
+                inter: act_inter,
+                rows,
+            }, Step::GroupedMoeGemm {
+                experts: down_experts,
+                which: MoeProj::DownExpanded,
+                sorted_slot_index: down_sorted,
+                expert_tile_ids: down_tiles,
+                x: down_x,
+                y: down_y,
+                m_total: down_m_total,
+                batch_size: down_batch,
+                k_top: down_k,
+            }, Step::MoeCombine {
+                down_out: combine_down,
+                topk_weights,
+                out,
+                hidden,
+                k_top: combine_k,
+                batch_size: combine_batch,
+                inverse_perm: combine_inverse,
+            }] => {
+                let expected_slots = batch_size
+                    .checked_mul(*k_top)
+                    .ok_or_else(|| DispatchError::Hip("grouped MoE slot count overflows".into()))?;
+                if *k_top != plan.k_top()
+                    || *k_top != *unscatter_k
+                    || *k_top != *down_k
+                    || *k_top != *combine_k
+                    || *batch_size != *down_batch
+                    || *batch_size != *combine_batch
+                    || *total_slots != expected_slots
+                    || *n_experts != experts.n_experts()
+                    || !same_tensor(topk_indices, plan.route_buffers().0)
+                    || same_tensor(topk_indices, sorted_slot_index)
+                    || !same_tensor(sorted_slot_index, gate_sorted)
+                    || !same_tensor(sorted_slot_index, unscatter_sorted)
+                    || !same_tensor(sorted_slot_index, down_sorted)
+                    || !same_tensor(expert_tile_ids, gate_tiles)
+                    || !same_tensor(expert_tile_ids, down_tiles)
+                {
+                    return Err(DispatchError::Hip(
+                        "grouped MoE route width, batch, or route identity mismatch".into(),
+                    ));
+                }
+                if !std::ptr::eq(*experts, *down_experts) {
+                    return Err(DispatchError::Hip(
+                        "grouped MoE phases use different expert owner views".into(),
+                    ));
+                }
+                if *n_experts == 0
+                    || *m_total_max == 0
+                    || *block_m == 0
+                    || !m_total_max.is_multiple_of(*block_m)
+                    || *gate_m_total == 0
+                    || *down_m_total != *gate_m_total
+                    || *unscatter_m_total != *gate_m_total
+                    || *gate_m_total > *m_total_max
+                {
+                    return Err(DispatchError::Hip(
+                        "grouped MoE scatter capacity or tile geometry is invalid".into(),
+                    ));
+                }
+                let expected_offsets = n_experts.checked_add(1).ok_or_else(|| {
+                    DispatchError::Hip("MoE expert offset count overflows".into())
+                })?;
+                let counts_elements = checked_numel(expert_token_counts, "expert counts")?;
+                let offset_elements = checked_numel(expert_offsets, "expert offsets")?;
+                if counts_elements == 0 || offset_elements < expected_offsets {
+                    return Err(DispatchError::Hip(
+                        "grouped MoE scatter metadata has empty or short buffers".into(),
+                    ));
+                }
+                let Some(combine_inverse) = *combine_inverse else {
+                    return Err(DispatchError::Hip(
+                        "grouped MoE combine requires the scatter inverse permutation".into(),
+                    ));
+                };
+                if !same_tensor(gate_y, y_grouped)
+                    || !same_tensor(gate_sorted, unscatter_sorted)
+                    || !same_tensor(gate_batch, act_gate)
+                    || !same_tensor(up_batch, act_up)
+                    || *inter != *act_inter
+                    || *rows != expected_slots
+                    || !same_tensor(rot_out, down_x)
+                    || !same_tensor(down_y, combine_down)
+                    || !same_tensor(inverse_perm, combine_inverse)
+                {
+                    return Err(DispatchError::Hip(
+                        "grouped MoE phase operands are not identity-linked".into(),
+                    ));
+                }
+                (
+                    MoeProtocolKind::Grouped,
+                    plan,
+                    *experts,
+                    *batch_size,
+                    6usize,
+                    *hidden,
+                    topk_indices,
+                    topk_weights,
+                )
+            }
+            _ => {
+                return Err(DispatchError::Hip(
+                    "MoE Step grammar must be exactly indexed or grouped".into(),
+                ))
+            }
+        };
+
+    experts.validate()?;
+    route.validate_against(experts.n_experts(), batch_size)?;
+    if !same_tensor(route_indices, route.route_buffers().0)
+        || !same_tensor(route_weights, route.route_buffers().1)
+    {
+        return Err(DispatchError::Hip(
+            "MoE route metadata is not bound to the concrete expert Steps".into(),
+        ));
+    }
+    if hidden == 0 || hidden != experts.expert_k() {
+        return Err(DispatchError::Hip(
+            "MoE combine hidden size does not match the expert down projection".into(),
+        ));
+    }
+    let gate_width = experts
+        .expert_m()
+        .checked_mul(2)
+        .ok_or_else(|| DispatchError::Hip("MoE gate/up shape overflows".into()))?;
+    let shape_gate = [gate_width, experts.expert_k()];
+    let shape_down = [experts.expert_k(), experts.expert_m()];
+    experts.validate_projection_shapes(&shape_gate, &shape_down)?;
+    let dtype_supported = match protocol {
+        MoeProtocolKind::Indexed => matches!(
+            experts.dtype(),
+            DType::MQ4G256 | DType::MQ6G256 | DType::MQ4G256V2 | DType::MQ6G256V2
+        ),
+        MoeProtocolKind::Grouped => matches!(
+            experts.dtype(),
+            DType::MQ2G256Lloyd
+                | DType::MQ2G256LloydU
+                | DType::MQ3G256Lloyd
+                | DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ6G256
+                | DType::MQ6G256V2
+                | DType::MFP4G32E8
+                | DType::ParoQ4G128
+        ),
+    };
+    if !dtype_supported {
+        return Err(DispatchError::Hip(format!(
+            "MoE {:?} protocol has no executable kernel for {:?}",
+            protocol,
+            experts.dtype()
+        )));
+    }
+    validate_step_tensors(steps, experts, batch_size, hidden)?;
+    validate_collectives(
+        collectives,
+        combine_index,
+        batch_size,
+        hidden,
+        experts.collective_kind(),
+    )?;
+    Ok(())
+}
+
+/// Couple the immutable plan identity to the exact executable grammar.
+pub fn validate_moe_protocol_schedule(
+    steps: &[Step],
+    collectives: &[StepCollective],
+    execution: ExpertExecutionPlan,
+) -> Result<(), DispatchError> {
+    let expected = execution.protocol()?;
+    validate_moe_step_schedule(steps, collectives)?;
+    let actual = if matches!(steps.get(1), Some(Step::MoeScatter { .. })) {
+        MoeProtocolKind::Grouped
+    } else {
+        MoeProtocolKind::Indexed
+    };
+    if expected != actual {
+        return Err(DispatchError::Hip(format!(
+            "MoE execution identity {:?} does not match {:?} Step grammar",
+            expected, actual
+        )));
+    }
+    Ok(())
+}
+
+fn derive_moe_execution_signature<'a>(
+    steps: &[Step<'a>],
+    execution: ExpertExecutionPlan,
+) -> Result<MoeExecutionSignature<'a>, DispatchError> {
+    let route = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::MoeRoute { plan } => Some(plan),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE schedule has no route".into()))?;
+    let experts = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::IndexedMoeGemv { experts, .. } | Step::GroupedMoeGemm { experts, .. } => {
+                Some(*experts)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE schedule has no expert owner view".into()))?;
+    let hidden = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::MoeCombine { hidden, .. } => Some(*hidden),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE schedule has no combine geometry".into()))?;
+    Ok(MoeExecutionSignature {
+        protocol: execution.protocol()?,
+        execution,
+        router_identity: experts.router_identity(),
+        router_selection: route.selection(),
+        k_top: route.k_top(),
+        normalize: route.normalizes(),
+        expert_dtype: experts.dtype(),
+        n_experts: experts.n_experts(),
+        expert_k: experts.expert_k(),
+        expert_m: experts.expert_m(),
+        batch_size: route.batch_size(),
+        hidden,
+        ownership_partition: experts.ownership_partition(),
+    })
+}
+
+/// An immutable, pre-validated typed MoE schedule.
+pub struct SealedMoeSchedule<'a> {
+    execution: ExpertExecutionPlan,
+    steps: Vec<Step<'a>>,
+    collectives: Vec<StepCollective>,
+}
+
+impl<'a> SealedMoeSchedule<'a> {
+    pub fn new(
+        execution: ExpertExecutionPlan,
+        steps: Vec<Step<'a>>,
+        collectives: Vec<StepCollective>,
+    ) -> Result<Self, DispatchError> {
+        validate_moe_protocol_schedule(&steps, &collectives, execution)?;
+        Ok(Self {
+            execution,
+            steps,
+            collectives,
+        })
+    }
+
+    pub fn execution(&self) -> ExpertExecutionPlan {
+        self.execution
+    }
+
+    pub fn steps(&self) -> &[Step<'a>] {
+        &self.steps
+    }
+
+    pub fn collectives(&self) -> &[StepCollective] {
+        &self.collectives
+    }
+    pub fn execution_signature(&self) -> Result<MoeExecutionSignature<'a>, DispatchError> {
+        derive_moe_execution_signature(&self.steps, self.execution)
+    }
+}
+
+pub fn execute_sealed_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    schedule: &SealedMoeSchedule<'_>,
+) -> Result<(), DispatchError> {
+    validate_moe_protocol_schedule(&schedule.steps, &schedule.collectives, schedule.execution)?;
+    if collective_count(&schedule.collectives) != 0 {
+        return Err(DispatchError::Hip(
+            "parallel MoE schedules require execute_sealed_steps_mesh".into(),
+        ));
+    }
+    execute_steps_inner(gpu, ctx, &schedule.steps)
+}
+
+/// Results of the host-only mesh checks shared by the executor and focused
+/// preflight tests. No device method is called while this value is built.
+struct MoeMeshPreflight<'a> {
+    dim: usize,
+    group: Vec<usize>,
+    outputs: Vec<&'a hip_bridge::DeviceBuffer>,
+}
+
+fn preflight_sealed_steps_mesh<'a>(
+    gpus_len: usize,
+    mesh: &DeviceMesh,
+    schedules: &[&SealedMoeSchedule<'a>],
+) -> Result<MoeMeshPreflight<'a>, DispatchError> {
+    if schedules.is_empty() {
+        return Err(DispatchError::Hip(
+            "parallel MoE execution has no rank schedules".into(),
+        ));
+    }
+    if mesh.n_devices() != gpus_len {
+        return Err(DispatchError::Hip(format!(
+            "MoE mesh has {} devices but Gpus owns {}",
+            mesh.n_devices(),
+            gpus_len
+        )));
+    }
+
+    let mut reduction: Option<(DimKind, usize, Vec<usize>, MeshEpoch)> = None;
+    let mut execution_signature: Option<MoeExecutionSignature<'a>> = None;
+    let mut outputs = Vec::with_capacity(schedules.len());
+    for (rank, schedule) in schedules.iter().enumerate() {
+        validate_moe_protocol_schedule(
+            schedule.steps(),
+            schedule.collectives(),
+            schedule.execution(),
+        )?;
+        let signature = schedule.execution_signature()?;
+        if let Some(expected) = &execution_signature {
+            if expected != &signature {
+                return Err(DispatchError::Hip(
+                    "MoE rank schedules disagree on executable identity".into(),
+                ));
+            }
+        } else {
+            execution_signature = Some(signature);
+        }
+        let (kind, dim, group, epoch, descriptor_rank) = schedule
+            .collectives()
+            .iter()
+            .find_map(|collective| match collective {
+                StepCollective::AllReduce {
+                    kind,
+                    dim,
+                    group,
+                    mesh,
+                    rank,
+                } => Some((*kind, *dim, group.clone(), *mesh, *rank)),
+                StepCollective::None => None,
+            })
+            .ok_or_else(|| {
+                DispatchError::Hip("parallel MoE schedule has no manifest-owned collective".into())
+            })?;
+        if descriptor_rank != rank {
+            return Err(DispatchError::Hip(
+                "MoE collective rank does not match schedule order".into(),
+            ));
+        }
+        let experts = schedule
+            .steps()
+            .iter()
+            .find_map(|step| match step {
+                Step::IndexedMoeGemv { experts, .. } | Step::GroupedMoeGemm { experts, .. } => {
+                    Some(*experts)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| DispatchError::Hip("MoE schedule has no expert owner view".into()))?;
+        if experts.owner_rank() != rank
+            || experts.group_devices() != group.as_slice()
+            || experts.mesh_epoch() != epoch
+            || experts.collective_kind() != Some(kind)
+        {
+            return Err(DispatchError::Hip(
+                "MoE schedule expert owner does not match its collective identity".into(),
+            ));
+        }
+        if let Some((expected_kind, expected_dim, expected_group, expected_epoch)) = &reduction {
+            if *expected_kind != kind
+                || *expected_dim != dim
+                || expected_group != &group
+                || *expected_epoch != epoch
+            {
+                return Err(DispatchError::Hip(
+                    "MoE rank schedules disagree on collective mesh identity".into(),
+                ));
+            }
+        } else {
+            reduction = Some((kind, dim, group, epoch));
+        }
+        let output = schedule
+            .steps()
+            .iter()
+            .find_map(|step| match step {
+                Step::MoeCombine { out, .. } => Some(&out.buf),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                DispatchError::Hip("parallel MoE schedule has no combine output".into())
+            })?;
+        outputs.push(output);
+    }
+
+    let (kind, dim, group, epoch) = reduction.expect("validated schedules have a collective");
+    if mesh.epoch() != epoch {
+        return Err(DispatchError::Hip(
+            "MoE collective belongs to a different mesh generation".into(),
+        ));
+    }
+    if group.len() != schedules.len() || group.len() < 2 {
+        return Err(DispatchError::Hip(
+            "MoE collective rank count does not match mesh group".into(),
+        ));
+    }
+    if group
+        .iter()
+        .enumerate()
+        .any(|(index, device)| *device >= mesh.n_devices() || group[..index].contains(device))
+    {
+        return Err(DispatchError::Hip(
+            "MoE collective group contains invalid or duplicate devices".into(),
+        ));
+    }
+    if mesh.group_along(kind, &mesh.coord_of(group[0])) != group {
+        return Err(DispatchError::Hip(
+            "MoE collective group is not a named DeviceMesh axis group".into(),
+        ));
+    }
+
+    for &device in &group {
+        if device >= gpus_len {
+            return Err(DispatchError::Hip(format!(
+                "MoE collective device {device} is outside the Gpus owner"
+            )));
+        }
+    }
+    Ok(MoeMeshPreflight {
+        dim,
+        group,
+        outputs,
+    })
+}
+/// Run the same host-only validation used by
+/// [`execute_sealed_steps_mesh`] without touching a device.
+///
+/// This is a hidden test/integration seam: callers still need fully sealed
+/// schedules, and the GPU executor invokes the identical preflight internally.
+#[doc(hidden)]
+pub fn validate_sealed_steps_mesh_preflight<'a>(
+    gpus_len: usize,
+    mesh: &DeviceMesh,
+    schedules: &[&SealedMoeSchedule<'a>],
+) -> Result<(), DispatchError> {
+    preflight_sealed_steps_mesh(gpus_len, mesh, schedules).map(|_| ())
+}
+
+/// Execute one sealed MoE schedule per participating device and perform its
+/// single manifest-owned routed reduction. Schedules are ordered by the
+/// collective's rank field; every schedule is validated before any GPU work.
+pub fn execute_sealed_steps_mesh<'a>(
+    gpus: &mut Gpus,
+    mesh: &DeviceMesh,
+    ctx: &DispatchCtx,
+    schedules: &[&SealedMoeSchedule<'a>],
+) -> Result<(), DispatchError> {
+    let preflight = preflight_sealed_steps_mesh(gpus.devices.len(), mesh, schedules)?;
+    for (rank, &device) in preflight.group.iter().enumerate() {
+        execute_steps_inner(&mut gpus.devices[device], ctx, schedules[rank].steps())?;
+    }
+    gpus.all_reduce_sum_f32_peer(&preflight.group, &preflight.outputs, preflight.dim)
+        .map_err(|error| DispatchError::Hip(error.to_string()))
+}
+
+fn same_tensor(a: &GpuTensor, b: &GpuTensor) -> bool {
+    std::ptr::eq(a, b) || (!a.buf.as_ptr().is_null() && a.buf.as_ptr() == b.buf.as_ptr())
+}
+
+fn checked_numel(tensor: &GpuTensor, name: &str) -> Result<usize, DispatchError> {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |elements, dimension| {
+            elements.checked_mul(*dimension)
+        })
+        .ok_or_else(|| DispatchError::Hip(format!("MoE {name} logical shape overflows")))
+}
+
+fn require_tensor(
+    tensor: &GpuTensor,
+    name: &str,
+    dtype: DType,
+    capacity: usize,
+) -> Result<(), DispatchError> {
+    let logical_elements = checked_numel(tensor, name)?;
+    let required_bytes = capacity
+        .checked_mul(dtype.size())
+        .ok_or_else(|| DispatchError::Hip(format!("MoE {name} byte capacity overflows")))?;
+    if tensor.dtype != dtype || logical_elements < capacity || tensor.buf.size() < required_bytes {
+        return Err(DispatchError::Hip(format!(
+            "MoE {name} has dtype {:?}/logical capacity {logical_elements}/physical bytes {}, \
+             expected {:?}/{capacity} elements/{required_bytes} bytes",
+            tensor.dtype,
+            tensor.buf.size(),
+            dtype
+        )));
+    }
+    Ok(())
+}
+
+fn require_raw_i32(tensor: &GpuTensor, name: &str, elements: usize) -> Result<(), DispatchError> {
+    let bytes = elements
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| DispatchError::Hip(format!("MoE {name} capacity overflows")))?;
+    let logical_bytes = checked_numel(tensor, name)?;
+    if tensor.dtype != DType::Raw || logical_bytes < bytes || tensor.buf.size() < bytes {
+        return Err(DispatchError::Hip(format!(
+            "MoE {name} has dtype {:?}/logical bytes {logical_bytes}/physical bytes {}, \
+             expected Raw/at least {bytes} bytes",
+            tensor.dtype,
+            tensor.buf.size()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_step_tensors(
+    steps: &[Step],
+    experts: &MoeExpertRef<'_>,
+    batch_size: usize,
+    hidden: usize,
+) -> Result<(), DispatchError> {
+    let k_top = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::IndexedMoeGemv { k_top, .. }
+            | Step::GroupedMoeGemm { k_top, .. }
+            | Step::MoeGateUpUnscatter { k_top, .. }
+            | Step::MoeCombine { k_top, .. } => Some(*k_top),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE grammar has no route width".into()))?;
+    let slots = batch_size
+        .checked_mul(k_top)
+        .ok_or_else(|| DispatchError::Hip("MoE slot capacity overflow".into()))?;
+    let route = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::MoeRoute { plan } => Some(plan),
+            _ => None,
+        })
+        .ok_or_else(|| DispatchError::Hip("MoE grammar has no route".into()))?;
+    require_tensor(route.route_buffers().0, "route indices", DType::F32, slots)?;
+    require_tensor(route.route_buffers().1, "route weights", DType::F32, slots)?;
+    let gate_capacity = slots
+        .checked_mul(experts.expert_m())
+        .ok_or_else(|| DispatchError::Hip("MoE gate capacity overflow".into()))?;
+    let down_capacity = slots
+        .checked_mul(experts.expert_k())
+        .ok_or_else(|| DispatchError::Hip("MoE down capacity overflow".into()))?;
+    for step in steps {
+        match step {
+            Step::IndexedMoeGemv {
+                which: MoeProj::GateUp { up_out },
+                input,
+                out,
+                ..
+            } => {
+                let x = match input {
+                    GemvInput::Prerotated(x) => *x,
+                    GemvInput::Raw(_) => {
+                        return Err(DispatchError::Hip(
+                            "generic indexed MoE requires pre-rotated input".into(),
+                        ))
+                    }
+                };
+                require_tensor(
+                    x,
+                    "indexed gate/up input",
+                    DType::F32,
+                    batch_size.checked_mul(experts.expert_k()).ok_or_else(|| {
+                        DispatchError::Hip("MoE indexed input capacity overflow".into())
+                    })?,
+                )?;
+                require_tensor(out, "indexed gate output", DType::F32, gate_capacity)?;
+                require_tensor(up_out, "indexed up output", DType::F32, gate_capacity)?;
+                if same_tensor(out, up_out) || same_tensor(x, out) || same_tensor(x, up_out) {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE gate/up buffers must not alias".into(),
+                    ));
+                }
+            }
+            Step::IndexedMoeGemv {
+                which: MoeProj::DownExpanded,
+                input,
+                out,
+                ..
+            } => {
+                let x = match input {
+                    GemvInput::Prerotated(x) => *x,
+                    GemvInput::Raw(_) => {
+                        return Err(DispatchError::Hip(
+                            "generic indexed MoE requires pre-rotated input".into(),
+                        ))
+                    }
+                };
+                require_tensor(x, "indexed down input", DType::F32, gate_capacity)?;
+                require_tensor(out, "indexed down output", DType::F32, down_capacity)?;
+                if same_tensor(x, out) {
+                    return Err(DispatchError::Hip(
+                        "indexed MoE down input/output must not alias".into(),
+                    ));
+                }
+            }
+            Step::MoeCombine {
+                down_out,
+                topk_weights,
+                out,
+                hidden,
+                ..
+            } => {
+                require_tensor(
+                    down_out,
+                    "combine down input",
+                    DType::F32,
+                    batch_size
+                        .checked_mul(k_top)
+                        .and_then(|slots| slots.checked_mul(*hidden))
+                        .ok_or_else(|| {
+                            DispatchError::Hip("MoE combine input capacity overflows".into())
+                        })?,
+                )?;
+                require_tensor(topk_weights, "combine weights", DType::F32, slots)?;
+                require_tensor(
+                    out,
+                    "combine output",
+                    DType::F32,
+                    batch_size
+                        .checked_mul(*hidden)
+                        .ok_or_else(|| DispatchError::Hip("MoE output capacity overflow".into()))?,
+                )?;
+                if same_tensor(down_out, out) || same_tensor(topk_weights, out) {
+                    return Err(DispatchError::Hip(
+                        "MoE combine input/output buffers must not alias".into(),
+                    ));
+                }
+            }
+            Step::MoeScatter {
+                expert_token_counts,
+                expert_offsets,
+                sorted_slot_index,
+                expert_tile_ids,
+                inverse_perm,
+                total_slots,
+                n_experts,
+                m_total_max,
+                block_m,
+                ..
+            } => {
+                let offsets = n_experts
+                    .checked_add(1)
+                    .ok_or_else(|| DispatchError::Hip("MoE expert offsets overflow".into()))?;
+                require_raw_i32(expert_token_counts, "expert counts", *n_experts)?;
+                require_raw_i32(expert_offsets, "expert offsets", offsets)?;
+                require_raw_i32(sorted_slot_index, "sorted slots", *m_total_max)?;
+                require_raw_i32(inverse_perm, "inverse permutation", *total_slots)?;
+                require_raw_i32(expert_tile_ids, "expert tile ids", *m_total_max / *block_m)?;
+            }
+            Step::GroupedMoeGemm {
+                which,
+                x,
+                y,
+                m_total,
+                ..
+            } => {
+                let input_capacity = match which {
+                    MoeProj::GateUp { .. } => {
+                        batch_size.checked_mul(experts.expert_k()).ok_or_else(|| {
+                            DispatchError::Hip("MoE grouped input capacity overflows".into())
+                        })?
+                    }
+                    MoeProj::DownExpanded => {
+                        slots.checked_mul(experts.expert_m()).ok_or_else(|| {
+                            DispatchError::Hip("MoE grouped input capacity overflows".into())
+                        })?
+                    }
+                };
+                require_tensor(x, "grouped input", DType::F32, input_capacity)?;
+                let output_width = match which {
+                    MoeProj::GateUp { .. } => {
+                        2usize.checked_mul(experts.expert_m()).ok_or_else(|| {
+                            DispatchError::Hip("MoE grouped output width overflows".into())
+                        })?
+                    }
+                    MoeProj::DownExpanded => experts.expert_k(),
+                };
+                require_tensor(
+                    y,
+                    "grouped output",
+                    DType::F32,
+                    m_total.checked_mul(output_width).ok_or_else(|| {
+                        DispatchError::Hip("grouped output capacity overflow".into())
+                    })?,
+                )?;
+            }
+            Step::MoeGateUpUnscatter {
+                y_grouped,
+                gate_batch,
+                up_batch,
+                inter,
+                m_total,
+                ..
+            } => {
+                require_tensor(
+                    y_grouped,
+                    "unscatter grouped input",
+                    DType::F32,
+                    m_total
+                        .checked_mul(2usize.checked_mul(*inter).ok_or_else(|| {
+                            DispatchError::Hip("MoE unscatter width overflows".into())
+                        })?)
+                        .ok_or_else(|| {
+                            DispatchError::Hip("MoE unscatter input overflows".into())
+                        })?,
+                )?;
+                require_tensor(
+                    gate_batch,
+                    "unscatter gate",
+                    DType::F32,
+                    slots.checked_mul(*inter).ok_or_else(|| {
+                        DispatchError::Hip("MoE unscatter gate capacity overflows".into())
+                    })?,
+                )?;
+                require_tensor(
+                    up_batch,
+                    "unscatter up",
+                    DType::F32,
+                    slots.checked_mul(*inter).ok_or_else(|| {
+                        DispatchError::Hip("MoE unscatter up capacity overflows".into())
+                    })?,
+                )?;
+            }
+            Step::MoeActivation {
+                gate,
+                up,
+                rot_out,
+                inter,
+                rows,
+                ..
+            } => {
+                let capacity = rows
+                    .checked_mul(*inter)
+                    .ok_or_else(|| DispatchError::Hip("MoE activation capacity overflow".into()))?;
+                require_tensor(gate, "activation gate", DType::F32, capacity)?;
+                require_tensor(up, "activation up", DType::F32, capacity)?;
+                require_tensor(rot_out, "activation output", DType::F32, capacity)?;
+                if same_tensor(gate, up) || same_tensor(gate, rot_out) || same_tensor(up, rot_out) {
+                    return Err(DispatchError::Hip(
+                        "MoE activation buffers must not alias".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = hidden;
+    Ok(())
+}
+
+fn validate_collectives(
+    collectives: &[StepCollective],
+    combine_index: usize,
+    batch_size: usize,
+    hidden: usize,
+    expected_kind: Option<DimKind>,
+) -> Result<(), DispatchError> {
+    let element_count = batch_size
+        .checked_mul(hidden)
+        .ok_or_else(|| DispatchError::Hip("MoE collective element count overflows".into()))?;
+    let mut reduction = None;
+    for (index, collective) in collectives.iter().enumerate() {
+        let StepCollective::AllReduce {
+            kind,
+            dim,
+            group,
+            mesh: _,
+            rank,
+        } = collective
+        else {
+            continue;
+        };
+        if index != combine_index {
+            return Err(DispatchError::Hip(
+                "MoE routed collective must be attached to combine".into(),
+            ));
+        }
+        if expected_kind != Some(*kind) {
+            return Err(DispatchError::Hip(format!(
+                "MoE collective axis {kind:?} does not match owner axis {expected_kind:?}"
+            )));
+        }
+        if *dim != element_count || group.len() < 2 || *rank >= group.len() {
+            return Err(DispatchError::Hip(
+                "MoE collective rank/group/output dimension is invalid".into(),
+            ));
+        }
+        if group
+            .iter()
+            .enumerate()
+            .any(|(offset, device)| group[..offset].contains(device))
+        {
+            return Err(DispatchError::Hip(
+                "MoE collective group contains duplicate devices".into(),
+            ));
+        }
+        if reduction.replace(*kind).is_some() {
+            return Err(DispatchError::Hip(
+                "MoE schedule contains duplicate routed collectives".into(),
+            ));
+        }
+    }
+    if expected_kind.is_some() != reduction.is_some() {
+        return Err(DispatchError::Hip(
+            "MoE collective count does not match the resolved owner parallelism".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Parallel MoE schedule guard. Single-device execution intentionally leaves
+/// all descriptors as `None` (the all-reduce is the identity); parallel
+/// execution requires the one post-combine collective emitted by the manifest
+/// plan.
+pub fn validate_moe_parallel_schedule(
+    steps: &[Step],
+    collectives: &[StepCollective],
+) -> Result<(), DispatchError> {
+    validate_moe_step_schedule(steps, collectives)?;
+    if collective_count(collectives) != 1 {
+        return Err(DispatchError::Hip(
+            "parallel MoE schedule requires exactly one routed collective".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ── Guard helpers ──────────────────────────────────────────────────────────
@@ -645,8 +1782,28 @@ const FUSED_TABLE: &[FusedPattern] = &[
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
+static MOE: std::sync::LazyLock<MoeFamily> = std::sync::LazyLock::new(MoeFamily::new);
+
+fn reject_unsealed_moe(steps: &[Step]) -> Result<(), DispatchError> {
+    if steps.iter().any(is_moe_step) {
+        return Err(DispatchError::Hip(
+            "unsealed MoE schedules require execute_sealed_steps or execute_sealed_steps_mesh"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 
 pub fn execute_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step],
+) -> Result<(), DispatchError> {
+    reject_unsealed_moe(steps)?;
+    execute_steps_inner(gpu, ctx, steps)
+}
+
+fn execute_steps_inner(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     steps: &[Step],
@@ -654,13 +1811,6 @@ pub fn execute_steps(
     let mut i = 0;
     while i < steps.len() {
         if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
-            // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
-            // When the flag is on, the matched window is a per-row 3-way QKV
-            // decode key whose kernel supports the fold, and the 3 steps right
-            // after the window are `BiasAdd` on the q/k/v outputs in order, fold
-            // the bias into the kernel's lane-0 store and skip those 3 steps.
-            // The fold is `acc + bias[row]` (fp32, same operand order as the
-            // separate `bias_add`) → byte-identical to the unfused path.
             if ctx.flags.fuse_qkv_bias && len == QKV3.len() && qkv_bias_fold_supported(key, ctx) {
                 if let Some(biases) = match_trailing_qkv_bias(&steps[i..], len) {
                     launch_fused_qkv_with_bias(gpu, ctx, key, &steps[i..i + len], biases)?;
@@ -668,7 +1818,6 @@ pub fn execute_steps(
                     continue;
                 }
             }
-            // ─────────────────────────────────────────────────────────────────
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
@@ -677,6 +1826,19 @@ pub fn execute_steps(
         }
     }
     Ok(())
+}
+
+fn is_moe_step(step: &Step<'_>) -> bool {
+    matches!(
+        step,
+        Step::MoeRoute { .. }
+            | Step::IndexedMoeGemv { .. }
+            | Step::MoeCombine { .. }
+            | Step::MoeScatter { .. }
+            | Step::GroupedMoeGemm { .. }
+            | Step::MoeGateUpUnscatter { .. }
+            | Step::MoeActivation { .. }
+    )
 }
 
 /// Keys whose 3-way QKV **decode** dispatch arm folds the optional Q/K/V bias
@@ -999,6 +2161,115 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         } => gpu
             .rmsnorm_batched(x, weight, x, *n_groups, *head_dim, *eps)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::MoeRoute { plan } => MOE.run_route(gpu, plan),
+        Step::IndexedMoeGemv {
+            experts,
+            which,
+            topk_indices,
+            input,
+            out,
+            k_top,
+            batch_size,
+        } => MOE.run_indexed(
+            gpu,
+            experts,
+            which,
+            topk_indices,
+            input,
+            out,
+            *k_top,
+            *batch_size,
+        ),
+        Step::MoeScatter {
+            topk_indices,
+            expert_token_counts,
+            expert_offsets,
+            sorted_slot_index,
+            expert_tile_ids,
+            inverse_perm,
+            total_slots,
+            n_experts,
+            m_total_max,
+            block_m,
+        } => MOE.run_scatter(
+            gpu,
+            topk_indices,
+            expert_token_counts,
+            expert_offsets,
+            sorted_slot_index,
+            expert_tile_ids,
+            inverse_perm,
+            *total_slots,
+            *n_experts,
+            *m_total_max,
+            *block_m,
+        ),
+        Step::GroupedMoeGemm {
+            experts,
+            which,
+            sorted_slot_index,
+            expert_tile_ids,
+            x,
+            y,
+            m_total,
+            batch_size,
+            k_top,
+        } => MOE.run_grouped(
+            gpu,
+            experts,
+            which,
+            sorted_slot_index,
+            expert_tile_ids,
+            x,
+            y,
+            *m_total,
+            *batch_size,
+            *k_top,
+        ),
+        Step::MoeGateUpUnscatter {
+            y_grouped,
+            sorted_slot_index,
+            gate_batch,
+            up_batch,
+            inter,
+            k_top,
+            m_total,
+        } => MOE.run_unscatter(
+            gpu,
+            y_grouped,
+            sorted_slot_index,
+            gate_batch,
+            up_batch,
+            *inter,
+            *k_top,
+            *m_total,
+        ),
+        Step::MoeActivation {
+            variant,
+            gate,
+            up,
+            rot_out,
+            inter,
+            rows,
+        } => MOE.run_activation(gpu, *variant, gate, up, rot_out, *inter, *rows),
+        Step::MoeCombine {
+            down_out,
+            topk_weights,
+            out,
+            hidden,
+            k_top,
+            batch_size,
+            inverse_perm,
+        } => MOE.run_combine(
+            gpu,
+            down_out,
+            topk_weights,
+            out,
+            *hidden,
+            *k_top,
+            *batch_size,
+            *inverse_perm,
+        ),
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
@@ -1555,5 +2826,18 @@ mod tests {
             keys.contains(&KernelKey::FusedGateUpQ8_0),
             "FusedGateUpQ8_0 missing from FUSED_TABLE"
         );
+    }
+
+    #[test]
+    fn unsealed_moe_schedule_is_rejected_before_gpu_execution() {
+        let route = GpuTensor::null_for_test();
+        let plan = RouterPlan::Precomputed {
+            topk_indices: &route,
+            topk_weights: &route,
+            k_top: 1,
+        };
+        let steps = [Step::MoeRoute { plan }];
+        let error = reject_unsealed_moe(&steps).expect_err("MoE must use a sealed executor path");
+        assert!(error.to_string().contains("unsealed MoE schedules"));
     }
 }

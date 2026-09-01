@@ -10,8 +10,12 @@ use hip_bridge;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::{LazyLock, OnceLock};
 
-pub(crate) mod steps;
-pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
+pub mod steps;
+
+pub use steps::{
+    execute_sealed_steps_mesh, execute_steps, FusedPattern, GemvInput, SealedMoeSchedule, Step,
+    StepCollective,
+};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
@@ -2860,7 +2864,7 @@ pub fn run_moe_prefill_bias_aware(
 
 /// MoE grouped-GEMM block size (WMMA tile row count). Must match the
 /// constant in qwen35.rs and the scatter kernel.
-const MOE_GROUPED_BLOCK_M: usize = 16;
+pub(crate) const MOE_GROUPED_BLOCK_M: usize = 16;
 
 /// Dispatch one grouped-GEMM for the given routed expert dtype.
 ///
@@ -3086,6 +3090,44 @@ fn dispatch_grouped_gemm(
             quant: "other",
         }),
     }
+}
+
+/// Execute one generic grouped expert projection through the existing MoE
+/// kernel table. The caller supplies the already-resolved typed projection
+/// shape; no family or storage representation is inferred here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_grouped_moe_gemm(
+    gpu: &mut Gpu,
+    dtype: DType,
+    ptrs: &GpuTensor,
+    tile_ids: &GpuTensor,
+    sorted_slot_index: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total: usize,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    dispatch_grouped_gemm(
+        gpu,
+        dtype,
+        None,
+        ptrs,
+        tile_ids,
+        sorted_slot_index,
+        x,
+        y,
+        m,
+        k,
+        x_row_div,
+        m_total,
+        rows,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Qwen3.5 batched MoE prefill routed-expert executor. Verbatim transcription

@@ -245,6 +245,7 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
     let mut gpus = match hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
         .ok()
         .filter(|s| !s.is_empty())
@@ -267,9 +268,10 @@ fn load_qwen35_pp(
                     sum, config.n_layers
                 ));
             }
-            hipfire_runtime::multi_gpu::Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+            hipfire_hardware::Gpus::init_layers(&device_opts, &counts)
+                .map_err(|e| format!("{e}"))?
         }
-        None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
+        None => hipfire_hardware::Gpus::init_uniform(&device_opts, pp, config.n_layers)
             .map_err(|e| format!("{e}"))?,
     };
     // Discrete GPUs: keep model pages in the page cache across reads —

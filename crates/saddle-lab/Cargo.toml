@@ -29,6 +29,7 @@ rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }

@@ -18,10 +18,10 @@
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, Qwen35Scratch, Qwen35ScratchSet, StateQuant,
 };
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -135,7 +135,8 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
 fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
     let mut hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
     let weights =

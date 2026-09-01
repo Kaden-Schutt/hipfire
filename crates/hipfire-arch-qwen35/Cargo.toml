@@ -14,6 +14,7 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }

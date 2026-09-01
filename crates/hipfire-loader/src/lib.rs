@@ -24,6 +24,7 @@ use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
@@ -32,7 +33,6 @@ use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
-use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
@@ -2990,8 +2990,9 @@ fn load_model_ep_ds4(
     let chat_template = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
-    let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, tp, config.num_hidden_layers)
+        .map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -3218,8 +3219,9 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let chat_template = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
-    let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, tp, config.num_hidden_layers)
+        .map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -3358,7 +3360,9 @@ fn load_model_ep_qwen35(
     let n_exp = config.num_experts;
     let chat_template = resolve_chat_template(&hfq_probe, path);
     let rec = hfq_probe.recommended_sampling();
-    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus =
+        Gpus::init_tp(&device_opts, tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -3489,7 +3493,9 @@ fn load_model_tp_qwen35_dense(
     };
     drop(hfq);
 
-    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus =
+        Gpus::init_tp(&device_opts, tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     if gpus.devices.len() != tp {
         return Err(format!(
             "init_tp gave {} devices, expected tp={tp}",

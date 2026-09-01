@@ -47,7 +47,7 @@ pub mod loader_api;
 pub mod loop_guard;
 pub mod model_load;
 pub mod model_source;
-pub mod multi_gpu;
+pub mod moe_plan;
 pub mod paro;
 pub mod prefix;
 pub mod reset_core;
@@ -75,5 +75,7 @@ pub mod tokenizer;
 pub mod calibration;
 pub mod tool_call;
 pub mod weight_backend;
+pub mod weight_manifest;
+pub mod weight_store;
 
 pub use crate::arch::{maybe_screen_mmq, screen_weight_tensor, MmqScreenable};

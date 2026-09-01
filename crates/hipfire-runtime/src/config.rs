@@ -73,7 +73,7 @@ pub struct RuntimeConfig {
     pub lm_head_f16: String,
     /// Tensor-parallel RCCL all-reduce toggle. `None` (unset) → RCCL is used
     /// (default). `Some(false)` (HIPFIRE_TP_USE_RCCL=0) → opt out of the RCCL
-    /// path. `Some(true)` → force on. Read by `multi_gpu::Gpus::ensure_rccl`.
+    /// path. `Some(true)` → force on. Read by `hipfire_hardware::Gpus::ensure_rccl`.
     pub tp_use_rccl: Option<bool>,
     pub ngram_loop_threshold: usize,
     pub ngram_window: usize,
@@ -202,6 +202,18 @@ impl RuntimeConfig {
                 .unwrap_or(3),
         }
     }
+
+    /// Lower the already-resolved hardware settings into the hardware leaf's
+    /// dependency-free construction value. In particular, `devices` is the
+    /// post-visibility logical HIP-ID list produced by `hipfire-config`.
+    pub fn device_resolve_opts(&self) -> hipfire_hardware::DeviceResolveOpts {
+        hipfire_hardware::DeviceResolveOpts {
+            tp_use_rccl: self.tp_use_rccl,
+            devices: self.devices.clone(),
+            allow_mixed_arch: self.allow_mixed_arch,
+            uniform_vram_tolerance_gb: self.uniform_vram_tolerance_gb,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +254,11 @@ mod tests {
             .set_cli("generation.loop_guard_threshold", "12")
             .unwrap();
         layer.set_cli("hardware.devices", "2,3").unwrap();
+        layer.set_cli("hardware.tp_use_rccl", "false").unwrap();
+        layer.set_cli("hardware.allow_mixed_arch", "true").unwrap();
+        layer
+            .set_cli("hardware.uniform_vram_tolerance_gb", "1.5")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -255,6 +272,11 @@ mod tests {
         assert!(!config.normalize_prompt);
         assert_eq!(config.ngram_loop_threshold, 12);
         assert_eq!(config.devices.as_deref(), Some("0,1"));
+        let opts = config.device_resolve_opts();
+        assert_eq!(opts.devices.as_deref(), Some("0,1"));
+        assert_eq!(opts.tp_use_rccl, Some(false));
+        assert!(opts.allow_mixed_arch);
+        assert_eq!(opts.uniform_vram_tolerance_gb, Some(1.5));
         assert!(config.prefill_batched, "sparse arch defaults remain intact");
     }
 
