@@ -670,6 +670,108 @@ fn validate_lowbit_layout(
     Ok(())
 }
 
+/// Validate that `data_len` exactly matches the published layout for `dtype` and `logical_shape`.
+///
+/// This is the canonical codec/layout/K-divisibility/exact-byte validator used by both the legacy
+/// HFQ loader and the manifest pilot before any GPU upload. It mirrors `decode_raw_codec`'s checks
+/// but is GPU-free. Host-decoded types (F32/F16/BF16) are validated by element count; quantized
+/// types are validated by K-divisibility and exact packed length for every layout that has a
+/// published byte formula. A future codec need only be added here and in `decode_raw_codec`.
+pub fn validate_weight_payload(
+    dtype: DType,
+    data_len: usize,
+    logical_shape: &[usize],
+    name: &str,
+) -> Result<(), String> {
+    if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        let expected = logical_shape
+            .iter()
+            .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+            .and_then(|elements| elements.checked_mul(dtype.size()));
+        if expected != Some(data_len) {
+            return Err(format!(
+                "source payload for {name} has {data_len} bytes, expected {expected:?} for {dtype:?} {logical_shape:?}"
+            ));
+        }
+        return Ok(());
+    }
+    if logical_shape.len() != 2 {
+        return Err(format!(
+            "quant payload {name} has {dtype:?} but logical_shape {logical_shape:?} is not 2D [m,k]"
+        ));
+    }
+    let m = logical_shape[0];
+    let k = logical_shape[1];
+    if let Some(block_bytes) = lowbit_block_bytes(dtype) {
+        validate_lowbit_layout(dtype, data_len, m, k, name, block_bytes)
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    if dtype.requires_k_mod_256() && k % 256 != 0 {
+        return Err(format!(
+            "{dtype:?} tensor has K={k} but kernel requires K%256==0 (caller: {name})"
+        ));
+    }
+    match dtype {
+        DType::MQ4G256V2 => {
+            let gpr = k / 256;
+            let expected = m * gpr * 136;
+            if data_len != expected {
+                return Err(format!(
+                    "MQ4G256V2 blob length mismatch: expected {expected}, got {data_len} (M={m} K={k} caller: {name})"
+                ));
+            }
+        }
+        DType::MQ4CG256 => {
+            let gpr = k / 256;
+            let expected = m * gpr * MQ4C_GROUP_BYTES;
+            if data_len != expected {
+                return Err(format!(
+                    "MQ4CG256 blob length mismatch: expected {expected}, got {data_len} (M={m} K={k} caller: {name})"
+                ));
+            }
+        }
+        DType::MQ6G256V2 => {
+            let gpr = k / 256;
+            let expected = m * gpr * MQ6G256V2_GROUP_BYTES;
+            if data_len != expected {
+                return Err(format!(
+                    "MQ6G256V2 blob length mismatch: expected {expected}, got {data_len} (M={m} K={k} caller: {name})"
+                ));
+            }
+        }
+        DType::MQ5G256V2 => {
+            let gpr = k / 256;
+            let expected = m * gpr * MQ5G256V2_GROUP_BYTES;
+            if data_len != expected {
+                return Err(format!(
+                    "MQ5G256V2 blob length mismatch: expected {expected}, got {data_len} (M={m} K={k} caller: {name})"
+                ));
+            }
+        }
+        DType::MQ3G256V2 => {
+            let gpr = k / 256;
+            let expected = m * gpr * MQ3G256V2_GROUP_BYTES;
+            if data_len != expected {
+                return Err(format!(
+                    "MQ3G256V2 blob length mismatch: expected {expected}, got {data_len} (M={m} K={k} caller: {name})"
+                ));
+            }
+        }
+        DType::MQ2G256V2 => {
+            let gpr = k / 256;
+            let expected = m * gpr * MQ2G256V2_GROUP_BYTES;
+            if data_len != expected {
+                return Err(format!(
+                    "MQ2G256V2 blob length mismatch: expected {expected}, got {data_len} (M={m} K={k} caller: {name})"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Quant `data` → device `WeightTensor [m, k]`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
 pub fn dequant_weight_raw(

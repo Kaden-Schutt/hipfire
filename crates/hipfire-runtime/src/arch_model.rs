@@ -99,6 +99,14 @@ pub trait ArchModel: Send + std::any::Any {
     /// experiment converted 15 sites of 154 and this hatch is expected to do
     /// better.
 
+    /// Validate that teardown on `gpu` would target the correct physical device.
+    ///
+    /// Read-only, performs zero GPU calls. Returning `Err` signals a wrong-device
+    /// mismatch and allows the caller to preserve the model for retry on the
+    /// correct device. The default is success so non-pilot arches need no change.
+    fn validate_teardown_device(&self, _device_id: i32) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Return every GPU buffer this model owns.
     ///

@@ -422,7 +422,7 @@ fn write_typed_error(
 /// model may be published only when that prior unload succeeds (or there was
 /// no prior model — caller passes `Ok(())` in that case). A failed prior
 /// unload must never install/emit `loaded` for the new model.
-fn ep_deferred_may_publish(prior_unload: &Result<(), String>) -> bool {
+fn ep_deferred_may_publish(prior_unload: &Result<(), hipfire_loader::UnloadError>) -> bool {
     prior_unload.is_ok()
 }
 
@@ -948,10 +948,14 @@ fn main() {
                     pflash_cfg = None;
                     if let Some(m) = model.take() {
                         if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            let reason = err.reason().to_owned();
+                            if let Some(restored) = err.into_model() {
+                                model.replace(restored);
+                            }
                             emit_uncorrelated_error(
                                 &mut stdout,
                                 None,
-                                &format!("prior unload failed: {err}"),
+                                &format!("prior unload failed: {reason}"),
                                 "internal",
                                 false,
                                 false,
@@ -1123,10 +1127,14 @@ fn main() {
                     pflash_cfg = None;
                     if let Some(m) = model.take() {
                         if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            let reason = err.reason().to_owned();
+                            if let Some(restored) = err.into_model() {
+                                model.replace(restored);
+                            }
                             emit_uncorrelated_error(
                                 &mut stdout,
                                 None,
-                                &format!("prior unload failed: {err}"),
+                                &format!("prior unload failed: {reason}"),
                                 "internal",
                                 false,
                                 false,
@@ -1697,20 +1705,36 @@ fn main() {
                                 Ok(())
                             };
                             if !ep_deferred_may_publish(&prior_unload) {
-                                let prior_err = prior_unload
-                                    .err()
-                                    .unwrap_or_else(|| "prior unload failed".to_string());
+                                let prior_err_owned = match prior_unload {
+                                    Ok(()) => "prior unload failed".to_string(),
+                                    Err(e) => {
+                                        let reason = e.reason().to_owned();
+                                        if let Some(restored) = e.into_model() {
+                                            model.replace(restored);
+                                        }
+                                        reason
+                                    }
+                                };
+                                let prior_err = prior_err_owned.as_str();
                                 // Roll back the newly built EP model — GpuTensor
                                 // has no Drop; must free explicitly.
-                                let rollback_err = match hipfire_loader::unload_model(m, &mut gpu) {
-                                    Ok(()) => None,
-                                    Err(e) => Some(e),
-                                };
-                                // model stays None; pflash already cleared above.
-                                let msg = ep_deferred_handoff_error_message(
-                                    &prior_err,
-                                    rollback_err.as_deref(),
-                                );
+                                let rollback_err_owned: Option<String> =
+                                    match hipfire_loader::unload_model(m, &mut gpu) {
+                                        Ok(()) => None,
+                                        Err(e) => {
+                                            let reason = e.reason().to_owned();
+                                            if let Some(restored) = e.into_model() {
+                                                // Only restore the new model if no prior retryable model already occupies the slot.
+                                                if model.is_none() {
+                                                    model.replace(restored);
+                                                }
+                                            }
+                                            Some(reason)
+                                        }
+                                    };
+                                let rollback_err = rollback_err_owned.as_deref();
+                                let msg =
+                                    ep_deferred_handoff_error_message(prior_err, rollback_err);
                                 write_error(&mut stdout, "", &msg);
                                 continue;
                             }
@@ -3446,25 +3470,43 @@ fn main() {
                     }
                 }
                 pflash_cfg = None;
-                let unload_result = if let Some(m) = model.take() {
-                    hipfire_loader::unload_model(m, &mut gpu)
-                } else {
-                    // No model: still retry any process-global pending VMM arenas.
-                    hipfire_loader::ensure_vmm_ready_for_load(&mut gpu)
-                };
-                match unload_result {
-                    Ok(()) => {
-                        let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
+                if let Some(m) = model.take() {
+                    match hipfire_loader::unload_model(m, &mut gpu) {
+                        Ok(()) => {
+                            let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
+                        }
+                        Err(err) => {
+                            let reason = err.reason().to_owned();
+                            if let Some(restored) = err.into_model() {
+                                model.replace(restored);
+                            }
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!(
+                                    "unload incomplete: {reason}; VMM arenas retained for retry"
+                                ),
+                                "internal",
+                                false,
+                                false,
+                            );
+                        }
                     }
-                    Err(err) => {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            &format!("unload incomplete: {err}; VMM arenas retained for retry"),
-                            "internal",
-                            false,
-                            false,
-                        );
+                } else {
+                    match hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        Ok(()) => {
+                            let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
+                        }
+                        Err(err) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("unload incomplete: {err}; VMM arenas retained for retry"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                        }
                     }
                 }
                 batch_scheduler = None;

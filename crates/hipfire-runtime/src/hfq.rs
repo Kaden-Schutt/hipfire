@@ -1595,7 +1595,14 @@ impl WeightSource for LlamaHfqSource<'_> {
     ) -> HipResult<(WeightTensor, bool)> {
         let cfg = self.cfg;
         let hfq = self.hfq;
-        let has_separate = hfq.find_tensor("lm_head.weight").is_some();
+        const LM_HEAD_CANDIDATES: &[&str] = &[
+            "lm_head.weight",
+            "model.lm_head.weight",
+            "model.language_model.lm_head.weight",
+        ];
+        let has_separate = LM_HEAD_CANDIDATES
+            .iter()
+            .any(|name| hfq.find_tensor(name).is_some());
         resolve_lm_head(
             gpu,
             has_separate,
@@ -1605,6 +1612,22 @@ impl WeightSource for LlamaHfqSource<'_> {
             cfg.vocab_size,
             cfg.dim,
             |gpu| {
+                // Try each explicit LM-head candidate; the first that exists is loaded
+                // with a direct single-name resolver so the sidecar name is derived
+                // from the actual on-disk name.
+                for cand in LM_HEAD_CANDIDATES {
+                    if hfq.find_tensor(cand).is_some() {
+                        if let Ok(w) =
+                            load_weight_tensor(hfq, gpu, cand, cfg.vocab_size, cfg.dim, |n| {
+                                vec![n.to_string()]
+                            })
+                        {
+                            return Ok(w);
+                        }
+                    }
+                }
+                // Fallback to the flat resolver for backward compatibility (covers
+                // any future naming not in the explicit set).
                 load_weight_tensor(
                     hfq,
                     gpu,

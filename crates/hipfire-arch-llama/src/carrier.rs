@@ -77,8 +77,25 @@ impl AttachedWeightStore {
         Ok(Self { transaction })
     }
 
-    pub(crate) fn drain(self, gpu: &mut rdna_compute::Gpu) -> hip_bridge::HipResult<()> {
-        self.transaction.rollback(gpu)
+    /// Read-only device gate for preflight. Performs zero GPU calls.
+    pub(crate) fn validate_device(&self, device_id: i32) -> Result<(), WeightStoreError> {
+        self.transaction.validate_device(device_id)
+    }
+
+    /// Gated drain that validates physical device before any GPU call.
+    pub(crate) fn try_drain(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), WeightStoreError> {
+        self.transaction.try_rollback(gpu)
+    }
+
+    pub(crate) fn drain(self, gpu: &mut rdna_compute::Gpu) -> Result<(), (Self, WeightStoreError)> {
+        let mut me = self;
+        match me.try_drain(gpu) {
+            Ok(()) => Ok(()),
+            Err(error) => Err((me, error)),
+        }
     }
 }
 
@@ -86,6 +103,26 @@ fn with_weight_rollback_error(reason: String, rollback: hip_bridge::HipResult<()
     match rollback {
         Ok(()) => reason,
         Err(error) => format!("{reason}; resident rollback failed: {error}"),
+    }
+}
+
+fn with_gated_rollback_error(
+    reason: String,
+    rollback: Result<(), (WeightLoadTransaction, WeightStoreError)>,
+) -> String {
+    match rollback {
+        Ok(()) => reason,
+        Err((_, error)) => format!("{reason}; resident rollback failed: {error}"),
+    }
+}
+
+fn with_store_drain_error(
+    reason: String,
+    drain: Result<(), (AttachedWeightStore, WeightStoreError)>,
+) -> String {
+    match drain {
+        Ok(()) => reason,
+        Err((_, error)) => format!("{reason}; weight store drain failed: {error}"),
     }
 }
 
@@ -157,7 +194,10 @@ fn hfq_entry_names(entry: &WeightEntry) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn hfq_entry_data(hfq: &HfqFile, entry: &WeightEntry) -> Result<(Vec<u8>, u8), String> {
+fn hfq_entry_data(
+    hfq: &HfqFile,
+    entry: &WeightEntry,
+) -> Result<(Vec<u8>, hipfire_runtime::hfq::HfqTensorInfo), String> {
     for name in hfq_entry_names(entry)? {
         if let Some((info, data)) = hfq.tensor_data_vec(&name) {
             if !matches!(
@@ -174,12 +214,29 @@ fn hfq_entry_data(hfq: &HfqFile, entry: &WeightEntry) -> Result<(Vec<u8>, u8), S
                     ));
                 }
             }
-            return Ok((data, info.quant_type));
+            // Authority: HFQ tensor shape must exactly match the manifest logical shape.
+            let expected_shape: Vec<u32> = entry.logical_shape.iter().map(|&d| d as u32).collect();
+            if info.shape != expected_shape {
+                return Err(format!(
+                    "llama: shape mismatch for {}[layer {:?}] (candidate {name}): HFQ shape {:?} != manifest logical_shape {:?}",
+                    entry.name, entry.layer, info.shape, entry.logical_shape
+                ));
+            }
+            return Ok((data, info.clone()));
         }
     }
     if entry.name == "lm_head" && entry.layer.is_none() {
         if let Some((info, data)) = hfq.tensor_data_vec("model.embed_tokens.weight") {
-            return Ok((data, info.quant_type));
+            // Tied fallback: still validate that the source shape matches the declared lm_head shape
+            // (manifest declares lm_head logical_shape as [vocab, dim], same as embed).
+            let expected_shape: Vec<u32> = entry.logical_shape.iter().map(|&d| d as u32).collect();
+            if info.shape != expected_shape {
+                return Err(format!(
+                    "llama: tied lm_head shape mismatch: HFQ embed shape {:?} != manifest logical_shape {:?}",
+                    info.shape, entry.logical_shape
+                ));
+            }
+            return Ok((data, info.clone()));
         }
     }
     Err(format!(
@@ -235,32 +292,48 @@ fn f32_bytes_from_hfq(quant_type: u8, data: &[u8], name: &str) -> Result<Vec<u8>
 }
 
 fn hfq_source(hfq: &HfqFile, entry: &WeightEntry) -> Result<(Vec<u8>, DType), String> {
-    let (data, quant_type) = hfq_entry_data(hfq, entry)?;
+    let (data, info) = hfq_entry_data(hfq, entry)?;
+    let quant_type = info.quant_type;
     let name = format!("{}[layer {:?}]", entry.name, entry.layer);
-    if entry.name == "token_embd" {
-        return match quant_type {
-            1 | 2 | 16 => Ok((f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32)),
-            3 => Ok((data, DType::Q8_0)),
-            4 => Ok((data, DType::Q4K)),
-            6 => Ok((data, DType::HFQ4G256)),
-            7 => Ok((data, DType::HFQ4G128)),
-            other => Err(format!(
-                "{name}: quant_type={other} is unsupported for a LLaMA embedding"
-            )),
-        };
-    }
-    if matches!(
+    let (bytes, dtype) = if entry.name == "token_embd" {
+        match quant_type {
+            1 | 2 | 16 => (f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32),
+            3 => (data, DType::Q8_0),
+            4 => (data, DType::Q4K),
+            6 => (data, DType::HFQ4G256),
+            7 => (data, DType::HFQ4G128),
+            other => {
+                return Err(format!(
+                    "{name}: quant_type={other} is unsupported for a LLaMA embedding"
+                ))
+            }
+        }
+    } else if matches!(
         entry.name.as_str(),
         "output_norm" | "attn_norm" | "ffn_norm" | "q_norm" | "k_norm"
     ) {
-        return Ok((f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32));
-    }
-    match quant_type {
-        1 | 2 | 16 => Ok((f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32)),
-        other => hfq_weight_dtype(other)
-            .map(|dtype| (data, dtype))
-            .ok_or_else(|| format!("{name}: unsupported HFQ quant_type={other}")),
-    }
+        (f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32)
+    } else {
+        match quant_type {
+            1 | 2 | 16 => (f32_bytes_from_hfq(quant_type, &data, &name)?, DType::F32),
+            other => {
+                let dtype = hfq_weight_dtype(other)
+                    .ok_or_else(|| format!("{name}: unsupported HFQ quant_type={other}"))?;
+                (data, dtype)
+            }
+        }
+    };
+    // Route every dtype (quantized or raw host float widened to F32) through the canonical
+    // layout/K-divisibility/exact-byte validator before any GPU upload. This reuses the single
+    // source of truth in weight_backend and fails malformed payloads before upload_raw.
+    hipfire_runtime::weight_backend::validate_weight_payload(
+        dtype,
+        bytes.len(),
+        &entry.logical_shape,
+        &name,
+    )
+    .map_err(|e| format!("llama: payload validation for {name} failed: {e}"))?;
+    Ok((bytes, dtype))
 }
 
 fn take_slot(
@@ -573,10 +646,13 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                     let weights = match assemble_llama_weights(&config, &mut transaction) {
                         Ok(weights) => weights,
                         Err(error) => {
-                            return Err(with_weight_rollback_error(
-                                error,
-                                transaction.rollback(ctx.gpu),
-                            ));
+                            let rollback = transaction.try_rollback(ctx.gpu);
+                            return Err(match rollback {
+                                Ok(()) => error,
+                                Err(rb_err) => {
+                                    format!("{error}; resident rollback failed: {rb_err}")
+                                }
+                            });
                         }
                     };
                     (weights, Some(transaction))
@@ -589,16 +665,17 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
             let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
                 Ok(scratch) => scratch,
                 Err(error) => {
-                    let rollback = if let Some(transaction) = weight_store.take() {
-                        transaction.rollback(ctx.gpu)
-                    } else {
-                        Ok(())
-                    };
+                    let rollback: Result<(), String> =
+                        if let Some(mut transaction) = weight_store.take() {
+                            transaction.try_rollback(ctx.gpu).map_err(|e| e.to_string())
+                        } else {
+                            Ok(())
+                        };
                     weights.free_gpu(ctx.gpu);
-                    return Err(with_weight_rollback_error(
-                        format!("llama: ForwardScratch::new_with_max_seq failed: {error:?}"),
-                        rollback,
-                    ));
+                    return Err(match rollback {
+                        Ok(()) => format!("llama: ForwardScratch::new_with_max_seq failed: {error:?}"),
+                        Err(rb_err) => format!("llama: ForwardScratch::new_with_max_seq failed: {error:?}; resident rollback failed: {rb_err}"),
+                    });
                 }
             };
             let dims = llama_kv_dims(&config, ctx.max_seq, None);
@@ -615,16 +692,17 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 Ok(kv) => kv,
                 Err(error) => {
                     scratch.free_gpu(ctx.gpu);
-                    let rollback = if let Some(transaction) = weight_store.take() {
-                        transaction.rollback(ctx.gpu)
-                    } else {
-                        Ok(())
-                    };
+                    let rollback: Result<(), String> =
+                        if let Some(mut transaction) = weight_store.take() {
+                            transaction.try_rollback(ctx.gpu).map_err(|e| e.to_string())
+                        } else {
+                            Ok(())
+                        };
                     weights.free_gpu(ctx.gpu);
-                    return Err(with_weight_rollback_error(
-                        format!("llama: <KvCache as KvCacheExt>::from_mode failed: {error}"),
-                        rollback,
-                    ));
+                    return Err(match rollback {
+                        Ok(()) => format!("llama: <KvCache as KvCacheExt>::from_mode failed: {error}"),
+                        Err(rb_err) => format!("llama: <KvCache as KvCacheExt>::from_mode failed: {error}; resident rollback failed: {rb_err}"),
+                    });
                 }
             };
             (
@@ -709,18 +787,21 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         dspark_assets: None,
     };
     if let Some(transaction) = weight_store {
-        if let Err((transaction, error)) = bundle.attach_weight_store(transaction) {
+        if let Err((mut transaction, error)) = bundle.attach_weight_store(transaction) {
             let LlamaBundle {
                 weights,
                 scratch,
                 kv,
                 ..
             } = bundle;
-            let rollback = transaction.rollback(ctx.gpu);
+            let rollback = transaction.try_rollback(ctx.gpu);
             scratch.free_gpu(ctx.gpu);
             weights.free_gpu(ctx.gpu);
             let _ = kv.free_gpu(ctx.gpu);
-            return Err(with_weight_rollback_error(error, rollback));
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rb_err) => format!("{error}; resident rollback failed: {rb_err}"),
+            });
         }
     }
     Ok(bundle)
@@ -895,7 +976,13 @@ mod tests {
             ));
         }
         if let Some(lm_head_name) = lm_head_name {
-            tensors.push(f32_hfq_tensor(lm_head_name, &[2, 32], false));
+            // AWQ sidecar path uses F16 for lm_head in legacy loader tests;
+            // use F16 when a sidecar is present so the legacy load_weight_tensor succeeds.
+            if with_awq_sidecar {
+                tensors.push(f16_hfq_tensor(lm_head_name, &[2, 32]));
+            } else {
+                tensors.push(f32_hfq_tensor(lm_head_name, &[2, 32], false));
+            }
         }
         let metadata = r#"{
             "config": {
@@ -1105,6 +1192,152 @@ mod tests {
             Box::new(bundle).free_gpu(&mut gpu);
             std::fs::remove_file(path).expect("remove HFQ fixture");
         }
+    }
+
+    #[test]
+    fn alternate_explicit_lm_head_with_awq_sidecar_is_not_tied() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        // AWQ sidecar forces the legacy route; alternate names must still be
+        // recognized as explicit heads and not silently tied.
+        for name in &HFQ_LM_HEAD_NAMES[1..] {
+            let (path, hfq) = fixture_hfq_with_lm_head(true, false, false, Some(name));
+            assert!(hfq_has_separate_lm_head(&hfq));
+            assert!(hfq.has_awq_sidecars());
+            let cask = CaskConfig::default();
+            let mut ctx = load_ctx(&path, &mut gpu, &cask);
+            let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
+                .expect("load alternate lm_head with AWQ sidecar");
+            drop(ctx);
+            assert!(
+                !bundle.weights.lm_head_aliases_embd,
+                "alternate {name} with AWQ sidecar must not be tied"
+            );
+            Box::new(bundle).free_gpu(&mut gpu);
+            std::fs::remove_file(path).expect("remove HFQ fixture");
+        }
+    }
+
+    #[test]
+    fn manifest_shape_mismatch_fails_before_upload() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        // Build a tiny HFQ where embed has wrong shape vs manifest.
+        let mut tensors = vec![
+            // manifest expects [2,32] for token_embd, give [2,16] instead
+            f32_hfq_tensor("model.embed_tokens.weight", &[2, 16], false),
+            f32_hfq_tensor("model.norm.weight", &[32], false),
+            f16_hfq_tensor("model.layers.0.self_attn.q_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.self_attn.k_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.self_attn.v_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.self_attn.o_proj.weight", &[32, 32]),
+            f16_hfq_tensor("model.layers.0.mlp.gate_proj.weight", &[64, 32]),
+            f16_hfq_tensor("model.layers.0.mlp.up_proj.weight", &[64, 32]),
+            f16_hfq_tensor("model.layers.0.mlp.down_proj.weight", &[32, 64]),
+            f32_hfq_tensor("model.layers.0.input_layernorm.weight", &[32], false),
+            f32_hfq_tensor(
+                "model.layers.0.post_attention_layernorm.weight",
+                &[32],
+                false,
+            ),
+            f32_hfq_tensor("lm_head.weight", &[2, 32], false),
+        ];
+        let metadata = r#"{
+            "config": {
+                "model_type": "llama",
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "intermediate_size": 64,
+                "vocab_size": 2,
+                "head_dim": 32,
+                "rms_norm_eps": 0.00001,
+                "max_position_embeddings": 8,
+                "rope_theta": 10000.0
+            }
+        }"#;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("hipfire-shape-mismatch-{nonce}.hfq"));
+        write_hfqm_package_mem(&path, 0, metadata, &tensors).expect("write");
+        let hfq = HfqFile::open(&path).expect("open");
+        let cask = CaskConfig::default();
+        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let err = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
+            Ok(_) => panic!("expected load_bundle to fail on shape mismatch"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("shape mismatch") || err.contains("logical_shape"),
+            "wrong shape must fail before upload, got: {err}"
+        );
+        drop(ctx);
+        std::fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
+    fn malformed_quant_payload_fails_before_upload() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        // Direct validator check: a truncated TQ2 payload must be rejected
+        // before any GPU upload via the canonical helper.
+        let dtype = rdna_compute::DType::TQ2G128;
+        let logical_shape = vec![32, 128];
+        let bad_len = 1;
+        let err = hipfire_runtime::weight_backend::validate_weight_payload(
+            dtype,
+            bad_len,
+            &logical_shape,
+            "test.malformed",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("mismatch")
+                || err.contains("expects")
+                || err.contains("blob length")
+                || err.contains("payload")
+        );
+        // Manifest path: a source returning a truncated quant payload must fail
+        // with a payload reason before upload_raw, and prior residents must be freed.
+        let mesh = hipfire_hardware::DeviceMesh::single().expect("mesh");
+        let manifest = vec![
+            hipfire_runtime::weight_manifest::WeightEntry::model(
+                "first",
+                vec![1],
+                rdna_compute::DType::F32,
+                hipfire_runtime::weight_manifest::ShardPolicy::Replicate,
+            ),
+            hipfire_runtime::weight_manifest::WeightEntry::model(
+                "bad_quant",
+                vec![32, 128],
+                rdna_compute::DType::TQ2G128,
+                hipfire_runtime::weight_manifest::ShardPolicy::Replicate,
+            ),
+        ];
+        let fulfill_err =
+            hipfire_runtime::weight_store::fulfill_manifest(&manifest, &mesh, 1, &gpu, |entry| {
+                if entry.name == "bad_quant" {
+                    Ok((vec![0u8; 1], rdna_compute::DType::TQ2G128))
+                } else {
+                    Ok((vec![0u8; 4], rdna_compute::DType::F32))
+                }
+            })
+            .unwrap_err();
+        assert!(
+            fulfill_err.reason.contains("payload")
+                || fulfill_err.reason.contains("mismatch")
+                || fulfill_err.reason.contains("expects")
+                || fulfill_err.reason.contains("blob"),
+            "malformed quant must fail, got: {}",
+            fulfill_err.reason
+        );
+        drop(gpu);
     }
 
     #[test]

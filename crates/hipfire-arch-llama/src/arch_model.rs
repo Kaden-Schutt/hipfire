@@ -34,7 +34,27 @@ impl ArchModel for LlamaBundle {
         Ok(())
     }
 
+    fn validate_teardown_device(&self, device_id: i32) -> Result<(), String> {
+        if let Some(store) = self.weight_store.as_ref() {
+            store
+                .validate_device(device_id)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
+        let mut bundle = *self;
+        // Preflight in `unload_model` already validated the device. If drain
+        // still fails (e.g., hip free error), keep fail-closed quarantine
+        // semantics but do not claim the failure is retryable.
+        if let Some(store) = bundle.weight_store.take() {
+            if let Err((_, error)) = store.drain(gpu) {
+                eprintln!("llama: failed to release attached weight store: {error}");
+                std::mem::forget(bundle);
+                return;
+            }
+        }
         let LlamaBundle {
             config: _,
             weights,
@@ -47,17 +67,9 @@ impl ArchModel for LlamaBundle {
             dflash_extract_layers: _,
             dspark_weights: _,
             dspark_assets: _,
-        } = *self;
-        // Mirror the existing unload ordering: scratch → store/weights → kv.
+        } = bundle;
+        drop(weight_store);
         scratch.free_gpu(gpu);
-        if let Some(store) = weight_store {
-            // Attachment already checked the complete origin and created this
-            // owner capability. There is no mismatch branch to leak the model:
-            // an attached store can only be drained by this consuming owner.
-            if let Err(error) = store.drain(gpu) {
-                eprintln!("llama: failed to release attached weight store: {error}");
-            }
-        }
         weights.free_gpu(gpu);
         let _ = kv.free_gpu(gpu);
     }
