@@ -3342,6 +3342,7 @@ pub fn handle_redline_shadow(
             "context_tokens": context,
             "iterations": iterations,
             "position_step": position_step,
+            "queue_id": prepared.2,
             "aql_host_us": aql_host_us,
             "aql_gpu_us": aql_gpu_us,
         });

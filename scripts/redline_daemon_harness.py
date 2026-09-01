@@ -559,6 +559,7 @@ def main():
                     f"shadow: backend=pm4_ib replay_only=true "
                     f"iterations={shadow.get('iterations')} "
                     f"position_step={shadow.get('position_step')} "
+                    f"queue_id={shadow.get('queue_id')} "
                     f"host_us={shadow.get('aql_host_us'):.1f}",
                     flush=True,
                 )
