@@ -552,6 +552,7 @@ pub fn validate_moe_step_schedule(
             experts.dtype()
         )));
     }
+    validate_step_tensors(steps, experts, batch_size, hidden)?;
     validate_collectives(
         collectives,
         combine_index,
