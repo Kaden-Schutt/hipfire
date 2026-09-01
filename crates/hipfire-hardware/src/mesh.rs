@@ -66,6 +66,20 @@ pub enum CollectiveHint {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum MeshError {
     CardinalityOverflow,
+    DuplicateAxis(DimKind),
+    InvalidDevice {
+        device: usize,
+        n_devices: usize,
+    },
+    RankMismatch {
+        expected: usize,
+        got: usize,
+    },
+    CoordinateOutOfBounds {
+        axis: usize,
+        value: usize,
+        size: usize,
+    },
 }
 
 impl std::fmt::Display for MeshError {
@@ -73,6 +87,24 @@ impl std::fmt::Display for MeshError {
         match self {
             Self::CardinalityOverflow => {
                 f.write_str("rectangular device mesh cardinality overflow")
+            }
+            Self::DuplicateAxis(kind) => {
+                write!(f, "duplicate mesh axis {kind:?}")
+            }
+            Self::InvalidDevice { device, n_devices } => {
+                write!(
+                    f,
+                    "device {device} out of range for mesh with {n_devices} devices"
+                )
+            }
+            Self::RankMismatch { expected, got } => {
+                write!(f, "coordinate rank {got} != mesh rank {expected}")
+            }
+            Self::CoordinateOutOfBounds { axis, value, size } => {
+                write!(
+                    f,
+                    "coordinate axis {axis} value {value} out of bounds (size {size})"
+                )
             }
         }
     }
@@ -111,13 +143,18 @@ impl DeviceMesh {
     /// coordinate space and at least one logical device. Named axes are kept
     /// in caller order; the final axis varies fastest in the flattened ID.
     ///
-    /// The cardinality is checked while constructing the mesh. Callers must
-    /// handle [`MeshError::CardinalityOverflow`] instead of observing a
-    /// wrapped device count.
+    /// The cardinality is checked while constructing the mesh. Duplicate
+    /// `DimKind` axes are rejected with [`MeshError::DuplicateAxis`]. Callers
+    /// must handle [`MeshError`] instead of observing a wrapped device count.
     pub fn rect(axes: &[(DimKind, usize)]) -> Result<Self, MeshError> {
         let mut normalized = Vec::with_capacity(axes.len());
+        let mut seen = Vec::new();
         let mut n_devices = 1usize;
         for &(kind, size) in axes {
+            if seen.contains(&kind) {
+                return Err(MeshError::DuplicateAxis(kind));
+            }
+            seen.push(kind);
             let size = size.max(1);
             n_devices = n_devices
                 .checked_mul(size)
@@ -167,43 +204,69 @@ impl DeviceMesh {
     }
 
     /// Convert a flattened row-major device ID to an axis coordinate.
-    pub fn coord_of(&self, dev: usize) -> Vec<usize> {
-        let mut rem = dev % self.n_devices();
+    ///
+    /// Fails when `dev` is out of range (`dev >= n_devices`). No modulo
+    /// aliasing is performed.
+    pub fn coord_of(&self, dev: usize) -> Result<Vec<usize>, MeshError> {
+        if dev >= self.n_devices {
+            return Err(MeshError::InvalidDevice {
+                device: dev,
+                n_devices: self.n_devices,
+            });
+        }
+        let mut rem = dev;
         let mut coord = vec![0; self.axes.len()];
         for (index, axis) in self.axes.iter().enumerate().rev() {
             coord[index] = rem % axis.size;
             rem /= axis.size;
         }
-        coord
+        Ok(coord)
     }
 
     /// Convert an axis coordinate to a flattened row-major device ID.
     ///
-    /// Coordinates are debug-asserted to have the mesh rank. In non-debug
-    /// builds, missing entries default to zero and out-of-range entries clamp
-    /// to the final valid index, preserving a total function for diagnostics.
-    pub fn device_of(&self, coord: &[usize]) -> usize {
-        debug_assert_eq!(coord.len(), self.axes.len());
-        self.axes.iter().enumerate().fold(0, |id, (index, axis)| {
-            let value = coord.get(index).copied().unwrap_or(0);
-            id * axis.size + value.min(axis.size - 1)
-        })
+    /// Fails when the coordinate rank does not match the mesh rank or any
+    /// coordinate entry is out of bounds (`value >= axis.size`).
+    pub fn device_of(&self, coord: &[usize]) -> Result<usize, MeshError> {
+        if coord.len() != self.axes.len() {
+            return Err(MeshError::RankMismatch {
+                expected: self.axes.len(),
+                got: coord.len(),
+            });
+        }
+        let mut id = 0usize;
+        for (index, axis) in self.axes.iter().enumerate() {
+            let value = coord[index];
+            if value >= axis.size {
+                return Err(MeshError::CoordinateOutOfBounds {
+                    axis: index,
+                    value,
+                    size: axis.size,
+                });
+            }
+            id = id * axis.size + value;
+        }
+        Ok(id)
     }
 
     /// Return the devices sharing all coordinates except `kind`, ordered by
     /// their index along that axis. An absent axis yields this device alone.
-    pub fn group_along(&self, kind: DimKind, coord: &[usize]) -> Vec<usize> {
+    ///
+    /// Fails when `coord` has the wrong rank or contains out-of-bounds
+    /// entries. No clamping is performed.
+    pub fn group_along(&self, kind: DimKind, coord: &[usize]) -> Result<Vec<usize>, MeshError> {
         let Some(axis_index) = self.axes.iter().position(|axis| axis.kind == kind) else {
-            return vec![self.device_of(coord)];
+            return Ok(vec![self.device_of(coord)?]);
         };
         let size = self.axes[axis_index].size;
-        let mut base = self.normalized_coord(coord);
-        (0..size)
-            .map(|index| {
-                base[axis_index] = index;
-                self.device_of(&base)
-            })
-            .collect()
+        let base = self.checked_coord(coord)?;
+        let mut out = Vec::with_capacity(size);
+        for index in 0..size {
+            let mut mutated = base.clone();
+            mutated[axis_index] = index;
+            out.push(self.device_of(&mutated)?);
+        }
+        Ok(out)
     }
 
     /// Return the pipeline stage containing `layer` under a uniform banding.
@@ -244,18 +307,42 @@ impl DeviceMesh {
     /// For a mesh without PP, all devices belong to the sole stage. For a
     /// composed mesh, every TP/EP coordinate in the selected PP stage is
     /// returned in row-major order.
-    pub fn stage_devices(&self, coord: &[usize]) -> Vec<usize> {
+    ///
+    /// Fails when `coord` has the wrong rank or contains out-of-bounds
+    /// entries, or when any device identity is stale.
+    pub fn stage_devices(&self, coord: &[usize]) -> Result<Vec<usize>, MeshError> {
         let Some(pp_index) = self.axes.iter().position(|axis| axis.kind == DimKind::Pp) else {
-            return (0..self.n_devices()).collect();
+            // No PP axis — all devices belong to the sole stage. Validate
+            // coordinate rank even though it is not used for filtering.
+            if coord.len() != self.axes.len() {
+                return Err(MeshError::RankMismatch {
+                    expected: self.axes.len(),
+                    got: coord.len(),
+                });
+            }
+            for (idx, v) in coord.iter().enumerate() {
+                let size = self.axes[idx].size;
+                if *v >= size {
+                    return Err(MeshError::CoordinateOutOfBounds {
+                        axis: idx,
+                        value: *v,
+                        size,
+                    });
+                }
+            }
+            return Ok((0..self.n_devices()).collect());
         };
-        let stage = coord
-            .get(pp_index)
-            .copied()
-            .unwrap_or(0)
-            .min(self.axes[pp_index].size - 1);
-        (0..self.n_devices())
-            .filter(|&device| self.coord_of(device)[pp_index] == stage)
-            .collect()
+        // Validate coordinate strictly before using it for stage selection.
+        let checked = self.checked_coord(coord)?;
+        let stage = checked[pp_index];
+        let mut out = Vec::new();
+        for device in 0..self.n_devices() {
+            let c = self.coord_of(device)?;
+            if c[pp_index] == stage {
+                out.push(device);
+            }
+        }
+        Ok(out)
     }
 
     /// Drop size-one axes while preserving the mesh epoch identity.
@@ -272,13 +359,24 @@ impl DeviceMesh {
         }
     }
 
-    fn normalized_coord(&self, coord: &[usize]) -> Vec<usize> {
-        debug_assert_eq!(coord.len(), self.axes.len());
-        self.axes
-            .iter()
-            .enumerate()
-            .map(|(index, axis)| coord.get(index).copied().unwrap_or(0).min(axis.size - 1))
-            .collect()
+    fn checked_coord(&self, coord: &[usize]) -> Result<Vec<usize>, MeshError> {
+        if coord.len() != self.axes.len() {
+            return Err(MeshError::RankMismatch {
+                expected: self.axes.len(),
+                got: coord.len(),
+            });
+        }
+        for (idx, axis) in self.axes.iter().enumerate() {
+            let v = coord[idx];
+            if v >= axis.size {
+                return Err(MeshError::CoordinateOutOfBounds {
+                    axis: idx,
+                    value: v,
+                    size: axis.size,
+                });
+            }
+        }
+        Ok(coord.to_vec())
     }
 }
 
@@ -315,13 +413,13 @@ mod tests {
         let mesh = DeviceMesh::single().unwrap();
         assert_eq!(mesh.n_devices(), 1);
         assert_eq!(mesh.axes(), &[]);
-        assert_eq!(mesh.coord_of(0), Vec::<usize>::new());
-        assert_eq!(mesh.device_of(&[]), 0);
-        assert_eq!(mesh.group_along(DimKind::Tp, &[]), vec![0]);
-        assert_eq!(mesh.group_along(DimKind::Ep, &[]), vec![0]);
+        assert_eq!(mesh.coord_of(0).unwrap(), Vec::<usize>::new());
+        assert_eq!(mesh.device_of(&[]).unwrap(), 0);
+        assert_eq!(mesh.group_along(DimKind::Tp, &[]).unwrap(), vec![0]);
+        assert_eq!(mesh.group_along(DimKind::Ep, &[]).unwrap(), vec![0]);
         assert_eq!(mesh.stage_for_layer(0, 32), 0);
         assert_eq!(mesh.band_xfer_after(0, 32), None);
-        assert_eq!(mesh.stage_devices(&[]), vec![0]);
+        assert_eq!(mesh.stage_devices(&[]).unwrap(), vec![0]);
     }
 
     #[test]
@@ -331,7 +429,7 @@ mod tests {
         assert_ne!(single, empty_rect);
         assert_eq!(single.axes(), empty_rect.axes());
         assert_eq!(single.n_devices(), empty_rect.n_devices());
-        assert_eq!(single.coord_of(0), empty_rect.coord_of(0));
+        assert_eq!(single.coord_of(0).unwrap(), empty_rect.coord_of(0).unwrap());
         assert_ne!(single.epoch(), empty_rect.epoch());
         assert_eq!(single.epoch(), single.clone().epoch());
     }
@@ -354,7 +452,7 @@ mod tests {
             Some(CollectiveHint::BandXfer { src: 1, dst: 2 })
         );
         assert_eq!(mesh.band_xfer_after(5, 6), None);
-        assert_eq!(mesh.stage_devices(&[1]), vec![1]);
+        assert_eq!(mesh.stage_devices(&[1]).unwrap(), vec![1]);
     }
 
     #[test]
@@ -362,22 +460,25 @@ mod tests {
         let mesh =
             DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2), (DimKind::Ep, 2)]).unwrap();
         assert_eq!(mesh.n_devices(), 8);
-        assert_eq!(mesh.coord_of(0), vec![0, 0, 0]);
-        assert_eq!(mesh.coord_of(7), vec![1, 1, 1]);
+        assert_eq!(mesh.coord_of(0).unwrap(), vec![0, 0, 0]);
+        assert_eq!(mesh.coord_of(7).unwrap(), vec![1, 1, 1]);
 
         // The final (Ep) axis varies fastest in the row-major flattening.
         let coord = [1, 0, 1];
-        assert_eq!(mesh.device_of(&coord), 5);
-        assert_eq!(mesh.coord_of(5), coord);
-        assert_eq!(mesh.group_along(DimKind::Tp, &coord), vec![5, 7]);
-        assert_eq!(mesh.group_along(DimKind::Ep, &coord), vec![4, 5]);
-        assert_eq!(mesh.stage_devices(&[1, 0, 0]), vec![4, 5, 6, 7]);
+        assert_eq!(mesh.device_of(&coord).unwrap(), 5);
+        assert_eq!(mesh.coord_of(5).unwrap(), coord);
+        assert_eq!(mesh.group_along(DimKind::Tp, &coord).unwrap(), vec![5, 7]);
+        assert_eq!(mesh.group_along(DimKind::Ep, &coord).unwrap(), vec![4, 5]);
+        assert_eq!(mesh.stage_devices(&[1, 0, 0]).unwrap(), vec![4, 5, 6, 7]);
 
         for pp in 0..2 {
             for tp in 0..2 {
                 for ep in 0..2 {
                     let coord = [pp, tp, ep];
-                    assert_eq!(mesh.coord_of(mesh.device_of(&coord)), coord);
+                    assert_eq!(
+                        mesh.coord_of(mesh.device_of(&coord).unwrap()).unwrap(),
+                        coord
+                    );
                 }
             }
         }
@@ -405,7 +506,10 @@ mod tests {
         let mesh =
             DeviceMesh::rect(&[(DimKind::Pp, 3), (DimKind::Tp, 2), (DimKind::Ep, 2)]).unwrap();
         for device in 0..mesh.n_devices() {
-            assert_eq!(mesh.device_of(&mesh.coord_of(device)), device);
+            assert_eq!(
+                mesh.device_of(&mesh.coord_of(device).unwrap()).unwrap(),
+                device
+            );
         }
     }
 
@@ -414,5 +518,65 @@ mod tests {
         let error = DeviceMesh::rect(&[(DimKind::Pp, usize::MAX), (DimKind::Tp, 2)])
             .expect_err("rectangular cardinality must fail closed");
         assert_eq!(error, MeshError::CardinalityOverflow);
+    }
+
+    #[test]
+    fn duplicate_axis_is_rejected() {
+        let err = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Pp, 2)])
+            .expect_err("duplicate Pp must fail");
+        assert_eq!(err, MeshError::DuplicateAxis(DimKind::Pp));
+        let err = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Tp, 1)])
+            .expect_err("duplicate Tp must fail");
+        assert_eq!(err, MeshError::DuplicateAxis(DimKind::Tp));
+        let err = DeviceMesh::rect(&[(DimKind::Ep, 2), (DimKind::Ep, 2)])
+            .expect_err("duplicate Ep must fail");
+        assert_eq!(err, MeshError::DuplicateAxis(DimKind::Ep));
+    }
+
+    #[test]
+    fn stale_device_and_bad_coordinate_fail_closed() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]).unwrap();
+        // stale/out-of-range device identities must not alias via modulo
+        assert!(matches!(
+            mesh.coord_of(4),
+            Err(MeshError::InvalidDevice {
+                device: 4,
+                n_devices: 4
+            })
+        ));
+        assert!(matches!(
+            mesh.coord_of(99),
+            Err(MeshError::InvalidDevice { .. })
+        ));
+        // wrong rank
+        assert!(matches!(
+            mesh.device_of(&[0]),
+            Err(MeshError::RankMismatch { .. })
+        ));
+        assert!(matches!(
+            mesh.device_of(&[0, 0, 0]),
+            Err(MeshError::RankMismatch { .. })
+        ));
+        // out-of-bounds coordinate
+        assert!(matches!(
+            mesh.device_of(&[2, 0]),
+            Err(MeshError::CoordinateOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            mesh.group_along(DimKind::Tp, &[2, 0]),
+            Err(MeshError::CoordinateOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            mesh.group_along(DimKind::Tp, &[0]),
+            Err(MeshError::RankMismatch { .. })
+        ));
+        assert!(matches!(
+            mesh.stage_devices(&[2, 0]),
+            Err(MeshError::CoordinateOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            mesh.stage_devices(&[0]),
+            Err(MeshError::RankMismatch { .. })
+        ));
     }
 }

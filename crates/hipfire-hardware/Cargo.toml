@@ -7,6 +7,7 @@ description = "Hardware ownership and multi-device topology for hipfire"
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 
 [features]

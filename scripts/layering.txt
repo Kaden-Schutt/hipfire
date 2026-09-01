@@ -30,6 +30,7 @@
  2 redline-dispatch
  3 rdna-compute
  4 hipfire-dispatch
+ 4 hipfire-hardware
  4 saddle-core
  5 hipfire-runtime
  6 hipfire-arch-cohere2moe

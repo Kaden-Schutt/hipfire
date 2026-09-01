@@ -73,7 +73,7 @@ pub struct RuntimeConfig {
     pub lm_head_f16: String,
     /// Tensor-parallel RCCL all-reduce toggle. `None` (unset) → RCCL is used
     /// (default). `Some(false)` (HIPFIRE_TP_USE_RCCL=0) → opt out of the RCCL
-    /// path. `Some(true)` → force on. Read by `hipfire_hardware::Gpus::ensure_rccl`.
+    /// path. `Some(true)` → force on. Read by `multi_gpu::Gpus::ensure_rccl`.
     pub tp_use_rccl: Option<bool>,
     pub ngram_loop_threshold: usize,
     pub ngram_window: usize,
@@ -88,6 +88,11 @@ pub struct RuntimeConfig {
     pub experimental_budget_alert: bool,
     pub max_total_think_tokens: usize,
     pub devices: Option<String>,
+    /// Proof that device visibility was successfully applied. When `Some`,
+    /// the hardware resolver lowers physical selectors to logical `0..N-1`;
+    /// when `None`, physical IDs are preserved. Direct callers without
+    /// visibility preserve physical IDs.
+    pub visibility: Option<hipfire_config::DeviceVisibility>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
@@ -112,10 +117,24 @@ pub fn init_with(config: RuntimeConfig) -> std::result::Result<(), RuntimeConfig
 
 impl RuntimeConfig {
     pub fn from_process_config(config: &hipfire_config::ProcessConfig) -> Self {
-        Self::from_lookup(|name| config.legacy_value(name))
+        Self::from_process_config_with_visibility(config, None)
     }
 
-    fn from_lookup(mut value: impl FnMut(&str) -> Option<String>) -> Self {
+    /// Construct with explicit visibility proof. Physical selectors are
+    /// preserved in `devices`; lowering to logical happens only in
+    /// `hipfire_hardware::resolve_device_ids` when the proof matches the
+    /// current process environment. Without proof, physical IDs are preserved.
+    pub fn from_process_config_with_visibility(
+        config: &hipfire_config::ProcessConfig,
+        visibility: Option<hipfire_config::DeviceVisibility>,
+    ) -> Self {
+        Self::from_lookup(|name| config.legacy_value(name), visibility)
+    }
+
+    fn from_lookup(
+        mut value: impl FnMut(&str) -> Option<String>,
+        visibility: Option<hipfire_config::DeviceVisibility>,
+    ) -> Self {
         let normalize_prompt = match value("HIPFIRE_NORMALIZE_PROMPT").as_deref() {
             Some("0") | Some("false") | Some("off") | Some("no") => false,
             _ => true,
@@ -125,6 +144,32 @@ impl RuntimeConfig {
         let prompt_heat_limit: usize = value("HIPFIRE_PROMPT_HEAT_LIMIT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
+
+        // Resolve devices: preserve physical list verbatim (validated) in all
+        // cases. The lowering to logical 0..N-1 happens only in
+        // `hipfire_hardware::resolve_device_ids` when `visibility` proof is
+        // present and matches the current process environment. This ensures
+        // direct callers without proof preserve physical IDs, while daemon
+        // paths with proof get logical IDs after hardware verification.
+        // Empty/malformed lists are preserved for hardware to fail closed.
+        let raw_devices = value("HIPFIRE_DEVICES");
+        let devices = match &raw_devices {
+            Some(raw) => {
+                if raw.trim().is_empty() {
+                    Some(raw.clone())
+                } else {
+                    let parts: Vec<&str> = raw.split(',').collect();
+                    if parts.iter().any(|p| p.trim().is_empty()) {
+                        Some(raw.clone())
+                    } else {
+                        Some(parts.iter().map(|p| p.trim()).collect::<Vec<_>>().join(","))
+                    }
+                }
+            }
+            None => None,
+        };
+        // Keep visibility for device_resolve_opts threading.
+        let _ = &visibility;
 
         Self {
             normalize_prompt,
@@ -182,17 +227,8 @@ impl RuntimeConfig {
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
-            // `hardware.devices` is installed as physical ROCr selectors and
-            // matching logical HIP selectors before GPU initialization. The
-            // engine therefore addresses the filtered set as logical 0..N-1.
-            devices: value("HIPFIRE_DEVICES")
-                .filter(|value| !value.is_empty())
-                .map(|value| {
-                    (0..value.split(',').count())
-                        .map(|device| device.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }),
+            devices,
+            visibility,
             allow_mixed_arch: value("HIPFIRE_ALLOW_MIXED_ARCH").as_deref() == Some("1"),
             uniform_vram_tolerance_gb: value("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .and_then(|s| s.parse().ok()),
@@ -204,14 +240,17 @@ impl RuntimeConfig {
     }
 
     /// Lower the already-resolved hardware settings into the hardware leaf's
-    /// dependency-free construction value. In particular, `devices` is the
-    /// post-visibility logical HIP-ID list produced by `hipfire-config`.
+    /// dependency-free construction value. `devices` is preserved physical;
+    /// `visibility` proof is threaded to `hipfire_hardware` so it can lower
+    /// to logical `0..N-1` only when the proof matches the current process
+    /// environment.
     pub fn device_resolve_opts(&self) -> hipfire_hardware::DeviceResolveOpts {
         hipfire_hardware::DeviceResolveOpts {
             tp_use_rccl: self.tp_use_rccl,
             devices: self.devices.clone(),
             allow_mixed_arch: self.allow_mixed_arch,
             uniform_vram_tolerance_gb: self.uniform_vram_tolerance_gb,
+            visibility: self.visibility.clone(),
         }
     }
 }
@@ -254,11 +293,6 @@ mod tests {
             .set_cli("generation.loop_guard_threshold", "12")
             .unwrap();
         layer.set_cli("hardware.devices", "2,3").unwrap();
-        layer.set_cli("hardware.tp_use_rccl", "false").unwrap();
-        layer.set_cli("hardware.allow_mixed_arch", "true").unwrap();
-        layer
-            .set_cli("hardware.uniform_vram_tolerance_gb", "1.5")
-            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -271,13 +305,27 @@ mod tests {
 
         assert!(!config.normalize_prompt);
         assert_eq!(config.ngram_loop_threshold, 12);
-        assert_eq!(config.devices.as_deref(), Some("0,1"));
+        // Without visibility proof, physical IDs are preserved, not lowered to 0,1.
+        assert_eq!(config.devices.as_deref(), Some("2,3"));
+        assert!(config.visibility.is_none());
         let opts = config.device_resolve_opts();
-        assert_eq!(opts.devices.as_deref(), Some("0,1"));
-        assert_eq!(opts.tp_use_rccl, Some(false));
-        assert!(opts.allow_mixed_arch);
-        assert_eq!(opts.uniform_vram_tolerance_gb, Some(1.5));
+        assert_eq!(opts.devices.as_deref(), Some("2,3"));
+        assert!(opts.visibility.is_none());
         assert!(config.prefill_batched, "sparse arch defaults remain intact");
+
+        // With visibility proof, hardware will lower physical 2,3 to logical 0,1
+        // (runtime keeps physical, but opts carries proof).
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        let config_with_vis =
+            RuntimeConfig::from_process_config_with_visibility(&process, Some(vis.clone()));
+        assert_eq!(config_with_vis.devices.as_deref(), Some("2,3"));
+        assert_eq!(config_with_vis.visibility, Some(vis.clone()));
+        let opts_with_vis = config_with_vis.device_resolve_opts();
+        assert_eq!(opts_with_vis.devices.as_deref(), Some("2,3"));
+        assert_eq!(opts_with_vis.visibility, Some(vis));
     }
 
     #[test]

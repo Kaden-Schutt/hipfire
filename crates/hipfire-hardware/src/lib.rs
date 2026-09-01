@@ -32,15 +32,26 @@ pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind, MeshEpoch, MeshError};
 /// Device-resolution knobs supplied by the resolved process/runtime config
 /// when constructing a [`Gpus`] owner.
 ///
-/// `devices` contains the post-visibility logical HIP IDs produced by
-/// `hipfire-config`, not the original physical ROCr selectors. Hardware
-/// consumes this value as-is and never rereads process environment.
+/// `devices` is the original `hardware.devices` physical selector list when
+/// `visibility` is `None`, and must be validated without lowering. Only
+/// when `visibility` is `Some` — proof that
+/// `hipfire_config::apply_device_visibility` was successfully applied to the
+/// current process and the environment reflects it — does
+/// `resolve_device_ids` lower the physical selectors `2,3` to logical
+/// `0,1`. Direct/example callers that do not apply visibility preserve
+/// validated physical IDs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceResolveOpts {
     pub tp_use_rccl: Option<bool>,
     pub devices: Option<String>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
+    /// Proof that device visibility was successfully applied to the current
+    /// process. When `Some`, `devices` (physical ROCr selectors) are lowered
+    /// to logical `0..N-1`; when `None`, physical IDs are preserved.
+    /// The proof must match the current process environment
+    /// (`HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES`).
+    pub visibility: Option<hipfire_config::DeviceVisibility>,
 }
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
@@ -1886,29 +1897,96 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Resolve logical device IDs from the already-resolved `hardware.devices`
-/// value, or use the first `n_devices` visible IDs. The supplied list is
-/// post-visibility logical HIP IDs and is consumed without physical-ID
-/// remapping.
+/// Resolve logical device IDs from `hardware.devices`, lowering physical
+/// selectors `2,3` to logical `0,1` only when `opts.visibility` proves that
+/// `apply_device_visibility` was successfully applied to the current process.
+/// Without proof, validated physical IDs are preserved. Empty or malformed
+/// lists (empty entries, non-numeric, negative) fail closed. When unset,
+/// the first `n_devices` visible IDs are used.
 fn resolve_device_ids(n_devices: usize, opts: &DeviceResolveOpts) -> HipResult<Vec<i32>> {
     if let Some(value) = &opts.devices {
-        let parsed = value
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(str::parse::<i32>)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| HipError::new(0, &format!("hardware.devices parse: {error}")))?;
-        if parsed.len() < n_devices {
+        if value.trim().is_empty() {
+            return Err(HipError::new(0, "hardware.devices: empty device list"));
+        }
+        // Strict split: empty entries (e.g. "2,,3" or "2, ") fail, not normalize.
+        let parts: Vec<&str> = value.split(',').collect();
+        let mut parsed_physical = Vec::with_capacity(parts.len());
+        for part in parts {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return Err(HipError::new(
+                    0,
+                    "hardware.devices: empty entry in device list",
+                ));
+            }
+            let id: i32 = trimmed
+                .parse()
+                .map_err(|error| HipError::new(0, &format!("hardware.devices parse: {error}")))?;
+            if id < 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("hardware.devices: negative device id {id}"),
+                ));
+            }
+            parsed_physical.push(id);
+        }
+        if parsed_physical.len() < n_devices {
             return Err(HipError::new(
                 0,
                 &format!(
                     "hardware.devices exposes {} ids but n_devices = {n_devices}",
-                    parsed.len()
+                    parsed_physical.len()
                 ),
             ));
         }
-        return Ok(parsed[..n_devices].to_vec());
+        if let Some(vis) = &opts.visibility {
+            // Proof must match current process environment.
+            let hip_env = std::env::var(hipfire_config::HIP_VISIBLE_DEVICES).unwrap_or_default();
+            let rocr_env = std::env::var(hipfire_config::ROCR_VISIBLE_DEVICES).unwrap_or_default();
+            if hip_env != vis.hip || rocr_env != vis.rocr {
+                return Err(HipError::new(
+                    0,
+                    "hardware.devices: visibility proof does not match current process environment — visibility was not successfully applied",
+                ));
+            }
+            let normalized_rocr = parsed_physical
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if vis.rocr != normalized_rocr {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "hardware.devices: visibility rocr {:?} does not match requested physical list {:?}",
+                        vis.rocr, normalized_rocr
+                    ),
+                ));
+            }
+            let expected_hip = (0..parsed_physical.len())
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if vis.hip != expected_hip {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "hardware.devices: visibility hip {:?} must be logical 0..N-1 {:?}",
+                        vis.hip, expected_hip
+                    ),
+                ));
+            }
+            // Proof valid — lower to logical 0..N-1.
+            return (0..n_devices)
+                .map(|id| {
+                    i32::try_from(id).map_err(|_| {
+                        HipError::new(0, "hardware.devices logical ID exceeds HIP range")
+                    })
+                })
+                .collect();
+        }
+        // No proof — preserve validated physical IDs.
+        return Ok(parsed_physical[..n_devices].to_vec());
     }
     (0..n_devices)
         .map(|id| {
@@ -2142,5 +2220,109 @@ mod tests {
             ..DeviceResolveOpts::default()
         };
         assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn resolver_preserves_physical_without_visibility() {
+        let opts = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            ..DeviceResolveOpts::default()
+        };
+        // No visibility proof — physical IDs preserved, not lowered to 0,1
+        assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![2, 3]);
+        // Single device 2 without visibility should stay 2
+        let opts2 = DeviceResolveOpts {
+            devices: Some("2".into()),
+            ..DeviceResolveOpts::default()
+        };
+        assert_eq!(resolve_device_ids(1, &opts2).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn resolver_lowers_with_applied_visibility_proof() {
+        // Simulate successful visibility application: physical 2,3 -> logical 0,1
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        // Install env vars to prove visibility was applied to current process
+        std::env::set_var(hipfire_config::HIP_VISIBLE_DEVICES, &vis.hip);
+        std::env::set_var(hipfire_config::ROCR_VISIBLE_DEVICES, &vis.rocr);
+        let opts = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            visibility: Some(vis.clone()),
+            ..DeviceResolveOpts::default()
+        };
+        assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![0, 1]);
+        // Even if physical is 2,3 but n_devices=1, lower to 0
+        assert_eq!(resolve_device_ids(1, &opts).unwrap(), vec![0]);
+        // Cleanup
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
+    }
+
+    #[test]
+    fn resolver_rejects_empty_and_malformed_lists() {
+        let cases = [
+            Some("".to_string()),
+            Some(",".to_string()),
+            Some("2,,3".to_string()),
+            Some("2, ".to_string()),
+            Some(",1".to_string()),
+            Some("2,3,".to_string()),
+        ];
+        for devices in cases {
+            let opts = DeviceResolveOpts {
+                devices: devices.clone(),
+                ..DeviceResolveOpts::default()
+            };
+            assert!(
+                resolve_device_ids(2, &opts).is_err(),
+                "malformed {:?} must fail, not normalize",
+                devices
+            );
+        }
+        // Also with visibility proof, malformed must still fail
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        std::env::set_var(hipfire_config::HIP_VISIBLE_DEVICES, &vis.hip);
+        std::env::set_var(hipfire_config::ROCR_VISIBLE_DEVICES, &vis.rocr);
+        let opts = DeviceResolveOpts {
+            devices: Some("2,,3".into()),
+            visibility: Some(vis),
+            ..DeviceResolveOpts::default()
+        };
+        assert!(resolve_device_ids(2, &opts).is_err());
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
+    }
+
+    #[test]
+    fn resolver_rejects_stale_visibility_proof() {
+        // Physical 2,3 but visibility proof is stale (doesn't match env or rocr)
+        let vis = hipfire_config::DeviceVisibility {
+            rocr: "2,3".into(),
+            hip: "0,1".into(),
+        };
+        // No env vars set — proof stale
+        let opts = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            visibility: Some(vis.clone()),
+            ..DeviceResolveOpts::default()
+        };
+        assert!(resolve_device_ids(2, &opts).is_err());
+        // Env vars set but mismatched rocr
+        std::env::set_var(hipfire_config::HIP_VISIBLE_DEVICES, "0,1");
+        std::env::set_var(hipfire_config::ROCR_VISIBLE_DEVICES, "0,1"); // wrong rocr
+        let opts2 = DeviceResolveOpts {
+            devices: Some("2,3".into()),
+            visibility: Some(vis),
+            ..DeviceResolveOpts::default()
+        };
+        assert!(resolve_device_ids(2, &opts2).is_err());
+        std::env::remove_var(hipfire_config::HIP_VISIBLE_DEVICES);
+        std::env::remove_var(hipfire_config::ROCR_VISIBLE_DEVICES);
     }
 }

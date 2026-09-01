@@ -520,8 +520,12 @@ fn init_tracing() {
 
 fn install_process_config(config: hipfire_config::ProcessConfig) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
-    hipfire_config::apply_device_visibility(&config).map_err(|error| error.to_string())?;
-    let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&config);
+    let visibility =
+        hipfire_config::apply_device_visibility(&config).map_err(|error| error.to_string())?;
+    let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config_with_visibility(
+        &config,
+        visibility.clone(),
+    );
     hipfire_config::install_process_config(config)
         .map_err(|_| "process configuration was already initialized".to_owned())?;
     hipfire_runtime::config::init_with(runtime)
