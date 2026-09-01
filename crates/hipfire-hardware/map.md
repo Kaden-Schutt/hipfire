@@ -1,18 +1,20 @@
 # hipfire-hardware — map
 
-> **Status:** `production` / `research` / `legacy` — pick exactly one
-> (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
-> **Layer:** see the layering table in
-> [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) — do not restate it here.
+> **Status:** `production`
+> **Layer:** hardware topology and multi-GPU ownership; see
+> [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ## Purpose
 
-<!-- hand-written: what this crate owns and why it exists. Prefer pointing at
-     the `//!` docs in `src/lib.rs` over copying prose. -->
+Owns typed device meshes, physical-to-logical device resolution, pipeline
+layer bands, peer copies, RCCL collectives, and their GPU-lifetime resources.
 
 ## Gotchas
 
-<!-- hand-written: what not to do here; traps a reader will hit. -->
+- All HIP work remains on the daemon's owning OS thread.
+- Physical selectors lower to logical IDs only with a visibility proof that
+  matches the current process environment.
+- Every `boundary_copy` event must be consumed by `wait_boundary`.
 
 ## Crate map
 
