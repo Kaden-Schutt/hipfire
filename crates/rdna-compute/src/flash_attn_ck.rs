@@ -44,6 +44,8 @@ pub enum FlashAttnCkKvFormat {
     Asym3Givens = 4,
     Asym3Fwht = 5,
     Lloyd = 6,
+    Asym4Givens = 7,
+    Asym4Fwht = 8,
 }
 
 pub const FLASH_ATTN_CK_CAP_CAUSAL: u32 = 1 << 0;
@@ -175,6 +177,24 @@ fn select_asym3_fwht_prefill_capabilities(
     select_packed_prefill_capabilities(capabilities, input)
 }
 
+fn select_asym4_prefill_capabilities(
+    capabilities: &[FlashAttnCkCapability],
+    input: FlashAttnCkPrefillInput,
+) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
+    let request = input.request;
+    if !matches!(
+        request.k_format,
+        FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht
+    ) || request.v_format != FlashAttnCkKvFormat::Q8
+    {
+        return Err(FlashAttnCkRejectReason::UnsupportedFormat);
+    }
+    if request.head_dim != 256 {
+        return Err(FlashAttnCkRejectReason::UnsupportedHeadDim);
+    }
+    select_packed_prefill_capabilities(capabilities, input)
+}
+
 fn select_packed_prefill_capabilities(
     capabilities: &[FlashAttnCkCapability],
     input: FlashAttnCkPrefillInput,
@@ -258,6 +278,8 @@ fn is_known_kv_format(value: i32) -> bool {
         || value == FlashAttnCkKvFormat::Asym3Givens as i32
         || value == FlashAttnCkKvFormat::Asym3Fwht as i32
         || value == FlashAttnCkKvFormat::Lloyd as i32
+        || value == FlashAttnCkKvFormat::Asym4Givens as i32
+        || value == FlashAttnCkKvFormat::Asym4Fwht as i32
 }
 
 fn is_supported_abi(version: u32) -> bool {
@@ -779,7 +801,7 @@ impl crate::Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> hip_bridge::HipResult<bool> {
-        self.try_flash_attn_ck_asym3_prefill_impl(
+        self.try_flash_attn_ck_transformed_prefill_impl(
             FlashAttnCkKvFormat::Asym3Givens,
             q,
             k_cache,
@@ -821,7 +843,7 @@ impl crate::Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> hip_bridge::HipResult<bool> {
-        self.try_flash_attn_ck_asym3_prefill_impl(
+        self.try_flash_attn_ck_transformed_prefill_impl(
             FlashAttnCkKvFormat::Asym3Fwht,
             q,
             k_cache,
@@ -842,8 +864,92 @@ impl crate::Gpu {
         )
     }
 
+    /// Try the explicit Asym4-Givens-K/Q8-V D256 prefill cell.
     #[allow(clippy::too_many_arguments)]
-    fn try_flash_attn_ck_asym3_prefill_impl(
+    pub fn try_flash_attn_ck_asym4_givens_prefill(
+        &mut self,
+        q: &crate::GpuTensor,
+        k_cache: &crate::GpuTensor,
+        v_cache: &crate::GpuTensor,
+        output: &crate::GpuTensor,
+        cos_theta: &crate::GpuTensor,
+        sin_theta: &crate::GpuTensor,
+        seqlen_q: usize,
+        seqlen_k: usize,
+        nhead_q: usize,
+        nhead_k: usize,
+        head_dim: usize,
+        contiguous_prefix: bool,
+        has_tree_bias: bool,
+        window: usize,
+        block_start: usize,
+        block_cols: usize,
+    ) -> hip_bridge::HipResult<bool> {
+        self.try_flash_attn_ck_transformed_prefill_impl(
+            FlashAttnCkKvFormat::Asym4Givens,
+            q,
+            k_cache,
+            v_cache,
+            output,
+            cos_theta,
+            sin_theta,
+            seqlen_q,
+            seqlen_k,
+            nhead_q,
+            nhead_k,
+            head_dim,
+            contiguous_prefix,
+            has_tree_bias,
+            window,
+            block_start,
+            block_cols,
+        )
+    }
+
+    /// Try the explicit Asym4-FWHT-K/Q8-V D256 prefill cell.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_flash_attn_ck_asym4_fwht_prefill(
+        &mut self,
+        q: &crate::GpuTensor,
+        k_cache: &crate::GpuTensor,
+        v_cache: &crate::GpuTensor,
+        output: &crate::GpuTensor,
+        signs1: &crate::GpuTensor,
+        signs2: &crate::GpuTensor,
+        seqlen_q: usize,
+        seqlen_k: usize,
+        nhead_q: usize,
+        nhead_k: usize,
+        head_dim: usize,
+        contiguous_prefix: bool,
+        has_tree_bias: bool,
+        window: usize,
+        block_start: usize,
+        block_cols: usize,
+    ) -> hip_bridge::HipResult<bool> {
+        self.try_flash_attn_ck_transformed_prefill_impl(
+            FlashAttnCkKvFormat::Asym4Fwht,
+            q,
+            k_cache,
+            v_cache,
+            output,
+            signs1,
+            signs2,
+            seqlen_q,
+            seqlen_k,
+            nhead_q,
+            nhead_k,
+            head_dim,
+            contiguous_prefix,
+            has_tree_bias,
+            window,
+            block_start,
+            block_cols,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_flash_attn_ck_transformed_prefill_impl(
         &mut self,
         k_format: FlashAttnCkKvFormat,
         q: &crate::GpuTensor,
@@ -874,8 +980,16 @@ impl crate::Gpu {
         }) else {
             return Ok(false);
         };
+        let asym4 = matches!(
+            k_format,
+            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht
+        );
         if q.dtype != crate::DType::F32 || output.dtype != crate::DType::F32 {
-            self.report_flash_attn_ck_route("asym3_dtype_miss");
+            self.report_flash_attn_ck_route(if asym4 {
+                "asym4_dtype_miss"
+            } else {
+                "asym3_dtype_miss"
+            });
             return Ok(false);
         }
         if self.replay.is_recording() {
@@ -917,6 +1031,12 @@ impl crate::Gpu {
                 self.flash_attn_ck.as_ref().unwrap().capabilities(),
                 input,
             ),
+            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht => {
+                select_asym4_prefill_capabilities(
+                    self.flash_attn_ck.as_ref().unwrap().capabilities(),
+                    input,
+                )
+            }
             _ => Err(FlashAttnCkRejectReason::UnsupportedFormat),
         };
         if let Err(reason) = selection {
@@ -924,7 +1044,13 @@ impl crate::Gpu {
             return Ok(false);
         }
 
-        let packed_k_head_bytes = 4 + head_dim * 3 / 8;
+        let packed_k_head_bytes = match k_format {
+            FlashAttnCkKvFormat::Asym3Givens | FlashAttnCkKvFormat::Asym3Fwht => {
+                4 + head_dim * 3 / 8
+            }
+            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht => 4 + head_dim / 2,
+            _ => return Ok(false),
+        };
         let packed_v_head_bytes = head_dim / 32 * 34;
         let q_elements = seqlen_q
             .checked_mul(nhead_q)
@@ -938,6 +1064,7 @@ impl crate::Gpu {
         let transform_elements = match k_format {
             FlashAttnCkKvFormat::Asym3Givens => head_dim / 2,
             FlashAttnCkKvFormat::Asym3Fwht => head_dim,
+            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht => 128,
             _ => return Ok(false),
         };
         if q_elements.is_none_or(|required| q.numel() < required || output.numel() < required)
@@ -948,7 +1075,11 @@ impl crate::Gpu {
             || cos_theta.numel() < transform_elements
             || sin_theta.numel() < transform_elements
         {
-            self.report_flash_attn_ck_route("asym3_buffer_contract_miss");
+            self.report_flash_attn_ck_route(if asym4 {
+                "asym4_buffer_contract_miss"
+            } else {
+                "asym3_buffer_contract_miss"
+            });
             return Ok(false);
         }
 
@@ -1009,27 +1140,33 @@ impl crate::Gpu {
         params.workspace = workspace.as_ptr();
         params.workspace_bytes = workspace.size();
         if let Err(error) = self.flash_attn_ck.as_ref().unwrap().is_supported(&params) {
-            if self
-                .flash_attn_ck_reported_routes
-                .insert("asym3_support_error")
-            {
-                eprintln!("optional CK attention fallback (asym3_support_error): {error}");
+            let reason = if asym4 {
+                "asym4_support_error"
+            } else {
+                "asym3_support_error"
+            };
+            if self.flash_attn_ck_reported_routes.insert(reason) {
+                eprintln!("optional CK attention fallback ({reason}): {error}");
             }
             return Ok(false);
         }
         if let Err(error) = unsafe { self.flash_attn_ck.as_ref().unwrap().forward(&params) } {
-            if self
-                .flash_attn_ck_reported_routes
-                .insert("asym3_launch_error")
-            {
-                eprintln!("optional CK attention fallback (asym3_launch_error): {error}");
+            let reason = if asym4 {
+                "asym4_launch_error"
+            } else {
+                "asym3_launch_error"
+            };
+            if self.flash_attn_ck_reported_routes.insert(reason) {
+                eprintln!("optional CK attention fallback ({reason}): {error}");
             }
             return Ok(false);
         }
         self.report_flash_attn_ck_route(match k_format {
             FlashAttnCkKvFormat::Asym3Givens => "selected_asym3_givens_d256",
             FlashAttnCkKvFormat::Asym3Fwht => "selected_asym3_fwht_d256",
-            _ => unreachable!("selector admitted an unsupported Asym3 format"),
+            FlashAttnCkKvFormat::Asym4Givens => "selected_asym4_givens_d256",
+            FlashAttnCkKvFormat::Asym4Fwht => "selected_asym4_fwht_d256",
+            _ => unreachable!("selector admitted an unsupported transformed format"),
         });
         Ok(true)
     }
@@ -1174,6 +1311,13 @@ mod tests {
     fn asym3_fwht_d256_capability() -> FlashAttnCkCapability {
         FlashAttnCkCapability {
             k_format: FlashAttnCkKvFormat::Asym3Fwht as i32,
+            ..q8_d256_capability()
+        }
+    }
+
+    fn asym4_d256_capability(format: FlashAttnCkKvFormat) -> FlashAttnCkCapability {
+        FlashAttnCkCapability {
+            k_format: format as i32,
             ..q8_d256_capability()
         }
     }
@@ -1371,7 +1515,52 @@ mod tests {
     }
 
     #[test]
-    fn q8_d256_prefill_selector_rejects_unsafe_shapes() {
+    fn asym4_prefill_selector_is_format_exact_and_fail_closed() {
+        let q8 = eligible_q8_prefill();
+        for format in [
+            FlashAttnCkKvFormat::Asym4Givens,
+            FlashAttnCkKvFormat::Asym4Fwht,
+        ] {
+            let input = FlashAttnCkPrefillInput {
+                request: FlashAttnCkRequest {
+                    k_format: format,
+                    ..q8.request
+                },
+                ..q8
+            };
+            let cell = asym4_d256_capability(format);
+            assert_eq!(
+                select_asym4_prefill_capabilities(&[cell], input),
+                Ok(input.request)
+            );
+            assert_eq!(
+                select_asym4_prefill_capabilities(
+                    &[cell],
+                    FlashAttnCkPrefillInput {
+                        capture_mode: true,
+                        ..input
+                    }
+                ),
+                Err(FlashAttnCkRejectReason::GraphCapture)
+            );
+            assert_eq!(
+                select_asym4_prefill_capabilities(
+                    &[cell],
+                    FlashAttnCkPrefillInput {
+                        request: FlashAttnCkRequest {
+                            head_dim: 128,
+                            ..input.request
+                        },
+                        ..input
+                    }
+                ),
+                Err(FlashAttnCkRejectReason::UnsupportedHeadDim)
+            );
+        }
+    }
+
+    #[test]
+    fn q8_prefill_selector_rejects_unsafe_shapes() {
         let cell = q8_d256_capability();
         let cases = [
             (
@@ -1559,6 +1748,18 @@ mod tests {
         assert!(!sidecar.capabilities().iter().any(|cell| {
             cell.k_format == FlashAttnCkKvFormat::Asym3Fwht as i32 && cell.head_dim == 512
         }));
+        for format in [
+            FlashAttnCkKvFormat::Asym4Givens,
+            FlashAttnCkKvFormat::Asym4Fwht,
+        ] {
+            assert!(sidecar.capabilities().iter().any(|cell| {
+                cell.arch == FlashAttnCkArch::Gfx1100 as i32
+                    && cell.dtype == FlashAttnCkDType::F32 as i32
+                    && cell.k_format == format as i32
+                    && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
+                    && cell.head_dim == 256
+            }));
+        }
         let error = sidecar
             .is_supported(&FlashAttnCkFwdParams::default())
             .expect_err("zero-shape parameters must be rejected");

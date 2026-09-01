@@ -10,6 +10,7 @@ use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
@@ -903,17 +904,26 @@ impl Carrier for LlamaCarrier {
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
                 block, conf_threshold
             );
-            let body = hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+            let body = match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
                 assets,
                 &dspark_weights.cfg,
                 ctx.gpu,
-            )
-            .map_err(|e| format!("llama DSpark body build failed: {e}"))?;
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    dspark_weights.free_gpu(ctx.gpu);
+                    Box::new(bundle).free_gpu(ctx.gpu);
+                    return Err(format!("llama DSpark body build failed: {error}"));
+                }
+            };
             Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                 body,
                 dspark_weights,
                 stage_norm,
                 lm_head,
+                true,  // sidecar globals moved out of the target bundle
+                false, // stage_norm aliases assets.weights.output_norm
+                false, // lm_head aliases assets.weights.output
                 block,
                 ctx.max_seq,
                 conf_threshold,
@@ -932,31 +942,46 @@ impl Carrier for LlamaCarrier {
                 Ok(draft_hfq) if draft_hfq.arch_id == 20 => {
                     // Parse DflashConfig to validate the cross-attention concat invariant
                     // (review finding L4): the drafter's hidden must equal the target dim.
-                    let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
-                        .ok_or_else(|| {
-                            format!(
-                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
-                                 'dflash' metadata block",
-                                dp
-                            )
-                        })?;
+                    let draft_cfg =
+                        match hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq) {
+                            Some(config) => config,
+                            None => {
+                                let error = format!(
+                                    "DFlash draft '{}' has arch_id=20 but missing or malformed \
+                                     'dflash' metadata block",
+                                    dp
+                                );
+                                Box::new(bundle).free_gpu(ctx.gpu);
+                                return Err(error);
+                            }
+                        };
                     if bundle.config.dim != draft_cfg.hidden {
-                        return Err(format!(
+                        let error = format!(
                             "DFlash draft '{}' hidden={} != target dim={} \
-                                 (cross-attention concat invariant L4: drafter hidden \
-                                 must equal target residual dim)",
+                             (cross-attention concat invariant L4: drafter hidden \
+                             must equal target residual dim)",
                             dp, draft_cfg.hidden, bundle.config.dim
-                        ));
+                        );
+                        Box::new(bundle).free_gpu(ctx.gpu);
+                        return Err(error);
                     }
                     // Drop the peek handle before the builder reopens it.
                     drop(draft_hfq);
-                    let spec = hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
-                        ctx.gpu,
-                        dp,
-                        &mut bundle,
-                        ctx.max_seq,
-                    )
-                    .map_err(|e| format!("DFlash generic speculator build failed: {e}"))?;
+                    let spec =
+                        match hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                            ctx.gpu,
+                            dp,
+                            &mut bundle,
+                            ctx.max_seq,
+                        ) {
+                            Ok(spec) => spec,
+                            Err(error) => {
+                                Box::new(bundle).free_gpu(ctx.gpu);
+                                return Err(format!(
+                                    "DFlash generic speculator build failed: {error}"
+                                ));
+                            }
+                        };
                     eprintln!(
                         "  DFlash generic speculator loaded for arch {} target: {}",
                         meta.arch_id, dp
@@ -1285,13 +1310,13 @@ impl Carrier for Deepseek4Carrier {
                 .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )
         } else if weights.mtp_layer.is_some() {
-            // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
-            // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-            let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
-                .unwrap_or(2);
+            // The loader resolved generic and DeepSeek-specific precedence
+            // before entering the carrier. Construction consumes that
+            // published value and never reads ambient process state again.
+            let max_n = ctx
+                .spec
+                .mtp_k
+                .unwrap_or(hipfire_runtime::config::DEFAULT_MTP_K);
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
             Some(

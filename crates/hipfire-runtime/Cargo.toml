@@ -30,7 +30,11 @@ lab = []
 # who attempt to build examples through their own build script.
 default = ["deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
-flash-attn-ck = ["rdna-compute/flash-attn-ck", "hipfire-dispatch/flash-attn-ck"]
+flash-attn-ck = [
+    "rdna-compute/flash-attn-ck",
+    "hipfire-dispatch/flash-attn-ck",
+    "hipfire-arch-qwen35/flash-attn-ck",
+]
 # ep-fault-inject: enables the EP partial-load fault-injection knob
 # (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
 # return a synthetic Err after uploading its weights so the staging-guard VRAM

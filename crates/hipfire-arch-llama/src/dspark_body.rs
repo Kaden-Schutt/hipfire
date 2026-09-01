@@ -59,8 +59,8 @@ use hipfire_runtime::dspark_core::{
 };
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
-    weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
-    PrefillBatchScratch, WeightTensor,
+    weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights,
+    ModelArch, PrefillBatchScratch, WeightTensor,
 };
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
@@ -97,6 +97,118 @@ pub struct Qwen3DrafterAssets {
     /// Block-parallel prefill scratch (block_size tokens × dim).
     pub pbs: PrefillBatchScratch,
 }
+impl Qwen3DrafterAssets {
+    /// Release every allocation owned by the drafter asset bundle.
+    ///
+    /// The body-construction path can fail after the sidecar has already
+    /// published all of these resources, so teardown lives on the asset owner
+    /// rather than being duplicated in each caller.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Self {
+            config: _,
+            weights,
+            kv,
+            scratch,
+            pbs,
+        } = self;
+        weights.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        pbs.free_gpu(gpu);
+    }
+}
+
+struct DsparkLoadStaging {
+    layers: Vec<LayerWeights>,
+    token_embd: Option<GpuTensor>,
+    embd_format: Option<EmbeddingFormat>,
+    output_norm: Option<GpuTensor>,
+    output: Option<WeightTensor>,
+    globals: DsparkWeights,
+    kv: Option<KvCache>,
+    scratch: Option<ForwardScratch>,
+    pbs: Option<PrefillBatchScratch>,
+}
+
+impl DsparkLoadStaging {
+    fn new(cfg: DsparkConfig, layer_capacity: usize) -> Self {
+        Self {
+            layers: Vec::with_capacity(layer_capacity),
+            token_embd: None,
+            embd_format: None,
+            output_norm: None,
+            output: None,
+            globals: DsparkWeights {
+                cfg,
+                main_proj: None,
+                main_norm: None,
+                markov_w1: None,
+                markov_w2: None,
+                confidence_proj: None,
+                confidence_bias: None,
+                d2t: None,
+            },
+            kv: None,
+            scratch: None,
+            pbs: None,
+        }
+    }
+
+    fn free_layer(layer: LayerWeights, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(layer.attn_norm);
+        layer.wq.free_all(gpu);
+        layer.wk.free_all(gpu);
+        layer.wv.free_all(gpu);
+        layer.wo.free_all(gpu);
+        if let Some(tensor) = layer.q_norm {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = layer.k_norm {
+            let _ = gpu.free_tensor(tensor);
+        }
+        let _ = gpu.free_tensor(layer.ffn_norm);
+        layer.w_gate.free_all(gpu);
+        layer.w_up.free_all(gpu);
+        layer.w_down.free_all(gpu);
+    }
+
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        for layer in self.layers.drain(..) {
+            Self::free_layer(layer, gpu);
+        }
+        if let Some(tensor) = self.token_embd.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.output_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.output.take() {
+            weight.free_all(gpu);
+        }
+        for tensor in [
+            self.globals.main_proj.take(),
+            self.globals.main_norm.take(),
+            self.globals.markov_w1.take(),
+            self.globals.markov_w2.take(),
+            self.globals.confidence_proj.take(),
+            self.globals.confidence_bias.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(kv) = self.kv.take() {
+            let _ = kv.free_gpu(gpu);
+        }
+        if let Some(scratch) = self.scratch.take() {
+            scratch.free_gpu(gpu);
+        }
+        if let Some(pbs) = self.pbs.take() {
+            pbs.free_gpu(gpu);
+        }
+    }
+}
 
 // ── Public loader ─────────────────────────────────────────────────────────────
 
@@ -122,7 +234,7 @@ pub fn load_qwen3_dspark(
     // 2. Derive drafter LlamaConfig from tensor shapes.
     //    The sidecar metadata only carries dspark_* keys (no model_type /
     //    hidden_size etc.), so config_from_hfq would fail on a missing
-    //    `model_type` field.  Derive the config from tensor shapes instead.
+    //    `model_type` field. Derive the config from tensor shapes instead.
     let mut cfg = config_from_sidecar_tensors(source)
         .map_err(|e| format!("qwen3_dspark: derive config: {e}"))?;
     // config_from_sidecar_tensors hardcodes rope θ=1e6 (qwen3-8B). Qwen3.5's
@@ -132,161 +244,163 @@ pub fn load_qwen3_dspark(
 
     let q_out_dim = cfg.n_heads * cfg.head_dim;
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    let mut staged = DsparkLoadStaging::new(dspark_cfg.clone(), cfg.n_layers);
+    let result = (|| -> Result<(DsparkWeights, Qwen3DrafterAssets), String> {
+        // 3. Load drafter body layers. `load_layer` owns a field-level
+        // transaction, while this staging object owns completed layers.
+        for i in 0..cfg.n_layers {
+            staged
+                .layers
+                .push(load_drafter_layer(source, gpu, &cfg, i, q_out_dim, kv_dim)?);
+        }
 
-    // 3. Load 5-layer drafter body
-    let mut layers = Vec::with_capacity(cfg.n_layers);
-    for i in 0..cfg.n_layers {
-        layers.push(load_drafter_layer(source, gpu, &cfg, i, q_out_dim, kv_dim)?);
-    }
+        // 4. Embedding table (embed_tokens.weight, qt=1 F16 → F32).
+        let (token_embd, embd_format) = {
+            let (info, data) = source
+                .tensor_data_pread("embed_tokens.weight")
+                .ok_or_else(|| "qwen3_dspark: embed_tokens.weight missing".to_string())?;
+            load_embedding(gpu, info.quant_type, &data, cfg.vocab_size, cfg.dim)
+                .map_err(|e| format!("qwen3_dspark: embed_tokens: {e:?}"))?
+        };
+        staged.token_embd = Some(token_embd);
+        staged.embd_format = Some(embd_format);
 
-    // 4. Embedding table (embed_tokens.weight, qt=1 F16 → F32 EmbeddingFormat::F32)
-    let (token_embd, embd_format) = {
-        let (ei, ed) = source
-            .tensor_data_pread("embed_tokens.weight")
-            .ok_or_else(|| "qwen3_dspark: embed_tokens.weight missing".to_string())?;
-        let qt = ei.quant_type;
-        load_embedding(gpu, qt, &ed, cfg.vocab_size, cfg.dim)
-            .map_err(|e| format!("qwen3_dspark: embed_tokens: {e:?}"))?
-    };
-
-    // 5. Final norm (norm.weight → F32)
-    let output_norm = {
-        let (ni, nd) = source
+        // 5. Final norm (norm.weight → F32).
+        let (info, data) = source
             .tensor_data_pread("norm.weight")
             .ok_or_else(|| "qwen3_dspark: norm.weight missing".to_string())?;
-        let qt = ni.quant_type;
-        dequant_norm(gpu, qt, &nd, &[cfg.dim], 0.0)
-            .map_err(|e| format!("qwen3_dspark: norm.weight: {e:?}"))?
-    };
+        staged.output_norm = Some(
+            dequant_norm(gpu, info.quant_type, &data, &[cfg.dim], 0.0)
+                .map_err(|e| format!("qwen3_dspark: norm.weight: {e:?}"))?,
+        );
 
-    // 6. lm_head.weight (qt=1 F16). Reduced-vocab drafters (EAGLE-3, e.g. qwen35
-    //    ORNITH) emit a compressed draft vocab, so the lm_head has
-    //    draft_vocab_size rows, not the full embed vocab. 0 ⇒ shared full vocab.
-    let draft_vocab = if dspark_cfg.draft_vocab_size > 0 {
-        dspark_cfg.draft_vocab_size
-    } else {
-        cfg.vocab_size
-    };
-    let lm_head = load_global_proj(source, gpu, "lm_head.weight", draft_vocab, cfg.dim)?;
-
-    let weights = LlamaWeights {
-        token_embd,
-        embd_format,
-        output_norm,
-        output: lm_head,
-        layers,
-        lm_head_aliases_embd: false,
-    };
-
-    // 7. DSpark globals
-    //    main_proj: [dim, n_targets * dim] F16 on GPU
-    let main_proj = Some(load_global_tensor(source, gpu, "main_proj.weight")?);
-
-    //    main_norm: [dim] F32
-    let main_norm = {
-        let (mi, md) = source
-            .tensor_data_pread("main_norm.weight")
-            .ok_or_else(|| "qwen3_dspark: main_norm.weight missing".to_string())?;
-        let qt = mi.quant_type;
-        dequant_norm(gpu, qt, &md, &[cfg.dim], 0.0)
-            .map_err(|e| format!("qwen3_dspark: main_norm.weight: {e:?}"))?
-    };
-
-    //    markov_w1/w2: [vocab, rank] F16
-    let markov_w1 = Some(load_global_tensor(
-        source,
-        gpu,
-        "markov_head.markov_w1.weight",
-    )?);
-    let markov_w2 = Some(load_global_tensor(
-        source,
-        gpu,
-        "markov_head.markov_w2.weight",
-    )?);
-
-    //    confidence_head.proj.weight: [1, dim+rank] F16
-    let confidence_proj = if dspark_cfg.enable_confidence {
-        Some(load_global_tensor(
+        // 6. lm_head.weight (qt=1 F16). Reduced-vocab drafters emit a
+        // compressed draft vocabulary; zero means shared full vocabulary.
+        let draft_vocab = if dspark_cfg.draft_vocab_size > 0 {
+            dspark_cfg.draft_vocab_size
+        } else {
+            cfg.vocab_size
+        };
+        staged.output = Some(load_global_proj(
             source,
             gpu,
-            "confidence_head.proj.weight",
-        )?)
-    } else {
-        None
-    };
+            "lm_head.weight",
+            draft_vocab,
+            cfg.dim,
+        )?);
 
-    //    confidence_head.proj.bias: [1] F16 → F32 — hard req #1 (qwen3 has bias)
-    let confidence_bias = if dspark_cfg.enable_confidence {
-        let bias_gpu = {
-            let (bi, bd) = source
+        // 7. DSpark globals.
+        staged.globals.main_proj = Some(load_global_tensor(source, gpu, "main_proj.weight")?);
+        let (info, data) = source
+            .tensor_data_pread("main_norm.weight")
+            .ok_or_else(|| "qwen3_dspark: main_norm.weight missing".to_string())?;
+        staged.globals.main_norm = Some(
+            dequant_norm(gpu, info.quant_type, &data, &[cfg.dim], 0.0)
+                .map_err(|e| format!("qwen3_dspark: main_norm.weight: {e:?}"))?,
+        );
+        staged.globals.markov_w1 = Some(load_global_tensor(
+            source,
+            gpu,
+            "markov_head.markov_w1.weight",
+        )?);
+        staged.globals.markov_w2 = Some(load_global_tensor(
+            source,
+            gpu,
+            "markov_head.markov_w2.weight",
+        )?);
+        if dspark_cfg.enable_confidence {
+            staged.globals.confidence_proj = Some(load_global_tensor(
+                source,
+                gpu,
+                "confidence_head.proj.weight",
+            )?);
+            let (info, data) = source
                 .tensor_data_pread("confidence_head.proj.bias")
                 .ok_or_else(|| "qwen3_dspark: confidence_head.proj.bias missing".to_string())?;
-            let qt = bi.quant_type;
-            dequant_f32(gpu, qt, &bd, 1)
-                .map_err(|e| format!("qwen3_dspark: confidence_head.proj.bias: {e:?}"))?
+            staged.globals.confidence_bias = Some(
+                dequant_f32(gpu, info.quant_type, &data, 1)
+                    .map_err(|e| format!("qwen3_dspark: confidence_head.proj.bias: {e:?}"))?,
+            );
+        }
+
+        // d2t is temporary device state; free it even when the host download
+        // fails before publishing the reduced-vocabulary map.
+        if dspark_cfg.draft_vocab_size > 0 {
+            let (info, data) = source
+                .tensor_data_pread("d2t")
+                .ok_or_else(|| "qwen3_dspark: d2t missing but draft_vocab_size>0".to_string())?;
+            let dev = dequant_f32(gpu, info.quant_type, &data, dspark_cfg.draft_vocab_size)
+                .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
+            let host = match gpu.download_f32(&dev) {
+                Ok(host) => host,
+                Err(error) => {
+                    let _ = gpu.free_tensor(dev);
+                    return Err(format!("qwen3_dspark: d2t download: {error:?}"));
+                }
+            };
+            let _ = gpu.free_tensor(dev);
+            staged.globals.d2t = Some(host.iter().map(|&value| value as u32).collect());
+        }
+
+        // qwen3 reference modeling.py feeds once-normed hidden to confidence.
+        staged.globals.cfg.confidence_uses_normed = true;
+        staged.globals.cfg.rms_norm_eps = cfg.norm_eps;
+
+        // 8–10. Allocate the drafter's KV, decode, and block-prefill scratch.
+        let block_cap = dspark_cfg.block_size;
+        staged.kv = Some(
+            KvCache::new_gpu(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, block_cap)
+                .map_err(|e| format!("qwen3_dspark: KvCache::new_gpu: {e:?}"))?,
+        );
+        staged.scratch = Some(
+            ForwardScratch::new(gpu, &cfg)
+                .map_err(|e| format!("qwen3_dspark: ForwardScratch::new: {e:?}"))?,
+        );
+        staged.pbs = Some(
+            PrefillBatchScratch::new(gpu, &cfg, block_cap, block_cap)
+                .map_err(|e| format!("qwen3_dspark: PrefillBatchScratch::new: {e:?}"))?,
+        );
+
+        let weights = LlamaWeights {
+            token_embd: staged.token_embd.take().expect("staged DSpark embedding"),
+            embd_format: staged
+                .embd_format
+                .take()
+                .expect("staged DSpark embedding format"),
+            output_norm: staged
+                .output_norm
+                .take()
+                .expect("staged DSpark output norm"),
+            output: staged.output.take().expect("staged DSpark lm head"),
+            layers: std::mem::take(&mut staged.layers),
+            lm_head_aliases_embd: false,
         };
-        Some(bias_gpu)
-    } else {
-        None
-    };
-
-    //    d2t: reduced-vocab draft→target token map, stored by the quantizer as
-    //    F32 (exact for token ids < 2^24). None ⇒ shared full vocab (qwen3-8B).
-    let d2t: Option<Vec<u32>> = if dspark_cfg.draft_vocab_size > 0 {
-        let (di, dd) = source
-            .tensor_data_pread("d2t")
-            .ok_or_else(|| "qwen3_dspark: d2t missing but draft_vocab_size>0".to_string())?;
-        let dev = dequant_f32(gpu, di.quant_type, &dd, dspark_cfg.draft_vocab_size)
-            .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
-        let host = gpu
-            .download_f32(&dev)
-            .map_err(|e| format!("qwen3_dspark: d2t download: {e:?}"))?;
-        let _ = gpu.free_tensor(dev);
-        Some(host.iter().map(|&v| v as u32).collect())
-    } else {
-        None
-    };
-
-    // qwen3 reference modeling.py feeds once-normed hidden (self.norm(hidden))
-    // to predict_confidence_step; set the flag so run_heads uses normed[i].
-    // Also pin rms_norm_eps from the derived drafter config (1e-6 for qwen3).
-    let mut qwen3_cfg = dspark_cfg.clone();
-    qwen3_cfg.confidence_uses_normed = true;
-    qwen3_cfg.rms_norm_eps = cfg.norm_eps;
-
-    let dspark_weights = DsparkWeights {
-        cfg: qwen3_cfg,
-        main_proj,
-        main_norm: Some(main_norm),
-        markov_w1,
-        markov_w2,
-        confidence_proj,
-        confidence_bias,
-        d2t,
-    };
-
-    // 8. Allocate drafter KvCache (block-only: cap = block_size tokens)
-    let block_cap = dspark_cfg.block_size;
-    let kv = KvCache::new_gpu(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, block_cap)
-        .map_err(|e| format!("qwen3_dspark: KvCache::new_gpu: {e:?}"))?;
-
-    // 9. ForwardScratch (single-token decode)
-    let scratch = ForwardScratch::new(gpu, &cfg)
-        .map_err(|e| format!("qwen3_dspark: ForwardScratch::new: {e:?}"))?;
-
-    // 10. PrefillBatchScratch (block-parallel forward, max_batch = block_size)
-    let pbs = PrefillBatchScratch::new(gpu, &cfg, block_cap, block_cap)
-        .map_err(|e| format!("qwen3_dspark: PrefillBatchScratch::new: {e:?}"))?;
-
-    let assets = Qwen3DrafterAssets {
-        config: cfg,
-        weights,
-        kv,
-        scratch,
-        pbs,
-    };
-
-    Ok(Some((dspark_weights, assets)))
+        let assets = Qwen3DrafterAssets {
+            config: cfg,
+            weights,
+            kv: staged.kv.take().expect("staged DSpark KV"),
+            scratch: staged.scratch.take().expect("staged DSpark scratch"),
+            pbs: staged.pbs.take().expect("staged DSpark PBS"),
+        };
+        let dspark_weights = DsparkWeights {
+            cfg: staged.globals.cfg.clone(),
+            main_proj: staged.globals.main_proj.take(),
+            main_norm: staged.globals.main_norm.take(),
+            markov_w1: staged.globals.markov_w1.take(),
+            markov_w2: staged.globals.markov_w2.take(),
+            confidence_proj: staged.globals.confidence_proj.take(),
+            confidence_bias: staged.globals.confidence_bias.take(),
+            d2t: staged.globals.d2t.take(),
+        };
+        Ok((dspark_weights, assets))
+    })();
+    match result {
+        Ok(result) => Ok(Some(result)),
+        Err(error) => {
+            staged.free_gpu(gpu);
+            Err(error)
+        }
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -519,50 +633,68 @@ impl Qwen3DsparkScratch {
     ) -> Result<Self, String> {
         let max_ctx_len = max_ctx_len.max(1);
         let kv_cap = max_ctx_len + block_size;
-        let kv = KvCache::new_gpu_q8(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_cap,
-        )
-        .map_err(|e| format!("Qwen3DsparkScratch: kv: {e:?}"))?;
+        let mut kv = None;
+        let mut pbs = None;
+        let mut tensors = Vec::with_capacity(6);
+        let result = (|| -> Result<Self, String> {
+            kv = Some(
+                KvCache::new_gpu_q8(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_cap,
+                )
+                .map_err(|e| format!("Qwen3DsparkScratch: kv: {e:?}"))?,
+            );
+            pbs = Some(
+                PrefillBatchScratch::new(gpu, config, block_size, kv_cap)
+                    .map_err(|e| format!("Qwen3DsparkScratch: pbs: {e:?}"))?,
+            );
 
-        let pbs = PrefillBatchScratch::new(gpu, config, block_size, kv_cap)
-            .map_err(|e| format!("Qwen3DsparkScratch: pbs: {e:?}"))?;
+            let kv_dim = config.n_kv_heads * config.head_dim;
+            for (name, shape, zero) in [
+                ("all_k", vec![kv_cap * kv_dim], false),
+                ("all_v", vec![kv_cap * kv_dim], false),
+                ("positions_kv_all", vec![kv_cap], false),
+                ("positions_q_block", vec![block_size], false),
+                ("positions_compact", vec![block_size], false),
+                ("bias", vec![block_size * block_size], true),
+            ] {
+                let tensor = if zero {
+                    gpu.zeros(&shape, DType::F32)
+                } else {
+                    gpu.alloc_tensor(&shape, DType::F32)
+                }
+                .map_err(|e| format!("Qwen3DsparkScratch: {name}: {e:?}"))?;
+                tensors.push(tensor);
+            }
 
-        let kv_dim = config.n_kv_heads * config.head_dim;
-
-        let all_k = gpu
-            .alloc_tensor(&[kv_cap * kv_dim], DType::F32)
-            .map_err(|e| format!("Qwen3DsparkScratch: all_k: {e:?}"))?;
-        let all_v = gpu
-            .alloc_tensor(&[kv_cap * kv_dim], DType::F32)
-            .map_err(|e| format!("Qwen3DsparkScratch: all_v: {e:?}"))?;
-        let positions_kv_all = gpu
-            .alloc_tensor(&[kv_cap], DType::F32)
-            .map_err(|e| format!("Qwen3DsparkScratch: positions_kv_all: {e:?}"))?;
-        let positions_q_block = gpu
-            .alloc_tensor(&[block_size], DType::F32)
-            .map_err(|e| format!("Qwen3DsparkScratch: positions_q_block: {e:?}"))?;
-        let positions_compact = gpu
-            .alloc_tensor(&[block_size], DType::F32)
-            .map_err(|e| format!("Qwen3DsparkScratch: positions_compact: {e:?}"))?;
-        let bias = gpu
-            .zeros(&[block_size * block_size], DType::F32)
-            .map_err(|e| format!("Qwen3DsparkScratch: bias: {e:?}"))?;
-
-        Ok(Self {
-            max_ctx_len,
-            kv,
-            pbs,
-            all_k,
-            all_v,
-            positions_kv_all,
-            positions_q_block,
-            positions_compact,
-            bias,
-        })
+            let mut allocations = std::mem::take(&mut tensors).into_iter();
+            Ok(Self {
+                max_ctx_len,
+                kv: kv.take().expect("staged DSpark KV"),
+                pbs: pbs.take().expect("staged DSpark PBS"),
+                all_k: allocations.next().expect("staged DSpark all_k"),
+                all_v: allocations.next().expect("staged DSpark all_v"),
+                positions_kv_all: allocations.next().expect("staged DSpark positions_kv_all"),
+                positions_q_block: allocations.next().expect("staged DSpark positions_q_block"),
+                positions_compact: allocations.next().expect("staged DSpark positions_compact"),
+                bias: allocations.next().expect("staged DSpark bias"),
+            })
+        })();
+        if result.is_err() {
+            for tensor in tensors.drain(..).rev() {
+                let _ = gpu.free_tensor(tensor);
+            }
+            if let Some(pbs) = pbs.take() {
+                pbs.free_gpu(gpu);
+            }
+            if let Some(kv) = kv.take() {
+                let _ = kv.free_gpu(gpu);
+            }
+        }
+        result
     }
 
     /// Release all GPU allocations.
@@ -1258,17 +1390,7 @@ impl DsparkBody for Qwen3DsparkBody {
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         self.scratch.free_gpu(gpu);
-        let Qwen3DrafterAssets {
-            config: _,
-            weights,
-            kv,
-            scratch,
-            pbs,
-        } = self.assets;
-        weights.free_gpu(gpu);
-        let _ = kv.free_gpu(gpu);
-        scratch.free_gpu(gpu);
-        pbs.free_gpu(gpu);
+        self.assets.free_gpu(gpu);
     }
 }
 
@@ -1288,7 +1410,12 @@ pub fn build_qwen3_dspark_body(
     gpu: &mut Gpu,
 ) -> Result<Box<dyn DsparkBody>, String> {
     let max_ctx_len = cfg.block_size + 1;
-    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len)
-        .map_err(|e| format!("build_qwen3_dspark_body: scratch: {e}"))?;
+    let scratch = match Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            assets.free_gpu(gpu);
+            return Err(format!("build_qwen3_dspark_body: scratch: {error}"));
+        }
+    };
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
 }

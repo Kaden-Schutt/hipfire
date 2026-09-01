@@ -1044,25 +1044,48 @@ pub fn build_generic_dflash_speculator(
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
     let config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;
+    let mut weights = Some(
+        DflashWeights::load(gpu, &draft_hfq, &config)
+            .map_err(|error| format!("draft weights: {error}"))?,
+    );
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.
-    // new_with_mq only for an MQ-quantized draft.
-    let scratch = if weights.has_mq {
+    // new_with_mq only for an MQ-quantized draft. Keep the loaded weights in
+    // an Option until every later stage has published successfully.
+    let scratch = match if weights.as_ref().is_some_and(|weights| weights.has_mq) {
         DflashScratch::new_with_mq(gpu, &config, block_size, ctx_capacity, true)
-            .map_err(|e| format!("{e}"))?
     } else {
-        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))?
+        DflashScratch::new(gpu, &config, block_size, ctx_capacity)
+    } {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            if let Some(weights) = weights.take() {
+                weights.free_gpu(gpu);
+            }
+            return Err(format!("draft scratch: {error}"));
+        }
     };
     let _ = draft_hfq;
 
     // Tell the target which residual-hidden layers to capture (the drafter's
     // target_layer_ids), and mint the per-target verify scratch.
     target.set_dflash_extract_layers(config.target_layer_ids.clone());
-    let verify_scratch = target.new_spec_scratch(gpu, block_size)?;
+    let verify_scratch = match target.new_spec_scratch(gpu, block_size) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            target.set_dflash_extract_layers(Vec::new());
+            scratch.free_gpu(gpu);
+            if let Some(weights) = weights.take() {
+                weights.free_gpu(gpu);
+            }
+            return Err(format!("target verify scratch: {error}"));
+        }
+    };
 
     Ok(Box::new(GenericDflashSpeculator {
-        weights,
+        weights: weights
+            .take()
+            .expect("generic DFlash weights staged before publish"),
         scratch,
         config,
         target_hidden_host: Vec::new(),

@@ -12,13 +12,13 @@
 //! `spec_ngram`). The registry is what lets the loader pick a drafter at load
 //! time without the daemon learning which ran.
 
-use hipfire_arch_qwen35::Qwen35Bundle;
-use std::any::Any;
 use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
 use hipfire_arch_qwen35::speculative::ModelSlot;
+use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
+use std::any::Any;
 use std::path::Path;
 
 /// RAII scope that moves the live `Qwen35Bundle` out of `m.state`, lends it to
@@ -66,7 +66,10 @@ impl<'m> Qwen35SlotGuard<'m> {
     /// untouched) if the model is not a loaded Qwen3.5 bundle — note the
     /// `matches!` guard *before* `take()` so a non-Qwen35 model is never moved
     /// out and dropped.
-    pub fn take(state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>, model_path: &str) -> Result<Self, String> {
+    pub fn take(
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        model_path: &str,
+    ) -> Result<Self, String> {
         if !state
             .as_ref()
             .is_some_and(|s| (s.as_ref() as &dyn Any).is::<Qwen35Bundle>())
@@ -76,7 +79,7 @@ impl<'m> Qwen35SlotGuard<'m> {
         let Some(state_box) = state.take() else {
             unreachable!("guarded by the matches! above")
         };
-        let bundle = * (state_box as Box<dyn Any>)
+        let bundle = *(state_box as Box<dyn Any>)
             .downcast::<Qwen35Bundle>()
             .unwrap();
         Ok(Self {
@@ -181,7 +184,7 @@ pub fn build_speculator(
         if eviction_is_none && matches!(arch_id, 5 | 6) {
             let max_n = spec
                 .mtp_k
-                .unwrap_or(hipfire_runtime::config::get().mtp_k)
+                .unwrap_or(hipfire_runtime::config::DEFAULT_MTP_K)
                 .clamp(1, 10);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             return Some(hipfire_arch_qwen35::build_qwen35_mtp_speculator(

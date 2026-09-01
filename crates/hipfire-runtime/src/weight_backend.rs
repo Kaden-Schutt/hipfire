@@ -1376,6 +1376,9 @@ pub trait WeightBackend {
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
     /// Load a bias vector (f32). Only qwen2 attention biases use this today.
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
+    /// Borrow the device allocator so composite layer loads can roll back
+    /// tensors already published by earlier fields.
+    fn gpu_mut(&mut self) -> &mut Gpu;
 }
 
 /// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
@@ -1430,6 +1433,9 @@ impl<'a> WeightBackend for HfqBackend<'a> {
             t.numel()
         );
         Ok(t)
+    }
+    fn gpu_mut(&mut self) -> &mut Gpu {
+        self.gpu
     }
 }
 
@@ -1489,6 +1495,9 @@ impl<'a> WeightBackend for ParoBackend<'a> {
             0,
             "ParoBackend: attention biases unsupported",
         ))
+    }
+    fn gpu_mut(&mut self) -> &mut Gpu {
+        self.gpu
     }
 }
 

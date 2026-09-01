@@ -21,6 +21,7 @@ use crate::speculative::{
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::loader_api::LoadFaultStage;
 use hipfire_runtime::spec::{
     request_rng_state, EvictRetain, PrefillOutcome, SpecGrammar, SpecRequestConfig, SpecStep,
     SpecTarget, Speculator,
@@ -148,6 +149,8 @@ pub fn load_dflash_state(
     // True when adaptive KV is engaged for this load (tier-switching cache).
     // Must be false for retained-PM4 admission.
     adaptive_kv: bool,
+    // Explicit lifecycle fault hook; normal loads pass `None`.
+    lifecycle_fault: Option<LoadFaultStage>,
 ) -> Result<DflashState, String> {
     let requested_ctx = ctx_capacity;
     // Open the draft container up-front: its declared SWA window is the
@@ -370,6 +373,19 @@ pub fn load_dflash_state(
         draft_scratch,
         draft_weights,
     );
+    if lifecycle_fault == Some(LoadFaultStage::DflashTargetVerifyScratch) {
+        // The target bundle is already the published owner at this point and
+        // the draft owner has reached the named verify-scratch boundary.
+        // Reclaim every draft-side allocation before propagating the fault;
+        // the caller's target staging guard owns the target cleanup.
+        verify_scratch.free_gpu(gpu);
+        hidden_rb.free_gpu(gpu);
+        draft_scratch.free_gpu(gpu);
+        draft_weights.free_gpu(gpu);
+        return Err("DFlash target verify scratch: target-owner-published; \
+             draft-owner-published; injected failure"
+            .to_string());
+    }
     let target_snap = or_free!(
         DeltaNetSnapshot::new_for(gpu, target_dn),
         "DeltaNetSnapshot::new_for",

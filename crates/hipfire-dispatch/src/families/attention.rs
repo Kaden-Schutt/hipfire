@@ -82,6 +82,27 @@ fn is_contiguous_prefill_prefix(pos: usize, batch_size: usize, max_ctx_len: usiz
     pos.checked_add(batch_size) == Some(max_ctx_len)
 }
 
+#[inline]
+fn native_asym4_wmma_eligible(
+    batch_size: usize,
+    partials_numel: usize,
+    n_heads: usize,
+    max_ctx_len: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> bool {
+    const BLOCK_M: usize = 16;
+    if batch_size < BLOCK_M || batch_size % BLOCK_M != 0 || tile_size == 0 {
+        return false;
+    }
+    let max_tiles = max_ctx_len.div_ceil(tile_size);
+    n_heads
+        .checked_mul(max_tiles)
+        .and_then(|n| n.checked_mul(2 + head_dim))
+        .and_then(|n| n.checked_mul(BLOCK_M))
+        .is_some_and(|required| partials_numel >= required)
+}
+
 pub struct AttentionFamily {
     registry: KernelRegistry,
 }
@@ -719,6 +740,67 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
+            #[cfg(feature = "flash-attn-ck")]
+            let contiguous_prefix =
+                is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
+            #[cfg(feature = "flash-attn-ck")]
+            let flash_force_off = matches!(
+                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                    .ok()
+                    .as_deref(),
+                Some("0") | Some("off") | Some("false")
+            );
+            #[cfg(feature = "flash-attn-ck")]
+            if !flash_force_off
+                && hip!(gpu.try_flash_attn_ck_asym4_givens_prefill(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    ct,
+                    st,
+                    io.batch_size,
+                    io.max_ctx_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    contiguous_prefix,
+                    io.tree_bias.is_some(),
+                    usize::try_from(plan.window).unwrap_or(usize::MAX),
+                    io.block_start,
+                    io.block_cols,
+                ))?
+            {
+                return Ok(());
+            }
+            if !native_asym4_wmma_eligible(
+                io.batch_size,
+                fp.numel(),
+                io.n_heads,
+                io.max_ctx_len,
+                io.head_dim,
+                gpu.attn_tile_size(),
+            ) {
+                return hip!(gpu.attention_flash_asym4_batched_masked(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.positions(),
+                    ct,
+                    st,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    fp,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                ));
+            }
             hip!(gpu.attention_flash_asym4_wmma_tile_batched(
                 io.q,
                 io.k_cache,
@@ -744,6 +826,67 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
+            #[cfg(feature = "flash-attn-ck")]
+            let contiguous_prefix =
+                is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
+            #[cfg(feature = "flash-attn-ck")]
+            let flash_force_off = matches!(
+                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                    .ok()
+                    .as_deref(),
+                Some("0") | Some("off") | Some("false")
+            );
+            #[cfg(feature = "flash-attn-ck")]
+            if !flash_force_off
+                && hip!(gpu.try_flash_attn_ck_asym4_givens_prefill(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    ct,
+                    st,
+                    io.batch_size,
+                    io.max_ctx_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    contiguous_prefix,
+                    io.tree_bias.is_some(),
+                    usize::try_from(plan.window).unwrap_or(usize::MAX),
+                    io.block_start,
+                    io.block_cols,
+                ))?
+            {
+                return Ok(());
+            }
+            if !native_asym4_wmma_eligible(
+                io.batch_size,
+                fp.numel(),
+                io.n_heads,
+                io.max_ctx_len,
+                io.head_dim,
+                gpu.attn_tile_size(),
+            ) {
+                return hip!(gpu.attention_flash_asym4_batched_masked(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.positions(),
+                    ct,
+                    st,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    fp,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                ));
+            }
             hip!(gpu.attention_flash_asym4_wmma_tile_batched_gfx12(
                 io.q,
                 io.k_cache,
@@ -1134,6 +1277,39 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                #[cfg(feature = "flash-attn-ck")]
+                let contiguous_prefix =
+                    is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
+                #[cfg(feature = "flash-attn-ck")]
+                let flash_force_off = matches!(
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                        .ok()
+                        .as_deref(),
+                    Some("0") | Some("off") | Some("false")
+                );
+                #[cfg(feature = "flash-attn-ck")]
+                if !flash_force_off
+                    && hip!(gpu.try_flash_attn_ck_asym4_givens_prefill(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        ct,
+                        st,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        contiguous_prefix,
+                        io.tree_bias.is_some(),
+                        usize::try_from(plan.window).unwrap_or(usize::MAX),
+                        io.block_start,
+                        io.block_cols,
+                    ))?
+                {
+                    return Ok(());
+                }
                 hip!(gpu.attention_flash_asym4_batched_masked(
                     io.q,
                     io.k_cache,
@@ -1158,6 +1334,40 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                #[cfg(feature = "flash-attn-ck")]
+                let contiguous_prefix =
+                    is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
+                #[cfg(feature = "flash-attn-ck")]
+                let flash_force_off = matches!(
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                        .ok()
+                        .as_deref(),
+                    Some("0") | Some("off") | Some("false")
+                );
+                #[cfg(feature = "flash-attn-ck")]
+                if !flash_force_off
+                    && plan.v_mode_bits == 8
+                    && hip!(gpu.try_flash_attn_ck_asym4_fwht_prefill(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        ct,
+                        st,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        contiguous_prefix,
+                        io.tree_bias.is_some(),
+                        usize::try_from(plan.window).unwrap_or(usize::MAX),
+                        io.block_start,
+                        io.block_cols,
+                    ))?
+                {
+                    return Ok(());
+                }
                 hip!(gpu.attention_flash_fwht4_batched_masked(
                     io.q,
                     io.k_cache,
@@ -1692,6 +1902,35 @@ mod tests {
         assert!(is_contiguous_prefill_prefix(2048, 512, 2560));
         assert!(!is_contiguous_prefill_prefix(2048, 512, 4096));
         assert!(!is_contiguous_prefill_prefix(usize::MAX, 2, usize::MAX));
+    }
+
+    #[test]
+    fn native_asym4_wmma_requires_complete_rows_and_one_tile_of_partials() {
+        let per_row = 24 * 12 * (2 + 256);
+        assert!(native_asym4_wmma_eligible(
+            512,
+            16 * per_row,
+            24,
+            1536,
+            256,
+            128,
+        ));
+        assert!(!native_asym4_wmma_eligible(
+            510,
+            16 * per_row,
+            24,
+            1536,
+            256,
+            128,
+        ));
+        assert!(!native_asym4_wmma_eligible(
+            512,
+            16 * per_row - 1,
+            24,
+            1536,
+            256,
+            128,
+        ));
     }
 
     #[test]

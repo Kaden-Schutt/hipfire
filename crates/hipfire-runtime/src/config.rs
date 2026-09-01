@@ -96,8 +96,13 @@ pub struct RuntimeConfig {
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
+    /// Default MTP draft width after process configuration resolution.
     pub mtp_k: usize,
 }
+
+/// Product-wide MTP width default used when neither a load-message value nor
+/// `HIPFIRE_MTP_K` is present.
+pub const DEFAULT_MTP_K: usize = 3;
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
@@ -235,7 +240,7 @@ impl RuntimeConfig {
             mtp_mode: value("HIPFIRE_MTP_MODE").unwrap_or_else(|| "auto".into()),
             mtp_k: value("HIPFIRE_MTP_K")
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(3),
+                .unwrap_or(DEFAULT_MTP_K),
         }
     }
 

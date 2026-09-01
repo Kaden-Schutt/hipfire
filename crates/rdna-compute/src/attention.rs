@@ -5041,6 +5041,18 @@ impl Gpu {
         // True when either the inline env-gated ladder fires (scalar→WMMA
         // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
         let use_wmma_grid = wmma_ok || force_wmma_grid;
+        // WMMA owns complete 16-row tiles and has no row-count kernarg. The
+        // capacity-derived sub-batch can be any integer (for example 342 at
+        // PP8192), so round it down before splitting an aligned outer batch.
+        // The dispatch wrappers reject non-aligned outer batches and use the
+        // scalar tile kernel instead.
+        let sub_batch = if use_wmma_grid {
+            debug_assert_eq!(batch_size % WMMA_BLOCK_M, 0);
+            (sub_batch / WMMA_BLOCK_M) * WMMA_BLOCK_M
+        } else {
+            sub_batch
+        };
+        debug_assert!(!use_wmma_grid || sub_batch >= WMMA_BLOCK_M);
         assert!(
             !(use_wmma_grid && (slot_descs.is_some() || row_slot.is_some())),
             "multi-slot descriptors are not supported on the WMMA tile grid; \

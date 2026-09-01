@@ -6,7 +6,7 @@
 //!
 //! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 
-use crate::terminal::active_attempt_id;
+use crate::terminal::{active_attempt_id, claim_terminal};
 
 /// Whether the authoritative Jinja generation suffix opens a reasoning span.
 /// This is deliberately tail-only: a literal `<think>` in user content must
@@ -18,7 +18,9 @@ pub fn render_tail_opens_think(rendered: &str) -> bool {
 /// Reduce the authoritative rendered-prompt state to the signal consumed by
 /// speculative emitters. Jinja owns the generation suffix, so the request's
 /// `assistant_prefix` is not authoritative once rendering succeeds.
-pub fn spec_assistant_prefix(started_in_think: bool) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+pub fn spec_assistant_prefix(
+    started_in_think: bool,
+) -> hipfire_runtime::prompt_frame::AssistantPrefix {
     if started_in_think {
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     } else {
@@ -164,7 +166,11 @@ pub fn canonical_json(v: &serde_json::Value) -> String {
     out
 }
 
-pub fn emit_error_with_id(stdout: &mut impl std::io::Write, id: &str, message: impl std::fmt::Display) {
+pub fn emit_error_with_id(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
     emit_active_attempt_error(
         stdout,
         Some(id),
@@ -187,6 +193,11 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    if let Some(id) = id {
+        if !claim_terminal(id, active_attempt_id()) {
+            return;
+        }
+    }
     write_error_envelope(
         stdout,
         id,
@@ -261,7 +272,14 @@ pub fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &s
     let _ = stdout.flush();
 }
 
-pub fn emit_qwen_ar_cancelled(stdout: &mut impl std::io::Write, id: &str, completion_tokens: usize) {
+pub fn emit_qwen_ar_cancelled(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) {
+    if !claim_terminal(id, active_attempt_id()) {
+        return;
+    }
     let attempt_id = active_attempt_id();
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
     let _ = writeln!(stdout, "{}", aborted);

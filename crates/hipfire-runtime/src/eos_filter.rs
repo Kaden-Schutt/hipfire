@@ -92,6 +92,9 @@ struct EosFilterState {
     in_think: bool,
     /// Generation has already stopped; further observe is a no-op Hold.
     stopped: bool,
+    /// End-of-stream has been finalized. Finalization is consuming and
+    /// idempotent: late bytes cannot become visible after terminal ownership.
+    finished: bool,
 }
 
 /// Per-request output-stream filter. Construct from a
@@ -134,54 +137,52 @@ impl EosFilter {
 
     /// Whether the filter currently has buffered bytes that have not
     /// been emitted. Useful for decisions like "did we drop content?"
-    /// at end-of-stream. The caller can call `flush_pending` to drain.
+    /// at end-of-stream. The caller can call `finish` to drain.
     pub fn has_pending(&self) -> bool {
-        if self.state.stopped {
+        if self.state.stopped || self.state.finished {
             return false;
         }
         self.safe_visible_end() > self.state.visible_emitted
     }
 
-    /// Whether the filter is currently inside a stripped think span
-    /// (including `started_in_think` before the first closer).
-    pub fn in_think(&self) -> bool {
-        self.state.in_think
-    }
-
-    /// Drain any bytes currently held back due to UTF-8 boundary or
-    /// marker-prefix buffering, *not* including bytes inside an open
-    /// `<think>` block. At true token EOS / length, ordinary trailing
-    /// watched-prefix prose (e.g. `answer <` that never completed a
-    /// stop/think marker) is emitted unchanged. Completed stop markers
-    /// remain suppressed (they set `stopped` and never enter visible).
-    /// Intended for end-of-stream when the caller wants disambiguated
-    /// safe prose. Returns the bytes that were held; caller emits them.
-    pub fn flush_pending(&mut self) -> Vec<u8> {
-        if self.state.stopped {
+    /// Finalize the stream and drain safe visible bytes held back by
+    /// marker-prefix or UTF-8 buffering. A repeated call returns no bytes,
+    /// and input observed after finalization is ignored until `reset`.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.state.stopped || self.state.finished {
             return Vec::new();
         }
         // Force-classify remaining raw. At EOS, trailing partial marker
         // prefixes are ordinary prose and must be emitted; open-think
         // content stays suppressed inside `pump(at_eos=true)`.
         let _ = self.pump(true);
-        if self.state.in_think {
-            // Do not leak hidden reasoning; leave residual unread.
-            return Vec::new();
-        }
-        let lo = self.state.visible_emitted;
-        let hi = self.state.visible.len();
-        if lo >= hi {
-            return Vec::new();
-        }
-        let out = self.state.visible[lo..hi].to_vec();
-        self.state.visible_emitted = hi;
-        out
+        let pending = if self.state.in_think {
+            // Do not leak hidden reasoning; leave no residual reusable state.
+            Vec::new()
+        } else {
+            let lo = self.state.visible_emitted;
+            let hi = self.state.visible.len();
+            if lo >= hi {
+                Vec::new()
+            } else {
+                let out = self.state.visible[lo..hi].to_vec();
+                self.state.visible_emitted = hi;
+                out
+            }
+        };
+        self.state.finished = true;
+        pending
     }
 
+    /// Compatibility spelling for existing generation callers. This is the
+    /// terminal operation, not a mid-stream flush; repeated calls are inert.
+    pub fn flush_pending(&mut self) -> Vec<u8> {
+        self.finish()
+    }
     /// Feed newly-decoded bytes from a single token. Returns the next
     /// action.
     pub fn observe(&mut self, raw_bytes: &[u8]) -> FilterAction {
-        if self.state.stopped {
+        if self.state.stopped || self.state.finished {
             return FilterAction::Hold;
         }
         if raw_bytes.is_empty()
@@ -751,6 +752,21 @@ mod tests {
         // True EOS: held watched-prefix prose must flush unchanged.
         assert_eq!(f.flush_pending(), b"<".to_vec());
         assert!(f.flush_pending().is_empty());
+    }
+
+    #[test]
+    fn finish_is_idempotent_and_rejects_late_bytes() {
+        let mut f = EosFilter::new(cfg_qwen_ar(false));
+        assert_eq!(
+            f.observe(b"answer <"),
+            FilterAction::Emit(b"answer ".to_vec())
+        );
+        assert_eq!(f.finish(), b"<".to_vec());
+        assert!(f.finish().is_empty());
+        assert_eq!(f.observe(b"late"), FilterAction::Hold);
+        assert!(f.flush_pending().is_empty());
+        f.reset();
+        assert_eq!(f.observe(b"fresh"), FilterAction::Emit(b"fresh".to_vec()));
     }
 
     #[test]

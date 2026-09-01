@@ -531,8 +531,11 @@ def main() -> int:
                 "params": {
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
+                    "speculation": "off",
                     "dflash_mode": "off",
+                    "dspark_mode": "off",
                     "mtp_mode": "off",
+                    "ngram_draft": False,
                     "tp": 1,
                     "pp": 1,
                 },

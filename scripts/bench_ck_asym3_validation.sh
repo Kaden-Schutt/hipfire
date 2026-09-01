@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Reproducible Asym3-Givens CK validation: LongBench hard30 plus long AR decode.
+# Reproducible quantized-KV CK validation: LongBench hard30 plus long AR decode.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,6 +15,7 @@ DATASET="${DATASET:-$DATA_ROOT/longbench-hard30-pp32k.jsonl}"
 MANIFEST="${MANIFEST:-$DATA_ROOT/longbench-hard30-pp32k.manifest.json}"
 GPU_ID="${GPU_ID:-0}"
 EXPECTED_ARCH="${EXPECTED_ARCH:-gfx1100}"
+KV_MODE="${KV_MODE:-asym3}"
 NATIVE_GPU_ID="${NATIVE_GPU_ID:-$GPU_ID}"
 CK_GPU_ID="${CK_GPU_ID:-$GPU_ID}"
 PARALLEL_AB="${PARALLEL_AB:-0}"
@@ -27,7 +28,7 @@ DECODE_RUNS="${DECODE_RUNS:-1}"
 COOLDOWN="${COOLDOWN:-10}"
 WORKSPACE_BYTES="${WORKSPACE_BYTES:-536870912}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/ck-asym3-givens/$RUN_ID}"
+OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/ck-${KV_MODE}/$RUN_ID}"
 
 for file in "$MODEL" "$SIDECAR" "$DATASET" "$MANIFEST"; do
     [[ -f "$file" ]] || { echo "missing required file: $file" >&2; exit 2; }
@@ -49,6 +50,7 @@ mkdir -p "$OUT_ROOT"
 {
     echo "git_head=$(git rev-parse HEAD)"
     echo "model=$MODEL"
+    echo "kv_mode=$KV_MODE"
     sha256sum "$MODEL" "$SIDECAR" "$DATASET" "$MANIFEST" "$DAEMON" "$BENCH"
     rocm-smi --showproductname --showmeminfo vram
 } >"$OUT_ROOT/meta.txt" 2>&1
@@ -64,12 +66,12 @@ run_longbench() {
     fi
     python3 "$ROOT/scripts/eval_gemma4_eseries.py" \
         --daemon "$DAEMON" --model "$MODEL" \
-        --model-label "qwen3.6-27b-asym3-longbench-$mode" \
+        --model-label "qwen3.6-27b-${KV_MODE}-longbench-$mode" \
         --suite longbench --dataset "$DATASET" --manifest "$MANIFEST" \
         --out-dir "$OUT_ROOT/longbench/$mode" --physical-gpu "$gpu_id" \
-        --expected-arch "$EXPECTED_ARCH" --runtime-home "/tmp/hipfire-ck-asym3-$mode" \
+        --expected-arch "$EXPECTED_ARCH" --runtime-home "/tmp/hipfire-ck-${KV_MODE}-$mode" \
         --max-seq "$MAX_SEQ" --max-tokens "$LONG_BENCH_MAX_TOKENS" \
-        --limit "$LONG_BENCH_LIMIT" --prefill-batch 8 --kv-mode asym3 --closed-think \
+        --limit "$LONG_BENCH_LIMIT" --prefill-batch 8 --kv-mode "$KV_MODE" --closed-think \
         --timeout 3600 "${ck_args[@]}"
 }
 
@@ -80,14 +82,14 @@ run_decode() {
     : >"$log"
     for ((run = 1; run <= DECODE_RUNS; run++)); do
         if [[ "$mode" == "ck" ]]; then
-            env HIP_VISIBLE_DEVICES="$gpu_id" HIPFIRE_KV_MODE=asym3 \
+            env HIP_VISIBLE_DEVICES="$gpu_id" HIPFIRE_KV_MODE="$KV_MODE" \
                 HIPFIRE_FLASH_ATTN_CK_LIB="$SIDECAR" \
                 HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES="$WORKSPACE_BYTES" \
                 "$BENCH" "$MODEL" --prefill "$DECODE_PREFILL" --prefill-runs 1 \
                 --warmup 8 --gen "$DECODE_TOKENS" 2>&1 | tee -a "$log"
         else
             env -u HIPFIRE_FLASH_ATTN_CK_LIB -u HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES \
-                -u HIPFIRE_FLASH_PREFILL HIP_VISIBLE_DEVICES="$gpu_id" HIPFIRE_KV_MODE=asym3 \
+                -u HIPFIRE_FLASH_PREFILL HIP_VISIBLE_DEVICES="$gpu_id" HIPFIRE_KV_MODE="$KV_MODE" \
                 "$BENCH" "$MODEL" --prefill "$DECODE_PREFILL" --prefill-runs 1 \
                 --warmup 8 --gen "$DECODE_TOKENS" 2>&1 | tee -a "$log"
         fi
@@ -160,4 +162,4 @@ print(
 print(f"Long decode medians: native={decode['native']['median']} ck={decode['ck']['median']} tok/s")
 PY
 
-echo "CK Asym3 validation complete: $OUT_ROOT"
+echo "CK $KV_MODE validation complete: $OUT_ROOT"

@@ -617,37 +617,107 @@ fn hfq_weight(
     Ok(wt)
 }
 
-impl DflashWeights {
-    /// True when the selector (candidate proposal) path is available.
-    pub fn has_candidate_selector(&self) -> bool {
-        self.selector_hidden_proj.is_some()
-            && self.predecessor_codebook.is_some()
-            && self.successor_codebook.is_some()
+#[derive(Default)]
+struct DflashLayerStaging {
+    attn_norm: Option<GpuTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    q_norm: Option<GpuTensor>,
+    k_norm: Option<GpuTensor>,
+    ffn_norm: Option<GpuTensor>,
+    w_gate: Option<WeightTensor>,
+    w_up: Option<WeightTensor>,
+    w_down: Option<WeightTensor>,
+    attn_conv_base: Option<GpuTensor>,
+    attn_conv_proj: Option<WeightTensor>,
+    mlp_conv_base: Option<GpuTensor>,
+    mlp_conv_proj: Option<WeightTensor>,
+}
+
+impl DflashLayerStaging {
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(tensor) = self.attn_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.wq.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wk.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wv.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wo.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = self.q_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.k_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.ffn_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.w_gate.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.w_up.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.w_down.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = self.attn_conv_base.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.attn_conv_proj.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = self.mlp_conv_base.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.mlp_conv_proj.take() {
+            weight.free_all(gpu);
+        }
     }
-    pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        let fc = hfq_weight(
-            hfq,
-            gpu,
-            "fc.weight",
-            cfg.hidden,
-            cfg.num_extract() * cfg.hidden,
-        )?;
-        let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
-        let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
 
-        let conv_k = cfg.conv_kernel_size.unwrap_or(2);
-        let conv_g = cfg.conv_group_size.unwrap_or(16);
-        let conv_groups = cfg.hidden / conv_g;
-        let proj_m = 2 * conv_k * conv_groups;
+    fn into_layer(&mut self) -> DflashLayerWeights {
+        DflashLayerWeights {
+            attn_norm: self.attn_norm.take().expect("staged DFlash attn_norm"),
+            wq: self.wq.take().expect("staged DFlash wq"),
+            wk: self.wk.take().expect("staged DFlash wk"),
+            wv: self.wv.take().expect("staged DFlash wv"),
+            wo: self.wo.take().expect("staged DFlash wo"),
+            q_norm: self.q_norm.take().expect("staged DFlash q_norm"),
+            k_norm: self.k_norm.take().expect("staged DFlash k_norm"),
+            ffn_norm: self.ffn_norm.take().expect("staged DFlash ffn_norm"),
+            w_gate: self.w_gate.take().expect("staged DFlash w_gate"),
+            w_up: self.w_up.take().expect("staged DFlash w_up"),
+            w_down: self.w_down.take().expect("staged DFlash w_down"),
+            attn_conv_base: self.attn_conv_base.take(),
+            attn_conv_proj: self.attn_conv_proj.take(),
+            mlp_conv_base: self.mlp_conv_base.take(),
+            mlp_conv_proj: self.mlp_conv_proj.take(),
+        }
+    }
 
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for i in 0..cfg.n_layers {
-            let p = format!("layers.{i}");
-            // Attempt DFlash2 conv weights; absent on legacy drafts.
-            let attn_conv_base = if cfg.conv_kernel_size.is_some() {
-                // base_kernel [2, K, H] -> 2*K*H
+    fn load(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        index: usize,
+        conv_k: usize,
+        proj_m: usize,
+    ) -> HipResult<DflashLayerWeights> {
+        let mut staged = Self::default();
+        let result = (|| -> HipResult<DflashLayerWeights> {
+            let p = format!("layers.{index}");
+            staged.attn_conv_base = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.self_attn.attention_conv.base_kernel");
-                // also try alternate naming `attn_conv` if upstream uses that
                 let alt = format!("{p}.attention_conv.base_kernel");
                 let key = if hfq.tensor_data(&name).is_some() {
                     name
@@ -655,7 +725,6 @@ impl DflashWeights {
                     alt
                 };
                 if hfq.tensor_data(&key).is_some() {
-                    // shape 2*K*H
                     Some(hfq_tensor_f32(
                         hfq,
                         gpu,
@@ -668,7 +737,7 @@ impl DflashWeights {
             } else {
                 None
             };
-            let attn_conv_proj = if cfg.conv_kernel_size.is_some() {
+            staged.attn_conv_proj = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
                 let alt = format!("{p}.attention_conv.kernel_projection.weight");
                 let key = if hfq.tensor_data(&name).is_some() {
@@ -684,7 +753,7 @@ impl DflashWeights {
             } else {
                 None
             };
-            let mlp_conv_base = if cfg.conv_kernel_size.is_some() {
+            staged.mlp_conv_base = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.mlp.mlp_conv.base_kernel");
                 let alt = format!("{p}.mlp_conv.base_kernel");
                 let key = if hfq.tensor_data(&name).is_some() {
@@ -705,7 +774,7 @@ impl DflashWeights {
             } else {
                 None
             };
-            let mlp_conv_proj = if cfg.conv_kernel_size.is_some() {
+            staged.mlp_conv_proj = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
                 let alt = format!("{p}.mlp_conv.kernel_projection.weight");
                 let key = if hfq.tensor_data(&name).is_some() {
@@ -721,227 +790,358 @@ impl DflashWeights {
             } else {
                 None
             };
-            let layer = DflashLayerWeights {
-                attn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.input_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                wq: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    cfg.q_dim(),
-                    cfg.hidden,
-                )?,
-                wk: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wv: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wo: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    cfg.hidden,
-                    cfg.q_dim(),
-                )?,
-                q_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                k_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                ffn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                w_gate: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_up: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_down: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    cfg.hidden,
-                    cfg.intermediate,
-                )?,
-                attn_conv_base,
-                attn_conv_proj,
-                mlp_conv_base,
-                mlp_conv_proj,
-            };
-            layers.push(layer);
+            staged.attn_norm = Some(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.input_layernorm.weight"),
+                vec![cfg.hidden],
+            )?);
+            staged.wq = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.q_proj.weight"),
+                cfg.q_dim(),
+                cfg.hidden,
+            )?);
+            staged.wk = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.k_proj.weight"),
+                cfg.kv_dim(),
+                cfg.hidden,
+            )?);
+            staged.wv = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.v_proj.weight"),
+                cfg.kv_dim(),
+                cfg.hidden,
+            )?);
+            staged.wo = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.o_proj.weight"),
+                cfg.hidden,
+                cfg.q_dim(),
+            )?);
+            staged.q_norm = Some(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.q_norm.weight"),
+                vec![cfg.head_dim],
+            )?);
+            staged.k_norm = Some(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.k_norm.weight"),
+                vec![cfg.head_dim],
+            )?);
+            staged.ffn_norm = Some(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.post_attention_layernorm.weight"),
+                vec![cfg.hidden],
+            )?);
+            staged.w_gate = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.gate_proj.weight"),
+                cfg.intermediate,
+                cfg.hidden,
+            )?);
+            staged.w_up = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.up_proj.weight"),
+                cfg.intermediate,
+                cfg.hidden,
+            )?);
+            staged.w_down = Some(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.down_proj.weight"),
+                cfg.hidden,
+                cfg.intermediate,
+            )?);
+            Ok(staged.into_layer())
+        })();
+        if result.is_err() {
+            staged.free_gpu(gpu);
         }
+        result
+    }
+}
 
-        // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side
-        // Exact HFQ names are `candidate_selector.hidden_projection.weight`,
-        // `candidate_selector.predecessor_codebook`, `candidate_selector.successor_codebook`.
-        // Optional fallback `.weight` suffix is tolerated but not required.
-        let selector_hidden_proj = if cfg.selector_rank.is_some() {
-            let rank = cfg.selector_rank.unwrap();
-            let candidates = [
-                "candidate_selector.hidden_projection.weight",
-                "selector.hidden_projection.weight",
-                "selector.hidden_proj.weight",
-            ];
-            let mut found = None;
-            for n in candidates {
-                if hfq.tensor_data(n).is_some() {
-                    found = Some(hfq_weight(hfq, gpu, n, rank, cfg.hidden)?);
-                    break;
-                }
-            }
-            found
-        } else {
-            None
+struct DflashWeightsStaging {
+    fc: Option<WeightTensor>,
+    hidden_norm: Option<GpuTensor>,
+    norm: Option<GpuTensor>,
+    layers: Vec<DflashLayerWeights>,
+    selector_hidden_proj: Option<WeightTensor>,
+}
+
+impl DflashWeightsStaging {
+    fn free_layer(layer: DflashLayerWeights, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(layer.attn_norm);
+        layer.wq.free_all(gpu);
+        layer.wk.free_all(gpu);
+        layer.wv.free_all(gpu);
+        layer.wo.free_all(gpu);
+        let _ = gpu.free_tensor(layer.q_norm);
+        let _ = gpu.free_tensor(layer.k_norm);
+        let _ = gpu.free_tensor(layer.ffn_norm);
+        layer.w_gate.free_all(gpu);
+        layer.w_up.free_all(gpu);
+        layer.w_down.free_all(gpu);
+        if let Some(tensor) = layer.attn_conv_base {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = layer.attn_conv_proj {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = layer.mlp_conv_base {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = layer.mlp_conv_proj {
+            weight.free_all(gpu);
+        }
+    }
+
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(weight) = self.fc.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = self.hidden_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        for layer in self.layers.drain(..) {
+            Self::free_layer(layer, gpu);
+        }
+        if let Some(weight) = self.selector_hidden_proj.take() {
+            weight.free_all(gpu);
+        }
+    }
+}
+
+impl DflashWeights {
+    /// True when the selector (candidate proposal) path is available.
+    pub fn has_candidate_selector(&self) -> bool {
+        self.selector_hidden_proj.is_some()
+            && self.predecessor_codebook.is_some()
+            && self.successor_codebook.is_some()
+    }
+    pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
+        let mut staged = DflashWeightsStaging {
+            fc: None,
+            hidden_norm: None,
+            norm: None,
+            layers: Vec::with_capacity(cfg.n_layers),
+            selector_hidden_proj: None,
         };
         let load_codebook = |names: &[&str],
                              vocab: usize,
                              rank: usize|
-         -> Option<SelectorCodebook> {
+         -> HipResult<Option<SelectorCodebook>> {
             for n in names {
                 if let Some((info, data)) = hfq.tensor_data(n) {
                     let expected = vocab * rank;
                     match info.quant_type {
                         1 => {
-                            assert_eq!(data.len(), expected * 2, "codebook {n} F16 size mismatch");
+                            if data.len() != expected * 2 {
+                                return Err(hip_bridge::HipError::new(
+                                    0,
+                                    &format!(
+                                        "selector codebook {n} F16 size mismatch: expected {}, got {}",
+                                        expected * 2,
+                                        data.len()
+                                    ),
+                                ));
+                            }
                             let mut v = Vec::with_capacity(expected);
                             for chunk in data.chunks_exact(2) {
                                 v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
                             }
-                            return Some(SelectorCodebook {
+                            return Ok(Some(SelectorCodebook {
                                 vocab,
                                 rank,
                                 f16_data: Some(v),
                                 f32_data: None,
-                            });
+                            }));
                         }
                         2 => {
-                            assert_eq!(data.len(), expected * 4, "codebook {n} F32 size mismatch");
+                            if data.len() != expected * 4 {
+                                return Err(hip_bridge::HipError::new(
+                                    0,
+                                    &format!(
+                                        "selector codebook {n} F32 size mismatch: expected {}, got {}",
+                                        expected * 4,
+                                        data.len()
+                                    ),
+                                ));
+                            }
                             let mut v = Vec::with_capacity(expected);
                             for chunk in data.chunks_exact(4) {
                                 v.push(f32::from_le_bytes([
                                     chunk[0], chunk[1], chunk[2], chunk[3],
                                 ]));
                             }
-                            return Some(SelectorCodebook {
+                            return Ok(Some(SelectorCodebook {
                                 vocab,
                                 rank,
                                 f16_data: None,
                                 f32_data: Some(v),
-                            });
+                            }));
                         }
-                        q => panic!("selector codebook {n} unsupported quant_type {q}"),
+                        q => {
+                            return Err(hip_bridge::HipError::new(
+                                0,
+                                &format!("selector codebook {n} unsupported quant_type {q}"),
+                            ));
+                        }
                     }
                 }
             }
-            None
+            Ok(None)
         };
-        let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) =
+        let result = (|| -> HipResult<Self> {
+            staged.fc = Some(hfq_weight(
+                hfq,
+                gpu,
+                "fc.weight",
+                cfg.hidden,
+                cfg.num_extract() * cfg.hidden,
+            )?);
+            staged.hidden_norm = Some(hfq_tensor_f32(
+                hfq,
+                gpu,
+                "hidden_norm.weight",
+                vec![cfg.hidden],
+            )?);
+            staged.norm = Some(hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?);
+
+            let conv_k = cfg.conv_kernel_size.unwrap_or(2);
+            let conv_g = cfg.conv_group_size.unwrap_or(16);
+            let conv_groups = cfg.hidden / conv_g;
+            let proj_m = 2 * conv_k * conv_groups;
+            for i in 0..cfg.n_layers {
+                staged
+                    .layers
+                    .push(DflashLayerStaging::load(hfq, gpu, cfg, i, conv_k, proj_m)?);
+            }
+
             if cfg.selector_rank.is_some() {
                 let rank = cfg.selector_rank.unwrap();
-                let vocab = cfg.vocab_size;
-                let pred = load_codebook(
-                    &[
-                        "candidate_selector.predecessor_codebook",
-                        "selector.predecessor_codebook",
-                        "candidate_selector.predecessor_codebook.weight",
-                        "selector.predecessor.weight",
-                    ],
-                    vocab,
-                    rank,
-                );
-                let succ = load_codebook(
-                    &[
-                        "candidate_selector.successor_codebook",
-                        "selector.successor_codebook",
-                        "candidate_selector.successor_codebook.weight",
-                        "selector.successor.weight",
-                    ],
-                    vocab,
-                    rank,
-                );
-                (pred, succ, cfg.selector_rank, cfg.selector_top_k)
-            } else {
-                (None, None, None, None)
-            };
+                for name in [
+                    "candidate_selector.hidden_projection.weight",
+                    "selector.hidden_projection.weight",
+                    "selector.hidden_proj.weight",
+                ] {
+                    if hfq.tensor_data(name).is_some() {
+                        staged.selector_hidden_proj =
+                            Some(hfq_weight(hfq, gpu, name, rank, cfg.hidden)?);
+                        break;
+                    }
+                }
+            }
+            let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) =
+                if let Some(rank) = cfg.selector_rank {
+                    let vocab = cfg.vocab_size;
+                    let predecessor_codebook = load_codebook(
+                        &[
+                            "candidate_selector.predecessor_codebook",
+                            "selector.predecessor_codebook",
+                            "candidate_selector.predecessor_codebook.weight",
+                            "selector.predecessor.weight",
+                        ],
+                        vocab,
+                        rank,
+                    )?;
+                    let successor_codebook = load_codebook(
+                        &[
+                            "candidate_selector.successor_codebook",
+                            "selector.successor_codebook",
+                            "candidate_selector.successor_codebook.weight",
+                            "selector.successor.weight",
+                        ],
+                        vocab,
+                        rank,
+                    )?;
+                    (
+                        predecessor_codebook,
+                        successor_codebook,
+                        Some(rank),
+                        cfg.selector_top_k,
+                    )
+                } else {
+                    (None, None, None, None)
+                };
 
-        let has_mq = std::iter::once(&fc)
-            .chain(layers.iter().flat_map(|l| {
-                let mut v: Vec<&WeightTensor> =
-                    vec![&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down];
-                if let Some(p) = &l.attn_conv_proj {
-                    v.push(p);
-                }
-                if let Some(p) = &l.mlp_conv_proj {
-                    v.push(p);
-                }
-                v.into_iter()
-            }))
-            .chain(selector_hidden_proj.iter())
-            .any(|w| {
-                matches!(
-                    w.gpu_dtype,
-                    DType::MQ4G256
-                        | DType::MQ4G256V2
-                        | DType::MQ6G256
-                        | DType::MQ6G256V2
-                        | DType::MQ5G256V2
-                        | DType::MQ3G256
-                        | DType::MQ3G256V2
-                        | DType::MQ2G256V2
-                )
-            });
-        if has_mq {
-            // MQ dispatch needs the engine's FWHT sign tables uploaded
-            // (matches `gemv_mq4g256_with_rotate`'s setup).
-            gpu.ensure_mq_signs()?;
+            let has_mq = staged
+                .fc
+                .iter()
+                .chain(staged.layers.iter().flat_map(|layer| {
+                    let mut weights: Vec<&WeightTensor> = vec![
+                        &layer.wq,
+                        &layer.wk,
+                        &layer.wv,
+                        &layer.wo,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                    ];
+                    if let Some(weight) = &layer.attn_conv_proj {
+                        weights.push(weight);
+                    }
+                    if let Some(weight) = &layer.mlp_conv_proj {
+                        weights.push(weight);
+                    }
+                    weights.into_iter()
+                }))
+                .chain(staged.selector_hidden_proj.iter())
+                .any(|weight| {
+                    matches!(
+                        weight.gpu_dtype,
+                        DType::MQ4G256
+                            | DType::MQ4G256V2
+                            | DType::MQ6G256
+                            | DType::MQ6G256V2
+                            | DType::MQ5G256V2
+                            | DType::MQ3G256
+                            | DType::MQ3G256V2
+                            | DType::MQ2G256V2
+                    )
+                });
+            if has_mq {
+                // MQ dispatch needs the engine's FWHT sign tables uploaded
+                // (matches `gemv_mq4g256_with_rotate`'s setup).
+                gpu.ensure_mq_signs()?;
+            }
+
+            Ok(DflashWeights {
+                fc: staged.fc.take().expect("staged DFlash fc"),
+                hidden_norm: staged
+                    .hidden_norm
+                    .take()
+                    .expect("staged DFlash hidden_norm"),
+                norm: staged.norm.take().expect("staged DFlash norm"),
+                layers: std::mem::take(&mut staged.layers),
+                has_mq,
+                selector_hidden_proj: staged.selector_hidden_proj.take(),
+                predecessor_codebook,
+                successor_codebook,
+                selector_rank: selector_rank_opt,
+                selector_top_k: selector_top_k_opt,
+                conv_group_size: cfg.conv_group_size,
+                conv_kernel_size: cfg.conv_kernel_size,
+            })
+        })();
+        if result.is_err() {
+            staged.free_gpu(gpu);
         }
-
-        Ok(DflashWeights {
-            fc,
-            hidden_norm,
-            norm,
-            layers,
-            has_mq,
-            selector_hidden_proj,
-            predecessor_codebook,
-            successor_codebook,
-            selector_rank: selector_rank_opt,
-            selector_top_k: selector_top_k_opt,
-            conv_group_size: cfg.conv_group_size,
-            conv_kernel_size: cfg.conv_kernel_size,
-        })
+        result
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
         // free_all (not .buf) so the awq_scale / paro sidecars are released too —

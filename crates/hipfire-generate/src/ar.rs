@@ -681,6 +681,70 @@ pub fn qwen_ar_forward_fail_action() -> QwenArForwardFailAction {
 pub fn qwen_ar_forward_fail_message(phase: &str, err: impl std::fmt::Display) -> String {
     format!("{phase}: {err}")
 }
+/// Reset Qwen35's non-reversible recurrent state through its canonical
+/// architecture method.  The live rollback adapter below supplies the KV
+/// cursor and request-owned surfaces separately so callers can keep disjoint
+/// bundle borrows alive.
+fn qwen_ar_reset_recurrent(
+    dn: &mut qwen35::DeltaNetState,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    dn.reset(gpu)
+        .map_err(|e| format!("qwen35 reset_recurrent: {e}"))
+}
+
+/// Run the production fail-closed rollback while the Qwen35 bundle is live.
+/// The target adapter owns the non-reversible DeltaNet state; the adaptive
+/// extra owns the KV cursor and restores adaptive cache flags only when its
+/// controller is healthy.  Sticky adaptive poison is deliberately retained.
+fn qwen_ar_reset_live<'spec, 'object>(
+    dn: &mut qwen35::DeltaNetState,
+    kv: &mut hipfire_runtime::llama::KvCache,
+    mut adaptive: Option<&mut hipfire_runtime::kv_adaptive::KvAdaptive>,
+    eviction: Option<&hipfire_loader::Eviction>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    spec: Option<&'spec mut (dyn hipfire_runtime::spec::Speculator + 'object)>,
+) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| qwen_ar_reset_recurrent(dn, gpu);
+    let mut reset_adaptive = |gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
+        // The target adapter cannot also borrow `kv` because the production
+        // epilogue receives both closures at once. Keep the cursor reset in
+        // this disjoint extra alongside adaptive cache-mode restoration.
+        kv.compact_offset = 0;
+        if let Some(ad) = adaptive.as_deref_mut() {
+            if !ad.is_poisoned() {
+                ad.reset_with_cache(gpu, kv);
+            }
+        }
+        Ok(())
+    };
+    let mut reset_eviction = |_gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
+        if let Some(owner) = eviction {
+            owner.reset_request_state(None);
+        }
+        Ok(())
+    };
+    crate::common::production_fail_closed_rollback_live_with_extras(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        spec,
+        ResetExtras {
+            adaptive: Some(&mut reset_adaptive),
+            batch: None,
+            eviction: Some(&mut reset_eviction),
+        },
+    )
+}
 
 /// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
 /// owns the layout.  Before the one-way handoff, the eviction window is not a
@@ -845,6 +909,577 @@ impl GenerationRoute {
             Self::DotsOcr => "dots_ocr",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Terminal kind used by the production route adapter registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminal {
+    Done,
+    Error,
+    Cancel,
+}
+
+/// Terminal payload accepted by every production route adapter. The borrowed
+/// payload keeps the adapter seam allocation-free for the normal done/error
+/// paths while the convenience [`GenerationRouteAdapter::emit_terminal`]
+/// method still gives tests a compact route-only terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminalEvent<'a> {
+    Done {
+        pending: Option<&'a serde_json::Value>,
+    },
+    Error {
+        id: Option<&'a str>,
+        message: Option<&'a str>,
+        class: &'a str,
+        retryable: bool,
+        rolled_back: bool,
+    },
+    Cancel {
+        completion_tokens: usize,
+    },
+}
+
+pub type RouteStartAdapter = fn(&mut dyn Write, &str, bool);
+pub type RouteTerminalAdapter = for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>);
+
+thread_local! {
+    /// A route can fall through from speculative capacity checks into AR.
+    /// Keep the start edge one-shot per `(id, attempt)` so a producer adapter
+    /// can be installed at both boundaries without duplicating `gen_start`.
+    static ROUTE_START_LATCH: std::cell::RefCell<
+        std::collections::HashSet<(String, u64)>
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
+    static ACTIVE_GENERATION_ROUTE: std::cell::Cell<Option<GenerationRoute>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn claim_route_start(id: &str, attempt: u64) -> bool {
+    ROUTE_START_LATCH.with(|latch| latch.borrow_mut().insert((id.to_owned(), attempt)))
+}
+
+fn release_route_start(id: &str, attempt: u64) {
+    ROUTE_START_LATCH.with(|latch| {
+        latch.borrow_mut().remove(&(id.to_owned(), attempt));
+    });
+}
+
+/// Set the route used by route-aware production terminal wrappers for the
+/// current generation thread. Batch, EP, VL, and the specialised Glimmer
+/// entrypoints call this before they can emit an error or terminal.
+pub fn set_generation_route(route: GenerationRoute) {
+    ACTIVE_GENERATION_ROUTE.with(|active| active.set(Some(route)));
+}
+
+struct GenerationRouteScope {
+    id: String,
+    attempt: u64,
+}
+
+impl GenerationRouteScope {
+    fn enter(route: GenerationRoute, id: &str) -> Self {
+        set_generation_route(route);
+        Self {
+            id: id.to_owned(),
+            attempt: active_attempt_id(),
+        }
+    }
+}
+
+impl Drop for GenerationRouteScope {
+    fn drop(&mut self) {
+        release_route_start(&self.id, self.attempt);
+        ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
+    }
+}
+
+pub fn active_generation_route() -> Option<GenerationRoute> {
+    ACTIVE_GENERATION_ROUTE.with(std::cell::Cell::get)
+}
+
+/// Concrete start/terminal pair for one selected generation route. The
+/// registry is intentionally exhaustive: route evidence must fail closed when
+/// a new `GenerationRoute` is added without a producer adapter.
+#[derive(Clone, Copy)]
+pub struct GenerationRouteAdapter {
+    pub route: GenerationRoute,
+    pub start: RouteStartAdapter,
+    pub terminal: RouteTerminalAdapter,
+}
+
+impl GenerationRouteAdapter {
+    /// Emit the default route start used by the route-cardinality tests.
+    pub fn emit_start(self, output: &mut dyn Write, id: &str) {
+        self.emit_start_with(output, id, false);
+    }
+
+    /// Emit a route start from a real producer. The latch is deliberately in
+    /// the production adapter rather than in tests, so fallback paths cannot
+    /// accidentally write a second `gen_start` for one attempt.
+    pub fn emit_start_with(self, output: &mut dyn Write, id: &str, started_in_think: bool) {
+        if claim_route_start(id, active_attempt_id()) {
+            (self.start)(output, id, started_in_think);
+        }
+    }
+
+    /// Compact route-only terminal used by the exhaustive barrier test.
+    pub fn emit_terminal(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        terminal: RouteTerminal,
+    ) {
+        let event = match terminal {
+            RouteTerminal::Done => RouteTerminalEvent::Done { pending: None },
+            RouteTerminal::Error => RouteTerminalEvent::Error {
+                id: Some(id),
+                message: None,
+                class: "internal",
+                retryable: false,
+                rolled_back: true,
+            },
+            RouteTerminal::Cancel => RouteTerminalEvent::Cancel {
+                completion_tokens: 0,
+            },
+        };
+        self.emit_terminal_event(output, id, attempt, event);
+    }
+
+    pub fn emit_done(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        pending: &serde_json::Value,
+    ) {
+        self.emit_terminal_event(
+            output,
+            id,
+            attempt,
+            RouteTerminalEvent::Done {
+                pending: Some(pending),
+            },
+        );
+    }
+
+    pub fn emit_error(
+        self,
+        output: &mut dyn Write,
+        id: Option<&str>,
+        attempt: u64,
+        message: &str,
+        class: &str,
+        retryable: bool,
+        rolled_back: bool,
+    ) {
+        self.emit_terminal_event(
+            output,
+            id.unwrap_or(""),
+            attempt,
+            RouteTerminalEvent::Error {
+                id,
+                message: Some(message),
+                class,
+                retryable,
+                rolled_back,
+            },
+        );
+    }
+
+    pub fn emit_cancel(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        completion_tokens: usize,
+    ) {
+        self.emit_terminal_event(
+            output,
+            id,
+            attempt,
+            RouteTerminalEvent::Cancel { completion_tokens },
+        );
+    }
+
+    fn emit_terminal_event(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        event: RouteTerminalEvent<'_>,
+    ) {
+        (self.terminal)(output, id, attempt, event);
+        release_route_start(id, attempt);
+    }
+}
+
+fn emit_route_terminal(
+    output: &mut dyn Write,
+    id: &str,
+    _attempt: u64,
+    event: RouteTerminalEvent<'_>,
+    route_name: &'static str,
+) {
+    let mut buffer = Vec::new();
+    match event {
+        RouteTerminalEvent::Done {
+            pending: Some(pending),
+        } => {
+            emit_staged_terminal_done(&mut buffer, pending);
+        }
+        RouteTerminalEvent::Done { pending: None } => {
+            let pending = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "attempt_id": active_attempt_id(),
+                "finish_reason": "stop",
+            });
+            emit_staged_terminal_done(&mut buffer, &pending);
+        }
+        RouteTerminalEvent::Error {
+            id: event_id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+        } => {
+            let fallback;
+            let message = match message {
+                Some(message) => message,
+                None => {
+                    fallback = format!("{route_name} terminal error");
+                    &fallback
+                }
+            };
+            emit_active_attempt_error(
+                &mut buffer,
+                event_id,
+                message,
+                class,
+                retryable,
+                rolled_back,
+            );
+        }
+        RouteTerminalEvent::Cancel { completion_tokens } => {
+            emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+        }
+    }
+    let _ = output.write_all(&buffer);
+}
+
+macro_rules! define_route_start {
+    ($name:ident, $arch:expr) => {
+        fn $name(output: &mut dyn Write, id: &str, started_in_think: bool) {
+            let mut buffer = Vec::new();
+            emit_gen_start(
+                &mut buffer,
+                id,
+                started_in_think,
+                gen_start_contract_version_for_arch($arch),
+            );
+            let _ = output.write_all(&buffer);
+        }
+    };
+}
+
+macro_rules! define_route_terminal {
+    ($name:ident, $route:expr) => {
+        fn $name(output: &mut dyn Write, id: &str, attempt: u64, event: RouteTerminalEvent<'_>) {
+            emit_route_terminal(output, id, attempt, event, $route.name());
+        }
+    };
+}
+
+define_route_start!(qwen_ar_route_start, 5);
+define_route_start!(qwen_dflash_route_start, 5);
+define_route_start!(qwen2_ar_route_start, 7);
+define_route_start!(qwen2_spec_route_start, 7);
+define_route_start!(deepseek4_ar_route_start, 9);
+fn deepseek4_ep_route_start(output: &mut dyn Write, id: &str, started_in_think: bool) {
+    let mut buffer = Vec::new();
+    crate::qwen::emit_ds4_ep_gen_start(
+        &mut buffer,
+        id,
+        if started_in_think {
+            ThinkMode::Low
+        } else {
+            ThinkMode::NonThink
+        },
+    );
+    let _ = output.write_all(&buffer);
+}
+define_route_start!(deepseek4_spec_route_start, 9);
+define_route_start!(cohere_ar_route_start, 12);
+define_route_start!(cohere_spec_route_start, 12);
+define_route_start!(maple_ar_route_start, 15);
+define_route_start!(minimax_ar_route_start, 10);
+define_route_start!(minimax_ep_route_start, 10);
+define_route_start!(minimax_spec_route_start, 10);
+define_route_start!(lfm_ar_route_start, 11);
+define_route_start!(lfm_spec_route_start, 11);
+define_route_start!(llama_ar_route_start, 0);
+define_route_start!(llama_spec_route_start, 0);
+define_route_start!(glimmer_ar_route_start, 14);
+define_route_start!(glimmer_spec_route_start, 14);
+define_route_start!(pipeline_parallel_route_start, 5);
+define_route_start!(dots_ocr_route_start, 8);
+define_route_start!(unknown_route_start, 255);
+
+define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
+define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
+define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
+define_route_terminal!(qwen2_spec_route_terminal, GenerationRoute::Qwen2Spec);
+define_route_terminal!(deepseek4_ar_route_terminal, GenerationRoute::Deepseek4Ar);
+define_route_terminal!(deepseek4_ep_route_terminal, GenerationRoute::Deepseek4Ep);
+define_route_terminal!(
+    deepseek4_spec_route_terminal,
+    GenerationRoute::Deepseek4Spec
+);
+define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
+define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
+define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
+define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
+define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
+define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
+define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
+define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
+define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
+define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
+define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
+define_route_terminal!(
+    pipeline_parallel_route_terminal,
+    GenerationRoute::PipelineParallel
+);
+define_route_terminal!(dots_ocr_route_terminal, GenerationRoute::DotsOcr);
+define_route_terminal!(unknown_route_terminal, GenerationRoute::Unknown);
+
+/// Return the concrete lifecycle producer adapter for every route in
+/// `GenerationRoute::ALL`. `None` is reserved for future variants and makes
+/// coverage tests fail rather than silently falling back to a label alias.
+pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRouteAdapter> {
+    let adapter = match route {
+        GenerationRoute::QwenAr => GenerationRouteAdapter {
+            route,
+            start: qwen_ar_route_start,
+            terminal: qwen_ar_route_terminal,
+        },
+        GenerationRoute::QwenDflash => GenerationRouteAdapter {
+            route,
+            start: qwen_dflash_route_start,
+            terminal: qwen_dflash_route_terminal,
+        },
+        GenerationRoute::Qwen2Ar => GenerationRouteAdapter {
+            route,
+            start: qwen2_ar_route_start,
+            terminal: qwen2_ar_route_terminal,
+        },
+        GenerationRoute::Qwen2Spec => GenerationRouteAdapter {
+            route,
+            start: qwen2_spec_route_start,
+            terminal: qwen2_spec_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ar => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ar_route_start,
+            terminal: deepseek4_ar_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ep => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ep_route_start,
+            terminal: deepseek4_ep_route_terminal,
+        },
+        GenerationRoute::Deepseek4Spec => GenerationRouteAdapter {
+            route,
+            start: deepseek4_spec_route_start,
+            terminal: deepseek4_spec_route_terminal,
+        },
+        GenerationRoute::CohereAr => GenerationRouteAdapter {
+            route,
+            start: cohere_ar_route_start,
+            terminal: cohere_ar_route_terminal,
+        },
+        GenerationRoute::CohereSpec => GenerationRouteAdapter {
+            route,
+            start: cohere_spec_route_start,
+            terminal: cohere_spec_route_terminal,
+        },
+        GenerationRoute::MapleAr => GenerationRouteAdapter {
+            route,
+            start: maple_ar_route_start,
+            terminal: maple_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxAr => GenerationRouteAdapter {
+            route,
+            start: minimax_ar_route_start,
+            terminal: minimax_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxEp => GenerationRouteAdapter {
+            route,
+            start: minimax_ep_route_start,
+            terminal: minimax_ep_route_terminal,
+        },
+        GenerationRoute::MiniMaxSpec => GenerationRouteAdapter {
+            route,
+            start: minimax_spec_route_start,
+            terminal: minimax_spec_route_terminal,
+        },
+        GenerationRoute::LfmAr => GenerationRouteAdapter {
+            route,
+            start: lfm_ar_route_start,
+            terminal: lfm_ar_route_terminal,
+        },
+        GenerationRoute::LfmSpec => GenerationRouteAdapter {
+            route,
+            start: lfm_spec_route_start,
+            terminal: lfm_spec_route_terminal,
+        },
+        GenerationRoute::LlamaAr => GenerationRouteAdapter {
+            route,
+            start: llama_ar_route_start,
+            terminal: llama_ar_route_terminal,
+        },
+        GenerationRoute::LlamaSpec => GenerationRouteAdapter {
+            route,
+            start: llama_spec_route_start,
+            terminal: llama_spec_route_terminal,
+        },
+        GenerationRoute::GlimmerAr => GenerationRouteAdapter {
+            route,
+            start: glimmer_ar_route_start,
+            terminal: glimmer_ar_route_terminal,
+        },
+        GenerationRoute::GlimmerSpec => GenerationRouteAdapter {
+            route,
+            start: glimmer_spec_route_start,
+            terminal: glimmer_spec_route_terminal,
+        },
+        GenerationRoute::PipelineParallel => GenerationRouteAdapter {
+            route,
+            start: pipeline_parallel_route_start,
+            terminal: pipeline_parallel_route_terminal,
+        },
+        GenerationRoute::DotsOcr => GenerationRouteAdapter {
+            route,
+            start: dots_ocr_route_start,
+            terminal: dots_ocr_route_terminal,
+        },
+        GenerationRoute::Unknown => GenerationRouteAdapter {
+            route,
+            start: unknown_route_start,
+            terminal: unknown_route_terminal,
+        },
+    };
+    Some(adapter)
+}
+
+/// Resolve a route adapter at a production dispatch boundary. The exhaustive
+/// match above is intentionally kept behind this small helper so every real
+/// producer and the lifecycle barrier use the same registry entry.
+fn production_route_adapter(route: GenerationRoute) -> GenerationRouteAdapter {
+    generation_route_adapter(route)
+        .unwrap_or_else(|| unreachable!("missing production adapter for {}", route.name()))
+}
+
+/// Emit the first event for a production generation route.
+pub fn emit_generation_start(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    started_in_think: bool,
+) {
+    set_generation_route(route);
+    production_route_adapter(route).emit_start_with(output, id, started_in_think);
+}
+
+/// Emit a production route's exact staged done payload.
+pub fn emit_generation_done(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    pending: &serde_json::Value,
+) {
+    production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
+}
+
+/// Emit a production route's claimed error terminal.
+pub fn emit_generation_error(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    production_route_adapter(route).emit_error(
+        output,
+        id,
+        active_attempt_id(),
+        message,
+        class,
+        retryable,
+        rolled_back,
+    );
+}
+
+/// Emit a production route's claimed cancellation terminal.
+pub fn emit_generation_cancel(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    completion_tokens: usize,
+) {
+    production_route_adapter(route).emit_cancel(output, id, active_attempt_id(), completion_tokens);
+}
+
+/// Route an error through the selected production adapter when a specialised
+/// producer only has the active generation context available.
+pub fn emit_active_route_error(
+    output: &mut dyn Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_error(route, output, id, message, class, retryable, rolled_back);
+    } else {
+        let mut buffer = Vec::new();
+        hipfire_engine::emit::emit_active_attempt_error(
+            &mut buffer,
+            id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+        );
+        let _ = output.write_all(&buffer);
+    }
+}
+
+/// Emit a done through the active production route adapter.
+pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_json::Value) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_done(route, output, id, pending);
+    } else {
+        let mut buffer = Vec::new();
+        emit_staged_terminal_done(&mut buffer, pending);
+        let _ = output.write_all(&buffer);
+    }
+}
+
+/// Emit a cancellation through the active production route adapter.
+pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tokens: usize) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_cancel(route, output, id, completion_tokens);
+    } else {
+        let mut buffer = Vec::new();
+        emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+        let _ = output.write_all(&buffer);
     }
 }
 
@@ -1153,6 +1788,7 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
@@ -1617,6 +2253,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_cohere2moe(
                 m,
                 gpu,
@@ -1643,6 +2280,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_cohere2moe(
                 m,
                 gpu,
@@ -1695,6 +2333,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_minimax(
                 m,
                 gpu,
@@ -1721,6 +2360,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_minimax(
                 m,
                 gpu,
@@ -1907,8 +2547,7 @@ pub fn generate(
     // budget+beta+safety regardless of conversation length, so reset never
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}",
@@ -1926,61 +2565,20 @@ pub fn generate(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset — this AR
-        // path is reachable by a DFlash-capable model (temp>0 / budgeted-think /
-        // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
-        if let Some(s) = m.speculator.as_mut() {
-            if let Err(e) = s.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-        }
-        // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
-        // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Use the canonical reset so newly added recurrent buffers (notably the
-        // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            if let Err(e) = b.dn_state.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
-        }) {
-            b.kv.compact_offset = 0;
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
+        let epilogue = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        if !epilogue.rolled_back {
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "context reset failed before starting the next turn",
+                "gpu",
+                true,
+                &epilogue,
+            );
+            return;
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
@@ -2730,12 +3328,10 @@ pub fn generate(
             match resumed {
                 Some(tail) => tail,
                 None => {
-                    // No usable checkpoint — full cold reset. DeltaNet recurrent
-                    // state is non-reversible; treat as a miss. Inlined (not
-                    // `full_reset_cold`) because a `&tokenizer` borrow of `m` is
-                    // live here; these are disjoint field accesses. qwen35 state
-                    // lives in the bundle (ModelState::Qwen35), not the always-None
-                    // m.dn_state/m.kv_cache.
+                    // No usable checkpoint — full cold reset. DeltaNet
+                    // recurrent state is non-reversible; treat as a miss.
+                    // Keep the reset operations field-disjoint because
+                    // `tokenizer` is borrowed above.
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
@@ -2743,24 +3339,7 @@ pub fn generate(
                         (s.as_mut() as &mut dyn Any)
                             .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
                     }) {
-                        let dn = &b.dn_state;
-                        for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_ef_residual {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                    }
-                    if let Some(b) = m.state.as_mut().and_then(|s| {
-                        (s.as_mut() as &mut dyn Any)
-                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                    }) {
+                        let _ = qwen_ar_reset_recurrent(&mut b.dn_state, gpu);
                         b.kv_cache.compact_offset = 0;
                     }
                     if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -2820,28 +3399,13 @@ pub fn generate(
             }
         }
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here.
+        // the always-None m.dn_state/m.kv_cache. Use the canonical reset
+        // method while keeping the `tokenizer` borrow and bundle access
+        // field-disjoint.
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
         }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
+            let _ = qwen_ar_reset_recurrent(&mut b.dn_state, gpu);
             b.kv_cache.compact_offset = 0;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -2942,8 +3506,7 @@ pub fn generate(
     let prefill_tokens = new_tokens.len();
     // Pure arch→contract selection (same function tests exercise).
     // Qwen AR (5/6) advertises v2; DS4 and others stay unset.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, started_in_think, gen_contract);
+    emit_generation_start(selected_route, stdout, id, started_in_think);
     let t0 = Instant::now();
 
     if hipfire_loader::carrier_for(m.arch_id)
@@ -2964,37 +3527,6 @@ pub fn generate(
         let scratch = &b.scratch;
         let kv = &mut b.kv_cache;
         let dn = &mut b.dn_state;
-        // Cold-reset after uncommitted AR prefill/decode failure. Mirrors
-        // multi-GPU `reset_pp_uncommitted_state!` and the prefill-abort path:
-        // DN is non-reversible, so partial forward must not poison the next
-        // turn. Adaptive poison stays sticky (`clear_adaptive_poison: false`).
-        macro_rules! reset_ar_uncommitted_state {
-            () => {{
-                debug_assert!(qwen_ar_forward_fail_action().reset_uncommitted_state);
-                debug_assert!(!qwen_ar_forward_fail_action().clear_adaptive_poison);
-                for s in &dn.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_ef_residual {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                kv.compact_offset = 0;
-                if let Some(ad) = m.kv_adaptive.as_mut() {
-                    if !ad.is_poisoned() {
-                        ad.reset_with_cache(gpu, kv);
-                    }
-                }
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-                crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
-            }};
-        }
 
         // Prefill this turn's tokens via the batched prefill entry point.
         // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
@@ -3066,16 +3598,31 @@ pub fn generate(
                     qwen35::PREFILL_MAX_BATCH,
                 ) {
                     let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        m.kv_adaptive.as_mut(),
+                        m.eviction.as_ref(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk_len;
@@ -3099,18 +3646,35 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            reset_ar_uncommitted_state!();
-                            crate::dense::emit_active_attempt_error(
+                            let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
+                            debug_assert!(!action.emit_failed_token);
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                Some(ad),
+                                m.eviction.as_ref(),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
-                                &format!(
-                                    "adaptive KV transition failed during eviction prefill: {e}"
+                                &qwen_ar_forward_fail_message(
+                                    "adaptive KV transition failed during eviction prefill",
+                                    e,
                                 ),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3148,16 +3712,31 @@ pub fn generate(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
                 ) {
                     let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        m.kv_adaptive.as_mut(),
+                        m.eviction.as_ref(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk.len();
@@ -3183,16 +3762,35 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            // maybe_downshift already poisons on partial failure; surface hard.
-                            crate::dense::emit_active_attempt_error(
+                            let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
+                            debug_assert!(!action.emit_failed_token);
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                Some(ad),
+                                m.eviction.as_ref(),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
-                                &format!("adaptive KV transition failed during prefill: {e}"),
+                                &qwen_ar_forward_fail_message(
+                                    "adaptive KV transition failed during prefill",
+                                    e,
+                                ),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3241,15 +3839,35 @@ pub fn generate(
                         "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — poisoning model",
                         m.seq_pos, e
                     );
-                    crate::dense::emit_active_attempt_error(
+                    let action = qwen_ar_forward_fail_action();
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        Some(ad),
+                        m.eviction.as_ref(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
                         stdout,
                         Some(id),
-                        &format!("adaptive KV transition failed after prefill: {e}"),
+                        &qwen_ar_forward_fail_message(
+                            "adaptive KV transition failed after prefill",
+                            e,
+                        ),
                         "transient",
                         true,
-                        false,
+                        &ep,
                     );
-                    let _ = stdout.flush();
                     return;
                 }
             }
@@ -3546,17 +4164,31 @@ pub fn generate(
                 gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
             ) {
                 let action = qwen_ar_forward_fail_action();
+                debug_assert!(action.reset_uncommitted_state);
+                debug_assert!(action.emit_request_error);
                 debug_assert!(!action.emit_failed_token);
-                if action.reset_uncommitted_state {
-                    reset_ar_uncommitted_state!();
-                }
-                if action.emit_request_error {
-                    write_error(
-                        stdout,
-                        id,
-                        &qwen_ar_forward_fail_message("forward_scratch decode", e),
-                    );
-                }
+                debug_assert!(!action.clear_adaptive_poison);
+                let ep = qwen_ar_reset_live(
+                    dn,
+                    kv,
+                    m.kv_adaptive.as_mut(),
+                    m.eviction.as_ref(),
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    m.speculator.as_deref_mut(),
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &qwen_ar_forward_fail_message("forward_scratch decode", e),
+                    "gpu",
+                    true,
+                    &ep,
+                );
                 return;
             }
             generated += 1;
@@ -3634,15 +4266,35 @@ pub fn generate(
                             "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — poisoning model",
                             m.seq_pos, e
                         );
-                        crate::dense::emit_active_attempt_error(
+                        let action = qwen_ar_forward_fail_action();
+                        debug_assert!(action.reset_uncommitted_state);
+                        debug_assert!(action.emit_request_error);
+                        debug_assert!(!action.emit_failed_token);
+                        debug_assert!(!action.clear_adaptive_poison);
+                        let ep = qwen_ar_reset_live(
+                            dn,
+                            kv,
+                            Some(ad),
+                            m.eviction.as_ref(),
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                            m.speculator.as_deref_mut(),
+                        );
+                        crate::common::emit_fail_closed_error(
                             stdout,
                             Some(id),
-                            &format!("adaptive KV transition failed during decode: {e}"),
+                            &qwen_ar_forward_fail_message(
+                                "adaptive KV transition failed during decode",
+                                e,
+                            ),
                             "transient",
                             true,
-                            false,
+                            &ep,
                         );
-                        let _ = stdout.flush();
                         return;
                     }
                 }
@@ -3763,17 +4415,31 @@ pub fn generate(
                             gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
                         ) {
                             let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
                             debug_assert!(!action.emit_failed_token);
-                            if action.reset_uncommitted_state {
-                                reset_ar_uncommitted_state!();
-                            }
-                            if action.emit_request_error {
-                                write_error(
-                                    stdout,
-                                    id,
-                                    &qwen_ar_forward_fail_message("forward_scratch think_close", e),
-                                );
-                            }
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                m.kv_adaptive.as_mut(),
+                                m.eviction.as_ref(),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
+                                stdout,
+                                Some(id),
+                                &qwen_ar_forward_fail_message("forward_scratch think_close", e),
+                                "gpu",
+                                true,
+                                &ep,
+                            );
                             return;
                         }
                         // Keep the grammar matcher in sync over force-closed tokens,
@@ -3958,20 +4624,31 @@ pub fn generate(
                             gpu, weights, config, tok, m.seq_pos, kv, dn, scratch,
                         ) {
                             let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
                             debug_assert!(!action.emit_failed_token);
-                            if action.reset_uncommitted_state {
-                                reset_ar_uncommitted_state!();
-                            }
-                            if action.emit_request_error {
-                                write_error(
-                                    stdout,
-                                    id,
-                                    &qwen_ar_forward_fail_message(
-                                        "forward_scratch budget_alert",
-                                        e,
-                                    ),
-                                );
-                            }
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                m.kv_adaptive.as_mut(),
+                                m.eviction.as_ref(),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
+                                stdout,
+                                Some(id),
+                                &qwen_ar_forward_fail_message("forward_scratch budget_alert", e),
+                                "gpu",
+                                true,
+                                &ep,
+                            );
                             return;
                         }
                         let prev_fed = bytes_fed_to_filter;
@@ -4122,16 +4799,31 @@ pub fn generate(
                     qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
                 {
                     let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_scratch trailer", e),
-                        );
-                    }
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        m.kv_adaptive.as_mut(),
+                        m.eviction.as_ref(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_scratch trailer", e),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
                     return;
                 }
                 // Producer-owned hidden commit: physical raw mutation + bookkeeping
@@ -4309,7 +5001,7 @@ pub fn generate(
             );
         }
 
-        emit_staged_terminal_done(stdout, &pending_done);
+        emit_generation_done(selected_route, stdout, id, &pending_done);
     } else {
         // LLaMA path -- multi-turn aware
         let has_eviction = m.eviction.is_some();
@@ -4527,7 +5219,9 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => {
+                emit_generation_done(selected_route, stdout, id, &pending_done)
+            }
             ClientTerminalDecision::Abort => {
                 // Bring-up AR path has no full production rollback attestation;
                 // suppress success done on cancel/disconnect (fail-closed).
@@ -4598,7 +5292,7 @@ pub fn emit_qwen_ar_done(
         cached_tokens,
         pflash_fragment_json,
     );
-    emit_staged_terminal_done(stdout, &envelope);
+    emit_active_route_done(stdout, id, &envelope);
 }
 
 pub fn model_retry_reset_eligible(arch_id: u32) -> bool {
