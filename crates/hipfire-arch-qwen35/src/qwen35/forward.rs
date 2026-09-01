@@ -3328,6 +3328,14 @@ fn triattn_tap(
     Ok(())
 }
 
+fn qwen35_fa_epilogue_route_supported(
+    is_gfx1201: bool,
+    q8_route: bool,
+    asym3_route: bool,
+) -> bool {
+    q8_route || (!is_gfx1201 && asym3_route)
+}
+
 /// KV cache write + attention dispatch. Inline from original.
 pub(crate) fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
@@ -3350,7 +3358,10 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let asym3_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteAsym3
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
-    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && (q8_route || asym3_route);
+    let fused_epilogue_route =
+        qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
+    let fused_epilogue =
+        qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -5553,13 +5564,22 @@ fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
 }
 /// Exact gfx1201 admission gate for the ported Qwen3.5 decode state fusions
 /// (gated-norm/MQ rotation, full-attention prep, gated MQ-rotate FA epilogue).
-/// Mirrors the gfx1151 seam: separate from broad capability checks so no
-/// neighboring architecture can inherit the gfx1201 schedules. The callers'
-/// shape checks bound admission to the official Ornith-1.5-35B-A3B MQV2R
-/// shape (hidden=2048, DeltaNet 32x128, full attention 16Q/2K, head_dim=256,
-/// n_rot=64, Q8 KV, decode T=1).
+/// Keep architecture and model-shape checks separate from broad capability
+/// checks so no neighboring GPU or lookalike Qwen configuration inherits the
+/// gfx1201 schedules.
 fn gfx1201_state_fusions_enabled(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx1201()
+}
+
+fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
+    config.dim == 2_048
+        && config.n_heads == 16
+        && config.n_kv_heads == 2
+        && config.head_dim == 256
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 32
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
 }
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and
@@ -5675,10 +5695,11 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     });
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu)
-        || gfx1201_state_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        || (gfx1201_state_fusions_enabled(gpu)
+            && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -5704,10 +5725,11 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
             != Some("0")
     });
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu)
-        || gfx1201_state_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        || (gfx1201_state_fusions_enabled(gpu)
+            && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -6030,6 +6052,13 @@ mod tests {
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
+    }
+
+    #[test]
+    fn gfx1201_fa_epilogue_is_q8_only() {
+        assert!(qwen35_fa_epilogue_route_supported(true, true, false));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, true));
+        assert!(qwen35_fa_epilogue_route_supported(false, false, true));
     }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
