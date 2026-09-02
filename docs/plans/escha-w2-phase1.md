@@ -583,9 +583,11 @@ git commit -m "feat(escha): H128 transforms and scale folding in the CPU referen
 
 ---
 
-### Task 3: `escha_ref` linear, SwiGLU and MoE block
+### Task 3: `escha_ref` expert linear, SwiGLU and w8a16
 
-Completes the oracle. `expert_linear` is what Task 7's GPU decode is gated against; `moe_block` is what Task 9's wiring is gated against.
+Completes the oracle. `expert_linear` is what Task 7's GPU decode is gated against, and `swiglu`/`w8a16` pin the two rounding points the Task 10 wiring must reproduce.
+
+No `moe_block` port is needed: Task 10's G4 gate compares hipfire directly against Escha's shipped `moeblk_out.f16` golden, so a Rust reimplementation of the block would add a second thing to keep in sync without gating anything.
 
 **Files:**
 - Modify: `crates/hipfire-quantize/src/escha_ref.rs`
