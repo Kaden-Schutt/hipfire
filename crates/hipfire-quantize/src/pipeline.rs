@@ -3038,6 +3038,20 @@ fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
         run_qwen3_dspark(args);
         return true;
     }
+    // ── escha: EschaLabs Escha-W2 trellis checkpoint -> .hfq ────────────────
+    // Input is the safetensors DIRECTORY (config.json + shards). Dispatches
+    // on quant_method inside config.json's quantization_config (escha =
+    // dense, arch 5; eschamoe = MoE, arch 6) — see pipeline_escha.rs.
+    //   hipfire-quantize --format escha --input <escha-dir> --output <out.hfq>
+    if format == "escha" || format == "escha-w2" || format == "eschamoe" {
+        if let Err(e) =
+            crate::pipeline_escha::convert_escha(Path::new(input_dir), Path::new(output_path))
+        {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return true;
+    }
     false
 }
 
