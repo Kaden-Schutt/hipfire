@@ -248,6 +248,13 @@ pub fn cba_decode(state: u16) -> u16 {
 }
 
 /// The 8 states lane `lane` owns, K=2. `words` is the tile's 16 u32.
+///
+/// DELIBERATE DUPLICATION: `kernels/src/escha_decode_tiles.hip` implements
+/// this same lane maths independently. That is the G2 gate — the GPU decode
+/// is asserted bit-exact against this one. Generating either from the other,
+/// or sharing a source, would make G2 circular: both paths could be wrong in
+/// exactly the same way and still agree. Two independent implementations of
+/// a published spec is the point. Do not deduplicate.
 pub fn decode8_k2(words: &[u32; 16], lane: usize) -> [u16; 8] {
     let t_off = lane * 8;
     let i1 = t_off >> 4;
@@ -1523,6 +1530,11 @@ Create `kernels/src/escha_decode_tiles.hip`:
 //
 // Escha's tile grid is in-major [in/16, out/16]; hipfire stores weights
 // out-major [out, in]. This kernel transposes on the way out.
+//
+// DELIBERATE DUPLICATION: hipfire-quantize/src/escha_ref.rs implements this
+// same lane maths in Rust. That is the G2 gate — this kernel is asserted
+// bit-exact against it. Generating either from the other would make G2
+// circular. Do not deduplicate.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -1947,83 +1959,146 @@ git commit -m "feat(escha): H128 input/output transform kernels, gated against t
 
 ### Task 9: Verify the arch-6 router contract (G4b)
 
-Done before wiring, because if the router disagrees the wiring is built on sand. The spec assumed arch-6's router is reusable; this proves or disproves it.
+Done before wiring, because if the router disagrees the wiring is built on
+sand. The spec assumed arch-6's router is reusable; this exercises the real
+router and proves or disproves it.
 
 **Files:**
-- Test: `crates/hipfire-arch-qwen35/examples/escha_router_contract.rs` (new)
+- Create: `crates/hipfire-arch-qwen35/examples/escha_router_contract.rs`
+- Possibly modify: the arch-6 router path (only if Step 4 shows a mismatch)
 
 **Interfaces:**
-- Consumes: `escha_ref` (for the f16 rounding helper)
+- Consumes: the `.hfq` from Task 6 (for `layers.0.mlp.gate.weight`), the golden
+  fixture from `crates/hipfire-quantize/tests/data/escha/`
+- Produces: a passing G4b assertion, or a fix to the router
 
-- [ ] **Step 1: Write the contract test**
+- [ ] **Step 1: Fetch the fixture**
+
+```bash
+crates/hipfire-quantize/tests/data/escha/fetch-goldens.sh
+```
+
+Expected: eight files. `moeblk_ids.i64` must have digest
+`0781eecdacd5fbfe30887f6d1f6af5d5ca001d32253da8bb3e1294230c2ed649`.
+
+- [ ] **Step 2: Write the failing test**
+
+This calls hipfire's **actual** arch-6 router — not a reimplementation of it —
+and asserts against Escha's shipped selection.
 
 Create `crates/hipfire-arch-qwen35/examples/escha_router_contract.rs`:
 
 ```rust
-//! G4b: escha rounds router logits to f16 BEFORE top-k. Selecting on
-//! unrounded f32 logits is a different function, and the rounding
-//! manufactures exact ties that f32 never produces — one occurs in an
-//! 8-token fixture. This example asserts hipfire's arch-6 router agrees.
-use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
+//! G4b: hipfire's arch-6 router must select the same experts Escha does.
+//!
+//! Escha rounds router logits to f16 BEFORE top-k (`ref.py`: the logits are
+//! computed as f16 then widened to f32 to select). Selecting on unrounded f32
+//! logits is a different function, and the rounding manufactures exact ties
+//! that f32 never produces.
+//!
+//! Asserts the SET, not the order: the combine is a sum over slots, so intra-k
+//! order cannot change the output. On the fixture, token 3 has two experts on
+//! identical f16 logits (1.80078), and which one lands in which slot is
+//! implementation-defined.
+//!
+//! Run:
+//!   cargo run --release -p hipfire-arch-qwen35 \
+//!     --example escha_router_contract -- /data/hipfire-models/escha-35b.hfq
+use std::collections::HashSet;
+use std::path::PathBuf;
 
-/// Reference selection, mirroring ref.py: f16(x @ gate_w.T) -> f32 -> top-k.
-fn reference_topk(logits_f32: &[f32], k: usize) -> Vec<usize> {
-    let rounded: Vec<f32> = logits_f32.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
-    let mut idx: Vec<usize> = (0..rounded.len()).collect();
-    idx.sort_by(|&a, &b| {
-        rounded[b].partial_cmp(&rounded[a]).unwrap().then(a.cmp(&b))
-    });
-    idx.truncate(k);
-    idx
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../hipfire-quantize/tests/data/escha")
+        .join(name)
+}
+
+fn read_f16_as_f32(name: &str) -> Vec<f32> {
+    let raw = std::fs::read(fixture(name)).expect("run fetch-goldens.sh first");
+    raw.chunks_exact(2)
+        .map(|c| hipfire_quantize::float16::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
 }
 
 fn main() {
-    // Two experts land on the same f16 value: 1.80078 is exactly representable
-    // and both 1.8007 and 1.8008 round to it.
-    let raw = vec![2.28516f32, 2.13086, 1.80070, 1.80085, 1.50000];
-    let sel = reference_topk(&raw, 4);
-    let r: Vec<f32> = raw.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
-    assert_eq!(r[2], r[3], "expected an exact f16 tie; fixture is stale");
-    println!("f16-rounded logits: {r:?}");
-    println!("reference top-4   : {sel:?}");
+    let hfq = std::env::args().nth(1).expect("usage: <model.hfq>");
+    let x = read_f16_as_f32("moeblk_x.f16"); // [8, 2048]
+    let raw_ids = std::fs::read(fixture("moeblk_ids.i64")).unwrap();
+    let want_ids: Vec<i64> = raw_ids
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect(); // [8, 8]
 
-    // A tie INSIDE k is harmless: the combine is a sum over slots, so order
-    // does not change the output. A tie AT the k boundary changes the set.
-    let boundary = reference_topk(&raw, 3);
-    println!("top-3 (tie at the boundary): {boundary:?}");
-    println!(
-        "NOTE: which of index 2/3 wins here is implementation-defined; \
-         hipfire and escha-ref may legitimately differ on such a token."
+    // Call hipfire's real router for layer 0 on each token.
+    let got = hipfire_arch_qwen35::escha_router_topk_for_test(&hfq, 0, &x, 8, 2048, 8)
+        .expect("router");
+
+    let mut bad = 0usize;
+    for t in 0..8 {
+        let want: HashSet<i64> = want_ids[t * 8..(t + 1) * 8].iter().copied().collect();
+        let mine: HashSet<i64> = got[t * 8..(t + 1) * 8].iter().map(|&v| v as i64).collect();
+        if want != mine {
+            bad += 1;
+            println!("token {t}: escha={:?}", &want_ids[t * 8..(t + 1) * 8]);
+            println!("         hipfire={:?}", &got[t * 8..(t + 1) * 8]);
+        }
+    }
+    println!("tokens with a differing top-8 SET: {bad}/8");
+    assert_eq!(
+        bad, 0,
+        "arch-6 router selects different experts than escha. Most likely cause: \
+         it is not rounding logits to f16 before top-k."
     );
-    println!("G4b reference behaviour recorded");
+    println!("G4b PASS");
 }
 ```
 
-- [ ] **Step 2: Run it**
+- [ ] **Step 3: Run it and confirm it fails**
 
 ```bash
-cargo run --release -p hipfire-arch-qwen35 --example escha_router_contract 2>&1 | tail -10
+cargo run --release -p hipfire-arch-qwen35 --example escha_router_contract \
+  -- /data/hipfire-models/escha-35b.hfq 2>&1 | tail -15
 ```
 
-Expected: prints the rounded logits with indices 2 and 3 equal, and the two selections. Assertion passes.
+Expected: compile error — `escha_router_topk_for_test` does not exist yet.
 
-- [ ] **Step 3: Inspect hipfire's router for the f16 rounding**
+- [ ] **Step 4: Expose the router and run the gate**
+
+Read the arch-6 router path first:
 
 ```bash
-grep -rn "fn.*moe_topk\|softmax\|norm_topk_prob" crates/hipfire-arch-qwen35/src/ | head -20
-grep -rn "moe_topk\|router" kernels/src/*.hip | head -10
+grep -rn "moe_topk\|router\|norm_topk_prob" crates/hipfire-arch-qwen35/src/ | head -20
+grep -rn "moe_topk" kernels/src/*.hip | head
 ```
 
-Read the router kernel. Answer one question and write the answer into the commit message: **does it round logits to f16 before selecting?**
+Add a thin `pub fn escha_router_topk_for_test(hfq_path: &str, layer: usize, x: &[f32], n_tokens: usize, hidden: usize, top_k: usize) -> Result<Vec<u32>, String>` that loads `layers.{layer}.mlp.gate.weight` from the `.hfq` and runs **the production router path** — not a reimplementation. If that path is not callable in isolation, extract the selection step into a function both it and this helper call, and leave the production behaviour unchanged.
 
-- If yes: no change needed. Record it.
-- If no: add the rounding on the escha path only, gated on the model's quant types, so existing `qwen3.6:35b-a3b-*` SKUs keep their current behaviour bit-for-bit.
-
-- [ ] **Step 4: Commit**
+Then run the gate:
 
 ```bash
-git add crates/hipfire-arch-qwen35/examples/escha_router_contract.rs
-git commit -m "test(escha): pin the router f16-rounding contract and tie semantics"
+cargo run --release -p hipfire-arch-qwen35 --example escha_router_contract \
+  -- /data/hipfire-models/escha-35b.hfq 2>&1 | tail -15
+```
+
+- **If it passes:** the router already matches. Record that in the commit message and change nothing.
+- **If it fails:** check whether the router rounds logits to f16 before top-k. If it does not, add the rounding **on the escha path only**, keyed on the model carrying `ESCHA2T16`/`ESCHA3T16` experts, so existing `qwen3.6:35b-a3b-*` SKUs keep their current selection bit-for-bit. Re-run until `G4b PASS`.
+
+- [ ] **Step 5: Confirm no existing SKU changed**
+
+Only required if Step 4 modified the router.
+
+```bash
+cargo test -p hipfire-arch-qwen35 2>&1 | tail -15
+cargo test -p hipfire-dispatch-tests qwen35 2>&1 | tail -10
+```
+
+Expected: all pass, unchanged.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/hipfire-arch-qwen35
+git commit -m "test(escha): G4b — arch-6 router selects the same experts as escha"
 ```
 
 ---
