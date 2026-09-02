@@ -111,6 +111,9 @@ pub enum RotationPlan {
     FwhtG128,
     Mq8Internal,
     Givens,
+    /// Escha-W2: unnormalised 128-point Walsh-Hadamard on BOTH sides,
+    /// RS = 1/sqrt(128), signs folded into rin/rout rather than seeded.
+    EschaH128,
 }
 
 /// Sign-domain plan for a dtype. `None` <=> no activation rotation required.
@@ -137,6 +140,12 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // whoever adds the next Lloyd variant should be forced to decide which
         // side of this line it belongs on.
         MQ2G256LloydU => RotationPlan::None,
+        // Escha-W2: rotated-domain weights, 128-point Hadamard on both sides.
+        // Stated explicitly rather than left to the `_` fallthrough below —
+        // reaching RotationPlan::None here would skip the H128 pair and feed
+        // an unrotated activation through a rotated-domain weight, which is
+        // silent, fluent-looking garbage rather than a crash.
+        Escha2T16 | Escha3T16 => RotationPlan::EschaH128,
         _ => RotationPlan::None,
     }
 }
@@ -155,6 +164,15 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
             GemvVariant::Prerotated
         }
+        // Escha-W2: stated explicitly rather than left to the `_` fallthrough.
+        // No GEMV kernel exists yet, so this value is never actually launched —
+        // `for_gemv(_, Plain)` has no arm for these types (always Err), and
+        // `prepare_rotation_scratch` errors on `RotationPlan::EschaH128` before
+        // any rotate kernel runs, so the end-to-end path is Err regardless of
+        // what is returned here. Kept as `Plain` (the same value the `_` arm
+        // would produce) purely so a future reader sees this dtype was
+        // considered, not missed.
+        Escha2T16 | Escha3T16 => GemvVariant::Plain,
         _ => GemvVariant::Plain,
     }
 }
@@ -881,6 +899,16 @@ impl KernelKey {
             // inherits the identical arch gating.
             MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            // Escha-W2: no GEMV kernel exists yet (Task 4 registers the ids/rotation
+            // plan only; the HIP kernels are future work), so there is no real
+            // hardware requirement to encode. `Always` is a placeholder, not a claim
+            // that a kernel runs everywhere — it is inert today: `for_gemv` has no
+            // arm for these types (always Err) and `dtype_post_rotation_variant`
+            // never maps them to `Prerotated`, so neither call site in
+            // `pipeline/mod.rs` that guards on `dtype_arch_predicate(..).eval_arch()`
+            // can reach this value for Escha. Revisit when the Escha GEMV kernel
+            // lands and give it its real arch gate then.
+            Escha2T16 | Escha3T16 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

@@ -326,6 +326,16 @@ pub enum DType {
     /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
     /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
     MQ3G256V2,
+    /// Escha-W2 trellis, K=2, 16x16 tile, cbA hash codebook (hfq qt=42, 2.00 bpw).
+    /// Weights are stored in the ROTATED domain — a 128-point unnormalised
+    /// Walsh-Hadamard is applied to activations on BOTH sides of the matmul
+    /// (see `RotationPlan::EschaH128`). Reaching an unrotated Plain GEMV with
+    /// this dtype produces fluent-looking but silently wrong output, not a
+    /// crash — see `dtype_rotation_plan` / `KernelKey::for_gemv`.
+    Escha2T16,
+    /// Escha-W2 trellis, K=3, 16x16 tile, cbA hash codebook (hfq qt=43, 3.00 bpw).
+    /// Same rotated-domain contract as `Escha2T16`.
+    Escha3T16,
     /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
     /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
@@ -432,6 +442,8 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL
             | DType::MQ3G256GL
+            | DType::Escha2T16
+            | DType::Escha3T16
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::MFP4G32Lloyd

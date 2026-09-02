@@ -768,6 +768,10 @@ fn gemv_steps_rotation_matches_plan() {
                 assert!(!has_fwht && !has_givens, "{dtype:?}: no rotation");
             }
             RotationPlan::Mq8Internal => {}
+            // Not exercised by the fixed dtype list above (no Escha GEMV kernel
+            // exists yet to produce steps for) — present only so this exhaustive
+            // match keeps compiling once RotationPlan gained EschaH128.
+            RotationPlan::EschaH128 => {}
         }
     }
 }
