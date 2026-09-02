@@ -929,13 +929,16 @@ impl KernelKey {
     }
 
     /// Pipeline steps required for a given (DType, GemvVariant) pair.
-    pub fn gemv_steps(dtype: DType, variant: GemvVariant) -> &'static [PipelineOp] {
+    pub fn gemv_steps(
+        dtype: DType,
+        variant: GemvVariant,
+    ) -> Result<&'static [PipelineOp], DispatchError> {
         use DType::*;
         use GemvVariant::*;
         match variant {
             Plain => match dtype_rotation_plan(dtype) {
-                RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
-                RotationPlan::None => &[PipelineOp::Gemv],
+                RotationPlan::Givens => Ok(&[PipelineOp::GivensRotate, PipelineOp::Gemv]),
+                RotationPlan::None => Ok(&[PipelineOp::Gemv]),
                 // Escha-W2: stated explicitly rather than left to the `_`
                 // catch-all below, which would mislabel the 128-point
                 // Hadamard as a `RotateFwht` step — a plausible-looking step
@@ -943,23 +946,21 @@ impl KernelKey {
                 // reaches this today: `for_gemv(_, Plain)` already returns
                 // Err for Escha2T16/Escha3T16 (see
                 // `escha_types_never_resolve_to_plain`), so this arm is dead
-                // code, not a load-bearing runtime path. Panic instead of
-                // guessing a step list, exactly as `kv_tier::k_bytes_per_pos`
-                // panics for its undefined cases — replace this panic with
-                // the real `[EschaRotate, Gemv]`-shaped step list when the
-                // H128 rotate/GEMV kernels land.
-                RotationPlan::EschaH128 => panic!(
-                    "gemv_steps(Plain, {dtype:?}): no step list exists for \
-                     RotationPlan::EschaH128 — the Escha-W2 rotate/GEMV \
-                     kernels are not implemented yet. This path must be \
-                     unreachable (for_gemv already rejects Plain for Escha \
-                     dtypes); if you hit this panic, something upstream \
-                     started calling gemv_steps for Escha before the kernel \
-                     landed. Replace this panic with the real step list then."
-                ),
-                _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
+                // code, not a load-bearing runtime path. Return an explicit
+                // error instead of guessing a step list (or panicking) —
+                // callers already handle `for_gemv`'s Err the same way via
+                // `let Ok(..) else { continue }`. Replace with the real
+                // `[EschaRotate, Gemv]`-shaped step list when the H128
+                // rotate/GEMV kernels land.
+                RotationPlan::EschaH128 => Err(DispatchError::UnsupportedVariant {
+                    family: "gemv",
+                    variant: "Plain",
+                    arch: "",
+                    quant: "escha-w2 (no GEMV kernel exists yet)",
+                }),
+                _ => Ok(&[PipelineOp::RotateFwht, PipelineOp::Gemv]),
             },
-            Prerotated => &[PipelineOp::Gemv],
+            Prerotated => Ok(&[PipelineOp::Gemv]),
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
@@ -970,7 +971,7 @@ impl KernelKey {
                     ],
                     _ => &[PipelineOp::Gemv, PipelineOp::ResidualAdd],
                 };
-                steps
+                Ok(steps)
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
@@ -984,7 +985,7 @@ impl KernelKey {
                         PipelineOp::ResidualAdd,
                     ],
                 };
-                steps
+                Ok(steps)
             }
         }
     }

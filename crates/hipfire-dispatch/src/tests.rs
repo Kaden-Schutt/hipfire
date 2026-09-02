@@ -798,7 +798,7 @@ fn gemv_steps_rotation_matches_plan() {
         DType::ParoQ4G128,
         DType::HFQ4G256,
     ] {
-        let steps = KernelKey::gemv_steps(dtype, GemvVariant::Plain);
+        let steps = KernelKey::gemv_steps(dtype, GemvVariant::Plain).unwrap();
         let plan = dtype_rotation_plan(dtype);
         let has_fwht = steps.contains(&PipelineOp::RotateFwht);
         let has_givens = steps.contains(&PipelineOp::GivensRotate);
@@ -825,6 +825,40 @@ fn gemv_steps_rotation_matches_plan() {
             RotationPlan::EschaH128 => {}
         }
     }
+}
+
+/// `gemv_steps(Plain, _)` must reject Escha-W2 dtypes with an explicit `Err`
+/// (no H128 rotate/GEMV kernel exists yet — see the `RotationPlan::EschaH128`
+/// arm), while every existing dtype keeps resolving to `Ok` exactly as
+/// before this function was converted from a panicking `&'static [_]` return
+/// to a `Result`.
+#[test]
+fn gemv_steps_rejects_escha_and_keeps_existing_dtypes_ok() {
+    for dtype in [DType::Escha2T16, DType::Escha3T16] {
+        assert!(
+            KernelKey::gemv_steps(dtype, GemvVariant::Plain).is_err(),
+            "{dtype:?}: gemv_steps(Plain) should be Err — no Escha GEMV kernel exists yet"
+        );
+    }
+
+    // MQ4G256: rotated dtype (RotationPlan::FwhtG256), exercises the `_`
+    // catch-all arm — must still succeed with the RotateFwht+Gemv steps.
+    let rotated = KernelKey::gemv_steps(DType::MQ4G256, GemvVariant::Plain)
+        .expect("MQ4G256 (rotated) must still resolve to Ok");
+    assert_eq!(
+        rotated,
+        &[PipelineOp::RotateFwht, PipelineOp::Gemv],
+        "MQ4G256 (rotated) must keep the same step list"
+    );
+
+    // F32: unrotated dtype (RotationPlan::None) — must still succeed.
+    let unrotated = KernelKey::gemv_steps(DType::F32, GemvVariant::Plain)
+        .expect("F32 (unrotated) must still resolve to Ok");
+    assert_eq!(
+        unrotated,
+        &[PipelineOp::Gemv],
+        "F32 (unrotated) must keep the same step list"
+    );
 }
 
 // ── GemvFamily::resolve via populated table ───────────────────────────────────
