@@ -91,19 +91,32 @@ surface:
   `[256,32,128,48]`). Everything else is int8 W8A16: attention projections,
   linear-attn `in_proj_qkv`/`in_proj_z`/`out_proj`, shared expert, embeddings,
   `lm_head`. No bias tensors anywhere.
-- **27B (`escha`)** — escha covers *every* projection, including the linear-attn
-  ones, and `gate_proj`/`up_proj` are **separate tensors carrying different K**:
+- **27B (`escha`)** — escha covers *every* projection: both attention families
+  and all three MLP legs, with `gate_proj`/`up_proj` as **separate tensors
+  carrying different K**:
 
-  | tensor | shape | in x out | K |
-  |---|---|---|---|
-  | `linear_attn.in_proj_qkv` | `[320, 640, 32]` | 5120 x 10240 | 2 |
-  | `linear_attn.in_proj_z` | `[320, 384, 32]` | 5120 x 6144 | 2 |
-  | `linear_attn.out_proj` | `[384, 320, 32]` | 6144 x 5120 | 2 |
-  | `mlp.gate_proj` | `[320, 1088, 32]` | 5120 x 17408 | 2 |
-  | `mlp.up_proj` | `[320, 1088, 48]` | 5120 x 17408 | 3 |
-  | `mlp.down_proj` | `[1088, 320, 48]` | 17408 x 5120 | 3 |
+  | tensor | layers | shape | in x out | K |
+  |---|---|---|---|---|
+  | `linear_attn.in_proj_qkv` | 48 | `[320, 640, 32]` | 5120 x 10240 | 2 |
+  | `linear_attn.in_proj_z` | 48 | `[320, 384, 32]` | 5120 x 6144 | 2 |
+  | `linear_attn.out_proj` | 48 | `[384, 320, 32]` | 6144 x 5120 | 2 |
+  | `self_attn.q_proj` | 16 | — | 5120 x 6144 | 2 |
+  | `self_attn.k_proj` | 16 | — | 5120 x 1024 | 2 |
+  | `self_attn.v_proj` | 16 | — | 5120 x 1024 | 2 |
+  | `self_attn.o_proj` | 16 | — | 6144 x 5120 | 2 |
+  | `mlp.gate_proj` | 64 | `[320, 1088, 32]` | 5120 x 17408 | 2 |
+  | `mlp.up_proj` | 64 | `[320, 1088, 48]` | 5120 x 17408 | 3 |
+  | `mlp.down_proj` | 64 | `[1088, 320, 48]` | 17408 x 5120 | 3 |
 
-  Only `in_proj_a`/`in_proj_b`, norms, embeddings and `lm_head` sit outside.
+  That is 10 distinct projections over 64 layers (48 linear-attention, 16 full
+  attention) — 400 escha tensors. **The full-attention layers are escha-coded
+  too**, which the linear-attention-only layer 0 does not reveal; sample a
+  layer 3 as well as a layer 0 when validating the converter. Consequence for
+  dispatch: the 27B needs the 3-way `FusedQkvQ8_0` path as well as the 4-way
+  `FusedQkvzaQ8_0` one.
+
+  Only `in_proj_a`/`in_proj_b` and the norms sit outside — but see §1.3 on what
+  `ignore` does and does not mean.
 
 ### 1.2 `rout` carries a per-expert channel prune mask
 
@@ -142,7 +155,7 @@ carried in `rout` rather than in a mask tensor. Consequences:
   each and are never used. Physically dropping them would shrink the model but
   would break the verbatim/`memcmp` property, so it is not done in this port.
 
-### 1.3 Three metadata traps
+### 1.3 Four metadata traps
 
 **`escha_config` has two lengths.** MoE exports ship `[9]`
 = `[16, K, 2, 1, E, in, out, in_p, out_p]`; dense exports ship `[6]`
@@ -159,6 +172,14 @@ itself across the two releases: the 35B records `down_proj` as
 consistent in both, and matches `escha_config[1]` and the code-tensor shapes.
 The converter keys off `K` and uses `bits` only as a cross-check it is allowed
 to fail.
+
+**`ignore` means "not escha-coded", not "not quantized".** Both models list
+`embed_tokens` and `lm_head` in `quantization_config.ignore`, and both ship them
+as `weight_int8` + `weight_scale` anyway (`int8_embedding: true`). A converter
+that reads `ignore` as "keep at source precision" will go looking for f16
+tensors that do not exist. Classify on the tensor suffix actually present, not
+on the ignore list. The 27B's list is shorter still (`in_proj_a`, `in_proj_b`,
+`lm_head`) because its norms simply never match.
 
 **The 27B carries biases the base model does not have.** Every escha linear in
 the dense export ships an F16 `bias` (`in_proj_qkv.bias [10240]`,
@@ -247,7 +268,7 @@ tensor in the safetensors index is classified; there is no default-skip branch.
 |---|---|
 | `*.escha_code` | `ESCHA2T16`/`ESCHA3T16` verbatim, K from `escha_config[1]` |
 | `*.escha_{rin,rout,s_in,s_out}` | folded to one f32 pair per projection |
-| `*.weight_int8` + `*.weight_scale` | `Q8_0` |
+| `*.weight_int8` + `*.weight_scale` | `Q8_0`, row scale replicated (§4.2.1) |
 | `*.bias` (27B only) | F16, new arch-5 bias slots |
 | norms, `A_log`, `conv1d`, `dt_bias`, `in_proj_a/b`, `mlp.gate`, `shared_expert_gate` | F16/F32, as today |
 | `mtp.*` (35B inline) / `mtp/` dir (27B) | existing `.mq4-mtp` trailer |
@@ -255,6 +276,22 @@ tensor in the safetensors index is classified; there is no default-skip branch.
 `escha_config` is read at both lengths (`[9]` MoE, `[6]` dense) and
 cross-checked against `quantization_config.layer_meta` rather than trusted —
 keying off `K`, with `bits` as a cross-check allowed to fail (§1.3).
+
+#### 4.2.1 The int8 repack is lossless only if done one specific way
+
+Escha's int8 is **per-output-row**: `w8 [O, K] int8` with `scale [O]` f16, and
+`ref.py::w8a16` dequantizes as `f16(w8 * scale)`. hipfire's `Q8_0` is
+**per-32-element block** (34 bytes per 32: 32 int8 plus one f16 scale).
+
+Do not recompute per-block scales from the dequantized values — that is a second
+quantization and adds avoidable error. Instead **replicate the row scale into
+every block of that row** and pass the int8 bytes through unchanged. The
+reconstruction is then bit-identical to Escha's, at a cost of 2 bytes per 32
+elements (6.25% overhead) for scales that are all equal within a row.
+
+Note also that a single logical tensor can straddle safetensors shards (the 27B's
+`mlp.up_proj` has its `escha_code` in shard 2 while its metadata sits in shard 1),
+so the converter resolves tensors through the index, never per-file.
 
 ### 4.3 Dispatch
 
@@ -347,7 +384,8 @@ have to be mixed-K, or stay split.
 
 ## 6. Constraints
 
-**No codebook LUT.** 65536 x f16 = 128 KB; gfx1151 has 64 KB LDS. Decode inline
+**No codebook LUT.** 65536 x f16 = 128 KB; gfx1151 has 64 KB LDS
+(`profiler.rs` records `lds_per_cu: 65536`). Decode inline
 instead — multiply, and, xor, two f16 unpacks, one f16 add. Five ops and no
 memory traffic, which is what makes Phase 2 plausible at all.
 
@@ -377,9 +415,23 @@ panic.
   self-inverse, so it passes while being wrong.
 - **G4** — single-expert `expert_linear` on GPU vs reference, then the full MoE
   block against `moeblk_out`.
-- **G5** — e2e coherence, then KLD against the escha-mlx reference on a fixed
-  wikitext slice. Not on the model's own output: for ds4 that scored 8x better
-  on the median and was optimistic.
+- **G5** — e2e coherence, then KLD on a fixed wikitext slice. Not on the model's
+  own output: for ds4 that scored 8x better on the median and was optimistic.
+
+  **The reference is `escha-ref` on CPU, not any Escha runtime.** None of
+  Escha's three runtimes can run on this box: `escha-mlx` is Metal / Apple
+  Silicon, the `escha` wheel is CUDA (sm_80–sm_120), and ZML requires an NVIDIA
+  driver. There is no cross-checking against their engine on gfx1151, and a gate
+  that cannot be executed proves nothing. This is not a downgrade: `ref.py`
+  declares itself "the semantic contract for every Metal kernel in this package"
+  and is itself gated on the goldens, so agreeing with `escha-ref` *is*
+  agreeing with their runtime — and it is exact rather than cross-machine.
+  Cost is CPU time; budget a few hundred positions, not thousands.
+
+  Run a second KLD against the **bf16 parent** (`Qwen/Qwen3.6-35B-A3B`) as well.
+  That one answers a different and independently useful question — whether
+  Escha's 2-bit delivers what they claim — and it is the number to compare
+  against the existing `qwen3.6:35b-a3b-mq2` measurement.
 - **G6** (Phase 2) — fused GEMV compared against the Phase 1 path at Q8
   precision, then KLD against `escha-ref`.
 
@@ -395,13 +447,26 @@ Refuse rather than guess:
 
 ## 9. Risks and expectations
 
-**Phase 1 perf will be bad, and that is the expected outcome.** ~35 GB resident
-for the 35B and roughly 3x the expert-path bandwidth of a native 2-bit build
-(MoE reads 8 of 256 experts per token, so per-token expert traffic goes from
-~0.34 GB to ~1 GB). It will lose to `qwen3.6:35b-a3b-mq2` on tok/s. The Phase 1
-deliverable is correctness plus a servable artifact; speed is Phase 2's job.
+**Phase 1 perf will be bad, and that is the expected outcome.** Worked through
+at `Q8_0`'s 34 bytes per 32 elements:
 
-**The 27B is not benchmarked before Phase 2.** At ~27 GB dense, re-read every
+| | 35B experts | 35B non-expert | 35B total |
+|---|---|---|---|
+| escha native | 9.4 GB | 2.3 GB | ~11.7 GB (published 12.3) |
+| Phase 1 `Q8_0` | 34.2 GB | 2.5 GB | **~36.7 GB** |
+
+MoE reads 8 of 256 experts per token, so per-token expert traffic goes from
+**0.29 GB to 1.07 GB — 3.6x**. It will lose to `qwen3.6:35b-a3b-mq2` on tok/s.
+The Phase 1 deliverable is correctness plus a servable artifact; speed is
+Phase 2's job. 36.7 GB is comfortable on 128 GB but is not free — check it
+against the standing heap baseline before assuming headroom.
+
+The same arithmetic applied to the 27B gives ~10 GB native against a published
+10.15 GB, and ~28 GB at `Q8_0`. That both reconstructions land within a few
+percent of the published sizes is independent confirmation that the format model
+in §1.1 is right — a wrong bpw or a missed tensor class would not close.
+
+**The 27B is not benchmarked before Phase 2.** At ~28 GB dense, re-read every
 token, a decode-at-load build is not worth timing. It still gets built and
 gated for correctness through G4 — that is how the dense code path, the
 different-K gate/up split and the new bias slots get exercised — but no
