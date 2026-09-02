@@ -265,11 +265,23 @@ byte-for-byte, `memcmp` as post-condition), and the kernels are mandatory.
 | Phase 2 GPU path | fused decode+GEMV; rotations unchanged |
 | model order | 35B-A3B first, 27B second |
 
-**Why ids 42/43.** On `origin/master` the enum tops out at `MFP2G32E8 = 37`.
-Ids 23/25/26/27 are documented do-not-reuse reservations. Ids 38/39 are claimed
-by the unmerged `feat/batched-attn-impl` (`MQ2G256GL`/`MQ3G256GL`) and 40/41 by
-the unmerged `nw_neutrino_fv5` (`FV5G256`/`FV5B256`). 42/43 is the next clear
-pair, taken the same way Neutrino skipped past 38/39.
+**Why ids 42/43.** The authoritative registry is
+`crates/hipfire-quantize/src/hfq.rs` — both the `#[repr(u8)] enum QuantType`
+and its `from_u8`, whose doc comment requires the two be kept in sync when a
+variant is added. Everything in the crate imports `crate::hfq::QuantType`.
+
+On `origin/master` the taken ids are **0–22, 24, 28–41, 44, 45, 47–51**, with
+23/25/26/27 documented do-not-reuse reservations. **42 and 43 are the lowest
+free pair**, and 46 and 52+ are also free.
+
+Note what is *already merged* here, because it contradicts what the branch
+survey suggests: 38/39 are `MQ2G256GL`/`MQ3G256GL` and **40/41 are
+`TQ2G128`/`BQ1G128`** — the Bonsai ternary/binary types. Anyone re-deriving
+this must read `hfq.rs` on master, not a `QuantType` enum in another checkout:
+the `loop/gfx1151` branch carries a stale partial copy that stops at
+`MFP2G32E8 = 37` and would suggest 38–41 are free. It also means the Neutrino
+plan's reservation of 40/41 for `FV5G256`/`FV5B256` is stale and needs
+renumbering independently of this port.
 
 **Why two types, not one.** `decode8_k2` reads a 16-word tile at a fixed 16-bit
 stride; `decode8_k3` walks 24 words at a computed bit offset with a modular
