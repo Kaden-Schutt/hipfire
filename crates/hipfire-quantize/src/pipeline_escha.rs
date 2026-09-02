@@ -153,7 +153,11 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                     passthrough.push(name.to_string())
                 }
                 _ => {
-                    let prefix = name.rsplit_once('.').unwrap().0.to_string();
+                    let prefix = name
+                        .rsplit_once('.')
+                        .ok_or_else(|| format!("{name}: escha leaf name has no '.' separator"))?
+                        .0
+                        .to_string();
                     by_proj
                         .entry(prefix)
                         .or_default()
@@ -186,8 +190,10 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
 
         // Fold the optional end-to-end scales into rin/rout — one f32 pair per
         // projection, per row when the tensor is E-stacked.
-        let (rin_m, rin_d) = find(&format!("{proj}.escha_rin")).unwrap();
-        let (rout_m, rout_d) = find(&format!("{proj}.escha_rout")).unwrap();
+        let (rin_m, rin_d) = find(&format!("{proj}.escha_rin"))
+            .ok_or_else(|| format!("{proj}: escha_rin vanished between passes"))?;
+        let (rout_m, rout_d) = find(&format!("{proj}.escha_rout"))
+            .ok_or_else(|| format!("{proj}: escha_rout vanished between passes"))?;
         let s_in = find(&format!("{proj}.escha_s_in")).map(|(_, d)| as_f32(d));
         let s_out = find(&format!("{proj}.escha_s_out")).map(|(_, d)| as_f32(d));
         let (ri, ro) = fold_scales(
@@ -224,8 +230,12 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             // Consumed alongside its weight_int8 sibling.
             Leaf::Int8Scale => continue,
             Leaf::Int8 => {
-                let prefix = name.rsplit_once('.').unwrap().0;
-                let (m, d) = find(name).unwrap();
+                let prefix = name
+                    .rsplit_once('.')
+                    .ok_or_else(|| format!("{name}: escha leaf name has no '.' separator"))?
+                    .0;
+                let (m, d) = find(name)
+                    .ok_or_else(|| format!("{name}: weight_int8 vanished between passes"))?;
                 let (_, sd) = find(&format!("{prefix}.weight_scale")).ok_or_else(|| {
                     format!("{name}: weight_int8 without a matching weight_scale")
                 })?;
@@ -243,7 +253,8 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                 });
             }
             _ => {
-                let (m, d) = find(name).unwrap();
+                let (m, d) = find(name)
+                    .ok_or_else(|| format!("{name}: passthrough tensor vanished between passes"))?;
                 tensors.push(HfqTensor {
                     name: name.clone(),
                     quant_type: match m.dtype.as_str() {
@@ -261,7 +272,12 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
         }
     }
 
+    // `config` is the parsed config.json verbatim: `config_from_metadata_json`
+    // (hipfire-arch-qwen35) requires it to reconstruct the arch config at load
+    // time, and it self-detects the nested `text_config`/`vision_config` these
+    // VL-shaped checkpoints carry — do not flatten or pre-process it here.
     let metadata = serde_json::json!({
+        "config": cfg,
         "escha": { "format_version": version, "quant_method": method },
     })
     .to_string();
@@ -429,5 +445,142 @@ mod tests {
     #[test]
     fn int8_repack_rejects_a_ragged_row() {
         assert!(int8_rows_to_q8_0(&[0i8; 20], &[0u16], 1, 20).is_err());
+    }
+}
+
+/// `convert_escha` integration test: a minimal synthetic checkpoint directory
+/// (config.json + one safetensors shard) through the real converter, then a
+/// real `HfqFile` read-back. This lives in-module (not under `tests/`) for
+/// the same reason as `reap_overlay::integ`: `hipfire-quantize` is a binary
+/// crate with no library target, so a `tests/` integration target can't reach
+/// `convert_escha`, which is crate-private. `hipfire-runtime` (CPU-only HFQ
+/// container reader) is a dev-dependency.
+///
+/// This is the test that Finding 1 (missing top-level `config` key) proves
+/// would have caught the regression: it asserts the round-tripped metadata
+/// carries `config` with the fields written into config.json.
+#[cfg(test)]
+mod convert_escha_tests {
+    use super::*;
+    use hipfire_quantize::escha_ref::f16_rne;
+    use hipfire_runtime::hfq::HfqFile;
+    use safetensors::tensor::TensorView;
+    use safetensors::Dtype;
+    use std::collections::HashMap;
+
+    /// escha_code payload: deterministic, recognizable bytes so the
+    /// verbatim-repack assertion can compare against a value computed
+    /// independently of what `build_fixture` wrote.
+    fn code_bytes() -> Vec<u8> {
+        (0..(4 * 32)).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Write a minimal Escha-W2 checkpoint directory: config.json with a
+    /// `quantization_config` block plus a couple of recognisable top-level
+    /// config fields, and one safetensors shard with one complete escha
+    /// linear (escha_code last dim 16*K=32 => K=2, plus escha_rin/rout) and
+    /// one int8 passthrough pair (weight_int8 + weight_scale).
+    fn build_fixture(dir: &Path) {
+        let cfg = serde_json::json!({
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "vocab_size": 100,
+            "quantization_config": {
+                "quant_method": "eschamoe",
+                "format_version": "2.0",
+            },
+        });
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+
+        let code = code_bytes();
+
+        let rin: Vec<u16> = (0..4).map(|i| f16_rne(1.0 + i as f32 * 0.1)).collect();
+        let rout: Vec<u16> = (0..4).map(|i| f16_rne(2.0 + i as f32 * 0.1)).collect();
+        let rin_bytes: Vec<u8> = rin.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rout_bytes: Vec<u8> = rout.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // int8 pair: oc=2, ic=32 (one Q8_0 block per row).
+        let w8: Vec<u8> = (0..(2 * 32)).map(|i| (i as i8) as u8).collect();
+        let scale: Vec<u16> = vec![f16_rne(0.5), f16_rne(1.5)];
+        let scale_bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let mut tensors: HashMap<String, TensorView> = HashMap::new();
+        tensors.insert(
+            "layers.0.mlp.up_proj.escha_code".to_string(),
+            TensorView::new(Dtype::U8, vec![4, 32], &code).unwrap(),
+        );
+        tensors.insert(
+            "layers.0.mlp.up_proj.escha_rin".to_string(),
+            TensorView::new(Dtype::F16, vec![4], &rin_bytes).unwrap(),
+        );
+        tensors.insert(
+            "layers.0.mlp.up_proj.escha_rout".to_string(),
+            TensorView::new(Dtype::F16, vec![4], &rout_bytes).unwrap(),
+        );
+        tensors.insert(
+            "lm_head.weight_int8".to_string(),
+            TensorView::new(Dtype::I8, vec![2, 32], &w8).unwrap(),
+        );
+        tensors.insert(
+            "lm_head.weight_scale".to_string(),
+            TensorView::new(Dtype::F16, vec![2], &scale_bytes).unwrap(),
+        );
+
+        let bytes = safetensors::serialize(&tensors, None).unwrap();
+        std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+    }
+
+    /// Unique scratch dir under the system temp root, cleaned up on drop.
+    struct TempCheckpointDir(std::path::PathBuf);
+    impl TempCheckpointDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire_escha_convert_test_{tag}_{}_{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempCheckpointDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn convert_escha_embeds_config_and_repacks_code_verbatim() {
+        let src = TempCheckpointDir::new("ok");
+        build_fixture(&src.0);
+        let out = src.0.join("out.hfq");
+
+        convert_escha(&src.0, &out).expect("conversion of a well-formed fixture must succeed");
+
+        let hf = HfqFile::open(&out).expect("convert_escha's output must parse as a valid .hfq");
+
+        // The regression Finding 1 caught: metadata must carry a top-level
+        // `config` key, or every arch loader's `config_from_metadata_json`
+        // fails before a tensor is read.
+        let meta: serde_json::Value = serde_json::from_str(&hf.metadata_json)
+            .expect("metadata_json must itself be valid JSON");
+        let config = meta
+            .get("config")
+            .expect("metadata must carry a top-level `config` key");
+        assert_eq!(config["hidden_size"], 64);
+        assert_eq!(config["num_hidden_layers"], 2);
+        assert_eq!(config["num_attention_heads"], 4);
+        assert_eq!(config["vocab_size"], 100);
+
+        // The verbatim-repack contract (G1): escha_code bytes in the output
+        // are byte-identical to the input.
+        let (_, out_code) = hf
+            .tensor_data("layers.0.mlp.up_proj.escha_code")
+            .expect("escha_code tensor must survive conversion");
+        assert_eq!(out_code, code_bytes().as_slice());
     }
 }
