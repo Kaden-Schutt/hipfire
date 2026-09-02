@@ -157,7 +157,8 @@ carried in `rout` rather than in a mask tensor. Consequences:
 
 ### 1.3 Four metadata traps
 
-**`escha_config` has two lengths.** MoE exports ship `[9]`
+**`escha_config` has two lengths — and is optional (§1.4).** When present, MoE
+exports ship `[9]`
 = `[16, K, 2, 1, E, in, out, in_p, out_p]`; dense exports ship `[6]`
 = `[16, K, 2, 1, in, out]`. Fields 0 (tile = 16), 1 (K) and the trailing dims
 are identified. **Fields 2 and 3 (values `2` and `1`) are not identified** — most
@@ -193,6 +194,41 @@ MoE path needs no such change.
 MTP packaging also differs: the 35B ships inline `mtp.*` tensors in the main
 shards; the 27B ships a separate `mtp/` subdirectory with its own `config.json`
 and `model.safetensors`.
+
+### 1.4 Leaf contract: three required, four optional
+
+Escha's own tests state the loader contract, and it is stricter and looser than
+the spec first assumed. The namespace is
+`CODED_LEAVES = (escha_code, escha_rin, escha_rout, escha_s_in, escha_s_out,
+escha_config)`, plus `bias`.
+
+**Required — `escha_code`, `escha_rin`, `escha_rout`.** A coded linear missing
+any transform vector must fail loudly. Their test is named
+`rejects_incomplete_linear` and its docstring is explicit that this must "fail
+loudly at load, not decode into noise". Our converter and loader adopt the same
+rule.
+
+**Optional — `escha_s_in`, `escha_s_out`, `escha_config`, `bias`.** An export
+produced without the end-to-end fine-tune stage ships none of them and must
+still load and run (`test_dense_checkpoint_without_optional_leaves`). Note their
+assertion is `bias is None`, not a zero bias — absence is a distinct state from
+zero, even though the two are numerically identical once applied.
+
+**Unknown `escha_*` leaves are a format mismatch and must be rejected**, not
+silently ignored and not allowed to fail deep inside a parameter-name error.
+Their named example is `escha_rotation_theta` — evidence the format anticipates
+a theta-parameterized (Givens-style) rotation variant that today's checkpoints
+do not use. hipfire already has `RotationPlan::Givens` for ParoQuant, so such a
+variant would not be alien, but it is **out of scope here**: if a future release
+ships it, conversion must stop rather than decode the codes under the wrong
+rotation.
+
+**Consequence for the converter.** Because `escha_config` is optional, it cannot
+be the source of truth for `K`. `K` is always derivable from the code tensor's
+own shape — the last dimension is `16K` — so that is the primary source, with
+`escha_config[1]` and `layer_meta` used as cross-checks *when present*. This is
+strictly more robust than §1.3's `bits`/`K` disagreement work-around: the shape
+cannot disagree with itself.
 
 ## 2. Why there is no lossless repack into an existing MQ codec
 
@@ -266,16 +302,18 @@ tensor in the safetensors index is classified; there is no default-skip branch.
 
 | source | destination |
 |---|---|
-| `*.escha_code` | `ESCHA2T16`/`ESCHA3T16` verbatim, K from `escha_config[1]` |
+| `*.escha_code` | `ESCHA2T16`/`ESCHA3T16` verbatim, K from `shape[-1] / 16` (§1.4) |
 | `*.escha_{rin,rout,s_in,s_out}` | folded to one f32 pair per projection |
 | `*.weight_int8` + `*.weight_scale` | `Q8_0`, row scale replicated (§4.2.1) |
 | `*.bias` (27B only) | F16, new arch-5 bias slots |
 | norms, `A_log`, `conv1d`, `dt_bias`, `in_proj_a/b`, `mlp.gate`, `shared_expert_gate` | F16/F32, as today |
 | `mtp.*` (35B inline) / `mtp/` dir (27B) | existing `.mq4-mtp` trailer |
 
-`escha_config` is read at both lengths (`[9]` MoE, `[6]` dense) and
-cross-checked against `quantization_config.layer_meta` rather than trusted —
-keying off `K`, with `bits` as a cross-check allowed to fail (§1.3).
+`escha_config`, when present, is read at both lengths (`[9]` MoE, `[6]` dense)
+and cross-checked against `quantization_config.layer_meta` rather than trusted.
+`K` comes from the code tensor's shape; `escha_config[1]`, `layer_meta.K` and
+`layer_meta.bits` are cross-checks, and `bits` is one that is allowed to fail
+(§1.3, §1.4).
 
 #### 4.2.1 The int8 repack is lossless only if done one specific way
 
@@ -407,7 +445,9 @@ panic.
   Rust translation, not an open question about the format. The goldens are real
   shipped tensors, so passing G0 means decoding the actual model correctly.
 - **G1** — converter `memcmp` round-trip on code streams; zero unclassified
-  tensors in the index.
+  tensors in the index; and the §1.4 leaf contract enforced in both directions —
+  a checkpoint with a transform vector removed must be rejected, and one with
+  `s_in`/`s_out`/`config`/`bias` absent must convert cleanly.
 - **G2** — GPU decode vs `escha-ref::reconstruct`, exact fp16 on every tile of a
   sampled expert set, **both K**.
 - **G3** — H128 kernels vs `escha-ref::h128` directly. A round-trip check
@@ -443,7 +483,16 @@ Refuse rather than guess:
 - `escha_config` disagreeing with `layer_meta` — hard error. This is what
   catches a shape assumption silently breaking on a future Escha release.
 - any tensor in the safetensors index left unclassified — hard error, not skip
+- a coded linear missing `escha_code`, `escha_rin` or `escha_rout` — hard error
+  ("incomplete escha linear"), never a partial decode (§1.4)
+- an `escha_*` leaf outside the known six — hard error naming the leaf. This is
+  the guard that stops a future `escha_rotation_theta` export from being decoded
+  under the wrong rotation (§1.4).
 - a missing `ESCHA3T16` dispatch arm must never resolve to `Plain`
+
+Conversely, absence of `escha_s_in`, `escha_s_out`, `escha_config` or `bias` is
+**not** an error — those are optional by contract and the fold/decode paths must
+run without them.
 
 ## 9. Risks and expectations
 
