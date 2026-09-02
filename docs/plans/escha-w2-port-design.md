@@ -22,8 +22,15 @@ field is identical. Both models are hybrid GatedDeltaNet + full-attention
 `arch_id` 5 (dense) and 6 (MoE). The registry already ships `qwen3.6:27b` and
 `qwen3.6:35b-a3b`.
 
+Base identity was checked both ways: the 35B's config differs from
+`Qwen/Qwen3.6-35B-A3B` only in `transformers_version`, and the 27B's differs
+from `Qwen/Qwen3.6-27B` only in the `quantization_config` block. Both bases are
+VL-shaped composites (nested `text_config` plus a `vision_config` carrying no
+weights), which is exactly the case `Qwen35Config::is_vl_text` already covers —
+the converter takes that branch rather than treating them as plain text configs.
+
 The one exception: the 27B's escha linears carry fp16 biases the base
-architecture does not have, so arch-5 gains bias slots (§1.2, §9). Otherwise
+architecture does not have, so arch-5 gains bias slots (§1.3, §9). Otherwise
 this is a codec + loader project.
 
 ### 1.1 Format
@@ -67,6 +74,15 @@ sign stage. `s_in`/`s_out` are the end-to-end fine-tune scales; MoE exports ship
 them all-ones, dense exports ship real values. Both collapse into `rin`/`rout`
 by `fold_scales`, which keeps the product in f32 and rounds once.
 
+**Verified 2026-09-02.** The above was checked, not inferred: `ref.py`'s
+`reconstruct_fast` run against the committed goldens reproduces
+`expected_gu_e0_k2.f16` and `expected_down_e0_k3.f16` **bit-exactly** at the
+stated tile grid and packing, for both K. A single expert projection uses
+**10,746 distinct fp16 values** — direct evidence for the trellis claim and for
+§2. The goldens are also not synthetic: `packed_gu_e0_k2.i16` is byte-identical
+to the shipped layer-0 / expert-0 `gate_up_proj.escha_code`, so G0 and G2 gate
+against real model data.
+
 **Coverage differs between the two models**, and the dense one is the larger
 surface:
 
@@ -89,7 +105,44 @@ surface:
 
   Only `in_proj_a`/`in_proj_b`, norms, embeddings and `lm_head` sit outside.
 
-### 1.2 Three metadata traps
+### 1.2 `rout` carries a per-expert channel prune mask
+
+`rin` is a clean sign x scale vector (no zeros, tight magnitude spread). **`rout`
+on `gate_up_proj` is not.** Measured on layer 0:
+
+| expert | `gate_up.rout` zeros | non-zero magnitude range |
+|---|---|---|
+| 0 | 560 / 1024 (54.7%) | 1.81 – 3.26 |
+| 1 | 594 / 1024 (58.0%) | 1.99 – 3.21 |
+| 2 | 142 / 1024 (13.9%) | 0.991 – 1.62 |
+| 7 | 378 / 1024 (36.9%) | 0.979 – 1.02 |
+
+The zeros are exact, the rate varies per expert, and the masks are **not shared**
+between experts (pairwise agreement ~0.47, i.e. chance). `down_proj.rout` by
+contrast has **zero** zeros on every expert sampled.
+
+The structure is exact, not incidental. `rout` is applied last
+(`y = f16(H128(mid) * RS * rout)`), so a zero hard-zeroes that output channel
+for every input. For expert 0, the 560 zeros split as **280 in the gate half and
+the same 280 channels in the up half** — `gate-only = 0`, `up-only = 0`.
+Confirmed end-to-end: running `expert_linear` on random inputs yields 560/1024
+output channels identically zero, and after SwiGLU **280 of the 512 intermediate
+channels are dead for all inputs**.
+
+So Escha's fine-tune leaves behind **structured, per-expert width pruning**,
+carried in `rout` rather than in a mask tensor. Consequences:
+
+- The "signs folded into `rin`/`rout`" description is correct for `rin` and for
+  `down_proj.rout`, and incomplete for `gate_up.rout`, which is
+  sign x scale x prune-mask.
+- It is exploitable — see §4.5. It is also a correctness trap: a kernel that
+  "optimizes away" the zero multiply without preserving exact-zero output would
+  change results.
+- The pruned `gate_up` columns are still stored in the code stream at 2 bits
+  each and are never used. Physically dropping them would shrink the model but
+  would break the verbatim/`memcmp` property, so it is not done in this port.
+
+### 1.3 Three metadata traps
 
 **`escha_config` has two lengths.** MoE exports ship `[9]`
 = `[16, K, 2, 1, E, in, out, in_p, out_p]`; dense exports ship `[6]`
@@ -128,6 +181,10 @@ bits, with no block scale. The alphabets are not nested and no MQ group scale
 recovers the mapping — a lossless transcode into MQ2 is not merely lossy, it is
 impossible. MQ8 would be near but still not lossless (256 levels vs arbitrary
 fp16). Only fp16 storage is exactly lossless, at 8x the bytes.
+
+This is measured, not argued from the spec: decoding the shipped layer-0 /
+expert-0 `gate_up_proj` yields **10,746 distinct fp16 values** across the
+2048 x 1024 matrix, spanning [-3.949, 3.949]. MQ2 can express 4 per group.
 
 Separately, folding the Hadamards into an effective weight
 `W_eff = diag(rin) . H128 . W . H128 . diag(rout) . RS^2` is exactly computable
@@ -197,7 +254,7 @@ tensor in the safetensors index is classified; there is no default-skip branch.
 
 `escha_config` is read at both lengths (`[9]` MoE, `[6]` dense) and
 cross-checked against `quantization_config.layer_meta` rather than trusted —
-keying off `K`, with `bits` as a cross-check allowed to fail (§1.2).
+keying off `K`, with `bits` as a cross-check allowed to fail (§1.3).
 
 ### 4.3 Dispatch
 
@@ -234,6 +291,27 @@ Phase 1, so the only new thing under test is the fusion.
 The dense gate+up is the one place fusion does not come free: `gate_proj` is
 K=2 and `up_proj` is K=3 (§1.1), so a fused dense gate+up kernel must either
 run mixed-K or stay split. Decide by measurement, not up front.
+
+**Exploiting the prune mask (MoE only).** Per §1.2 a large, per-expert fraction
+of `gate_up`'s output channels is identically zero — 55% on layer-0 expert 0,
+14–58% across the experts sampled. What that does and does not buy:
+
+- **Not skippable:** the `gate_up` GEMV itself. `rout` is applied *after* the
+  output H128, and the Hadamard mixes all 128 channels of a block, so producing
+  the surviving channels still requires the full `mid` vector. Dropping GEMV
+  columns for pruned outputs would corrupt their block-mates.
+- **Skippable:** the final `rout` multiply and SwiGLU for pruned channels, and —
+  the real prize — the corresponding **input rows of `down_proj`**. Those
+  intermediate activations are exactly zero, so for layer-0 expert 0 the K=3
+  `down_proj` GEMV can skip 280 of its 512 input rows. `down_proj` is the more
+  expensive of the two (K=3, 3.0 bpw), so this lands on the dominant half of the
+  expert.
+
+The mask is static per expert, so it can be precomputed once at load into a
+compacted row index rather than tested per token. Treat this as a Phase 2
+optimization gated on measurement, not a Phase 1 requirement — and note the
+correctness trap in §1.2: pruned outputs must stay *exactly* zero, not
+approximately.
 
 ### 4.6 Loader + registry
 
@@ -287,6 +365,9 @@ panic.
 - **G0** — `escha-ref` bit-exact against committed goldens: `packed_gu_e0_k2` ->
   `expected_gu_e0_k2` and `packed_down_e0_k3` -> `expected_down_e0_k3` exact;
   `w8a16` fixture; `moeblk_x` -> `moeblk_out` within fp16 rounding.
+  **Already demonstrated in NumPy** (§1.1), so G0 is a port-fidelity gate on the
+  Rust translation, not an open question about the format. The goldens are real
+  shipped tensors, so passing G0 means decoding the actual model correctly.
 - **G1** — converter `memcmp` round-trip on code streams; zero unclassified
   tensors in the index.
 - **G2** — GPU decode vs `escha-ref::reconstruct`, exact fp16 on every tile of a
@@ -327,7 +408,7 @@ different-K gate/up split and the new bias slots get exercised — but no
 tok/s number is reported for it until fused kernels exist.
 
 **The 27B needs a change outside the codec.** Its escha linears carry fp16
-biases the base architecture does not have (§1.2), so `hipfire-arch-qwen35`'s
+biases the base architecture does not have (§1.3), so `hipfire-arch-qwen35`'s
 arch-5 path gains bias slots on `in_proj_qkv`, `in_proj_z`, `out_proj` and the
 three MLP projections. This is the only work in the port that touches an
 existing architecture, and it must not perturb the existing `qwen3.6:27b` SKUs
