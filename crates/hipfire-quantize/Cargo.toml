@@ -26,6 +26,7 @@ hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+sha2 = "0.10"
 # CPU-only reader for the overlay round-trip test: HfqFile parses the .hfq
 # container header/index by name without touching the GPU (builds on CPU).
 # hipfire-quantize is a binary crate (no lib target), so the overlay
