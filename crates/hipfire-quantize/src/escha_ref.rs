@@ -248,6 +248,61 @@ pub fn fold_scales(
     (ri, ro)
 }
 
+/// Full single-expert linear for one token: `x [ic] -> [oc]` fp16 bits.
+///
+/// `w_bits` is the decoded bare weight, row-major `[ic, oc]` — decode it once
+/// with `reconstruct` and reuse it. `ref.moe_block` in the Python original
+/// re-decodes per (token, slot), which is 128 full tile decodes for an
+/// 8-token fixture; do not reproduce that.
+pub fn expert_linear(x: &[f32], w_bits: &[u16], rin: &[f32], rout: &[f32]) -> Vec<u16> {
+    let (ic, oc) = (rin.len(), rout.len());
+    assert_eq!(x.len(), ic);
+    assert_eq!(w_bits.len(), ic * oc);
+    let xh = input_transform(x, rin);
+    let mut mid = vec![0.0f32; oc];
+    for i in 0..ic {
+        let a = f16_to_f32(xh[i]);
+        if a == 0.0 {
+            continue;
+        }
+        let row = &w_bits[i * oc..(i + 1) * oc];
+        for (m, &wb) in mid.iter_mut().zip(row) {
+            *m += a * f16_to_f32(wb);
+        }
+    }
+    output_transform(&mid, rout)
+}
+
+/// `silu(g) * u` on the fp16-rounded merged output; gate is the first half.
+pub fn swiglu(gate_up_bits: &[u16], inter: usize) -> Vec<u16> {
+    assert_eq!(gate_up_bits.len(), 2 * inter);
+    let mut out = Vec::with_capacity(inter);
+    for i in 0..inter {
+        let g = f16_to_f32(gate_up_bits[i]);
+        let s = f16_to_f32(f16_rne(g / (1.0 + (-g).exp())));
+        out.push(f16_rne(s * f16_to_f32(gate_up_bits[inter + i])));
+    }
+    out
+}
+
+/// `y = f16( x @ f16(w8 * scale)^T )`. `w8` is `[oc, ic]`, `scale` is `[oc]`
+/// fp16 bits — Escha's int8 is per-output-row, not per-block.
+pub fn w8a16(x: &[f32], w8: &[i8], scale: &[u16], oc: usize, ic: usize) -> Vec<u16> {
+    assert_eq!(w8.len(), oc * ic);
+    assert_eq!(scale.len(), oc);
+    assert_eq!(x.len(), ic);
+    let mut out = Vec::with_capacity(oc);
+    for o in 0..oc {
+        let s = f16_to_f32(scale[o]);
+        let mut acc = 0.0f32;
+        for i in 0..ic {
+            acc += x[i] * f16_to_f32(f16_rne(w8[o * ic + i] as f32 * s));
+        }
+        out.push(f16_rne(acc));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +615,77 @@ mod tests {
             actual[oc..],
             "rows must transform independently, not collapse to the same output"
         );
+    }
+
+    /// A pruned output channel must be EXACTLY zero, not approximately.
+    /// gate_up.rout carries a per-expert prune mask (design §1.2): on the
+    /// shipped layer-0 expert 0, 560 of 1024 channels are hard zeros. A kernel
+    /// that "optimises away" the zero multiply must preserve exact zero.
+    #[test]
+    fn zero_rout_gives_exactly_zero_output() {
+        let ic = 128;
+        let oc = 128;
+        let w: Vec<u16> = (0..ic * oc)
+            .map(|i| f16_rne((i % 7) as f32 - 3.0))
+            .collect();
+        let rin = vec![1.0f32; ic];
+        let mut rout = vec![1.0f32; oc];
+        rout[3] = 0.0;
+        rout[57] = 0.0;
+        let x: Vec<f32> = (0..ic).map(|i| (i as f32 * 0.11).cos()).collect();
+        let y = expert_linear(&x, &w, &rin, &rout);
+        assert_eq!(y.len(), oc);
+        assert_eq!(
+            f16_to_f32(y[3]),
+            0.0,
+            "pruned channel 3 must be exactly zero"
+        );
+        assert_eq!(
+            f16_to_f32(y[57]),
+            0.0,
+            "pruned channel 57 must be exactly zero"
+        );
+        assert!(y
+            .iter()
+            .enumerate()
+            .any(|(i, &v)| i != 3 && i != 57 && f16_to_f32(v) != 0.0));
+    }
+
+    /// SwiGLU splits the f16-ROUNDED merged output at the halfway point, gate
+    /// first. Rounding before the split is part of the contract.
+    #[test]
+    fn swiglu_uses_gate_first_half() {
+        let inter = 2;
+        // gate = [0, 0], up = [5, 7]; silu(0) == 0 so both outputs are zero.
+        let gu: Vec<u16> = [0.0, 0.0, 5.0, 7.0].iter().map(|&v| f16_rne(v)).collect();
+        let h = swiglu(&gu, inter);
+        assert_eq!(h.len(), inter);
+        assert_eq!(f16_to_f32(h[0]), 0.0);
+        assert_eq!(f16_to_f32(h[1]), 0.0);
+        // gate = [large, large] -> silu(x) ~ x, so out ~ gate*up.
+        let gu2: Vec<u16> = [10.0, 10.0, 2.0, 3.0].iter().map(|&v| f16_rne(v)).collect();
+        let h2 = swiglu(&gu2, inter);
+        assert!(
+            (f16_to_f32(h2[0]) - 20.0).abs() < 0.1,
+            "{}",
+            f16_to_f32(h2[0])
+        );
+        assert!(
+            (f16_to_f32(h2[1]) - 30.0).abs() < 0.2,
+            "{}",
+            f16_to_f32(h2[1])
+        );
+    }
+
+    /// Escha's int8 is per-output-ROW: y = f16(x @ f16(w8*scale)^T).
+    #[test]
+    fn w8a16_applies_per_row_scale() {
+        let (ic, oc) = (4, 2);
+        let w8: Vec<i8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let scale: Vec<u16> = vec![f16_rne(0.5), f16_rne(2.0)];
+        let x = vec![1.0f32, 1.0, 1.0, 1.0];
+        let y = w8a16(&x, &w8, &scale, oc, ic);
+        assert_eq!(f16_to_f32(y[0]), 5.0); // (1+2+3+4)*0.5
+        assert_eq!(f16_to_f32(y[1]), 52.0); // (5+6+7+8)*2.0
     }
 }
