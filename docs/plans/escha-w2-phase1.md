@@ -1242,7 +1242,15 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
         }
     }
 
+    // The top-level "config" key is REQUIRED: `hipfire-arch-qwen35`'s
+    // `config_from_hfq` -> `config_from_metadata_json` errors "qwen35: missing
+    // config" before touching a single tensor, so an .hfq without it is
+    // unloadable no matter how correct the codec is. Every sibling converter
+    // (pipeline_gguf.rs, pipeline_deepseek.rs, pipeline_maple.rs) embeds the
+    // parsed config.json the same way. `from_config_value` self-detects the
+    // nested text_config/vision_config these VL-shaped checkpoints carry.
     let metadata = serde_json::json!({
+        "config": cfg,
         "escha": { "format_version": version, "quant_method": method },
     })
     .to_string();
