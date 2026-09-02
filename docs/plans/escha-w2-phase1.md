@@ -16,6 +16,7 @@
 - Quant type ids are **`ESCHA2T16 = 42`** and **`ESCHA3T16 = 43`**. The authoritative registry is `crates/hipfire-quantize/src/hfq.rs` — the `#[repr(u8)] enum QuantType` **and** its `from_u8`, which its own doc comment requires be kept in sync. Do not consult the stale partial enum in the `loop/gfx1151` checkout.
 - `RS = 0.088388347648` exactly (`1/sqrt(128)`). `kernels/src/gemv_mq4g128.hip:116` already pins `0.0883883476f`.
 - Codebook hash constants, exact: multiplier `0xCBAC1FED`, mask `0x8FFF8FFF`, xor `0x3B603B60`.
+- **Every `f16(...)` in the escha contract is round-to-nearest-even.** Do NOT use `crate::float16::f32_to_f16` for it — that helper **truncates**, deliberately, to keep existing HFQ bytes stable (see its module doc). Truncating breaks the codebook: it misses published constants at states 3, 6 and 7. Use `escha_ref::f16_rne` (Task 2), which routes through `half::f16::from_f32`. Decoding with `crate::float16::f16_to_f32` is fine — only the encode direction differs. Found by TDD in Task 1; upstream `ref.py` states the contract outright: "numpy f16+f16 rounds RNE, like the GPU".
 - **No codebook LUT in any kernel.** 65536 × f16 = 128 KB; gfx1151 has 64 KB LDS (`crates/rdna-compute/src/profiler.rs`, `lds_per_cu: 65536`). Decode inline.
 - Required leaves are `escha_code`, `escha_rin`, `escha_rout`. Optional: `escha_s_in`, `escha_s_out`, `escha_config`, `bias`. Unknown `escha_*` leaves are a hard error. See spec §1.4.
 - `K` comes from `code.shape[-1] / 16`. Never from `escha_config` (optional) and never from `layer_meta.bits` (self-inconsistent across releases).
@@ -57,7 +58,7 @@ The trellis decode is the heart of the port. Everything else is gated against it
 - Test: inline `#[cfg(test)]` in `escha_ref.rs` (this crate has no `tests/` dir; all tests are inline)
 
 **Interfaces:**
-- Consumes: `crate::float16::{f16_to_f32, f32_to_f16}`
+- Consumes: `crate::float16::f16_to_f32`, `half::f16::from_f32` (RNE encode — see Global Constraints)
 - Produces: `pub const RS: f32`, `pub fn cba_decode(state: u16) -> u16`, `pub fn decode8_k2(words: &[u32; 16], lane: usize) -> [u16; 8]`, `pub fn decode8_k3(words: &[u32; 24], lane: usize) -> [u16; 8]`, `pub fn lane_positions(lane: usize) -> [(usize, usize); 8]`, `pub fn reconstruct(code: &[i16], in_features: usize, out_features: usize, k: usize) -> Vec<u16>` (returns f16 **bits**, row-major `[in_features, out_features]`)
 
 - [ ] **Step 1: Vendor the packed golden inputs**
@@ -222,10 +223,21 @@ Expected: compile error, `cannot find function 'cba_decode' in this scope` (and 
 Insert above the `#[cfg(test)] mod tests` block in `escha_ref.rs`:
 
 ```rust
-use crate::float16::{f16_to_f32, f32_to_f16};
+use crate::float16::f16_to_f32;
 
 /// 1/sqrt(128) — the exact f32 constant the format pins.
 pub const RS: f32 = 0.088388347648;
+
+/// Round f32 to fp16 bits, round-to-nearest-even.
+///
+/// Every `f16(...)` in the escha contract is RNE. `crate::float16::f32_to_f16`
+/// TRUNCATES — deliberately, to keep existing HFQ bytes stable — and using it
+/// here silently corrupts the codec: it misses the published cbA constants at
+/// states 3, 6 and 7. Do not "simplify" this back to the crate helper.
+#[inline]
+pub fn f16_rne(v: f32) -> u16 {
+    half::f16::from_f32(v).to_bits()
+}
 
 /// Decode one 16-bit trellis state to fp16 **bits** via the cbA codebook.
 ///
@@ -236,6 +248,9 @@ pub const RS: f32 = 0.088388347648;
 /// of two fp16 values is always representable in f32, so the single rounding
 /// here is the correctly-rounded fp16 result.
 ///
+/// The round MUST be `half::f16::from_f32`, not `crate::float16::f32_to_f16`
+/// — the latter truncates by design and misses states 3, 6 and 7.
+///
 /// There are 65536 reachable values, so a lookup table would be 128 KB and
 /// will not fit gfx1151's 64 KB LDS. This is five integer/FP ops and no
 /// memory traffic — keep it that way in the kernels.
@@ -244,7 +259,7 @@ pub fn cba_decode(state: u16) -> u16 {
     let r = ((state as u32).wrapping_mul(0xCBAC_1FED) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
     let lo = f16_to_f32((r & 0xFFFF) as u16);
     let hi = f16_to_f32((r >> 16) as u16);
-    f32_to_f16(lo + hi)
+    half::f16::from_f32(lo + hi).to_bits()
 }
 
 /// The 8 states lane `lane` owns, K=2. `words` is the tile's 16 u32.
@@ -388,7 +403,8 @@ git commit -m "feat(escha): trellis codec CPU reference, gated on golden vectors
 
 **Interfaces:**
 - Consumes: `RS` from Task 1
-- Produces: `pub fn h128_inplace(x: &mut [f32])`, `pub fn input_transform(x: &[f32], rin: &[f32]) -> Vec<u16>`, `pub fn output_transform(mid: &[f32], rout: &[f32]) -> Vec<u16>`, `pub fn fold_scales(rin: &[u16], rout: &[u16], s_in: Option<&[f32]>, s_out: Option<&[f32]>) -> (Vec<f32>, Vec<f32>)`
+- Produces: `pub fn f16_rne(v: f32) -> u16`, `pub fn h128_inplace(x: &mut [f32])`, `pub fn input_transform(x: &[f32], rin: &[f32]) -> Vec<u16>`, `pub fn output_transform(mid: &[f32], rout: &[f32]) -> Vec<u16>`, `pub fn fold_scales(rin: &[u16], rout: &[u16], s_in: Option<&[f32]>, s_out: Option<&[f32]>) -> (Vec<f32>, Vec<f32>)`
+- Note: Task 1 inlined `half::f16::from_f32(..).to_bits()` in `cba_decode`. Extract that into `f16_rne` here and have `cba_decode` call it, so there is exactly one RNE encode site in the module.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -443,8 +459,8 @@ Add inside the existing `mod tests` block in `escha_ref.rs`:
     /// must go through one code path.
     #[test]
     fn fold_scales_handles_absent_scales() {
-        let rin = [f32_to_f16(2.0), f32_to_f16(-3.0)];
-        let rout = [f32_to_f16(0.5)];
+        let rin = [f16_rne(2.0), f16_rne(-3.0)];
+        let rout = [f16_rne(0.5)];
         let (a, b) = fold_scales(&rin, &rout, None, None);
         assert_eq!(a, vec![2.0, -3.0]);
         assert_eq!(b, vec![0.5]);
@@ -501,7 +517,7 @@ pub fn input_transform(x: &[f32], rin: &[f32]) -> Vec<u16> {
     for row in buf.chunks_exact_mut(ic) {
         h128_inplace(row);
     }
-    buf.iter().map(|v| f32_to_f16(v * RS)).collect()
+    buf.iter().map(|v| f16_rne(v * RS)).collect()
 }
 
 /// `y = f16( H128(mid) * RS * rout )`. Returns fp16 bits.
@@ -514,7 +530,7 @@ pub fn output_transform(mid: &[f32], rout: &[f32]) -> Vec<u16> {
     }
     buf.iter()
         .zip(rout.iter().cycle())
-        .map(|(v, s)| f32_to_f16(v * RS * s))
+        .map(|(v, s)| f16_rne(v * RS * s))
         .collect()
 }
 
@@ -591,7 +607,7 @@ Add inside `mod tests`:
     fn zero_rout_gives_exactly_zero_output() {
         let ic = 128;
         let oc = 128;
-        let w: Vec<u16> = (0..ic * oc).map(|i| f32_to_f16((i % 7) as f32 - 3.0)).collect();
+        let w: Vec<u16> = (0..ic * oc).map(|i| f16_rne((i % 7) as f32 - 3.0)).collect();
         let rin = vec![1.0f32; ic];
         let mut rout = vec![1.0f32; oc];
         rout[3] = 0.0;
@@ -610,13 +626,13 @@ Add inside `mod tests`:
     fn swiglu_uses_gate_first_half() {
         let inter = 2;
         // gate = [0, 0], up = [5, 7]; silu(0) == 0 so both outputs are zero.
-        let gu: Vec<u16> = [0.0, 0.0, 5.0, 7.0].iter().map(|&v| f32_to_f16(v)).collect();
+        let gu: Vec<u16> = [0.0, 0.0, 5.0, 7.0].iter().map(|&v| f16_rne(v)).collect();
         let h = swiglu(&gu, inter);
         assert_eq!(h.len(), inter);
         assert_eq!(f16_to_f32(h[0]), 0.0);
         assert_eq!(f16_to_f32(h[1]), 0.0);
         // gate = [large, large] -> silu(x) ~ x, so out ~ gate*up.
-        let gu2: Vec<u16> = [10.0, 10.0, 2.0, 3.0].iter().map(|&v| f32_to_f16(v)).collect();
+        let gu2: Vec<u16> = [10.0, 10.0, 2.0, 3.0].iter().map(|&v| f16_rne(v)).collect();
         let h2 = swiglu(&gu2, inter);
         assert!((f16_to_f32(h2[0]) - 20.0).abs() < 0.1, "{}", f16_to_f32(h2[0]));
         assert!((f16_to_f32(h2[1]) - 30.0).abs() < 0.2, "{}", f16_to_f32(h2[1]));
@@ -627,7 +643,7 @@ Add inside `mod tests`:
     fn w8a16_applies_per_row_scale() {
         let (ic, oc) = (4, 2);
         let w8: Vec<i8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let scale: Vec<u16> = vec![f32_to_f16(0.5), f32_to_f16(2.0)];
+        let scale: Vec<u16> = vec![f16_rne(0.5), f16_rne(2.0)];
         let x = vec![1.0f32, 1.0, 1.0, 1.0];
         let y = w8a16(&x, &w8, &scale, oc, ic);
         assert_eq!(f16_to_f32(y[0]), 5.0); // (1+2+3+4)*0.5
@@ -679,8 +695,8 @@ pub fn swiglu(gate_up_bits: &[u16], inter: usize) -> Vec<u16> {
     let mut out = Vec::with_capacity(inter);
     for i in 0..inter {
         let g = f16_to_f32(gate_up_bits[i]);
-        let s = f16_to_f32(f32_to_f16(g / (1.0 + (-g).exp())));
-        out.push(f32_to_f16(s * f16_to_f32(gate_up_bits[inter + i])));
+        let s = f16_to_f32(f16_rne(g / (1.0 + (-g).exp())));
+        out.push(f16_rne(s * f16_to_f32(gate_up_bits[inter + i])));
     }
     out
 }
@@ -696,9 +712,9 @@ pub fn w8a16(x: &[f32], w8: &[i8], scale: &[u16], oc: usize, ic: usize) -> Vec<u
         let s = f16_to_f32(scale[o]);
         let mut acc = 0.0f32;
         for i in 0..ic {
-            acc += x[i] * f16_to_f32(f32_to_f16(w8[o * ic + i] as f32 * s));
+            acc += x[i] * f16_to_f32(f16_rne(w8[o * ic + i] as f32 * s));
         }
-        out.push(f32_to_f16(acc));
+        out.push(f16_rne(acc));
     }
     out
 }
@@ -871,7 +887,7 @@ Create `crates/hipfire-quantize/src/pipeline_escha.rs` with only this test modul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::float16::f32_to_f16;
+    use crate::escha_ref::f16_rne;
 
     #[test]
     fn k_comes_from_the_code_shape_not_metadata() {
@@ -940,7 +956,7 @@ mod tests {
         let oc = 2;
         let ic = 64; // two Q8_0 blocks per row
         let w8: Vec<i8> = (0..(oc * ic)).map(|i| (i % 127) as i8).collect();
-        let scale = vec![f32_to_f16(0.5), f32_to_f16(2.0)];
+        let scale = vec![f16_rne(0.5), f16_rne(2.0)];
         let q8 = int8_rows_to_q8_0(&w8, &scale, oc, ic).unwrap();
         assert_eq!(q8.len(), oc * (ic / 32) * 34);
         // Both blocks of row 0 carry row 0's scale, unchanged.
