@@ -262,9 +262,6 @@ pub fn expert_linear(x: &[f32], w_bits: &[u16], rin: &[f32], rout: &[f32]) -> Ve
     let mut mid = vec![0.0f32; oc];
     for i in 0..ic {
         let a = f16_to_f32(xh[i]);
-        if a == 0.0 {
-            continue;
-        }
         let row = &w_bits[i * oc..(i + 1) * oc];
         for (m, &wb) in mid.iter_mut().zip(row) {
             *m += a * f16_to_f32(wb);
@@ -651,8 +648,49 @@ mod tests {
             .any(|(i, &v)| i != 3 && i != 57 && f16_to_f32(v) != 0.0));
     }
 
+    /// `expert_linear` is a plain matmul (`mid = xh_f32 @ W_f32`) and this
+    /// module is the numerical ORACLE that GPU kernels are gated against.
+    /// Skipping a zero activation as a "the term is zero anyway" shortcut is
+    /// only valid if every weight it would multiply is finite: IEEE-754 says
+    /// `0.0 * NaN = NaN`, so a real matmul must let a non-finite weight
+    /// contaminate the output even where the paired activation is exactly
+    /// zero. Silently substituting 0 there would mask a corrupted decode
+    /// instead of surfacing it.
+    ///
+    /// An all-zero `x` makes every activation exactly zero
+    /// (`input_transform`: `f16(H128(0 * rin) * RS) == 0`), so this poisons
+    /// one weight with NaN and asserts the oracle still reports NaN rather
+    /// than swallowing it to 0.0.
+    #[test]
+    fn expert_linear_propagates_nan_weight_through_zero_activation() {
+        let ic = 128;
+        let oc = 128;
+        let rin = vec![1.0f32; ic];
+        let rout = vec![1.0f32; oc];
+        let x = vec![0.0f32; ic]; // -> every activation channel is exactly 0.0
+        let mut w: Vec<u16> = (0..ic * oc)
+            .map(|i| f16_rne((i % 7) as f32 - 3.0))
+            .collect();
+        w[5 * oc + 10] = f16_rne(f32::NAN); // one poisoned weight, row 5 col 10
+        let y = expert_linear(&x, &w, &rin, &rout);
+        assert!(
+            y.iter().any(|&b| f16_to_f32(b).is_nan()),
+            "0.0 * NaN must propagate as NaN somewhere in the output, not be skipped to \
+             all-zero: a faithful matmul cannot discard a NaN weight just because the paired \
+             activation happens to be zero"
+        );
+    }
+
     /// SwiGLU splits the f16-ROUNDED merged output at the halfway point, gate
     /// first. Rounding before the split is part of the contract.
+    ///
+    /// The first case (gate=[0,0]) does NOT by itself discriminate a
+    /// gate/up swap: silu(0) == 0 zeroes the output whichever half is
+    /// treated as gate, so it only pins `silu(0) == 0`. The second case
+    /// (gate=[10,10], up=[2,3]) is the one that actually catches a swap —
+    /// silu(large) ~= large makes the output track gate*up, so swapping
+    /// gate and up would swap which operand tracks toward ~1 and change
+    /// the result.
     #[test]
     fn swiglu_uses_gate_first_half() {
         let inter = 2;
