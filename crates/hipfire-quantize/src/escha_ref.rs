@@ -393,4 +393,172 @@ mod tests {
         assert_eq!(c, vec![6.0, -6.0]);
         assert_eq!(d, vec![2.0]);
     }
+
+    /// Mixed case: `s_in` present, `s_out` absent. `fold_scales` has four
+    /// (s_in, s_out) combinations; the all-Some and all-None corners are
+    /// covered above, but a branch that only handles the symmetric cases
+    /// would still pass those. This and the next test pin the two mixed
+    /// corners.
+    #[test]
+    fn fold_scales_handles_s_in_only() {
+        let rin = [f16_rne(2.0), f16_rne(-3.0)];
+        let rout = [f16_rne(0.5)];
+        let (a, b) = fold_scales(&rin, &rout, Some(&[3.0, 2.0]), None);
+        assert_eq!(a, vec![6.0, -6.0]);
+        assert_eq!(
+            b,
+            vec![0.5],
+            "rout must pass through unscaled when s_out is None"
+        );
+    }
+
+    /// Mixed case: `s_in` absent, `s_out` present.
+    #[test]
+    fn fold_scales_handles_s_out_only() {
+        let rin = [f16_rne(2.0), f16_rne(-3.0)];
+        let rout = [f16_rne(0.5)];
+        let (a, b) = fold_scales(&rin, &rout, None, Some(&[4.0]));
+        assert_eq!(
+            a,
+            vec![2.0, -3.0],
+            "rin must pass through unscaled when s_in is None"
+        );
+        assert_eq!(b, vec![2.0]);
+    }
+
+    /// `input_transform` is specified as `f16( H128(x * rin) * RS )` — scale
+    /// applied BEFORE the Hadamard transform. H128 mixes elements within a
+    /// block, so for a non-constant `rin` that is a materially different
+    /// operation from scaling after the transform. This is the exact
+    /// ordering contract the GPU kernels get gated against, so pin it
+    /// directly against an independently-built expected value, and prove
+    /// the chosen inputs actually discriminate the two orderings.
+    #[test]
+    fn input_transform_scales_before_not_after() {
+        let ic = 128;
+        let rin: Vec<f32> = (0..ic).map(|i| 1.0 + (i as f32) * 0.05).collect();
+        let x: Vec<f32> = (0..ic).map(|i| ((i as f32) * 0.13).cos()).collect();
+
+        // Correct: scale THEN transform THEN RS.
+        let mut correct: Vec<f32> = x.iter().zip(rin.iter()).map(|(a, b)| a * b).collect();
+        h128_inplace(&mut correct);
+        let correct_bits: Vec<u16> = correct.iter().map(|v| f16_rne(v * RS)).collect();
+
+        // Wrong: transform THEN scale THEN RS — the order a later edit
+        // could plausibly swap to.
+        let mut wrong = x.clone();
+        h128_inplace(&mut wrong);
+        let wrong_bits: Vec<u16> = wrong
+            .iter()
+            .zip(rin.iter())
+            .map(|(v, s)| f16_rne(v * s * RS))
+            .collect();
+
+        assert_ne!(
+            correct_bits, wrong_bits,
+            "chosen rin/x must make the two orderings diverge, or this test proves nothing"
+        );
+
+        assert_eq!(input_transform(&x, &rin), correct_bits);
+    }
+
+    /// `output_transform` is specified as `f16( H128(mid) * RS * rout )` —
+    /// scale applied AFTER the Hadamard transform, the mirror image of
+    /// `input_transform`'s contract. Same reasoning as above: a
+    /// non-constant `rout` makes pre- and post-transform scaling diverge.
+    #[test]
+    fn output_transform_scales_after_not_before() {
+        let oc = 128;
+        let rout: Vec<f32> = (0..oc).map(|i| 1.0 + (i as f32) * 0.05).collect();
+        let mid: Vec<f32> = (0..oc).map(|i| ((i as f32) * 0.19).sin()).collect();
+
+        // Correct: transform THEN RS*scale.
+        let mut correct = mid.clone();
+        h128_inplace(&mut correct);
+        let correct_bits: Vec<u16> = correct
+            .iter()
+            .zip(rout.iter())
+            .map(|(v, s)| f16_rne(v * RS * s))
+            .collect();
+
+        // Wrong: scale THEN transform THEN RS.
+        let mut wrong: Vec<f32> = mid.iter().zip(rout.iter()).map(|(a, b)| a * b).collect();
+        h128_inplace(&mut wrong);
+        let wrong_bits: Vec<u16> = wrong.iter().map(|v| f16_rne(v * RS)).collect();
+
+        assert_ne!(
+            correct_bits, wrong_bits,
+            "chosen rout/mid must make the two orderings diverge, or this test proves nothing"
+        );
+
+        assert_eq!(output_transform(&mid, &rout), correct_bits);
+    }
+
+    /// `input_transform` broadcasts `rin` across rows via `.iter().cycle()`.
+    /// A multi-row input must apply the exact same per-channel scale to row
+    /// 2 as row 1, and the two rows must transform independently (H128
+    /// never mixes across the 128 boundary — see
+    /// `h128_does_not_mix_across_blocks` — so row 2 must not see row 1's
+    /// data either). The expected vector is built by hand, per row, rather
+    /// than by calling `input_transform`.
+    #[test]
+    fn input_transform_broadcasts_scale_across_rows() {
+        let ic = 128;
+        let rin: Vec<f32> = (0..ic).map(|i| 1.0 + (i as f32) * 0.03).collect();
+        let row0: Vec<f32> = (0..ic).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let row1: Vec<f32> = row0.iter().map(|v| v + 10.0).collect();
+        let mut x = row0.clone();
+        x.extend_from_slice(&row1);
+
+        let mut expected = Vec::with_capacity(2 * ic);
+        for row in [&row0, &row1] {
+            let mut buf: Vec<f32> = row.iter().zip(rin.iter()).map(|(a, b)| a * b).collect();
+            h128_inplace(&mut buf);
+            expected.extend(buf.iter().map(|v| f16_rne(v * RS)));
+        }
+
+        let actual = input_transform(&x, &rin);
+        assert_eq!(
+            actual, expected,
+            "row 2 must see the same per-channel rin as row 1"
+        );
+        assert_ne!(
+            actual[..ic],
+            actual[ic..],
+            "rows must transform independently, not collapse to the same output"
+        );
+    }
+
+    /// Mirror of the above for `output_transform`'s `rout` broadcast.
+    #[test]
+    fn output_transform_broadcasts_scale_across_rows() {
+        let oc = 128;
+        let rout: Vec<f32> = (0..oc).map(|i| 1.0 + (i as f32) * 0.03).collect();
+        let row0: Vec<f32> = (0..oc).map(|i| ((i as f32) * 0.17).cos()).collect();
+        let row1: Vec<f32> = row0.iter().map(|v| v + 5.0).collect();
+        let mut mid = row0.clone();
+        mid.extend_from_slice(&row1);
+
+        let mut expected = Vec::with_capacity(2 * oc);
+        for row in [&row0, &row1] {
+            let mut buf = row.clone();
+            h128_inplace(&mut buf);
+            expected.extend(
+                buf.iter()
+                    .zip(rout.iter())
+                    .map(|(v, s)| f16_rne(v * RS * s)),
+            );
+        }
+
+        let actual = output_transform(&mid, &rout);
+        assert_eq!(
+            actual, expected,
+            "row 2 must see the same per-channel rout as row 1"
+        );
+        assert_ne!(
+            actual[..oc],
+            actual[oc..],
+            "rows must transform independently, not collapse to the same output"
+        );
+    }
 }
