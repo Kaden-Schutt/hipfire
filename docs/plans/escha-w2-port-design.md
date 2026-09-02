@@ -291,6 +291,12 @@ A Rust port of `ref.py`: `cba_decode`, `decode_tile`, `reconstruct`, `h128`,
 `input_transform`, `output_transform`, `expert_linear`, `fold_scales`, `swiglu`,
 `w8a16`. Pure functions, no GPU and no hipfire dependencies.
 
+One practical note from running it: `ref.moe_block` calls `expert_linear`
+without a pre-decoded weight, so a literal port re-decodes the same expert once
+per (token, slot) — 128 full tile decodes for an 8-token fixture. Memoize
+`reconstruct` per (expert, projection) or the reference is unusably slow at
+G4/G5 scale.
+
 **This is the numerical oracle for every other component.** The Phase 1
 Q8-resident build is explicitly *not* the oracle — it carries its own
 quantization error. Two different artifacts, two different roles.
@@ -403,12 +409,31 @@ x -> *rin_eff -> H128 blockwise -> *RS -> round f16
   -> H128 -> *RS -> *rout_eff -> f16 -> (+bias, dense only)
 ```
 
-For the MoE, the router, top-k and shared expert are untouched existing arch-6
-code; only the two expert projections change. Two rounding points are
-load-bearing and easy to lose:
+For the MoE, the router, top-k and shared expert are *intended* to be untouched
+existing arch-6 code; only the two expert projections change. Three rounding
+points are load-bearing and easy to lose:
 
 - SwiGLU runs on the **f16-rounded merged** `gate_up` output, gate first half.
 - The expert combine multiplies by `f16(score)`, not the f32 score.
+- **Router logits are rounded to f16 before top-k**: `ref.py` computes
+  `f16(x @ gate_w.T)` and only then widens to f32 to select. Selecting on
+  unrounded f32 logits is a different function.
+
+**f16 logit ties are real, and they are the one place "untouched arch-6 router"
+needs checking rather than assuming.** Rounding to f16 before top-k manufactures
+exact ties that f32 would not produce, and they are not rare: in an 8-token
+fixture, one token has two experts on identical logits (§7 G4b). Consequences:
+
+- A tie *inside* the selected k is harmless — the combine is a sum over slots,
+  so slot order does not change the output.
+- A tie *at the k / k+1 boundary* changes the selected set and therefore the
+  output. It is implementation-defined which expert wins, so hipfire and
+  `escha-ref` may legitimately disagree on such a token.
+- Therefore: if hipfire's arch-6 router does not round logits to f16 before
+  top-k, it will diverge from Escha more often than tie-breaking alone explains.
+  Verify this before assuming the router is reusable as-is.
+- And when reading G5: a handful of divergent positions traceable to boundary
+  ties is expected, not a codec bug. Attribute before investigating.
 
 **Fusion and orientation.** `qwen35/weights.rs:69` documents
 `experts[X].gate_up: [2*moe_intermediate, hidden]`, i.e. hipfire already stores
@@ -440,7 +465,8 @@ panic.
 
 - **G0** — `escha-ref` bit-exact against committed goldens: `packed_gu_e0_k2` ->
   `expected_gu_e0_k2` and `packed_down_e0_k3` -> `expected_down_e0_k3` exact;
-  `w8a16` fixture; `moeblk_x` -> `moeblk_out` within fp16 rounding.
+  `w8a16` fixture. The MoE-block fixture is **not** a bit-exact gate — see
+  below.
   **Already demonstrated in NumPy** (§1.1), so G0 is a port-fidelity gate on the
   Rust translation, not an open question about the format. The goldens are real
   shipped tensors, so passing G0 means decoding the actual model correctly.
@@ -453,8 +479,28 @@ panic.
 - **G3** — H128 kernels vs `escha-ref::h128` directly. A round-trip check
   (`H128 . H128 = 128 I`) is **not** sufficient: a wrong butterfly order is also
   self-inverse, so it passes while being wrong.
-- **G4** — single-expert `expert_linear` on GPU vs reference, then the full MoE
-  block against `moeblk_out`.
+- **G4** — single-expert `expert_linear` on GPU vs reference, then the MoE block
+  against `moeblk_out`. Two things about this fixture, both measured:
+
+  **It is a tolerance gate, not a bit-exact one.** Running `ref.moe_block`
+  against it with the real shipped layer-0 weights gives `max|diff| = 1.22e-4`,
+  `mean|diff| = 2.1e-6`, with 4752 of 16384 values differing at ULP level
+  against outputs whose mean magnitude is 0.0185. The golden was evidently
+  produced by the Metal path, not by `ref.py`, so "within fp16 rounding" is too
+  vague to gate on. Use **`max|diff| <= 2e-4` and `mean|diff| <= 1e-5`**, and do
+  not assert equality. The codec goldens in G0 *are* bit-exact; do not
+  generalize this tolerance to them.
+
+  **It does not gate the router.** The fixture ships `moeblk_ids.i64` and
+  `moeblk_scores.f32` and injects them, bypassing selection entirely. Router
+  correctness needs its own check — G4b below.
+
+- **G4b** — router, gated separately since G4 cannot see it. Reproducing
+  selection from `mlp.gate.weight` on the fixture's `x` gives the **identical
+  top-8 set for all 8 tokens** and scores agreeing to 3e-8, confirming the
+  contract. Assert the set and the scores, **not the order**: token 3 orders two
+  experts differently because experts 65 and 43 have *exactly equal* f16 logits
+  (both 1.80078). See §5 on why that is benign here and when it is not.
 - **G5** — e2e coherence, then KLD on a fixed wikitext slice. Not on the model's
   own output: for ds4 that scored 8x better on the median and was optimistic.
 
