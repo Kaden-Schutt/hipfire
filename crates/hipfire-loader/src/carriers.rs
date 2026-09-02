@@ -384,6 +384,20 @@ impl Carrier for Qwen35Carrier {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
     }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        // Qwen3.5 is the only carrier with a pp>1 path (load_qwen35_pp), HFQ
+        // only. Dir + pp>1 is refused; VMM + pp>1 is refused globally upstream.
+        if pp > 1 && is_dir {
+            return Err("qwen35: safetensors + pp>1 unsupported".into());
+        }
+        Ok(())
+    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: true,
@@ -1637,6 +1651,18 @@ impl Carrier for Cohere2MoeCarrier {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
     }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("cohere2moe: pp>1 unsupported via registry".into());
+        }
+        Ok(())
+    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1746,6 +1772,18 @@ impl Carrier for MapleCarrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 15
+    }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("maple: pp>1 unsupported via registry".into());
+        }
+        Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -1876,6 +1914,18 @@ impl Carrier for Gemma4Carrier {
         // "no carrier" error and keeps the two namespaces aligned. Primary serve of 22 alone
         // would still need a target model, so it naturally fails later in generate routing.
         matches!(arch_id, 13 | 22)
+    }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("gemma4: pp>1 unsupported".into());
+        }
+        Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
