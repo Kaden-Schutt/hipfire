@@ -121,18 +121,6 @@ fn config_number(config: &serde_json::Value, key: &str) -> usize {
         .unwrap_or(0) as usize
 }
 
-fn config_model_type(config: &serde_json::Value) -> Option<&str> {
-    config
-        .get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|text| text.get("model_type"))
-                .and_then(serde_json::Value::as_str)
-        })
-}
-
 fn source_has_tensor(src: &ModelSource, name: &str) -> bool {
     match src {
         // `tensor_data` deliberately checks that indexed data is present,
@@ -172,22 +160,13 @@ fn classify_qwen35(src: &ModelSource) -> Result<ModelVariant, String> {
         _ => unreachable!("arch_id was checked above"),
     };
 
-    let has_vision_config = config.get("vision_config").is_some();
-    let has_vision_tensor = source_has_tensor(src, "model.visual.patch_embed.proj.weight");
-    let model_type_is_vl = config_model_type(&config)
-        .map(|model_type| model_type.to_ascii_lowercase().contains("vl"))
-        .unwrap_or(false);
-
-    // Qwen3.5-VL may share arch id 5 or 6 with text checkpoints. A vision
-    // marker without the actual tower is malformed and must fail closed
-    // rather than silently turning into a dense text model.
-    if has_vision_config || has_vision_tensor || model_type_is_vl {
-        if !has_vision_tensor {
-            return Err(
-                "qwen35: vision metadata/model type present but the vision tensor is missing"
-                    .into(),
-            );
-        }
+    // A VL checkpoint is identified by its vision tower being present. Every
+    // Qwen3.5-family HF config embeds `vision_config` (the upstream
+    // architecture is text_config + vision_config) even when the quantizer
+    // emitted a text-only artifact, so config/model_type markers alone never
+    // decide; the tensor does. This matches master's carrier
+    // (`tensor_data("model.visual.patch_embed.proj.weight").is_some()`).
+    if source_has_tensor(src, "model.visual.patch_embed.proj.weight") {
         return Ok(match backbone {
             ModelVariant::Qwen35Dense => ModelVariant::Qwen35DenseVl,
             ModelVariant::Qwen35Moe => ModelVariant::Qwen35MoeVl,
@@ -202,21 +181,11 @@ fn classify_lfm2(src: &ModelSource) -> Result<ModelVariant, String> {
     let config = source_config(src)?;
     let text_config = config.get("text_config").unwrap_or(&config);
     let experts = config_number(text_config, "num_experts");
-    let has_vision_config = config.get("vision_config").is_some();
-    let has_vision_tensor = source_has_tensor(
+    // Same rule as Qwen3.5: the vision tower tensor decides, not config markers.
+    if source_has_tensor(
         src,
         "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
-    );
-    let model_type_is_vl = config_model_type(&config)
-        .map(|model_type| model_type.to_ascii_lowercase().contains("vl"))
-        .unwrap_or(false);
-    if has_vision_config || has_vision_tensor || model_type_is_vl {
-        if !has_vision_tensor {
-            return Err(
-                "lfm2moe: vision metadata/model type present but the vision tensor is missing"
-                    .into(),
-            );
-        }
+    ) {
         return Ok(ModelVariant::Lfm2Vl);
     }
     Ok(if experts > 0 {
@@ -2827,6 +2796,28 @@ mod qwen35_classification_tests {
         assert_eq!(dense, ModelVariant::Qwen35DenseVl);
         assert_eq!(moe, ModelVariant::Qwen35MoeVl);
         assert_ne!(dense, moe);
+    }
+
+    /// Every Qwen3.5-family HF config embeds `vision_config` even for
+    /// text-only quantized artifacts (the 27B/A3B production files all do).
+    /// The vision tower tensor decides; config markers alone must classify as
+    /// the text backbone, never refuse.
+    #[test]
+    fn qwen35_text_artifact_with_vision_config_marker_is_text() {
+        let dense = classify_fixture(
+            5,
+            r#"{"config":{"model_type":"qwen3_5","num_experts":0,"vision_config":{"depth":27}}}"#,
+            false,
+        )
+        .unwrap();
+        let moe = classify_fixture(
+            6,
+            r#"{"config":{"model_type":"qwen3_5_moe","num_experts":8,"vision_config":{"depth":27}}}"#,
+            false,
+        )
+        .unwrap();
+        assert_eq!(dense, ModelVariant::Qwen35Dense);
+        assert_eq!(moe, ModelVariant::Qwen35Moe);
     }
 
     #[test]
