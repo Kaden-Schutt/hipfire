@@ -597,6 +597,16 @@ pub enum ArchPredicate {
     /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
     /// refuses non-gfx942 outright, so the predicate must match the wrapper.
     IsGfx942,
+    /// No kernel exists for this dtype yet; fail closed. Evaluates to `false`
+    /// on every architecture (see `eval_arch`), so any table registration
+    /// gated on this predicate is dead-on-arrival rather than silently
+    /// advertised as available everywhere. This is the correct default for a
+    /// dtype whose GEMV/GEMM kernel is future work — `Always` would be an
+    /// affirmatively wrong claim that compiles cleanly and only breaks at
+    /// runtime, on real hardware, the day someone registers the kernel.
+    /// MUST be replaced (not removed) with the kernel's real arch gate when
+    /// that kernel lands.
+    Unimplemented,
 }
 
 #[derive(Clone, Debug)]
@@ -901,14 +911,19 @@ impl KernelKey {
             MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
             // Escha-W2: no GEMV kernel exists yet (Task 4 registers the ids/rotation
             // plan only; the HIP kernels are future work), so there is no real
-            // hardware requirement to encode. `Always` is a placeholder, not a claim
-            // that a kernel runs everywhere — it is inert today: `for_gemv` has no
-            // arm for these types (always Err) and `dtype_post_rotation_variant`
-            // never maps them to `Prerotated`, so neither call site in
-            // `pipeline/mod.rs` that guards on `dtype_arch_predicate(..).eval_arch()`
-            // can reach this value for Escha. Revisit when the Escha GEMV kernel
-            // lands and give it its real arch gate then.
-            Escha2T16 | Escha3T16 => ArchPredicate::Always,
+            // hardware requirement to encode yet. `Unimplemented` fails closed on
+            // every arch (see its doc comment) rather than claiming — as `Always`
+            // would — that a kernel runs everywhere. It is inert today the same way
+            // `Always` was inert: `for_gemv` has no arm for these types (always Err)
+            // and `dtype_post_rotation_variant` never maps them to `Prerotated`, so
+            // neither call site in `pipeline/mod.rs` that guards on
+            // `dtype_arch_predicate(..).eval_arch()` can reach this value for Escha.
+            // The difference is what happens the day someone registers an Escha
+            // entry in `gemv_table.rs` without touching this function: `Always`
+            // would silently advertise it on every arch; `Unimplemented` fails
+            // closed with an explicit dispatch error instead. Replace with the
+            // real arch gate when the Escha GEMV kernel lands.
+            Escha2T16 | Escha3T16 => ArchPredicate::Unimplemented,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -921,6 +936,27 @@ impl KernelKey {
             Plain => match dtype_rotation_plan(dtype) {
                 RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
                 RotationPlan::None => &[PipelineOp::Gemv],
+                // Escha-W2: stated explicitly rather than left to the `_`
+                // catch-all below, which would mislabel the 128-point
+                // Hadamard as a `RotateFwht` step — a plausible-looking step
+                // list for a rotate kernel that does not exist. No caller
+                // reaches this today: `for_gemv(_, Plain)` already returns
+                // Err for Escha2T16/Escha3T16 (see
+                // `escha_types_never_resolve_to_plain`), so this arm is dead
+                // code, not a load-bearing runtime path. Panic instead of
+                // guessing a step list, exactly as `kv_tier::k_bytes_per_pos`
+                // panics for its undefined cases — replace this panic with
+                // the real `[EschaRotate, Gemv]`-shaped step list when the
+                // H128 rotate/GEMV kernels land.
+                RotationPlan::EschaH128 => panic!(
+                    "gemv_steps(Plain, {dtype:?}): no step list exists for \
+                     RotationPlan::EschaH128 — the Escha-W2 rotate/GEMV \
+                     kernels are not implemented yet. This path must be \
+                     unreachable (for_gemv already rejects Plain for Escha \
+                     dtypes); if you hit this panic, something upstream \
+                     started calling gemv_steps for Escha before the kernel \
+                     landed. Replace this panic with the real step list then."
+                ),
                 _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
             },
             Prerotated => &[PipelineOp::Gemv],

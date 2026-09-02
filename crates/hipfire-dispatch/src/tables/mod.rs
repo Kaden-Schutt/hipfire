@@ -114,6 +114,11 @@ impl ArchPredicate {
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
             Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
             Self::IsGfx942 => ctx.arch.is_gfx942(),
+            // No kernel exists yet for whatever dtype carries this predicate.
+            // Fail closed on every arch rather than advertise availability
+            // nothing backs. See the variant's doc comment on why this must
+            // never collapse to `Always`.
+            Self::Unimplemented => false,
         }
     }
 }

@@ -80,6 +80,17 @@ fn dp4a_variant(key: KernelKey) -> KernelVariant {
     }
 }
 
+fn unimplemented_variant(key: KernelKey) -> KernelVariant {
+    KernelVariant {
+        key,
+        arch_required: ArchPredicate::Unimplemented,
+        shape_gate: None,
+        steps: &[],
+        has_awq: false,
+        tile: TileImpl::None,
+    }
+}
+
 // ── ShapePredicate::eval ──────────────────────────────────────────────────────
 
 #[test]
@@ -198,6 +209,21 @@ fn arch_has_mmq_on_rdna3_or_rdna4() {
     assert!(!ArchPredicate::HasMmq.eval_arch(&ctx_rdna2()));
     assert!(ArchPredicate::HasMmq.eval_arch(&ctx_rdna3()));
     assert!(ArchPredicate::HasMmq.eval_arch(&ctx_rdna4())); // RDNA4 MQ6/HFQ6
+}
+
+/// `Unimplemented` must evaluate to `false` on every architecture this test
+/// can construct — it exists to fail closed for a dtype with no kernel yet
+/// (currently Escha2T16/Escha3T16). Unlike the other predicates above, there
+/// is no arch that should ever flip this to `true`; that is the entire point
+/// of the variant (see its doc comment in `types.rs`).
+#[test]
+fn arch_unimplemented_is_false_on_every_arch() {
+    assert!(!ArchPredicate::Unimplemented.eval_arch(&ctx_rdna1()));
+    assert!(!ArchPredicate::Unimplemented.eval_arch(&ctx_rdna2()));
+    assert!(!ArchPredicate::Unimplemented.eval_arch(&ctx_rdna3()));
+    assert!(!ArchPredicate::Unimplemented.eval_arch(&ctx_rdna4()));
+    assert!(!ArchPredicate::Unimplemented.eval_arch(&ctx_gfx906()));
+    assert!(!ArchPredicate::Unimplemented.eval_arch(&DispatchCtx::for_test("gfx942")));
 }
 
 #[test]
@@ -340,6 +366,31 @@ fn registry_resolve_falls_through_to_second_variant() {
             .key,
         KernelKey::GemmHfq4G256Wmma,
     );
+}
+
+/// A kernel gated on `ArchPredicate::Unimplemented` must never resolve as
+/// available, on any architecture — that is the fail-closed contract for a
+/// dtype with no kernel yet (e.g. Escha2T16/Escha3T16 in
+/// `dtype_arch_predicate`). This is the scenario Finding 1 describes: a
+/// future contributor adds a real registration for such a dtype to
+/// `gemv_table.rs` without touching `dtype_arch_predicate` — the predicate
+/// alone must be what stops `resolve()` from advertising it everywhere.
+#[test]
+fn registry_resolve_unimplemented_arch_never_resolves_on_any_arch() {
+    let mut reg = KernelRegistry::new();
+    reg.register(unimplemented_variant(KernelKey::GemvF32));
+    for arch in [
+        "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx906", "gfx942",
+    ] {
+        let ctx = DispatchCtx::for_test(arch);
+        let err = reg
+            .resolve(KernelKey::GemvF32, &ctx, None)
+            .expect_err("Unimplemented must never resolve to an available kernel");
+        assert!(
+            matches!(err, DispatchError::MissingImpl { .. }),
+            "expected MissingImpl on {arch}, got {err:?}"
+        );
+    }
 }
 
 #[test]
