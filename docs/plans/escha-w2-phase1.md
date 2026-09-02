@@ -679,10 +679,10 @@ pub fn expert_linear(x: &[f32], w_bits: &[u16], rin: &[f32], rout: &[f32]) -> Ve
     let xh = input_transform(x, rin);
     let mut mid = vec![0.0f32; oc];
     for i in 0..ic {
+        // Unconditional MAC — no zero-activation skip. This is the oracle, so
+        // it must be a faithful matmul: 0.0 * NaN is NaN, not 0, and skipping
+        // would MASK a corrupted decode instead of surfacing it.
         let a = f16_to_f32(xh[i]);
-        if a == 0.0 {
-            continue;
-        }
         let row = &w_bits[i * oc..(i + 1) * oc];
         for (m, &wb) in mid.iter_mut().zip(row) {
             *m += a * f16_to_f32(wb);
