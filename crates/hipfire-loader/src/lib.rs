@@ -2841,6 +2841,23 @@ impl Drop for Qwen35DenseTpStaging {
     }
 }
 
+/// Admission refusal for Qwen3.5-MoE under expert-parallel load (#683 family).
+/// Pure so the contract is unit-testable: any Qwen3.5 config with routed
+/// experts (`num_experts > 0`, i.e. arch 6 and any mis-stamped arch 5) has no
+/// EP serve path — `generate_ep` routes arch 6 at the dense-TP server, which
+/// only accepts `EpArch::Qwen35DenseTp`. Refuse here, before `Gpus::init_tp`
+/// and the per-rank weight upload, instead of after a full 4-rank load.
+/// Dense Qwen3.5 (`num_experts == 0`) is unaffected and keeps its EP path.
+pub fn qwen35_ep_moe_refusal(arch_id: u32, num_experts: usize) -> Option<String> {
+    if num_experts > 0 {
+        Some(format!(
+            "Qwen3.5-MoE (arch_id={arch_id}) has no EP serve path; use TP or single-GPU"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
 /// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
 /// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
@@ -3343,6 +3360,11 @@ fn load_model_ep_qwen35(
     }
     // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
     let _ = (kv_mode, kv_backend, state_quant);
+    // Admission (#683): MoE has no EP serve path — refuse before `Gpus::init_tp`
+    // (first device init) and the per-rank weight upload, not after a full load.
+    if let Some(reason) = qwen35_ep_moe_refusal(hfq_probe.arch_id, config.num_experts) {
+        return Err(reason);
+    }
     if tp != 4 {
         return Err(format!(
             "EP qwen35 MoE requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
@@ -3866,6 +3888,25 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     match first_err {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod ep_admission_tests {
+    use super::qwen35_ep_moe_refusal;
+    #[test]
+    fn qwen35_moe_ep_refuses_before_load_but_dense_admits() {
+        // Arch 6 MoE under EP: refused with the combination named.
+        let err =
+            qwen35_ep_moe_refusal(6, 128).expect("arch-6 MoE + EP must be refused at admission");
+        assert!(err.contains("Qwen3.5-MoE"), "reason names the model: {err}");
+        assert!(err.contains("no EP serve path"), "reason: {err}");
+        assert!(err.contains('6'), "reason names the arch: {err}");
+        // Mis-stamped arch 5 with routed experts: same missing serve path.
+        assert!(qwen35_ep_moe_refusal(5, 128).is_some());
+        // Adjacent supported: dense Qwen3.5 (either arch id) keeps its EP path.
+        assert_eq!(qwen35_ep_moe_refusal(5, 0), None);
+        assert_eq!(qwen35_ep_moe_refusal(6, 0), None);
     }
 }
 
