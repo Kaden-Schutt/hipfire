@@ -1929,8 +1929,7 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     );
     // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands —
     // intentionally not part of the shared rule, in both callers.
-    let mq4cg256_gfx12 =
-        matches!(dt, DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
+    let mq4cg256_gfx12 = matches!(dt, DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
     wmma_only || mq3_gfx10_scalar || mq4_v2 || mq4cg256_gfx12
 }
 
