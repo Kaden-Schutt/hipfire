@@ -110,7 +110,13 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
         const _Float16* xg = x_base + slab * 512 + wave * 64;
         const int frag_base = quarter_in_group * 4;
 
-        #pragma unroll
+        // Deliberately NOT unrolled (`unroll 1`): a rolled 4-iteration loop
+        // keeps exactly one fragment's pk0/pk1/a_reg/b_reg live at a time
+        // (plus the loop-carried float8 acc and sc_h/zp_h scalars). A fully
+        // unrolled body holds 4 fragments' temporaries simultaneously and
+        // costs 126 VGPRs -> 1 WG/CU; the rolled form targets <= 64 VGPRs
+        // (2 WGs/CU). A 4-trip loop is negligible at this shape.
+        #pragma unroll 1
         for (int f = 0; f < 4; ++f) {
             // Global 16-wide fragment within the group; 8 bytes = 2 u32.
             const int frag = frag_base + f;
