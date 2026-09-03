@@ -245,7 +245,16 @@ fn escha_routed_gemm_grouped(
     // Decode has `slots == k` (8), far below `2 * n_exp`, so this is also what
     // keeps the decode route on the slot-parallel GEMV.
     let _ = rows;
-    if slots < 2 * n_exp {
+    // HIPFIRE_ESCHA_GROUP_ALWAYS forces the grouped/WMMA route at decode too.
+    // Measured negative result, kept because the reasoning is not obvious:
+    // decode 47.7 -> 47.6 tok/s, i.e. nothing. In PREFILL each decoded tile
+    // feeds ~8 slots, so FMAs dominate and WMMA wins 2.2x. At decode there is
+    // ONE slot per expert, so the same decoded tile feeds a single MAC — the
+    // trellis decode dominates and there are no FMAs worth moving to the
+    // matrix cores. Same kernel, opposite bottleneck, purely from
+    // slots-per-expert.
+    let force = std::env::var("HIPFIRE_ESCHA_GROUP_ALWAYS").is_ok();
+    if !force && slots < 2 * n_exp {
         return escha_routed_gemv(gpu, dtype, expert_ptrs, ids, x, y, m, k, slots);
     }
 
