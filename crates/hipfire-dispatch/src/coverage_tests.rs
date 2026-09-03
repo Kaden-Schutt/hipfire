@@ -749,6 +749,99 @@ fn escha_layer_must_not_take_the_indexed_gpu_topk_path() {
     );
 }
 
+/// LAYER 1g — the BATCHED-PREFILL twin of 1f: an escha layer must never fall
+/// into a prefill path that applies no Hadamard transform.
+///
+/// `run_moe_prefill`'s escha branch keys on `MoePrefillParams::escha`, which is
+/// gated on `escha_indexed_route_enabled()`. `None` there falls through into
+/// Path 1 / Path 2, which feed the activation straight into the expert GEMMs
+/// and combine the raw result — no H128 pair, no error, ~1e-1-wrong output.
+///
+/// That is unreachable TODAY only because no admission arm outside escha's own
+/// admits Q8_0 routed experts to batched prefill: a property of a dtype table
+/// in `families::moe`, not of the branch that depends on it. The next planned
+/// change (a Q8_0 grouped GEMM over sorted expert groups) adds exactly such an
+/// arm. `check_moe_prefill_supported` therefore states the requirement at the
+/// point of danger, keyed on the UNGATED `layer_is_escha` marker.
+///
+/// The cases, and what each one catches:
+///   1. escha layer + tables present   → ADMITTED (production; the escha
+///      branch runs and returns before Path 1 / Path 2 are reached).
+///   2. escha layer + tables ABSENT    → REJECTED. This is the whole point:
+///      `HIPFIRE_ESCHA_INDEXED=0` produces exactly this state, and so would a
+///      future generic Q8_0 prefill arm. Goes GREEN-to-RED if the guard is
+///      removed.
+///   3. non-escha + tables absent      → ADMITTED (every other MoE model —
+///      the guard must be a no-op for them).
+///   4. the marker must be UNGATED     → asserted structurally below.
+#[test]
+fn escha_layer_must_not_take_a_non_escha_prefill_path() {
+    use crate::pipeline::check_moe_prefill_supported;
+
+    // ── 1. Production shape ────────────────────────────────────────────────
+    assert!(
+        check_moe_prefill_supported(/*layer_is_escha=*/ true, /*escha_tables_present=*/ true)
+            .is_ok(),
+        "an escha layer WITH its transform tables is the supported batched-prefill shape — the \
+         escha branch in run_moe_prefill runs it and returns. If this is red the guard is \
+         refusing production."
+    );
+
+    // ── 2. The silent-wrong-output case ────────────────────────────────────
+    let err = check_moe_prefill_supported(
+        /*layer_is_escha=*/ true, /*escha_tables_present=*/ false,
+    )
+    .expect_err(
+        "an escha layer that reaches run_moe_prefill WITHOUT its transform tables MUST be \
+         refused. Path 1 and Path 2 apply NO Hadamard transform and raise no error, so this \
+         is a rotated-domain weight multiplied by an unrotated activation: finite, fluent, \
+         ~1e-1-wrong output with nothing to catch it. This is reachable today by setting \
+         HIPFIRE_ESCHA_INDEXED=0, and will be reachable by default the moment a generic Q8_0 \
+         routed prefill arm exists.",
+    );
+    match err {
+        DispatchError::UnsupportedVariant {
+            family, variant, ..
+        } => {
+            assert_eq!(family, "moe");
+            assert_eq!(
+                variant, "escha-routed-experts-on-non-escha-prefill-path",
+                "the refusal must name escha and the unsupported path"
+            );
+        }
+        other => panic!("expected UnsupportedVariant, got {other:?}"),
+    }
+
+    // ── 3. Every non-escha MoE model is untouched ──────────────────────────
+    assert!(
+        check_moe_prefill_supported(false, false).is_ok(),
+        "the guard must be a no-op for non-escha models — they legitimately have no tables"
+    );
+    assert!(
+        check_moe_prefill_supported(false, true).is_ok(),
+        "tables without the escha marker is not a state this guard has an opinion about"
+    );
+
+    // ── 4. The marker must be UNGATED ──────────────────────────────────────
+    //
+    // `escha_tables_present` is `MoePrefillParams::escha.is_some()`, which the
+    // model ANDs with `escha_indexed_route_enabled()`. If `layer_is_escha`
+    // were built the same way, case 2 could never arise — the guard would be
+    // structurally dead, always seeing `(false, false)`. Stated as an
+    // assertion over the pair rather than left as prose: the ONLY pair the
+    // guard rejects is the one a gated marker cannot produce.
+    let rejected: Vec<(bool, bool)> = [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .filter(|&(l, t)| check_moe_prefill_supported(l, t).is_err())
+        .collect();
+    assert_eq!(
+        rejected,
+        vec![(true, false)],
+        "exactly one input pair may be refused: escha layer, no tables. A gated `layer_is_escha` \
+         would never produce it, which is why the field is documented as UNGATED."
+    );
+}
+
 /// LAYER 1f (companion) — the Q8_0 indexed arm must stay ESCHA-SCOPED.
 ///
 /// `routed_indexable_escha_q8` is the first arm in `MoeResolution` that

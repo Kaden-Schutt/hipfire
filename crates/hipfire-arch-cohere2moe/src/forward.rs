@@ -893,8 +893,10 @@ pub fn forward_batch(
                     routed_out: None,
                     // Not an escha model: the escha branch in
                     // `run_moe_prefill` is skipped and Path 1 / Path 2 run
-                    // exactly as before.
+                    // exactly as before, and `check_moe_prefill_supported` is
+                    // a no-op for `layer_is_escha == false`.
                     escha: None,
+                    layer_is_escha: false,
                     hidden,
                 };
                 moe_family()

@@ -281,6 +281,52 @@ pub fn check_moe_decode_supported(
     Ok(())
 }
 
+/// The BATCHED-PREFILL mirror of [`check_moe_decode_supported`]'s arm (c).
+///
+/// [`run_moe_prefill`] branches to the escha routed executor on
+/// `MoePrefillParams::escha.is_some()`. If that is `None`, control falls
+/// through into Path 1 / Path 2, which apply NO Hadamard transform and raise
+/// no error — the same finite, fluent, ~1e-1-wrong output arm (c) exists to
+/// prevent on the decode side.
+///
+/// # Why the layer marker must be UNGATED
+///
+/// `MoePrefillParams::escha` is `Some` only when the layer is escha AND
+/// `escha_indexed_route_enabled()`. So `escha.is_none()` on its own cannot
+/// tell "this is a plain Q8_0 MoE layer" apart from "this is an escha layer
+/// with `HIPFIRE_ESCHA_INDEXED=0`". `layer_is_escha` is therefore taken
+/// straight from the layer's own transform tables (`ffn.escha.is_some()`, a
+/// load-time model-state property), never from an env var — exactly as the
+/// router f16 rounding in `qwen35::prefill` already does.
+///
+/// # Why this is not "safe today, therefore unnecessary"
+///
+/// It is safe today only because no admission arm outside escha's own admits
+/// Q8_0 routed experts to batched prefill — a property of a dtype table in
+/// another crate, 200 lines from the branch that depends on it. The next
+/// planned work is a Q8_0 grouped GEMM over sorted expert groups, which is
+/// precisely a generic Q8_0 routed arm; when it lands, an escha layer with the
+/// indexed route disabled becomes indistinguishable from a plain Q8_0 MoE
+/// layer inside `run_moe_prefill` and takes the transform-free path. This
+/// makes that a loud refusal at the point of danger instead.
+///
+/// Like arm (c), it ERRORS rather than silently rerouting: a new prefill arm
+/// has to be taught about escha, or explicitly excluded from it, consciously.
+pub fn check_moe_prefill_supported(
+    layer_is_escha: bool,
+    escha_tables_present: bool,
+) -> Result<(), DispatchError> {
+    if layer_is_escha && !escha_tables_present {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-experts-on-non-escha-prefill-path",
+            arch: "",
+            quant: "",
+        });
+    }
+    Ok(())
+}
+
 /// True when the gate→down step must NOT fuse the FWHT rotation, because the
 /// routed `down` weights were packed in the NATURAL basis.
 ///
@@ -3355,6 +3401,12 @@ pub fn run_moe_prefill(
             $e.map_err(|e| DispatchError::Hip(e.to_string()))
         };
     }
+
+    // BEFORE any GPU work, and before the escha branch below: an escha layer
+    // that reaches here without its transform tables would fall into Path 1 /
+    // Path 2, which apply no Hadamard transform and raise no error. See
+    // `check_moe_prefill_supported`.
+    check_moe_prefill_supported(p.layer_is_escha, p.escha.is_some())?;
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;

@@ -3914,6 +3914,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         } else {
             None
         },
+        // UNGATED, deliberately — the one marker in this struct that is not
+        // ANDed with `escha_indexed_route_enabled()`. Keyed on the layer's own
+        // transform tables, exactly as the router f16 rounding above is. With
+        // the indexed route off, `escha` is `None` while this stays true, and
+        // `check_moe_prefill_supported` refuses the layer rather than letting
+        // it fall into a transform-free Path 1 / Path 2.
+        layer_is_escha: ffn.escha.is_some(),
         hidden: dim,
     };
     hipfire_runtime::llama::moe_family()

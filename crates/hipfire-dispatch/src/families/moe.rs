@@ -918,6 +918,19 @@ pub struct MoePrefillParams<'a> {
     /// batched prefill uses the model-global `[n_tokens × k]` scratch from
     /// `Gpu::ensure_escha_prefill_scratch` instead.
     pub escha: Option<crate::pipeline::escha::EschaRoutedRefs<'a>>,
+    /// UNGATED marker: this layer's routed experts are escha-coded, full stop.
+    ///
+    /// Set from `ffn.escha.is_some()` alone — never ANDed with
+    /// `escha_indexed_route_enabled()` or any other env lever. That is the
+    /// whole point of the field: [`escha`](Self::escha) above IS gated, so
+    /// `escha.is_none()` cannot distinguish "not an escha layer" from "an
+    /// escha layer with the indexed route switched off", and the second of
+    /// those must never be allowed to run Path 1 / Path 2.
+    ///
+    /// Consumed by `pipeline::check_moe_prefill_supported`, which refuses
+    /// `layer_is_escha && escha.is_none()` before any GPU work. `false` for
+    /// every non-escha model, where the check is a no-op.
+    pub layer_is_escha: bool,
     /// Model hidden size. Decode's `MoeParams` already carries this; prefill
     /// did not need it until the escha branch, whose H128 transforms are sized
     /// by it (`down_m` happens to equal it, but relying on that coincidence is
