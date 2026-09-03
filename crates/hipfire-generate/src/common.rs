@@ -572,6 +572,26 @@ pub fn qwen_dflash_hit_length_cap(
     generated >= max_tokens && !decoded_eot && !semantic_stop
 }
 
+/// Shared ctx-capacity margin for the spec entry guard (`generate_dflash`
+/// AR fallback) and the in-loop guard (`generate_spec` hard error). A
+/// request fits only when prompt + budget + one full draft block fits the
+/// draft's context-indexed structures; the `+ block_size` margin is what the
+/// mid-loop `position + block_size >= ctx_capacity` break enforces per
+/// cycle. Both sites must use this so any request `generate_spec` would
+/// refuse falls back to AR at entry instead of erroring after `gen_start`
+/// (audit-DFlash Broken 5).
+pub fn spec_ctx_request_fits(
+    prompt_len: usize,
+    max_tokens: usize,
+    block_size: usize,
+    ctx_capacity: usize,
+) -> bool {
+    prompt_len
+        .saturating_add(max_tokens)
+        .saturating_add(block_size)
+        <= ctx_capacity
+}
+
 /// Extract held ToolCalls from a FinishSummary (generate_spec holds them).
 pub fn finish_summary_held_tool_calls(
     finish: &FinishSummary,
@@ -1289,6 +1309,11 @@ pub struct SpecRun {
     /// `finish.decoded_eot` — wrappers OR both so stop-at-max_tokens wins over
     /// length. GrammarViolation is fail-closed, not carried here.
     pub semantic_stop: Option<StopReason>,
+    /// The mid-loop `position + block_size >= ctx_capacity` break fired: the
+    /// draft cannot host another full block. Wrappers OR this into the
+    /// length-cap decision so the turn reports `finish_reason=length` with
+    /// no cache store instead of a natural `stop`.
+    pub ctx_exhausted: bool,
     /// Truthful rollback attestation when this turn ended fail-closed
     /// (grammar / open-think / malformed). `None` on safe Done paths.
     pub fail_closed_rollback: Option<RollbackEpilogue>,
@@ -1537,7 +1562,7 @@ pub fn token_logprob_fields(
 
 #[cfg(test)]
 mod tests {
-    use super::latch_request_think_cap;
+    use super::{latch_request_think_cap, spec_ctx_request_fits};
 
     #[test]
     fn numeric_think_cap_latches_once_and_keeps_first_position() {
@@ -1565,5 +1590,25 @@ mod tests {
         ));
         assert!(latched);
         assert_eq!(mark, Some(4096));
+    }
+
+    #[test]
+    fn spec_ctx_request_fits_holds_one_block_margin() {
+        // Sum is prompt + max_tokens + block_size vs ctx_capacity: exactly
+        // at cap fits, cap+1 refuses, and a bare prompt+max_tokens == cap
+        // still refuses once the block margin is added (the band the entry
+        // guard used to admit and the loop guard then rejected).
+        assert!(spec_ctx_request_fits(100, 900, 24, 1024));
+        assert!(spec_ctx_request_fits(100, 899, 24, 1023));
+        assert!(!spec_ctx_request_fits(100, 900, 24, 1023));
+        assert!(!spec_ctx_request_fits(1000, 24, 24, 1024));
+        assert!(!spec_ctx_request_fits(900, 100, 24, 1023));
+        // Zero block degrades to the legacy prompt+max_tokens check.
+        assert!(spec_ctx_request_fits(100, 900, 0, 1000));
+        assert!(!spec_ctx_request_fits(100, 901, 0, 1000));
+        // Saturating arithmetic: huge budgets clamp instead of panicking
+        // (debug) or wrapping (release) into a false fit.
+        assert!(spec_ctx_request_fits(usize::MAX, 1, 1, usize::MAX));
+        assert!(!spec_ctx_request_fits(usize::MAX - 10, 20, 0, usize::MAX - 1));
     }
 }

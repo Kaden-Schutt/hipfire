@@ -324,6 +324,59 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     }
 
     #[test]
+    fn ctx_exhausted_maps_to_length_with_budget_unspent() {
+        // Mid-loop `position + block_size >= ctx_capacity` break with
+        // generated < max_tokens: the epilogue ORs `run.ctx_exhausted` into
+        // the length decision, so the turn reports `length` with no tool
+        // release and no cache store instead of a natural `stop`.
+        let calls = vec![ToolCall {
+            id: None,
+            name: "t".into(),
+            arguments: serde_json::json!({}),
+            rendered_body: None,
+        }];
+        let fin = summary_tool_calls(calls);
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(
+            10, 16, false, false
+        ));
+        // Wrapper-level mapping (`generate_dflash` / dense spec epilogue).
+        let ctx_exhausted = true;
+        let hit_length_cap = ctx_exhausted
+            || hipfire_generate::common::qwen_dflash_hit_length_cap(10, 16, false, false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(
+            &fin,
+            hit_length_cap,
+            false,
+            "partial",
+            false,
+        );
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                fingerprint_text,
+            } => {
+                assert_eq!(*finish_reason, "length");
+                assert!(!*release_tool_calls);
+                assert!(!*store_cache);
+                assert!(wire_tool_calls.is_empty());
+                assert!(fingerprint_text.is_empty());
+            }
+            other => panic!("expected length Done, got {other:?}"),
+        }
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
+        assert!(!action.store);
+        assert!(hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+            |_, _| panic!("must not insert"),
+            &action,
+            vec![1, 2]
+        )
+        .is_none());
+    }
+
+    #[test]
     fn final_token_eot_beats_length() {
         assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, true, false));
         let calls = vec![ToolCall {

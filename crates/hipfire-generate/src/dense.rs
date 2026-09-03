@@ -559,12 +559,15 @@ pub fn generate_deepseek4_spec(
     }
     // Semantic stop (StopSequence/EOS/ThinkCap) or decoded_eot at cap is not
     // length — preserves stop/tool_calls when generated == max_tokens.
-    let hit_length_cap = qwen_dflash_hit_length_cap(
-        run.generated,
-        max_tokens,
-        run.finish.decoded_eot,
-        run.semantic_stop.is_some(),
-    );
+    // A ctx-exhausted mid-loop break is a length stop even when the token
+    // budget is unspent: same `length` + no-store path as the cap below.
+    let hit_length_cap = run.ctx_exhausted
+        || qwen_dflash_hit_length_cap(
+            run.generated,
+            max_tokens,
+            run.finish.decoded_eot,
+            run.semantic_stop.is_some(),
+        );
     match ds4_spec_wire_terminal(
         run.finish.finish_reason,
         run.finish.tool_calls,

@@ -2075,7 +2075,20 @@ pub fn generate_dflash(
         .as_ref()
         .map(|s| s.ctx_capacity())
         .unwrap_or(usize::MAX);
-    if prompt_tokens.len().saturating_add(max_tokens) > spec_ctx_capacity {
+    let spec_block_size = m
+        .speculator
+        .as_ref()
+        .map(|s| s.block_size())
+        .unwrap_or(0);
+    // Shared margin with the `generate_spec` hard guard below: prompt +
+    // budget + one draft block must fit, so any request the loop would refuse
+    // falls back to AR here instead of erroring after `gen_start`.
+    if !spec_ctx_request_fits(
+        prompt_tokens.len(),
+        max_tokens,
+        spec_block_size,
+        spec_ctx_capacity,
+    ) {
         emit_qwen_ar_info(
             stdout,
             id,
@@ -2430,8 +2443,10 @@ pub fn generate_dflash(
                 im_end_token,
             );
         let semantic_stop = run.semantic_stop.is_some();
-        let hit_length_cap =
-            qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
+        // A ctx-exhausted mid-loop break is a length stop even when the token
+        // budget is unspent: same `length` + no-store path as the cap below.
+        let hit_length_cap = run.ctx_exhausted
+            || qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
         // Prefer producer-visible channel; fall back to finish Token events.
         let visible = if !run.finish.visible_text.is_empty() {
             run.finish.visible_text.clone()
@@ -2637,12 +2652,13 @@ pub fn generate_dflash(
         let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
         // Semantic stop / decoded_eot at the budget boundary is stop/tool_calls,
         // not length — same rule as the qwen_semantic_v2 path.
-        let hit_length_cap = qwen_dflash_hit_length_cap(
-            run.generated,
-            max_tokens,
-            run.finish.decoded_eot,
-            run.semantic_stop.is_some(),
-        );
+        let hit_length_cap = run.ctx_exhausted
+            || qwen_dflash_hit_length_cap(
+                run.generated,
+                max_tokens,
+                run.finish.decoded_eot,
+                run.semantic_stop.is_some(),
+            );
         let finish_reason = if hit_length_cap {
             "length"
         } else if !emit_tool_calls.is_empty() {
@@ -2977,12 +2993,11 @@ pub fn generate_spec(
         let _ = stdout.flush();
         return None;
     }
+    // Shared margin with the `generate_dflash` entry fallback above (same
+    // predicate): without eviction the entry already diverted these to AR,
+    // so this is belt-and-suspenders for direct `generate_spec` callers.
     if m.eviction.is_none()
-        && prompt_tokens
-            .len()
-            .saturating_add(max_tokens)
-            .saturating_add(block_size)
-            > ctx_capacity
+        && !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity)
     {
         emit_active_attempt_error(
             stdout,
@@ -3151,6 +3166,11 @@ pub fn generate_spec(
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
     let mut generated = 0usize;
+    // Set when the mid-loop `position + block_size >= ctx_capacity` break
+    // fires: the draft's context-indexed structures cannot host another
+    // full block, so the epilogue must report a length stop
+    // (`finish_reason=length`, no cache store) rather than a natural stop.
+    let mut ctx_exhausted = false;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -3366,6 +3386,7 @@ pub fn generate_spec(
             return None;
         }
         if position.saturating_add(block_size) >= ctx_capacity {
+            ctx_exhausted = true;
             break;
         }
 
@@ -3958,6 +3979,7 @@ pub fn generate_spec(
         finish,
         grammar_violated,
         semantic_stop,
+        ctx_exhausted,
         fail_closed_rollback,
         prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
         total_s: t_end.duration_since(t0).as_secs_f64(),
