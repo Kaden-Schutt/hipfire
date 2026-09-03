@@ -4623,7 +4623,11 @@ impl Gpu {
                     "escha_h128_out_batched",
                     "escha_swiglu_batched",
                 ],
-                "escha_bare_to_outmajor" => vec!["escha_bare_to_q8_0", "escha_bare_to_f32"],
+                "escha_bare_to_outmajor" => vec![
+                    "escha_bare_to_q8_0",
+                    "escha_bare_to_f32",
+                    "escha_bare_to_f16",
+                ],
                 "escha_moe_gemv_k8_indexed" => vec![
                     "escha_gemv_q8_0_moe_k8_indexed_batched",
                     "escha_gemv_q8_0_wide_moe_k8_indexed_batched",

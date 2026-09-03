@@ -56,6 +56,25 @@ pub enum EschaWeightStore {
     /// caller can separate "the H128 wiring is wrong" from "Q8_0 costs this
     /// much". Do not use for a whole model.
     F32,
+    /// Weight-exact arm that DOES fit a whole model: transpose only, F16
+    /// store (2 B/weight). The decode already produced fp16, so this holds
+    /// bit-identically the same values as [`EschaWeightStore::F32`] in half
+    /// the bytes. It is the G5 KLD reference arm.
+    ///
+    /// It is not merely cheaper than F32, it is free relative to production.
+    /// Every per-expert buffer is a separate allocation that the HIP
+    /// allocator rounds up to a 2 MiB granule, and at A3B shapes Q8_0's
+    /// 2.125 MiB gate_up / 1.0625 MiB down round to exactly the 4 MiB / 2 MiB
+    /// that F16 needs outright. Both arms therefore sit at 60 GiB of experts
+    /// — measured 67.9 GB of GTT for the whole Q8_0 model on gfx1151 against
+    /// a 34.2 GB "logical" expert size. The only difference between the arms
+    /// is the 8-bit re-quantisation, which is exactly what G5 prices.
+    ///
+    /// Like F32 this loses the indexed GPU-top-K fast path (admission is
+    /// `routed_gate_up == Q8_0 && routed_down == Q8_0`, see
+    /// hipfire-dispatch `families/moe.rs`) and runs host-routed instead. That
+    /// is slower and numerically identical.
+    F16,
 }
 
 /// One layer's Escha-W2 transform tables plus the per-layer decode scratch the
@@ -413,6 +432,19 @@ fn decode_projection(
                 WeightTensor {
                     buf,
                     gpu_dtype: DType::F32,
+                    m: oc,
+                    k: ic,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                }
+            }
+            EschaWeightStore::F16 => {
+                let buf = gpu.alloc_tensor(&[oc, ic], DType::F16)?;
+                gpu.escha_bare_to_f16(&bare, &buf, ic, oc)?;
+                WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F16,
                     m: oc,
                     k: ic,
                     row_stride: 0,

@@ -63,6 +63,7 @@ Sizes below are **registry declarations**, not a substitute for runtime MoE layo
 | `qwen3.5:35b-a3b` | `qwen3.5-35b-a3b.mq4` | 19.7 | 22 | q8 | 35B / 3B-active |
 | `qwen3.6:35b-a3b` | `qwen3.6-35b-a3b.mq4p` | 19.8 | 22 | q8 | Default graded mq4p SKU |
 | `qwen3.6:35b-a3b-mq2` | `qwen3.6-35b-a3b.mq2` | 11.6 | 14 | | Floor SKU |
+| `qwen3.6:35b-a3b-escha` | `qwen3.6-35b-a3b.escha` | 12.3 | 72 | | EschaLabs Escha-W2 2-bit trellis. Local-only (empty `repo`) until published. Min VRAM 72, NOT 14: the file is small but the experts decode to Q8_0 at load and sit at 67.9 GB resident, measured on gfx1151 — see `docs/plans/escha-w2-port-design.md` §10.3. Phase 1 is correctness, not speed (40 tok/s decode). |
 | `qwen3.6:35b-a3b-mq3p` | `qwen3.6-35b-a3b.mq3p` | 17.2 | 20 | | MQ3+P graded |
 | `qwen3.6:35b-a3b-mq4p` | `qwen3.6-35b-a3b.mq4p` | 19.8 | 22 | | MQ4+P graded |
 | `qwen3.6:35b-a3b-mfp4` | `qwen3.6-35b-a3b.mfp4` | 20.2 | 22 | | MFP4-E8 |

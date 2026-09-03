@@ -82,3 +82,36 @@ extern "C" __global__ void escha_bare_to_f32(
     if (i >= ic) return;
     out[(size_t)o * ic + i] = __half2float(bare[(size_t)i * oc + o]);
 }
+
+// F16 out-major transpose — the weight-exact arm that fits a whole model.
+//
+// This is PURE DATA MOVEMENT: `escha_decode_tiles` already produced fp16, so
+// the stored value is bit-identical to `escha_ref::reconstruct`'s output. F32
+// (above) is exactly as exact and twice the bytes, which is why it is only a
+// small-layer diagnostic; this one is what a model-scale weight-exact
+// reference arm has to use.
+//
+// The 35B's A3B shapes make the difference stark, and it is an allocator
+// effect rather than an arithmetic one. Per expert the two projections are
+// gate_up `[1024, 2048]` and down `[2048, 512]`:
+//
+//   store  gate_up      down        per-expert   x10240 experts
+//   Q8_0   2.125 MiB    1.0625 MiB  3.1875 MiB   31.9 GiB  (34.2 GB)
+//   F16    4 MiB        2 MiB       6 MiB        60 GiB    (64.4 GB)
+//   F32    8 MiB        4 MiB       12 MiB       120 GiB   (129 GB)
+//
+// but each buffer is a separate allocation that the HIP allocator rounds up
+// to a 2 MiB granule, so the Q8_0 arm's 2.125/1.0625 MiB buffers occupy 4 and
+// 2 MiB anyway — 60 GiB resident, the SAME as F16. Measured on gfx1151:
+// 67.9 GB of GTT for the Q8_0 model against 64.4 GB of expert granules plus
+// ~3.4 GB of everything else. So F16 is weight-exact at no resident cost over
+// production, whereas F32 would be 2x and would not fit.
+extern "C" __global__ void escha_bare_to_f16(
+    const __half* __restrict__ bare,   // [ic, oc] in-major
+    __half* __restrict__ out,          // [oc, ic] out-major
+    int ic, int oc) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int o = blockIdx.y;
+    if (i >= ic) return;
+    out[(size_t)o * ic + i] = bare[(size_t)i * oc + o];
+}

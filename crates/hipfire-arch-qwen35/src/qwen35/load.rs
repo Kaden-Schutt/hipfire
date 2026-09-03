@@ -4361,13 +4361,25 @@ fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
 /// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
 /// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
-/// Escha-W2 expert storage. Production is `Q8_0`; `HIPFIRE_ESCHA_EXPERT_STORE=f32`
-/// selects the weight-exact F32 control arm, which is 4x the memory (60 GiB of
-/// experts on the 35B) and exists so the Q8_0 re-quantisation cost can be
-/// measured rather than assumed. See `qwen35/escha.rs`.
+/// Escha-W2 expert storage. Production is `Q8_0`. The two other values select
+/// weight-exact arms, so the Q8_0 re-quantisation cost can be measured rather
+/// than assumed:
+///
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=f16` — 2 B/weight. The decode already
+///   produced fp16, so this is exact, and because per-expert buffers are
+///   rounded to 2 MiB granules it costs the same 60 GiB the Q8_0 arm already
+///   costs. This is the arm the G5 KLD reference is built with; it is the only
+///   weight-exact arm that fits the 35B.
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=f32` — 4 B/weight, ~129 GB of experts on the
+///   35B. Equally exact and does NOT fit; small-layer diagnostic only (the G4
+///   block gate uses it).
+///
+/// Both lose the indexed GPU-top-K path and run host-routed. See
+/// `qwen35/escha.rs`.
 fn escha_weight_store() -> EschaWeightStore {
     match hipfire_config::developer_var("HIPFIRE_ESCHA_EXPERT_STORE").as_deref() {
         Ok("f32") | Ok("F32") => EschaWeightStore::F32,
+        Ok("f16") | Ok("F16") => EschaWeightStore::F16,
         _ => EschaWeightStore::Q8_0,
     }
 }

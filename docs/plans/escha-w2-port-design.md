@@ -599,7 +599,145 @@ goldens.
 release that changes tile size or codebook constants must fail loudly at
 conversion, not decode into garbage.
 
-## 10. Out of scope
+## 10. Phase 1 results (measured)
+
+Artifact: `/data/hipfire-models/escha-35b.hfq`, sha256
+`bd186b37037ee6c1cb58ce6a5c053b785e9ba30b7f1de04fda7ef4f4f06e3010`, 12.34 GB,
+arch_id 6, registered as `qwen3.6:35b-a3b-escha`. Host gfx1151, ROCm 7.2.2.
+
+### 10.1 Quality (G5)
+
+Reproduce with `scripts/escha-kld.sh`.
+
+| | value |
+|---|---|
+| corpus | `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt`, n_ctx 384, 6 chunks |
+| scored positions | 1146, teacher-forced |
+| **mean KLD vs weight-exact escha** | **0.00276 nats** (95% CI 0.0019–0.0039) |
+| p99 KLD | 0.054 nats |
+| reference PPL / NLL | 7.6651 / 2.036678 |
+| candidate PPL / NLL | 7.6585 / 2.035821 |
+| negative control (exact vs itself) | **0.000000** nats, NLL identical to 8 dp |
+| KLD vs the bf16 parent | **not run** — see §10.2 |
+
+Near-zero, as §7 predicted, and it is the `Q8_0` intermediate rather than the
+codec: the reference arm is the same forward with the experts stored
+weight-exactly (`HIPFIRE_ESCHA_EXPERT_STORE=f16`, bit-identical to
+`escha_ref::reconstruct`), so the only thing that differs between the arms is
+the 8-bit re-quantisation. The p99 sits ~20x the mean, consistent with the
+boundary-tie behaviour in §5 concentrating the error on a handful of positions
+rather than spreading it; that shape is expected and is not a codec bug.
+
+Three things about the method are load-bearing and were each got wrong once
+before being fixed:
+
+- **Teacher forcing is structural, not a flag.** `build_kld_ref_native` writes
+  the token stream into the HFKLDR file and `eval_hipfire` reads the tokens
+  from that file, so both arms are scored on one identical committed stream by
+  construction. Nothing is scored on a model's own greedy output.
+- **`--kv-mode f32` matters more than it looks.** The reference builder uses an
+  unquantised F32 KV cache; `eval_hipfire` defaults to `asym3`. Leaving that
+  default in place gives **0.018357** nats on the identical reference — 6.5x
+  the real figure, and almost all of it is KV quantisation, not the codec.
+- **The negative control is the thing that makes the number attributable.**
+  Scoring the exact arm against its own reference returns exactly 0.000000, so
+  the harness is not reporting a run-to-run noise floor.
+
+The reference could not be `escha_ref` driving a CPU forward: `escha_ref` is a
+block-level oracle (codec, H128, `expert_linear`, `swiglu`) and this repo has
+no CPU transformer, so a CPU reference would have meant hand-writing a
+40-layer hybrid DeltaNet MoE forward and then trusting it more than the thing
+under test. Storing escha's own decoded fp16 weights and reusing the gated GPU
+forward keeps `escha_ref` as the authority for every step it actually defines
+(G2 and G3 gate the decode and the H128 pair bit-exact against it).
+
+### 10.2 The bf16 parent comparison was not run
+
+`Qwen/Qwen3.6-35B-A3B` is not on this box in any form. `/data/hipfire-models`
+has no safetensors copy, and the only cached artifact of the parent is
+`unsloth/Qwen3.6-35B-A3B-GGUF: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` — a 4-bit
+quant, which is a peer rather than a reference. Fetching the parent is ~70 GB.
+Skipped deliberately and left open rather than substituted with the Q4 GGUF,
+which would have produced a number that reads like the answer and is not.
+
+Consequence: **the "does Escha's 2-bit deliver" question is still open**, and
+there is no comparable figure against `qwen3.6:35b-a3b-mq2` on quality. §10.1
+prices the port, not the codec.
+
+### 10.3 Speed and memory
+
+| | escha (Phase 1) | `qwen3.6:35b-a3b-mq4r` |
+|---|---|---|
+| decode | **40.0 tok/s** | 71.8 tok/s (MTP engaged, tau 1.52) |
+| prefill, 1240-token prompt | **40.0 tok/s** | — |
+| prefill, short prompt | 37.5–40.7 tok/s | 289.6 tok/s |
+| file on disk | 12.34 GB | 18.7 GB |
+| resident (GTT) | **67.9 GB** | — |
+
+Phase 1 **loses to `qwen3.6:35b-a3b-mq2` on speed**, as §9 predicted, and that
+is Phase 2's job. mq2 itself is not on this box, so the table uses `mq4r` from
+the same family; the conclusion is a-fortiori rather than assumed — mq2 is
+11.6 GB against mq4r's 18.7 GB, reads strictly fewer expert bytes per token,
+and takes the same indexed GPU-top-K path, so it is at least as fast as the
+column shown. The decode row is not like-for-like (mq4r has its MTP sidecar
+attached and escha has no speculator wired); the prefill row is, and it is the
+starker gap: escha has no admissible batched prefill body, so
+`forward_prefill_batch` falls to a per-token loop and prefill runs at decode
+speed, 7.2x behind.
+
+**Resident memory is 67.9 GB, not the ~36.7 GB §9 predicted.** The prediction
+was not wrong about the format; it was wrong about the allocator. Measured on
+gfx1151 as GTT delta over baseline (`mem_info_gtt_used`, 71.2 GB peak against a
+3.4 GB idle baseline), steady through decode. The cause is allocation
+granularity across 20,480 separate per-expert buffers:
+
+| | logical | rounded to 2 MiB granules |
+|---|---|---|
+| gate_up `[1024, 2048]` Q8_0 | 2.125 MiB | 4 MiB |
+| down `[2048, 512]` Q8_0 | 1.0625 MiB | 2 MiB |
+| x 10240 experts | 31.9 GiB (34.2 GB) | 60 GiB (64.4 GB) |
+
+64.4 GB of granules plus ~3.4 GB of everything else is 67.8 GB, against 67.9 GB
+observed — the arithmetic closes to 0.1%, which is why this is attributed to
+granularity rather than to a leak. Two consequences worth carrying into Phase 2:
+
+- The fix is one contiguous per-layer expert buffer with per-expert offsets,
+  not a change of codec or carrier. It would recover ~30 GB, nearly half the
+  footprint, and is independent of the fused-GEMV work.
+- Until then, the weight-exact **F16** store is free: F16's 4 MiB / 2 MiB
+  projections are exactly what Q8_0 already occupies. That is what makes the
+  §10.1 reference arm runnable at all — F32 would be 129 GB and would not fit.
+
+`escha_model_smoke`'s own note that it "OOMs with ~60 GB already in use"
+corroborates ~65-70 GB rather than the 36 GB it states next to it.
+
+### 10.4 Coherence
+
+Verbatim, greedy (`temperature: 0.0`), via `scripts/_coherence_runner.py`:
+
+    prompt: /no_think What is the capital of France? Answer in one word.
+    reasoning channel: (a short numbered plan, ending) 4. Final Output
+      Generation: - Paris - Matches all constraints.
+    answer channel: Paris
+
+    prompt: /no_think Write three sentences describing a harbour at dawn.
+    Pale gold light spills across the still water, painting the masts of
+    sleeping boats in soft amber hues. A gentle mist clings to the wooden
+    docks while the distant cry of a gull breaks the quiet morning air.
+    Slowly, the first fishing trawler rumbles to life, its engine echoing
+    through the quiet cove as the sun finally crests the horizon.
+
+Attractor detector clean (unique-token ratio 0.617, max token frequency 0.055
+over the first 128 tokens; no 3-gram flag). First run was already coherent —
+no kernel-cache garbage, single-toolchain cache with hipcc on PATH.
+
+One thing to know rather than to fix: the model ignores `/no_think` as a mode
+switch and reasons anyway, so a short `max_tokens` truncates mid-think and the
+daemon reports `open think span at end of generation (validation)`. That is a
+budget artifact, not a decode fault — the same prompt with headroom closes the
+span and emits a normal answer.
+
+## 11. Out of scope
 
 - Reproducing Escha's quantization or recovery fine-tune. We consume their
   weights; we do not build a quantizer.
@@ -611,7 +749,7 @@ conversion, not decode into garbage.
 - MTP-driven speculative decode. The head is carried through conversion so it is
   available, but wiring it is separate work.
 
-## 11. References
+## 12. References
 
 - `EschaLabs/escha-mlx` (Apache-2.0) — `escha_mlx/ref.py` is the format
   contract; `tests/data/codec/` holds the golden vectors.

@@ -14291,6 +14291,65 @@ impl Gpu {
         }
     }
 
+    /// Weight-exact arm of [`Self::escha_bare_to_q8_0`] that fits a whole
+    /// model: same transpose, F16 store, no re-quantisation.
+    ///
+    /// The decode already produced fp16, so this is pure data movement and
+    /// the stored weight is bit-identical to `escha_ref::reconstruct`.
+    /// [`Self::escha_bare_to_f32`] is equally exact but 4 B/weight, which is
+    /// 129 GB of experts on the 35B; this is 2 B/weight, and because every
+    /// per-expert buffer is separately allocated and rounded to a 2 MiB
+    /// granule it occupies the SAME 60 GiB the Q8_0 arm already occupies.
+    /// That is what makes a model-scale weight-exact KLD reference runnable
+    /// (G5, docs/plans/escha-w2-port-design.md).
+    pub fn escha_bare_to_f16(
+        &mut self,
+        bare: &GpuTensor,
+        out: &GpuTensor,
+        ic: usize,
+        oc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if bare.numel() != ic * oc || out.numel() != ic * oc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_f16: bare={} out={} need {} each",
+                    bare.numel(),
+                    out.numel(),
+                    ic * oc
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+            "escha_bare_to_f16",
+        )?;
+        let mut b_ptr = bare.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ic_i = ic as i32;
+        let mut oc_i = oc as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ic_i as *mut _ as *mut c_void,
+            &mut oc_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_bare_to_f16"];
+        let bx = 256u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(ic as u32).div_ceil(bx), oc as u32, 1],
+                [bx, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,
