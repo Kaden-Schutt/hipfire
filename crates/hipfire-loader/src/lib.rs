@@ -188,12 +188,14 @@ pub enum ContinuousBatchRoute {
     Qwen35,
     Lfm2Moe,
 }
-/// Exact arch_id -> continuous-batch route. Mirrors the two batch-capable
-/// families (qwen35 5|6, lfm2moe 11). No carrier probing — pure id match.
+/// Exact arch_id -> continuous-batch route. Only qwen35 5|6 admits: LFM2 (11)
+/// has no servable batch path (see the lfm2moe carrier caps), so the route
+/// refuses it and no batch state is ever allocated. No carrier probing — pure
+/// id match. `ContinuousBatchRoute::Lfm2Moe` stays for the staging body, which
+/// is now unreachable.
 pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
     match arch_id {
         5 | 6 => Some(ContinuousBatchRoute::Qwen35),
-        11 => Some(ContinuousBatchRoute::Lfm2Moe),
         _ => None,
     }
 }
@@ -3956,6 +3958,27 @@ mod ep_admission_tests {
 }
 
 #[cfg(test)]
+mod lfm2_batch_admission_tests {
+    #[test]
+    fn lfm2_continuous_batch_never_admits_but_qwen_still_does() {
+        use super::{carrier_for, continuous_batch_route};
+        // Arch 11: the route refuses, so staging takes the fallback arm and
+        // no Lfm2DecodeBatchState is ever allocated; the caps gate in
+        // `is_batch_request_eligible` (and the engine scheduler) agrees.
+        assert_eq!(continuous_batch_route(11), None);
+        let caps = carrier_for(11).expect("lfm2moe carrier").caps();
+        assert!(
+            !caps.supports_continuous_batch,
+            "lfm2moe caps must stay false while no batch path is servable"
+        );
+        // Adjacent supported: qwen35 5|6 still admit continuous batching.
+        assert!(continuous_batch_route(5).is_some());
+        assert!(continuous_batch_route(6).is_some());
+        assert!(carrier_for(5).expect("qwen35 carrier").caps().supports_continuous_batch);
+    }
+}
+
+#[cfg(test)]
 mod registry_tests {
     use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
 
@@ -4250,10 +4273,12 @@ mod registry_tests {
             }
         );
         assert_eq!(caps_of("minimax"), text_only);
+        // lfm2moe declares supports_continuous_batch: false — the batch state
+        // was allocated and never driven (eligibility always false), so the
+        // capability is truthful only when false. Single-stream LFM unaffected.
         assert_eq!(
             caps_of("lfm2moe"),
             ArchCaps {
-                supports_continuous_batch: true,
                 supports_images: true,
                 ..text_only
             }
@@ -4275,13 +4300,12 @@ mod registry_tests {
             }
         );
 
-        // ── continuous_batch_route: 5|6 -> Qwen35, 11 -> Lfm2Moe ──
+        // ── continuous_batch_route: 5|6 -> Qwen35 only (11/LFM2 refuses) ──
         // The Some/None half duplicates caps().supports_continuous_batch; the
         // variant picks between two distinct staging bodies in batch_staging.
         for id in 0u32..=14 {
             let want = match id {
                 5 | 6 => Some(ContinuousBatchRoute::Qwen35),
-                11 => Some(ContinuousBatchRoute::Lfm2Moe),
                 _ => None,
             };
             assert_eq!(
