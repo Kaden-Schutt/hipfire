@@ -2127,9 +2127,10 @@ pub fn generate_dflash(
     let cache_plan: Option<PromptCachePlan> = if try_jinja {
         if let Some(hist) = messages_history {
             // Assistant-opener primer from THIS turn's cold jinja render
-            // (everything after the last `<|im_start|>assistant\n`) — the
-            // template renders history turns without it, so the replay
-            // prepends it (mirrors generate()'s item-#37 primer).
+            // (everything after the last `<|im_start|>assistant\n`). The
+            // replay prepends it only when the template does not already
+            // re-emit it on history assistant turns (Qwen3.5 does not,
+            // Qwen3.8 does) — mirrors generate()'s item-#37 primer.
             let tok = m.tokenizer.as_ref().unwrap();
             let im_start = tok.special_token_id("<|im_start|>");
             let opener_len = tok.encode("<|im_start|>assistant\n").len();
@@ -2151,6 +2152,12 @@ pub fn generate_dflash(
                 reasoning_strength: None,
                 reasoning_effort,
             };
+            let primer: Vec<u32> =
+                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
+                    Vec::new()
+                } else {
+                    primer
+                };
             let cache_ref = &mut m.asst_turn_cache;
             let trace_cache =
                 std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");

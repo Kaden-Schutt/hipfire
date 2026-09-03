@@ -1495,6 +1495,83 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>
     Some(deduped)
 }
 
+/// Does this template already emit `primer` at the head of a HISTORY
+/// assistant turn?
+///
+/// The generation primer is whatever the cold render leaves after
+/// `<|im_start|>assistant\n` on the live turn (for Qwen with thinking off,
+/// `<think>\n\n</think>\n\n`). The cached assistant body is stored
+/// post-primer, so the jinja splice must re-supply the primer exactly once.
+/// Qwen3.5's template renders history assistant turns bare
+/// (`assistant\n{content}`), so the caller prepends it; Qwen3.8's template
+/// re-emits the empty-think block on history turns too, so prepending
+/// doubles it and the LCP dies at the first assistant turn of every session
+/// (measured 2026-09-03: `lcp=26` against `prior_len=118`, the dumped
+/// render carrying `<think>\n\n</think>\n\n` twice back to back).
+///
+/// Decide from the template itself: render a one-exchange history whose
+/// assistant content is a sentinel word and check whether the primer tokens
+/// sit between the assistant opener and the sentinel. Any render failure
+/// or an unfound opener answers `false` (prepend, the historical behaviour).
+pub fn template_emits_history_primer(frame: &JinjaChatFrame, primer: &[u32]) -> bool {
+    if primer.is_empty() {
+        return false;
+    }
+    let tok = frame.tokenizer;
+    let sentinel = "zqxjkv";
+    let probe = vec![
+        Message {
+            role: Role::User,
+            content: "probe".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        },
+        Message {
+            role: Role::Assistant,
+            content: sentinel.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        },
+        Message {
+            role: Role::User,
+            content: "again".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        },
+    ];
+    let Ok(rendered) = frame.render_messages(&probe, None, None) else {
+        return false;
+    };
+    let tokens = tok.encode(&rendered);
+    let opener = tok.encode("<|im_start|>assistant\n");
+    let sentinel_ids = tok.encode(sentinel);
+    if opener.is_empty() || sentinel_ids.is_empty() {
+        return false;
+    }
+    // First assistant opener in the render is the history turn.
+    let Some(start) = tokens
+        .windows(opener.len())
+        .position(|w| w == opener.as_slice())
+        .map(|p| p + opener.len())
+    else {
+        return false;
+    };
+    tokens[start..].starts_with(primer)
+        && tokens[start + primer.len()..].starts_with(&sentinel_ids)
+}
+
 /// Jinja-native analogue of [`build_cached_history`]: render the conversation
 /// through the model's **trained** `chat_template` but splice each cached
 /// channel body verbatim. The resulting token stream byte-exactly reproduces
@@ -2114,6 +2191,51 @@ mod tests {
         assert_eq!(m.role, Role::Tool);
         assert_eq!(m.content, "72F");
         assert_eq!(m.tool_call_id.as_deref(), Some("call_42"));
+    }
+
+    #[test]
+    fn history_primer_probe_distinguishes_qwen35_and_qwen38_templates() {
+        // Thinking off: the live turn's cold render primes
+        // `<think>\n\n</think>\n\n` after the assistant opener. Qwen3.5-style
+        // templates render HISTORY assistant turns bare; Qwen3.8-style
+        // templates re-emit the empty-think block on them. The cached body is
+        // stored post-primer, so the splice must prepend the primer for the
+        // former and must NOT for the latter (measured 2026-09-03: the double
+        // primer put `lcp=26` against `prior_len=118` on every turn).
+        let t = make_tokenizer();
+        let bare = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{% endif %}";
+        let reemit = "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.role == 'assistant' and not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{% endif %}";
+        let primer = t.encode("<think>\n\n</think>\n\n");
+        assert!(!primer.is_empty());
+        for (template, expect) in [(bare, false), (reemit, true)] {
+            let frame = JinjaChatFrame {
+                tokenizer: &t,
+                template,
+                system: None,
+                user: "",
+                enable_thinking: false,
+                bos_token: Some(""),
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            assert_eq!(
+                template_emits_history_primer(&frame, &primer),
+                expect,
+                "template {template:?}"
+            );
+        }
+        // Empty primer (thinking on with no opener text): never claim re-emit.
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: reemit,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        assert!(!template_emits_history_primer(&frame, &[]));
     }
 
     #[test]
