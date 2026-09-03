@@ -13637,30 +13637,93 @@ impl Gpu {
         result
     }
 
-    /// Decode an escha code stream to a bare fp16 weight matrix `[ic, oc]`.
-    /// Host-side helper used by the G2 parity gate; the load path uses the
-    /// device-resident form.
-    pub fn escha_decode_tiles_host(
-        &mut self,
-        code: &[i16],
+    /// Shared validation for both `escha_decode_tiles` entry points: catches
+    /// a bad shape/K/code-length combination before it becomes an
+    /// out-of-bounds device read. The kernel launches
+    /// `(in_features/16)*(out_features/16)` blocks, each reading `16*K`
+    /// shorts starting at `tile*16*K` — a short `code` slice, an `in_features`
+    /// or `out_features` that is not a multiple of 16, or an unsupported `K`
+    /// all lead to a device-side OOB read (undefined behaviour, not just a
+    /// wrong answer) rather than a clean failure. Mirrors the assertion the
+    /// CPU oracle already makes (`escha_ref::reconstruct`).
+    fn escha_validate_tile_shape(
         in_features: u32,
         out_features: u32,
         k: u32,
-    ) -> HipResult<Vec<u16>> {
+        code_len: usize,
+    ) -> HipResult<()> {
+        if in_features % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_decode_tiles: in_features {in_features} is not a multiple of 16"),
+            ));
+        }
+        if out_features % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_decode_tiles: out_features {out_features} is not a multiple of 16"),
+            ));
+        }
+        if k != 2 && k != 3 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_decode_tiles: unsupported K={k} (only 2 and 3 are defined)"),
+            ));
+        }
+        let want_len = (in_features as usize / 16) * (out_features as usize / 16) * 16 * k as usize;
+        if code_len != want_len {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_decode_tiles: code length mismatch: got {code_len} shorts, expected \
+                     {want_len} for in_features={in_features} out_features={out_features} K={k}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decode an escha code stream already resident on the GPU into a bare
+    /// fp16 weight matrix `[in_features, out_features]`, also GPU-resident.
+    /// This is the load-path form: no host round trip. `escha_decode_tiles_host`
+    /// is the host-roundtrip convenience wrapper used by the G2 parity gate
+    /// and by callers that do not already have the code on-device; it calls
+    /// this function rather than duplicating the launch.
+    pub fn escha_decode_tiles(
+        &mut self,
+        code: &GpuTensor,
+        bare_out: &GpuTensor,
+        in_features: u32,
+        out_features: u32,
+        k: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
+        // Validate against the tensors' LOGICAL shapes, not `buf.size()`: pooled
+        // allocations (`alloc_tensor`) can hand back a physically larger buffer
+        // than requested (see `GpuPool::alloc`), so the physical capacity is not
+        // proof of how much real code/output data is present.
+        Self::escha_validate_tile_shape(in_features, out_features, k, code.numel())?;
         let n_elems = (in_features as usize) * (out_features as usize);
+        if bare_out.numel() != n_elems {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_decode_tiles: bare_out has {} elements, need exactly {} for \
+                     {in_features}x{out_features} fp16",
+                    bare_out.numel(),
+                    n_elems
+                ),
+            ));
+        }
         let n_tiles = (in_features / 16) * (out_features / 16);
-        let code_bytes: Vec<u8> = code.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let d_code = self.upload_raw(&code_bytes, &[code.len()])?;
-        let d_bare = self.alloc_tensor(&[n_elems], DType::F16)?;
         self.ensure_kernel(
             "escha_decode_tiles",
             kernels::ESCHA_DECODE_TILES_SRC,
             "escha_decode_tiles",
         )?;
 
-        let mut code_ptr = d_code.buf.as_ptr();
-        let mut bare_ptr = d_bare.buf.as_ptr();
+        let mut code_ptr = code.buf.as_ptr();
+        let mut bare_ptr = bare_out.buf.as_ptr();
         let mut ic = in_features as i32;
         let mut oc = out_features as i32;
         let mut kk = k as i32;
@@ -13674,8 +13737,28 @@ impl Gpu {
         let func = &self.functions["escha_decode_tiles"];
         unsafe {
             self.hip
-                .launch_kernel(func, [n_tiles, 1, 1], [32, 1, 1], 0, None, &mut params)?;
+                .launch_kernel(func, [n_tiles, 1, 1], [32, 1, 1], 0, None, &mut params)
         }
+    }
+
+    /// Decode an escha code stream to a bare fp16 weight matrix `[ic, oc]`.
+    /// Host-side helper used by the G2 parity gate; the load path uses the
+    /// device-resident `escha_decode_tiles` above, which this calls.
+    pub fn escha_decode_tiles_host(
+        &mut self,
+        code: &[i16],
+        in_features: u32,
+        out_features: u32,
+        k: u32,
+    ) -> HipResult<Vec<u16>> {
+        self.bind_thread()?;
+        Self::escha_validate_tile_shape(in_features, out_features, k, code.len())?;
+        let n_elems = (in_features as usize) * (out_features as usize);
+        let code_bytes: Vec<u8> = code.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_code = self.upload_raw(&code_bytes, &[code.len()])?;
+        let d_bare = self.alloc_tensor(&[n_elems], DType::F16)?;
+
+        self.escha_decode_tiles(&d_code, &d_bare, in_features, out_features, k)?;
 
         let mut out = vec![0u8; n_elems * 2];
         self.hip.memcpy_dtoh(&mut out, &d_bare.buf)?;

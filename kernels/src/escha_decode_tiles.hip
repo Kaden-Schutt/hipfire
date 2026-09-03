@@ -1,13 +1,14 @@
-// Escha-W2 one-shot tile decode -> Q8_0 resident weights (Phase 1).
+// Escha-W2 one-shot tile decode -> bare fp16 (Phase 1/2).
 //
-// Reads the verbatim int16 code stream, decodes 16x16 trellis tiles, and
-// writes hipfire Q8_0 (34 bytes per 32 elements: f16 scale + 32 int8).
+// Reads the verbatim int16 code stream and decodes 16x16 trellis tiles,
+// writing raw __half values into `bare`, a row-major [in_features,
+// out_features] buffer — the SAME in-major orientation Escha's packed code
+// already uses. There is no quantisation and no transpose: this kernel is a
+// pure decode, not a requantiser. (A later stage owns any Q8_0/HFQ
+// requantisation and any transpose to hipfire's preferred layout.)
 //
 // The codebook is computed inline. A 65536-entry fp16 LUT would be 128 KB and
 // gfx1151 has 64 KB LDS, so there is no table anywhere in this file.
-//
-// Escha's tile grid is in-major [in/16, out/16]; hipfire stores weights
-// out-major [out, in]. This kernel transposes on the way out.
 //
 // DELIBERATE DUPLICATION: hipfire-quantize/src/escha_ref.rs implements this
 // same lane maths in Rust. That is the G2 gate — this kernel is asserted
@@ -25,12 +26,30 @@ __device__ __forceinline__ __half escha_cba(unsigned short state) {
     return __hadd(lo, hi);  // fp16 RNE add — matches the reference exactly
 }
 
+// Load tile word `i` (a little-endian pair of int16s) directly from the code
+// stream. Two of these per lane replace what used to be a 16- or 24-entry
+// `unsigned int words[]` staged in registers and indexed at runtime by `i`.
+// That runtime-indexed array measurably cost ~90 v_cndmask/94 v_cmp select
+// instructions per invocation (compiler-generated select cascades to keep a
+// dynamically-indexed array out of scratch memory) even though it never
+// actually spilled to scratch (private_segment_fixed_size was 0). Loading
+// the two needed words directly turns that ALU-bound cascade into two
+// small global loads that land in the same one or two cache lines every
+// other lane in the block is already touching.
+__device__ __forceinline__ unsigned int escha_load_word(
+    const short* __restrict__ src, int i) {
+    return ((unsigned int)(unsigned short)src[2 * i]) |
+           (((unsigned int)(unsigned short)src[2 * i + 1]) << 16);
+}
+
 __device__ __forceinline__ void escha_decode8_k2(
-    const unsigned int* w, int lane, unsigned short* out) {
+    const short* __restrict__ src, int lane, unsigned short* out) {
     int t_off = lane * 8;
     int i1 = t_off >> 4;
     int i0 = (i1 + 15) & 15;
-    unsigned long long merged = ((unsigned long long)w[i0] << 32) | w[i1];
+    unsigned int w0 = escha_load_word(src, i0);
+    unsigned int w1 = escha_load_word(src, i1);
+    unsigned long long merged = ((unsigned long long)w0 << 32) | w1;
     int shift = ((~t_off) & 8) << 1;   // 16 for even lanes, 0 for odd
     unsigned int v = (unsigned int)((merged >> shift) & 0xFFFFFFFFull);
     #pragma unroll
@@ -38,7 +57,7 @@ __device__ __forceinline__ void escha_decode8_k2(
 }
 
 __device__ __forceinline__ void escha_decode8_k3(
-    const unsigned int* w, int lane, unsigned short* out) {
+    const short* __restrict__ src, int lane, unsigned short* out) {
     const int BITS = 3;
     int t_off = lane * 8;
     int b1 = (t_off + 257) * BITS;
@@ -47,8 +66,9 @@ __device__ __forceinline__ void escha_decode8_k3(
     int i0 = b0 >> 5;
     int i2 = (b2 - 1) >> 5;
     int s2 = ((i2 + 1) << 5) - b2;
-    unsigned long long merged =
-        ((unsigned long long)w[i0 % 24] << 32) | w[i2 % 24];
+    unsigned int w0 = escha_load_word(src, i0 % 24);
+    unsigned int w2 = escha_load_word(src, i2 % 24);
+    unsigned long long merged = ((unsigned long long)w0 << 32) | w2;
     unsigned int w7 = (unsigned int)((merged >> s2) & 0xFFFFFFFFull);
     unsigned int w3 = (unsigned int)((merged >> (s2 + BITS * 4)) & 0xFFFFFFFFull);
     out[0] = (unsigned short)(w3 >> 9); out[1] = (unsigned short)(w3 >> 6);
@@ -66,17 +86,12 @@ extern "C" __global__ void escha_decode_tiles(
     int tn = out_features / 16;
     int kt = tile / tn, nt = tile % tn;
     int lane = threadIdx.x;
-    if (lane >= 32) return;
 
-    unsigned int words[24];
     const short* src = code + (size_t)tile * 16 * K;
-    for (int i = 0; i < 8 * K; ++i)
-        words[i] = ((unsigned int)(unsigned short)src[2 * i]) |
-                   (((unsigned int)(unsigned short)src[2 * i + 1]) << 16);
 
     unsigned short st[8];
-    if (K == 2) escha_decode8_k2(words, lane, st);
-    else        escha_decode8_k3(words, lane, st);
+    if (K == 2) escha_decode8_k2(src, lane, st);
+    else        escha_decode8_k3(src, lane, st);
 
     int l0 = lane & ~4;
     int c_off = (lane >> 2) & 1;
