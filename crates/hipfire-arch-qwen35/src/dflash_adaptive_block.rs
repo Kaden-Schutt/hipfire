@@ -43,6 +43,12 @@ pub const ADAPTIVE_WINDOW: usize = 8;
 pub const ADAPTIVE_HEADROOM: usize = 2;
 /// Floor proposal width: below 2 rows the verify saves nothing worth reseeding.
 pub const ADAPTIVE_MIN_BLOCK: usize = 2;
+/// Absolute context position below which the shrink never engages. Fixed-B
+/// holds ~parity with AR below ~2-4k ctx at session τ (issue #693), where the
+/// B×L verify scan is trivial and acceptance is everything — shrinking there
+/// only costs τ (v1 aborted run: adaptive 39.5 tok/s @τ 2.14 vs fixed-B 48.2
+/// @τ 2.85 at L=51). The B×L scan only dominates above this gate.
+pub const ADAPTIVE_CTX_GATE: usize = 2048;
 
 /// Trailing-τ proposal-width controller owned by [`crate::dflash_spec::DflashSpeculator`].
 ///
@@ -85,6 +91,17 @@ impl DflashAdaptiveBlock {
             return self.full;
         }
         self.effective
+    }
+
+    /// Proposal width at absolute context `position`: full below
+    /// [`ADAPTIVE_CTX_GATE`], else [`Self::effective`]. The window keeps
+    /// filling via `observe()` regardless, so the shrink engages immediately
+    /// past the gate on a warm window.
+    pub fn effective_at(&self, position: usize) -> usize {
+        if position < ADAPTIVE_CTX_GATE {
+            return self.full;
+        }
+        self.effective()
     }
 
     /// Mean accepted drafts over the current window (`None` while seeding).
@@ -235,5 +252,39 @@ mod tests {
             c.observe(1);
         }
         assert_eq!(c.effective(), 3);
+    }
+
+    #[test]
+    fn gate_holds_full_below_threshold() {
+        // All-zeros window would shrink to 2 — but below the gate it holds full.
+        let mut c = DflashAdaptiveBlock::new(16, true);
+        for _ in 0..8 {
+            c.observe(0);
+        }
+        assert_eq!(c.effective(), 2);
+        assert_eq!(c.effective_at(51), 16);
+        assert_eq!(c.effective_at(ADAPTIVE_CTX_GATE - 1), 16);
+    }
+
+    #[test]
+    fn gate_releases_above_threshold() {
+        let mut c = DflashAdaptiveBlock::new(16, true);
+        for _ in 0..8 {
+            c.observe(0);
+        }
+        assert_eq!(c.effective_at(ADAPTIVE_CTX_GATE), 2);
+        assert_eq!(c.effective_at(4096), 2);
+    }
+
+    #[test]
+    fn window_warms_while_gated() {
+        // Feed 8 low counts at position 0 -> still full; then past the gate
+        // the shrink engages with no further observes.
+        let mut c = DflashAdaptiveBlock::new(16, true);
+        for _ in 0..8 {
+            c.observe(1);
+            assert_eq!(c.effective_at(0), 16);
+        }
+        assert_eq!(c.effective_at(4096), 3);
     }
 }

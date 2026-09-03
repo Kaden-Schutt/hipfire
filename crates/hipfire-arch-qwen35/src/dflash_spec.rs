@@ -855,12 +855,19 @@ impl Speculator for DflashSpeculator {
         // (uniform for max_emit >= 1); max_accept clamps accept before commit
         // so max_emit == 1 is a true one-token path (accept 0 + bonus).
         let block_override = {
-            // Adaptive proposal width: the trailing-τ controller's effective
-            // block (full until 8 cycles observed / when opted out), further
-            // bounded by the remaining client budget below. Proposing fewer
-            // rows only shortens the accepted run — greedy-parity holds by
-            // construction (causal draft prefix + longest-prefix verify).
-            let cfg_b = self.adaptive.effective().max(2).min(self.df.block_size.max(2));
+            // Adaptive proposal width at this absolute position: the
+            // trailing-τ controller's effective block, gated on context
+            // length (full below ADAPTIVE_CTX_GATE where the B×L scan is
+            // trivial; full until 8 cycles observed / when opted out),
+            // further bounded by the remaining client budget below.
+            // Proposing fewer rows only shortens the accepted run —
+            // greedy-parity holds by construction (causal draft prefix +
+            // longest-prefix verify).
+            let cfg_b = self
+                .adaptive
+                .effective_at(position)
+                .max(2)
+                .min(self.df.block_size.max(2));
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
             if b < cfg_b || b != self.df.draft_config.block_size {
