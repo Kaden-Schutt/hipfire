@@ -14,6 +14,7 @@ use super::config::Qwen35Config;
 use super::config::TreeVerifyCtx;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
+use super::forward::forward_scratch_opts;
 use super::forward::forward_scratch_with_hidden;
 use super::forward::kv_cache_attention_dispatch;
 use super::forward::moe_ffn_has_mq3_experts_uniform;
@@ -1188,7 +1189,16 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // One-shot: mark this forward AR-graph-eligible iff it's plain
                 // single-token decode (consumed inside forward_scratch).
                 gpu.graphs.ar_graph_eligible = plain_ar_graph_eligible;
-                forward_scratch(
+                // Only the LAST token's logits survive this loop — every
+                // earlier token's are overwritten by the next iteration and
+                // never read. Skipping the lm_head for them is not a
+                // shortcut, it deletes work that has no consumer: measured
+                // 2.32 ms of a 24.55 ms escha-35b prefill token (508 MB of
+                // weight traffic at vocab 248 320), 9.5 % of prefill, on
+                // every token but one. `scratch.tmp` (post-output-norm
+                // hidden) is still written, so the `per_token_hidden_out`
+                // copy below is unaffected.
+                forward_scratch_opts(
                     gpu,
                     weights,
                     config,
@@ -1197,6 +1207,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     kv_cache,
                     dn_state,
                     scratch,
+                    i + 1 == tokens.len(),
                 )?;
             }
             if let Some(dst) = per_token_hidden_out {
@@ -1837,7 +1848,24 @@ pub fn qwen35_layer_batch_admissible(
                 arch,
             );
             if !moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch) {
-                return Err(HipError::new(0, "DeltaNetMoe moe_ffn not batch-admissible"));
+                // Name the dtypes. "not batch-admissible" alone sends the
+                // reader to a 180-line predicate; the six dtypes it keys on
+                // identify the missing arm directly.
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "DeltaNetMoe moe_ffn not batch-admissible: router={:?} \
+                         shared_gate={:?} shared=({:?},{:?},{:?}) routed=({:?},{:?}) escha={}",
+                        l.ffn.router.gpu_dtype,
+                        l.ffn.shared_expert_gate.gpu_dtype,
+                        l.ffn.shared_expert.gate.gpu_dtype,
+                        l.ffn.shared_expert.up.gpu_dtype,
+                        l.ffn.shared_expert.down.gpu_dtype,
+                        l.ffn.experts.first().map(|e| e.gate_up.gpu_dtype),
+                        l.ffn.experts.first().map(|e| e.down.gpu_dtype),
+                        l.ffn.escha.is_some(),
+                    ),
+                ));
             }
             Ok(())
         }
@@ -1907,7 +1935,24 @@ pub fn qwen35_layer_batch_admissible(
                 arch,
             );
             if !moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch) {
-                return Err(HipError::new(0, "FullAttnMoe moe_ffn not batch-admissible"));
+                // Name the dtypes. "not batch-admissible" alone sends the
+                // reader to a 180-line predicate; the six dtypes it keys on
+                // identify the missing arm directly.
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "FullAttnMoe moe_ffn not batch-admissible: router={:?} \
+                         shared_gate={:?} shared=({:?},{:?},{:?}) routed=({:?},{:?}) escha={}",
+                        l.ffn.router.gpu_dtype,
+                        l.ffn.shared_expert_gate.gpu_dtype,
+                        l.ffn.shared_expert.gate.gpu_dtype,
+                        l.ffn.shared_expert.up.gpu_dtype,
+                        l.ffn.shared_expert.down.gpu_dtype,
+                        l.ffn.experts.first().map(|e| e.gate_up.gpu_dtype),
+                        l.ffn.experts.first().map(|e| e.down.gpu_dtype),
+                        l.ffn.escha.is_some(),
+                    ),
+                ));
             }
             Ok(())
         }
@@ -2492,6 +2537,40 @@ pub fn prefill_batch_pbs_eligible(
              all_layers_ok={all_layers_ok}",
             n >= MIN_BATCH,
         );
+        // `all_layers_ok=false` on its own says a model prefills at decode
+        // speed but not WHY, and the reason is a string inside an `is_ok()`
+        // that nothing prints. Report each DISTINCT refusal once, with how
+        // many layers it covers, so a per-token prefill is diagnosable from
+        // one run instead of a source read. (Escha-W2 was diagnosed this way.)
+        if !all_layers_ok {
+            let mut seen: Vec<(String, Vec<usize>)> = Vec::new();
+            for (i, lw) in weights.layers.iter().enumerate() {
+                let reason = if matches!(
+                    lw,
+                    LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+                ) && !moe_router_logits_present
+                {
+                    Some("MoE layer with no batched router-logits buffer".to_string())
+                } else {
+                    qwen35_layer_batch_admissible(lw, config, arch)
+                        .err()
+                        .map(|e| e.message.clone())
+                };
+                if let Some(reason) = reason {
+                    match seen.iter_mut().find(|(r, _)| *r == reason) {
+                        Some((_, layers)) => layers.push(i),
+                        None => seen.push((reason, vec![i])),
+                    }
+                }
+            }
+            for (reason, layers) in &seen {
+                eprintln!(
+                    "[hipfire::batch_eligible]   REFUSED {} layer(s) (first is {}): {reason}",
+                    layers.len(),
+                    layers[0],
+                );
+            }
+        }
     }
     result
 }

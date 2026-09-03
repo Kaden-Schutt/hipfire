@@ -844,7 +844,7 @@ fn forward_from_x_gpu(
 
     // Run the production pipeline
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, &scratch, None, None,
+        gpu, weights, config, pos, kv_cache, dn_state, &scratch, None, None, true,
     )?;
 
     // DEBUG_LAYERS: dump per-layer residual norms
@@ -1396,6 +1396,19 @@ fn ar_graph_trace_enabled() -> bool {
     })
 }
 
+/// Whether this forward may capture or replay the plain-AR hipGraph.
+///
+/// `emit_logits == false` produces a DIFFERENT kernel sequence (no lm_head),
+/// so a logits-suppressed forward must neither capture the graph nor replay
+/// one captured from a full forward: replaying a full graph would re-run the
+/// lm_head the caller meant to skip, and capturing a suppressed one would
+/// leave a later plain decode replaying a graph that never writes
+/// `scratch.logits` — stale logits, no error, no NaN.
+#[inline]
+fn ar_graph_eligible_for(requested: bool, compact_offset: usize, emit_logits: bool) -> bool {
+    emit_logits && ar_graph_eligible_for_kv(requested, compact_offset)
+}
+
 #[inline]
 fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     // The captured single-token route is built while compact_offset is zero.
@@ -1417,6 +1430,48 @@ pub fn forward_scratch(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    forward_scratch_opts(
+        gpu, weights, config, token, pos, kv_cache, dn_state, scratch, true,
+    )
+}
+
+/// [`forward_scratch`] with the final lm_head projection made optional.
+///
+/// `emit_logits == false` runs every layer, the KV/DeltaNet state updates and
+/// the final output norm exactly as before, and stops short of the vocabulary
+/// GEMV. `scratch.tmp` (the post-output-norm hidden state) is still written, so
+/// the per-token-hidden extraction in `forward_prefill_batch`'s fallback is
+/// unaffected; only `scratch.logits` is left holding the previous call's value.
+///
+/// # Why this exists
+///
+/// A model that fails batched-prefill admission prefills through a per-token
+/// `forward_scratch` loop, and every one of those tokens computed a full
+/// `[vocab, hidden]` projection whose result the next token immediately
+/// overwrote. Only the LAST token's logits are ever read. On escha-35b
+/// (`vocab = 248 320`, Q8_0 lm_head) `rocprofv3 --kernel-trace` prices that at
+/// **2.32 ms of a 24.55 ms prefill token — 508 MB of weight traffic, 9.5 % of
+/// the token** — spent producing a value that is discarded.
+///
+/// It is a real saving rather than a bookkeeping one because this model is
+/// bandwidth-bound: the lm_head GEMV moves the whole 508 MB weight matrix per
+/// call and achieves ~219 GB/s doing it.
+///
+/// CONTRACT: pass `false` only when the caller will not read `scratch.logits`
+/// for that position. The prefill fallback passes `true` for the final token,
+/// which is the only one whose logits survive the loop.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    emit_logits: bool,
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
     // Grow before any possible AR graph capture/replay. Stable virtual
@@ -1533,8 +1588,19 @@ pub fn forward_scratch(
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
     let requested_graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
-    let graph_eligible =
-        ar_graph_eligible_for_kv(requested_graph_eligible, kv_cache.compact_offset);
+    // A logits-suppressed forward emits a DIFFERENT kernel sequence (no
+    // lm_head), so it must never capture the plain-AR graph nor replay one
+    // captured from a full forward — a replay would either re-run the lm_head
+    // this call meant to skip or, captured the other way round, leave a later
+    // plain decode reading stale logits. Today's only `emit_logits == false`
+    // caller (the prefill fallback) already sets `ar_graph_eligible = false`;
+    // this makes the invariant a property of the function rather than of its
+    // callers, so a new caller cannot reintroduce the hazard.
+    let graph_eligible = ar_graph_eligible_for(
+        requested_graph_eligible,
+        kv_cache.compact_offset,
+        emit_logits,
+    );
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
@@ -1620,7 +1686,16 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            None,
+            emit_logits,
         )?;
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
@@ -1641,7 +1716,16 @@ pub fn forward_scratch(
             gpu.active_stream.as_ref().unwrap(),
         )?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            None,
+            emit_logits,
         )?;
         gpu.graphs.end_graph_capture(
             &gpu.hip,
@@ -1664,7 +1748,16 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            None,
+            emit_logits,
         )?;
     }
     if gpu.replay.should_auto_finalize_capture() {
@@ -1775,6 +1868,7 @@ pub fn forward_scratch_with_hidden(
         scratch,
         Some(hidden_rb),
         None,
+        true,
     )?;
     hidden_rb.advance_head();
     Ok(())
@@ -1805,7 +1899,7 @@ pub fn forward_scratch_embed(
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None, true,
     )
 }
 
@@ -1896,6 +1990,7 @@ pub fn forward_scratch_mrope(
         scratch,
         None,
         Some(mc),
+        true,
     )
 }
 
@@ -1947,11 +2042,21 @@ pub fn forward_scratch_embed_mrope(
         scratch,
         None,
         Some(mc),
+        true,
     )
 }
 
 // ── Forward scratch layers (dispatch family version) ────────────────────
 
+/// `emit_logits == false` runs the whole layer stack and the final output
+/// norm but skips the lm_head GEMV. See [`forward_scratch_opts`] for why.
+/// Honoured on BOTH arms: the hand-written one below and the lowered super-op
+/// executor (`forward_scratch_layers_lowered`), which is the DEFAULT
+/// (`HIPFIRE_FORWARD_LOWERED` opts out with `0`). Threading it through only
+/// the hand arm makes the saving invisible on the default path — that mistake
+/// was made once here and caught by counting lm_head dispatches in the kernel
+/// trace, not by the wall clock, which moved 0.3 %.
+#[allow(clippy::too_many_arguments)]
 fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1962,6 +2067,7 @@ fn forward_scratch_layers(
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
+    emit_logits: bool,
 ) -> HipResult<()> {
     // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
     // single-GPU decode through the lowered super-op executor. Skipped when a
@@ -1975,7 +2081,16 @@ fn forward_scratch_layers(
     // silently reinstate sequential positions. VL therefore always takes the
     // hand arms below, which DO branch on `mrope`.
     if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() {
-        return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
+        return forward_scratch_layers_lowered(
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            s,
+            emit_logits,
+        );
     }
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -2622,9 +2737,12 @@ fn forward_scratch_layers(
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
 
-    // Final norm + logits into scratch.logits
+    // Final norm — ALWAYS. `s.tmp` is the post-norm hidden state and is read
+    // by callers that never look at the logits (per-token hidden extraction in
+    // the prefill fallback, hidden-ring staging), so it is not part of what
+    // `emit_logits == false` skips.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    {
+    if emit_logits {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
@@ -5915,6 +6033,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
 /// to `forward_scratch_layers`'s hand arms (validated byte-identical via the
 /// external committed-token md5 gate). Builds a coarse-super-op `LayerProgram`
 /// per layer and runs it through the dispatch substrate's executor.
+#[allow(clippy::too_many_arguments)]
 fn forward_scratch_layers_lowered(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -5923,6 +6042,7 @@ fn forward_scratch_layers_lowered(
     kv_cache: &mut llama::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
+    emit_logits: bool,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -5993,7 +6113,7 @@ fn forward_scratch_layers_lowered(
 
     // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    {
+    if emit_logits {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
@@ -6128,6 +6248,24 @@ mod tests {
         assert_eq!(lower_variant(Q35Variant::DeltaNet).len(), 7);
         assert_eq!(lower_variant(Q35Variant::DeltaNetMoe).len(), 6);
         assert_eq!(lower_variant(Q35Variant::FullAttnMoe).len(), 4);
+    }
+
+    /// A logits-suppressed forward must never touch the plain-AR graph.
+    ///
+    /// Without this, the prefill fallback's `emit_logits = false` tokens could
+    /// replay a graph captured from a full forward (re-running the lm_head the
+    /// skip exists to remove — the optimisation silently does nothing), or
+    /// capture a logits-free graph that a later plain decode replays, leaving
+    /// `scratch.logits` holding a previous token's values with no error and no
+    /// NaN to catch it.
+    #[test]
+    fn logits_suppressed_forward_is_never_ar_graph_eligible() {
+        // Otherwise-perfect conditions: requested, no KV compaction.
+        assert!(ar_graph_eligible_for(true, 0, true));
+        assert!(!ar_graph_eligible_for(true, 0, false));
+        // emit_logits cannot RE-enable a forward the other conditions refuse.
+        assert!(!ar_graph_eligible_for(false, 0, true));
+        assert!(!ar_graph_eligible_for(true, 128, true));
     }
 
     #[test]
