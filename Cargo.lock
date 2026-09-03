@@ -1381,6 +1381,7 @@ dependencies = [
 name = "hipfire-dispatch"
 version = "0.3.0"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "rdna-compute",

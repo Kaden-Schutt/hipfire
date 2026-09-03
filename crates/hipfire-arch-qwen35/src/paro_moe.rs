@@ -218,5 +218,7 @@ pub(crate) fn paro_load_moe_ffn(
         paro_shared: Some(shared),
         global_expert_dtypes: None,
         ep_dummy_buffers: Vec::new(),
+        // ParoQuant, not Escha-W2.
+        escha: None,
     })
 }

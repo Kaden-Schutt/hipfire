@@ -17,6 +17,10 @@ pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
 
+/// Escha-W2 routed-expert decode executor (Task 10). Replaces step 4 of the
+/// CPU-top-K fallback for escha layers; everything else stays arch-6 code.
+pub mod escha;
+
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
 }
@@ -885,6 +889,20 @@ pub fn run_moe_decode(
     // shared-expert down → generic per-expert routed loop, then returns. It
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // k=8 + an indexable routed dtype).
+    // Escha-only router-logits f16 round-trip. This is HOISTED ABOVE the
+    // CPU-fallback return on purpose (Task 10 fix): Task 9 placed it further
+    // down, on the GPU-top-K path only, but escha's routed experts are stored
+    // Q8_0 and Q8_0 is not an indexable routed dtype — so every real escha
+    // layer takes the `!use_gpu_topk` branch below and the rounding was
+    // unreachable on the one model family that needs it. The rationale for
+    // the rounding itself is unchanged; see the comment at the (now
+    // no-op-for-escha) second call site below and
+    // `MoeDtypes::has_escha_experts`. `p.has_escha()` also admits layers whose
+    // routed dtype has been rewritten to Q8_0 by the escha loader, which
+    // `has_escha_experts()` alone can no longer see.
+    if p.has_escha() {
+        hip!(gpu.router_logits_round_f16_rne(p.router_logits))?;
+    }
     if !res.use_gpu_topk {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
@@ -928,9 +946,11 @@ pub fn run_moe_decode(
     // BEFORE the kernel-selection `if`/`else` below, so both routes (the
     // fused exact-wave64 kernel and the softmax_f32 + moe_topk_renorm_k8
     // fallback pair) see identically-rounded logits.
-    if p.dtypes.has_escha_experts() {
-        hip!(gpu.router_logits_round_f16_rne(p.router_logits))?;
-    }
+    // (The rounding itself was applied above, hoisted so the CPU-top-K
+    // fallback gets it too. Re-rounding here would be numerically a no-op —
+    // f16(f16(x)) == f16(x) — but the launch would not be free, so it is not
+    // repeated. This site keeps the rationale next to the selection kernels
+    // it protects.)
     static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
     let router_shared_fuse = exact_wave64_router
         && p.batch_size == 1
@@ -2075,6 +2095,47 @@ fn run_moe_decode_cpu_fallback(
             arch: "",
             quant: "",
         });
+    }
+
+    // ── 4a. Escha-W2 routed experts: the H128-wrapped, batched executor ──────
+    // Escha weights are in a rotated domain; a plain per-expert `run_auto`
+    // here would silently produce ~1e-1-wrong output. The executor also
+    // batches the transforms across the token's k experts, which is a
+    // measured hard requirement (see pipeline::escha module docs), so it
+    // replaces the loop below wholesale rather than wrapping each iteration.
+    if let Some(escha) = p.escha.as_ref() {
+        if p.expert_down_awq_ptrs.is_some() || p.expert_dtype_tags.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-with-awq-or-graded-tiers",
+                arch: "",
+                quant: "",
+            });
+        }
+        if gpu.hessian_capture.is_some() {
+            // The capture keys off the RAW pre-rotation activations; on the
+            // escha path those are the H128 outputs, not `x_norm`/`silu(g)*u`,
+            // so silently reusing the loop below's keys would poison the
+            // Hessians. Refuse rather than record the wrong thing.
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-hessian-capture-unsupported",
+                arch: "",
+                quant: "",
+            });
+        }
+        return crate::pipeline::escha::escha_routed_decode(
+            ctx,
+            gpu,
+            escha,
+            p.routed_experts,
+            &topk_indices,
+            &topk_weights,
+            p.x_norm,
+            p.x_residual,
+            p.hidden,
+            mi,
+        );
     }
 
     // ── 4. Per-expert routed loop (master's generic `weight_gemv` arm) ────────

@@ -86,3 +86,15 @@ mod tests {
         );
     }
 }
+
+/// Process-wide count of `escha_h128_in_batched` / `escha_h128_out_batched`
+/// launches. The Escha-W2 forward path is launch-bound (Task 8), so the
+/// per-token launch budget is a correctness-adjacent property: the G4 gate
+/// reads this to report the achieved launches/token instead of asserting a
+/// comment. Diagnostic only — nothing synchronises on it.
+pub static ESCHA_H128_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read (and optionally reset) the H128 batched-launch tally.
+pub fn escha_h128_launches() -> u64 {
+    ESCHA_H128_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}

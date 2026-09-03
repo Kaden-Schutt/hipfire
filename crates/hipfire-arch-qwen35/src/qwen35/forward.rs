@@ -712,6 +712,11 @@ fn moe_ffn_decode_impl(
         topk_indices: s.topk_indices,
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
+        // Escha-W2 (Task 10). `Some` only for Escha-W2 layers; it is both the
+        // transform tables the H128-wrapped routed executor needs AND the
+        // layer's escha marker (the loader has already turned the trellis
+        // experts into Q8_0, so no routed dtype says "escha" any more).
+        escha: ffn.escha.as_ref().map(|e| e.refs()),
     };
     // Build one DispatchCtx per token (the family threads it through every
     // inner GEMV — no internal DispatchCtx::new reconstructions).

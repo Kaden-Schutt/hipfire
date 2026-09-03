@@ -13849,6 +13849,278 @@ impl Gpu {
             .collect())
     }
 
+    /// One H128 launch covering ALL `slots` top-k experts of a token
+    /// (Task 10). `entry` is `escha_h128_in_batched` or
+    /// `escha_h128_out_batched`.
+    ///
+    /// This is a HARD REQUIREMENT of the escha forward path, not an
+    /// optimisation: Task 8 measured these kernels launch-bound (an empty
+    /// kernel at the same grid/block is 70-75% of a real launch's cost), so
+    /// the per-expert form costs 1280 launches/token = 3.07 ms = a 326 tok/s
+    /// ceiling before any GEMV work. The batched form is 160 launches.
+    ///
+    /// - `a`: `[n]` when `x_batched == false` (input side of gate_up — every
+    ///   top-k expert sees the same post-rmsnorm activation), else
+    ///   `[slots, n]`. The output side is always `[slots, n]`.
+    /// - `r_table`: the whole resident `[E, n]` `escha_rin_eff` /
+    ///   `escha_rout_eff` tensor. Slot `s` reads row `ids[s]` — that indexing
+    ///   IS the batching; no per-expert vector is gathered or copied.
+    /// - `ids`: `[slots]` i32 expert ids, device-resident.
+    /// - `out`: `[slots, n]` F32 holding f16-ROUNDED values (see the kernel).
+    pub fn escha_h128_batched(
+        &mut self,
+        entry: &str,
+        a: &GpuTensor,
+        r_table: &GpuTensor,
+        ids: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        slots: usize,
+        x_batched: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_h128_batched: n={n} is not a multiple of 128"),
+            ));
+        }
+        let want_a = if x_batched { slots * n } else { n };
+        if a.numel() != want_a {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: a has {} elements, need {want_a}",
+                    a.numel()
+                ),
+            ));
+        }
+        if out.numel() != slots * n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: out has {} elements, need {}",
+                    out.numel(),
+                    slots * n
+                ),
+            ));
+        }
+        if r_table.numel() % n != 0 || r_table.numel() < n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: r table has {} elements, not a whole number of {n}-wide rows",
+                    r_table.numel()
+                ),
+            ));
+        }
+        if ids.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: ids has {} elements, need {slots}",
+                    ids.numel()
+                ),
+            ));
+        }
+        self.ensure_kernel("escha_h128", kernels::ESCHA_H128_SRC, entry)?;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut r_ptr = r_table.buf.as_ptr();
+        let mut i_ptr = ids.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut xb = i32::from(x_batched);
+        let mut params: Vec<*mut c_void> = if entry == "escha_h128_in_batched" {
+            vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut r_ptr as *mut _ as *mut c_void,
+                &mut i_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+                &mut xb as *mut _ as *mut c_void,
+            ]
+        } else {
+            vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut r_ptr as *mut _ as *mut c_void,
+                &mut i_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ]
+        };
+        let func = &self.functions[entry];
+        let grid = (slots * (n / 128)) as u32;
+        // Counted so the "160 H128 launches per token" budget is a MEASURED
+        // number in the G4 gate, not a claim in a comment. Relaxed ordering:
+        // this is a diagnostic tally, nothing synchronises on it.
+        crate::ESCHA_H128_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [128, 1, 1], 0, None, &mut params)
+        }
+    }
+
+    /// SwiGLU over the f16-rounded merged `gate_up` output, batched across
+    /// the token's top-k slots. `y` is `[slots, 2*inter]` (gate = FIRST
+    /// half), `h` is `[slots, inter]`. One launch for the whole token.
+    pub fn escha_swiglu_batched(
+        &mut self,
+        y: &GpuTensor,
+        h: &GpuTensor,
+        inter: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if y.numel() != slots * 2 * inter || h.numel() != slots * inter {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_swiglu_batched: y={} h={} for slots={slots} inter={inter}",
+                    y.numel(),
+                    h.numel()
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_h128",
+            kernels::ESCHA_H128_SRC,
+            "escha_swiglu_batched",
+        )?;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut h_ptr = h.buf.as_ptr();
+        let mut inter_i = inter as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut h_ptr as *mut _ as *mut c_void,
+            &mut inter_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_swiglu_batched"];
+        let bx = 256u32;
+        let gx = (inter as u32).div_ceil(bx);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [gx, slots as u32, 1],
+                [bx, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// Load path: transpose the bare in-major `[ic, oc]` fp16 that
+    /// `escha_decode_tiles` produced into hipfire's OUT-major expert slot,
+    /// re-quantising to Q8_0 in the same pass. `out` must be
+    /// `oc * (ic/32) * 34` bytes.
+    pub fn escha_bare_to_q8_0(
+        &mut self,
+        bare: &GpuTensor,
+        out: &GpuTensor,
+        ic: usize,
+        oc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if ic % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_bare_to_q8_0: ic={ic} is not a multiple of 32"),
+            ));
+        }
+        if bare.numel() != ic * oc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_q8_0: bare has {} elements, need {}",
+                    bare.numel(),
+                    ic * oc
+                ),
+            ));
+        }
+        let want = oc * (ic / 32) * 34;
+        if out.byte_size() != want {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_q8_0: out is {} bytes, need {want}",
+                    out.byte_size()
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+            "escha_bare_to_q8_0",
+        )?;
+        let mut b_ptr = bare.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ic_i = ic as i32;
+        let mut oc_i = oc as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ic_i as *mut _ as *mut c_void,
+            &mut oc_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_bare_to_q8_0"];
+        let grid = (oc * (ic / 32)) as u32;
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
+        }
+    }
+
+    /// Weight-exact control arm of [`Self::escha_bare_to_q8_0`]: same
+    /// transpose, F32 store, no re-quantisation. 4 B/weight — diagnostic
+    /// only (the G4 gate uses it to separate wiring error from Q8_0 error).
+    pub fn escha_bare_to_f32(
+        &mut self,
+        bare: &GpuTensor,
+        out: &GpuTensor,
+        ic: usize,
+        oc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if bare.numel() != ic * oc || out.numel() != ic * oc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_f32: bare={} out={} need {} each",
+                    bare.numel(),
+                    out.numel(),
+                    ic * oc
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+            "escha_bare_to_f32",
+        )?;
+        let mut b_ptr = bare.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ic_i = ic as i32;
+        let mut oc_i = oc as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ic_i as *mut _ as *mut c_void,
+            &mut oc_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_bare_to_f32"];
+        let bx = 256u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(ic as u32).div_ceil(bx), oc as u32, 1],
+                [bx, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,

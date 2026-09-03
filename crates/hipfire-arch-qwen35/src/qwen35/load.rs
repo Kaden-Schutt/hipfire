@@ -8,6 +8,8 @@
 use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
+use super::escha;
+use super::escha::EschaWeightStore;
 use super::forward::layers_have_mq6_moe;
 use super::weights::dtype_from_quant_type;
 use super::weights::mixed_expert_tag;
@@ -1435,6 +1437,8 @@ fn paro_load_moe_ffn(
         paro_shared: Some(shared),
         global_expert_dtypes: None,
         ep_dummy_buffers: Vec::new(),
+        // ParoQuant/paged, not Escha-W2.
+        escha: None,
     })
 }
 
@@ -4357,6 +4361,17 @@ fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
 /// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
 /// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
+/// Escha-W2 expert storage. Production is `Q8_0`; `HIPFIRE_ESCHA_EXPERT_STORE=f32`
+/// selects the weight-exact F32 control arm, which is 4x the memory (60 GiB of
+/// experts on the 35B) and exists so the Q8_0 re-quantisation cost can be
+/// measured rather than assumed. See `qwen35/escha.rs`.
+fn escha_weight_store() -> EschaWeightStore {
+    match hipfire_config::developer_var("HIPFIRE_ESCHA_EXPERT_STORE").as_deref() {
+        Ok("f32") | Ok("F32") => EschaWeightStore::F32,
+        _ => EschaWeightStore::Q8_0,
+    }
+}
+
 pub(crate) fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -4750,19 +4765,57 @@ pub(crate) fn load_moe_ffn(
         .map(|slot| ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot))
         .filter(|&x| owns_orig(x))
         .collect();
-    let packed = if ep_shard.is_none() && packed_mq4_experts_supported(gpu) {
+    // ── Escha-W2 routed experts (Task 10) ────────────────────────────────
+    // An Escha-W2 layer carries ONE trellis code tensor per projection for
+    // all experts, not the per-expert `experts.{x}.gate_up_proj.weight`
+    // tensors every other path fishes out by index, so it bypasses both the
+    // packed-MQ4 fast path and the generic per-expert loop below.
+    let escha_layer = escha::layer_is_escha(hfq, p);
+    if escha_layer && (ep_shard.is_some() || ep.is_some()) {
+        return Err(HipError::new(
+            0,
+            "qwen35: Escha-W2 routed experts do not support EP sharding or a REAP keep-map              (both re-map experts across the per-expert tensors escha does not have)",
+        ));
+    }
+    let escha_tables = if escha_layer {
+        let store = escha_weight_store();
+        let (experts, tables) = escha::load_escha_moe_experts(
+            hfq,
+            gpu,
+            p,
+            &expert_ids,
+            n_exp,
+            config.dim,
+            mi,
+            config.num_experts_per_tok,
+            store,
+        )?;
+        if layer_idx == 0 {
+            eprintln!(
+                "  Escha-W2 routed experts: {} experts decoded from the trellis, stored {store:?}",
+                experts.len()
+            );
+        }
+        Some((experts, tables))
+    } else {
+        None
+    };
+
+    let packed = if !escha_layer && ep_shard.is_none() && packed_mq4_experts_supported(gpu) {
         try_load_packed_mq4_experts(hfq, gpu, p, &expert_ids, mi, config.dim)?
     } else {
         None
     };
-    let (mut experts, packed_expert_owners) = if let Some((experts, owners)) = packed {
+    let (mut experts, packed_expert_owners, escha_tables) = if let Some((e, t)) = escha_tables {
+        (e, None, Some(t))
+    } else if let Some((experts, owners)) = packed {
         if layer_idx == 0 {
             eprintln!(
                 "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
                 2 * experts.len()
             );
         }
-        (experts, Some(owners))
+        (experts, Some(owners), None)
     } else {
         let mut experts = Vec::with_capacity(expert_ids.len());
         for x in expert_ids {
@@ -4784,7 +4837,7 @@ pub(crate) fn load_moe_ffn(
             )?;
             experts.push(ExpertWeights { gate_up, down });
         }
-        (experts, None)
+        (experts, None, None)
     };
     if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() && ep_shard.is_none() {
         let mut converted = 0usize;
@@ -4902,5 +4955,6 @@ pub(crate) fn load_moe_ffn(
         paro_shared: None,
         global_expert_dtypes: None,
         ep_dummy_buffers,
+        escha: escha_tables,
     })
 }

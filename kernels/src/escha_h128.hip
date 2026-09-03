@@ -142,3 +142,102 @@ extern "C" __global__ void escha_h128_out(
     float* out = h128_parallel(bufA, bufB, t);
     y[idx] = f2h_rne(out[t] * ESCHA_RS * rout[idx]);
 }
+
+// ── Batched-across-experts forms (Task 10) ───────────────────────────────
+//
+// WHY THESE EXIST: Task 8 measured the H128 kernels as LAUNCH-bound, not
+// bandwidth-bound — an empty kernel at the same grid/block costs 1.74-1.78 us
+// against a real launch's 2.4 us, and the overhead-subtracted time is nearly
+// flat (0.59 -> 0.69 us) from 16 to 136 blocks. Issuing one launch per
+// (expert, projection, side) costs 40 layers x 8 experts x 4 transforms =
+// 1280 launches/token = 3.07 ms = a 326 tok/s ceiling from the transforms
+// ALONE, before any GEMV work. One launch per (layer, projection, side)
+// covering all top_k experts is 160 launches = 0.38 ms.
+//
+// The maths is identical to the per-expert form; the only change is that
+// `r` is now the whole resident `[E, n]` table and each slot picks its row
+// via `ids[slot]`. Grid is `slots * (n/128)` blocks of 128 threads; block
+// `g` serves slot `g / (n/128)`, group `g % (n/128)`.
+//
+// OUTPUT DTYPE: these write f32 holding the f16-ROUNDED value (widened),
+// not __half. The value set is identical to the per-expert kernels' — the
+// rounding happens at exactly the same point — but the consumer is
+// hipfire's f32 GEMV, so widening here saves a separate convert launch.
+//
+// `x_batched == 0` broadcasts a single `[n]` activation across all slots
+// (the gate_up input side: every top_k expert of a token sees the same
+// post-rmsnorm x, only `rin` differs). `x_batched != 0` reads `[slots, n]`
+// (the down input side, whose per-slot activation is that slot's SwiGLU
+// output).
+extern "C" __global__ void escha_h128_in_batched(
+    const float* __restrict__ x, const float* __restrict__ r,
+    const int* __restrict__ ids, float* __restrict__ out,
+    int n, int x_batched) {
+    __shared__ float bufA[128];
+    __shared__ float bufB[128];
+    int groups = n >> 7;
+    int slot = blockIdx.x / groups;
+    int grp = blockIdx.x - slot * groups;
+    int t = threadIdx.x;
+    int lane = grp * 128 + t;
+    int e = ids[slot];
+    float xv = x_batched ? x[(size_t)slot * n + lane] : x[lane];
+    bufA[t] = xv * r[(size_t)e * n + lane];
+    __syncthreads();
+    float* h = h128_parallel(bufA, bufB, t);
+    out[(size_t)slot * n + lane] = __half2float(f2h_rne(h[t] * ESCHA_RS));
+}
+
+extern "C" __global__ void escha_h128_out_batched(
+    const float* __restrict__ mid, const float* __restrict__ r,
+    const int* __restrict__ ids, float* __restrict__ out, int n) {
+    __shared__ float bufA[128];
+    __shared__ float bufB[128];
+    int groups = n >> 7;
+    int slot = blockIdx.x / groups;
+    int grp = blockIdx.x - slot * groups;
+    int t = threadIdx.x;
+    int lane = grp * 128 + t;
+    int e = ids[slot];
+    bufA[t] = mid[(size_t)slot * n + lane];
+    __syncthreads();
+    float* h = h128_parallel(bufA, bufB, t);
+    // Pruned channel (r == 0) must read back EXACTLY zero — f2h_rne routes
+    // the exact-zero product around __float2half by hand (see the comment on
+    // f2h_rne), so a negative pre-scale value against a pruned channel gives
+    // -0.0, not a denormal and not a dropped sign. Do NOT reorder or
+    // "optimise away" this multiply.
+    out[(size_t)slot * n + lane] =
+        __half2float(f2h_rne(h[t] * ESCHA_RS * r[(size_t)e * n + lane]));
+}
+
+// SwiGLU over the f16-ROUNDED merged gate_up output, batched across slots.
+// `y` is `[slots, 2*inter]`, gate is the FIRST half. `y` is already the
+// output of escha_h128_out_batched, i.e. every element is an exactly
+// representable f16 value — that is the escha contract ("SwiGLU runs on the
+// f16-rounded merged gate_up output"), and it is why this kernel must be fed
+// the transform's output and never a pre-transform accumulator.
+//
+// The two interior f16 roundings are `escha_ref::swiglu`'s, not an accident:
+// the frozen oracle rounds silu(g) and then rounds the product. Output is
+// stored as f32 holding that f16 value (the down-projection input transform
+// consumes f32).
+//
+// `expf`, not `__expf`: the fast intrinsic is a different function; hipfire's
+// own `silu_mul_f32` (kernels/src/silu_mul.hip) uses `expf` and so does the
+// oracle. Note this kernel is NOT bit-exact against `escha_ref::swiglu` for
+// every input — device `expf` and Rust's `f32::exp` can differ by 1 ulp in
+// f32, and about 1 in 2^13 of those land on an f16 rounding boundary. The G3
+// gate therefore bounds the swiglu mismatch at <=1 f16 ulp rather than
+// demanding equality; the H128 transforms themselves ARE bit-exact and are
+// gated as such.
+extern "C" __global__ void escha_swiglu_batched(
+    const float* __restrict__ y, float* __restrict__ h, int inter) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int slot = blockIdx.y;
+    if (i >= inter) return;
+    const float* row = y + (size_t)slot * 2 * inter;
+    float g = row[i];
+    float s = __half2float(f2h_rne(g / (1.0f + expf(-g))));
+    h[(size_t)slot * inter + i] = __half2float(f2h_rne(s * row[inter + i]));
+}

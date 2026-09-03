@@ -508,6 +508,32 @@ pub struct MoeParams<'a> {
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
     pub down_expanded: &'a GpuTensor,
+
+    /// Escha-W2 (Task 10): per-layer H128 transform tables + the phase
+    /// scratch the batched routed executor needs. `Some` only for layers
+    /// loaded from an Escha-W2 checkpoint; `None` leaves every other model
+    /// byte-identical.
+    ///
+    /// This is ALSO the escha marker `MoeDtypes::has_escha_experts` can no
+    /// longer be: the loader decodes the trellis at load time and stores the
+    /// experts as `Q8_0`, so by the time dispatch sees the layer no routed
+    /// dtype says "escha" any more. See [`MoeParams::has_escha`].
+    pub escha: Option<crate::pipeline::escha::EschaRoutedRefs<'a>>,
+}
+
+impl MoeParams<'_> {
+    /// True iff this layer must take escha semantics — the f16 router-logit
+    /// round-trip and the H128-wrapped routed executor.
+    ///
+    /// Two sources, deliberately OR-ed: `dtypes.has_escha_experts()` still
+    /// catches a layer whose routed dtype is literally `Escha2T16`/`Escha3T16`
+    /// (what a future on-the-fly-decode GEMV would present), and
+    /// `escha.is_some()` catches today's shape, where the loader has already
+    /// materialised the experts as `Q8_0` and only the transform tables
+    /// remain as evidence.
+    pub fn has_escha(&self) -> bool {
+        self.dtypes.has_escha_experts() || self.escha.is_some()
+    }
 }
 
 // ── DeepSeek-V4 bias-aware decode parameters ───────────

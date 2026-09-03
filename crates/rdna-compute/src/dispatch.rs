@@ -4273,6 +4273,10 @@ impl Gpu {
             kernels::ESCHA_DECODE_TILES_SRC.to_string(),
         ));
         specs.push(("escha_h128", kernels::ESCHA_H128_SRC.to_string()));
+        specs.push((
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC.to_string(),
+        ));
 
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
@@ -4603,6 +4607,19 @@ impl Gpu {
                     "sample_topk_partial_fast65",
                     "sample_topk_finalize_fast65",
                 ],
+                // Escha-W2 (Tasks 8/10): two multi-entry modules whose module
+                // name is NOT a symbol. Without these arms the `other =>
+                // vec![other]` default asks hipModuleGetFunction for a symbol
+                // named "escha_h128" / "escha_bare_to_outmajor", which does not
+                // exist, and the whole precompile batch fails.
+                "escha_h128" => vec![
+                    "escha_h128_in",
+                    "escha_h128_out",
+                    "escha_h128_in_batched",
+                    "escha_h128_out_batched",
+                    "escha_swiglu_batched",
+                ],
+                "escha_bare_to_outmajor" => vec!["escha_bare_to_q8_0", "escha_bare_to_f32"],
                 other => vec![other],
             };
             // Compile and ensure the module is loaded once.

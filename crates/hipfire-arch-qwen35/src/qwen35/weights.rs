@@ -300,6 +300,17 @@ pub struct MoeFfnWeights {
     /// non-owned storage layout. Non-owned global slots alias into the
     /// matching entry. Owned so `free_moe_ffn` can reclaim them.
     pub(crate) ep_dummy_buffers: Vec<GpuTensor>,
+
+    /// Escha-W2 (Task 10): per-layer H128 transform tables + decode scratch.
+    /// `Some` only for layers loaded from an Escha-W2 checkpoint.
+    ///
+    /// This is also the layer's escha MARKER. The loader decodes the trellis
+    /// and stores the experts as `Q8_0`, so `experts[i].gate_up.gpu_dtype` no
+    /// longer says "escha" by the time dispatch resolves the layer; only this
+    /// field does. `moe_ffn_decode_impl` threads it into
+    /// `MoeParams::escha`, whose `has_escha()` drives both the f16
+    /// router-logit round-trip and the H128-wrapped routed executor.
+    pub escha: Option<super::escha::EschaMoeTables>,
 }
 
 /// Owning storage for the per-layer shared ParoQuant rotation sidecars.
@@ -1048,6 +1059,10 @@ impl PendingEpMoeFfn {
             paro_shared: None,
             global_expert_dtypes: self.global_dtypes,
             ep_dummy_buffers: self.dummy_buffers,
+            // The EP / pending-commit path does not carry escha layers (an
+            // Escha-W2 checkpoint has one code tensor per layer, not the
+            // per-expert tensors EP sharding streams).
+            escha: None,
         }
     }
 }
@@ -1340,6 +1355,11 @@ impl MmqScreenable for Qwen35Weights {
 }
 
 fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+    // Escha-W2 transform tables + decode scratch. Owned outright (nothing
+    // aliases them), so free before the experts they describe.
+    if let Some(e) = ffn.escha {
+        e.free_gpu(gpu);
+    }
     ffn.router.free_all(gpu);
     ffn.shared_expert_gate.free_all(gpu);
     ffn.shared_expert.gate.free_all(gpu);

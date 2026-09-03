@@ -11,6 +11,9 @@
 pub mod batch;
 pub mod config;
 pub mod ep_batch;
+/// Escha-W2 routed-expert loading (Task 10): trellis decode -> transpose ->
+/// Q8_0, plus the per-layer H128 transform tables.
+pub mod escha;
 pub mod forward;
 pub mod load;
 pub mod prefill;
@@ -31,6 +34,7 @@ pub use ep_batch::{
     forward_ep, forward_prefill_batch_ep, forward_prefill_batch_multi, forward_scratch_multi,
     validate_ep_batch_compatibility, Qwen35DecodeBatchEpState,
 };
+pub use escha::{EschaMoeTables, EschaWeightStore};
 pub use forward::{
     dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp, forward_scratch,
     forward_scratch_dense_tp, forward_scratch_embed, forward_scratch_embed_mrope,

@@ -4821,6 +4821,15 @@ pub const ESCHA_DECODE_TILES_SRC: &str =
 /// entry points sharing one source file — see `ensure_kernel` call sites.
 pub const ESCHA_H128_SRC: &str = include_str!("../../../kernels/src/escha_h128.hip");
 
+/// Escha-W2 load-path transpose: `escha_decode_tiles` writes bare fp16
+/// IN-major `[ic, oc]` (escha's tile grid is in-major); hipfire's expert
+/// slots are OUT-major `[oc, ic]`. Two entry points — `escha_bare_to_q8_0`
+/// (production: transpose + Q8_0 re-quantise in one pass) and
+/// `escha_bare_to_f32` (the weight-exact control arm the G4 gate uses to
+/// separate wiring error from re-quantisation error).
+pub const ESCHA_BARE_TO_OUTMAJOR_SRC: &str =
+    include_str!("../../../kernels/src/escha_bare_to_outmajor.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
