@@ -34,6 +34,10 @@ pub mod arch;
 pub mod arch_model;
 #[cfg(feature = "deltanet")]
 pub mod carrier;
+/// DFlash adaptive verify-block controller (trailing-τ proposal shrink).
+/// Pure math, no GPU types — hence not deltanet-gated (the gated
+/// `dflash_spec` owns one per speculator).
+pub mod dflash_adaptive_block;
 /// Qwen3.5 DFlash / DDTree speculative-decode state (`DflashState`,
 /// `load_dflash_state`) and the `DflashSpeculator` impl of the arch-generic
 /// `hipfire_runtime::spec::Speculator`. Deltanet-gated — it owns `ModelSlot`-

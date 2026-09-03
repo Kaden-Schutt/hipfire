@@ -10,6 +10,7 @@
 //! [`Speculator`] trait, and [`build_dflash_speculator`] (its env-resolving
 //! constructor). All types here are qwen35 + runtime types — no loader types —
 //! so the loader only calls in; it never owns the DFlash mechanics.
+use crate::dflash_adaptive_block::DflashAdaptiveBlock;
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
@@ -550,13 +551,26 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// Adaptive verify-block controller (trailing-τ proposal shrink).
+    /// Disabled (fixed full block) when the load knob or env kill-switch
+    /// opted out; reset to full at request start via `configure_request`.
+    adaptive: DflashAdaptiveBlock,
 }
 
 impl DflashSpeculator {
     /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
     /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
     /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
-    pub fn new(df: DflashState, resume_enabled: bool, ck_interval: usize, ck_cap: usize) -> Self {
+    /// `adaptive_b` is the already-resolved knob (load param AND env
+    /// kill-switch folded by the caller) — likewise env-free here.
+    pub fn new(
+        df: DflashState,
+        resume_enabled: bool,
+        ck_interval: usize,
+        ck_cap: usize,
+        adaptive_b: bool,
+    ) -> Self {
+        let full = df.block_size;
         Self {
             df,
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
@@ -574,6 +588,7 @@ impl DflashSpeculator {
             resume_enabled,
             ck_interval,
             ck_cap,
+            adaptive: DflashAdaptiveBlock::new(full, adaptive_b),
         }
     }
 
@@ -840,7 +855,12 @@ impl Speculator for DflashSpeculator {
         // (uniform for max_emit >= 1); max_accept clamps accept before commit
         // so max_emit == 1 is a true one-token path (accept 0 + bonus).
         let block_override = {
-            let cfg_b = self.df.block_size.max(2);
+            // Adaptive proposal width: the trailing-τ controller's effective
+            // block (full until 8 cycles observed / when opted out), further
+            // bounded by the remaining client budget below. Proposing fewer
+            // rows only shortens the accepted run — greedy-parity holds by
+            // construction (causal draft prefix + longest-prefix verify).
+            let cfg_b = self.adaptive.effective().max(2).min(self.df.block_size.max(2));
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
             if b < cfg_b || b != self.df.draft_config.block_size {
@@ -935,11 +955,32 @@ impl Speculator for DflashSpeculator {
             )
         };
 
-        result
+        let out = result
             .map(lower_qwen35)
             // Defense only — accept stage already committed ≤ max_emit.
             .map(|s| s.cap_emit(max_emit))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        // Feed the committed accept count into the trailing-τ controller for
+        // the NEXT cycle's proposal width (chain and ddtree cycles alike —
+        // only the chain proposal width shrinks; the tree budget stays
+        // structural). cap_emit already reconciled `accepted` with the
+        // truncated emit, so this is what really committed.
+        if let Ok(s) = &out {
+            let prev = self.adaptive.effective();
+            let next = self.adaptive.observe(s.accepted);
+            if next != prev {
+                eprintln!(
+                    "[dflash] adaptive_b {}: effective block {} -> {} (tau_hat {:.2} over last 8, full {}, accepted {} this cycle)",
+                    if next < prev { "shrink" } else { "recover" },
+                    prev,
+                    next,
+                    self.adaptive.tau_hat().unwrap_or(0.0),
+                    self.adaptive.full(),
+                    s.accepted,
+                );
+            }
+        }
+        out
     }
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
@@ -961,11 +1002,13 @@ impl Speculator for DflashSpeculator {
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
-        // daemon's job — it owns the bundle).
+        // daemon's job — it owns the bundle). The adaptive window reseeds to
+        // full too — the fail-safe direction (today's fixed-B behaviour).
         self.df.draft_scratch.reset_upload_tracking();
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
+        self.adaptive.reset();
         Ok(())
     }
 
@@ -980,7 +1023,10 @@ impl Speculator for DflashSpeculator {
     }
 
     fn block_size(&self) -> usize {
-        self.df.block_size
+        // Effective proposal width (adaptive shrink); full when opted out or
+        // seeding. The generate loop's capacity checks + overflow guard read
+        // this per cycle, and `step` truncates the draft block to match.
+        self.adaptive.effective()
     }
 
     fn ctx_capacity(&self) -> usize {
@@ -1028,6 +1074,11 @@ impl Speculator for DflashSpeculator {
         self.sample_top_k = cfg.top_k;
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
+        // Per-request reseed of the adaptive window: a new request opens at
+        // the full block; the controller re-shrinks only after a fresh
+        // 8-cycle window. Both generate_spec entry paths (qwen wrapper +
+        // dense DS4) call this exactly once before the step loop.
+        self.adaptive.reset();
     }
 
     fn requires_greedy(&self) -> bool {
@@ -1063,8 +1114,15 @@ impl Speculator for DflashSpeculator {
 /// the env config the daemon's old `generate_dflash` read inline: checkpoint
 /// resume (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
-/// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
-pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
+/// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
+/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces fixed-block, mirroring DSpark's
+/// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`). Called once at load. `adaptive_b` is
+/// the `SpecLoadCfg::dflash_adaptive_b` load param (None = default on).
+pub fn build_dflash_speculator(
+    df: DflashState,
+    eviction_is_none: bool,
+    adaptive_b: bool,
+) -> Box<dyn Speculator> {
     let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
         .ok()
         .as_deref()
@@ -1080,11 +1138,20 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)
         .max(1);
+    // Default-on; HIPFIRE_DFLASH_ADAPTIVE_B=0 opts out (fixed block == today).
+    // The load param ANDs with it here so this constructor stays the single
+    // env-touching site and `new` stays pure (mirrors build_dspark_speculator).
+    let adaptive_b = adaptive_b
+        && hipfire_config::developer_var("HIPFIRE_DFLASH_ADAPTIVE_B")
+            .ok()
+            .as_deref()
+            != Some("0");
     Box::new(DflashSpeculator::new(
         df,
         resume_enabled,
         ck_interval,
         ck_cap,
+        adaptive_b,
     ))
 }
 

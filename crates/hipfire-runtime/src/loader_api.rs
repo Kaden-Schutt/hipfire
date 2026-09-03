@@ -132,6 +132,11 @@ pub struct SpecLoadCfg {
     pub mtp: Option<bool>,
     /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
     pub mtp_k: Option<usize>,
+    /// DFlash adaptive verify-block (`dflash_adaptive_b`, default true).
+    /// `None` = loader default (on). Env `HIPFIRE_DFLASH_ADAPTIVE_B=0`
+    /// forces the fixed full block at build, mirroring
+    /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`.
+    pub dflash_adaptive_b: Option<bool>,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

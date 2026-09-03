@@ -2829,6 +2829,11 @@ pub fn generate_spec(
     // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
     // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
     // so the guard, the speculator borrow, and the bookkeeping below coexist.
+    // `block_size` is the speculator's EFFECTIVE proposal width: the DFlash
+    // trailing-τ controller reseeds it to full at request start
+    // (`configure_request`) and only shrinks it after 8 observed cycles, so
+    // the request-start capacity checks below see the full block while the
+    // in-loop overflow guard re-reads the live value each cycle.
     let (block_size, ctx_capacity) = match m.speculator.as_ref() {
         Some(s) => (s.block_size(), s.ctx_capacity()),
         None => {
@@ -3355,7 +3360,10 @@ pub fn generate_spec(
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
         }
-        if position.saturating_add(block_size) >= ctx_capacity {
+        // Overflow guard reads the CURRENT effective width each cycle — the
+        // controller may have shrunk the proposal below the full block since
+        // the request-start capacity checks above.
+        if position.saturating_add(spec.block_size()) >= ctx_capacity {
             break;
         }
 
