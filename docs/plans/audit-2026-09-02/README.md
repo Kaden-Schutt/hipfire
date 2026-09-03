@@ -4,7 +4,7 @@
 
 _Lifecycle: planned intent (docs/INDEX.md § plans). A point-in-time audit of master `8cd15a62b` with a ranked remediation plan; findings are cited to `path:line` at that commit and go stale as those lines move._
 
-Master `8cd15a62b`. Twelve read-only scouts, one slice each, same rubric (broken / missing / would change, every finding cited to `path:line`). Their full reports are alongside this file as `audit-<Slice>.md`. I spot-checked the five findings below marked ★ by reading the cited lines myself; the rest are the scouts' verified claims and should be read as "cited, plausible, not re-derived by me."
+Master `8cd15a62b`. Twelve read-only scouts, one slice each, same rubric (broken / missing / would change, every finding cited to `path:line`). Their full reports are alongside this file as `audit-<Slice>.md`. A follow-up kernel-family audit of MQ4G256V2 (qt=44), the production 4-bit format, is in [`audit-Mq4v2Kernels.md`](audit-Mq4v2Kernels.md) — verdict: sound end to end, one runtime admit out of lockstep, one non-discriminating parity fixture. I spot-checked the five findings below marked ★ by reading the cited lines myself; the rest are the scouts' verified claims and should be read as "cited, plausible, not re-derived by me."
 
 ## The shape of it
 
