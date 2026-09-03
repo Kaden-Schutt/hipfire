@@ -14494,6 +14494,102 @@ impl Gpu {
     /// tile columns, so a short tail would leave rows holding whatever `y`
     /// happened to contain.
     #[allow(clippy::too_many_arguments)]
+    /// Expert-grouped routed GEMM on the RDNA3 matrix cores.
+    ///
+    /// Same grouping contract as [`Self::escha_gemm_native_moe_grouped`] —
+    /// `expert_offsets` is the padded exclusive scan, `sorted_slot_index` maps
+    /// sorted position to flat slot, `-1` is the padding sentinel — but the
+    /// inner product runs on WMMA instead of scalar FMAs.
+    ///
+    /// Prefill is compute bound once grouping has fixed the weight traffic
+    /// (weights are ~4% of prefill time), so this is where the remaining time
+    /// is: the scalar path measured 1.75 TFLOP/s against a WMMA comparator's
+    /// 4.59.
+    ///
+    /// NOT bit-identical to the scalar grouped path: WMMA accumulates over a
+    /// different partition of the contraction. The decoded weight VALUES are
+    /// identical; only summation order moves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemm_native_moe_grouped_wmma(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        n_exp: usize,
+        trellis_k: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let what = "escha_gemm_native_moe_grouped_wmma";
+        if k % 16 != 0 || m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: m={m} k={k} must both be multiples of 16"),
+            ));
+        }
+        if slots == 0 || m == 0 || n_exp == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: slots={slots} m={m} n_exp={n_exp}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: x has {} elements (need {}), y has {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        let entry = match trellis_k {
+            2 => "escha_gemm_grouped_wmma_k2",
+            3 => "escha_gemm_grouped_wmma_k3",
+            other => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{what}: unsupported trellis K={other}"),
+                ))
+            }
+        };
+        self.ensure_kernel(entry, kernels::ESCHA_MOE_GEMM_GROUPED_WMMA_SRC, entry)?;
+
+        let mut ep = expert_ptrs.buf.as_ptr();
+        let mut off = expert_offsets.buf.as_ptr();
+        let mut idx = sorted_slot_index.buf.as_ptr();
+        let mut xp = x_batch.buf.as_ptr();
+        let mut yp = y_batch.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ep as *mut _ as *mut c_void,
+            &mut off as *mut _ as *mut c_void,
+            &mut idx as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[entry];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(m / 16) as u32, n_exp as u32, 1],
+                [32, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
     pub fn escha_gemm_native_moe_grouped(
         &mut self,
         expert_ptrs: &GpuTensor,

@@ -4862,6 +4862,8 @@ pub const ESCHA_MOE_GEMV_NATIVE_SRC: &str =
 /// the activation is read once for all of them. See the .hip header for the
 /// traffic arithmetic and for which projections stay bit-identical to the
 /// slot-parallel kernel (the narrow ones) and which do not (the wide ones).
+pub const ESCHA_MOE_GEMM_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemm_grouped_wmma.hip");
 pub const ESCHA_MOE_GEMM_GROUPED_SRC: &str =
     include_str!("../../../kernels/src/escha_moe_gemm_grouped.hip");
 

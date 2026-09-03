@@ -173,6 +173,9 @@ fn main() {
         let d_y_grp = gpu
             .alloc_tensor(&[slots * case.oc], DType::F32)
             .expect("y grouped");
+        let d_y_wmma = gpu
+            .alloc_tensor(&[slots * case.oc], DType::F32)
+            .expect("y wmma");
 
         // ── the slot-parallel baseline ───────────────────────────────────────
         //
@@ -290,6 +293,64 @@ fn main() {
                 grp_w_gb + grp_x_gb,
                 (grp_w_gb + grp_x_gb) / (grp_ms / 1e3)
             );
+
+            // ── WMMA arm ──────────────────────────────────────────────
+            // Same grouping inputs, matrix cores instead of scalar FMAs.
+            // Run once per (rows, ctiles) sweep entry is wasteful — it does
+            // not take a register tile — so only do it on the first entry.
+            if rows == 8 && ctiles == 4 {
+                let mut w_ms = f64::INFINITY;
+                let mut ok = true;
+                for _ in 0..iters {
+                    gpu.hip.device_synchronize().expect("sync");
+                    let t = std::time::Instant::now();
+                    let r = gpu.escha_gemm_native_moe_grouped_wmma(
+                        &code_ptrs,
+                        &d_offsets,
+                        &d_sorted,
+                        &d_x,
+                        &d_y_wmma,
+                        case.oc,
+                        case.ic,
+                        slots,
+                        n_exp,
+                        case.trellis_k,
+                    );
+                    if let Err(e) = r {
+                        println!("  wmma  : launch refused: {e}");
+                        ok = false;
+                        break;
+                    }
+                    gpu.hip.device_synchronize().expect("sync");
+                    w_ms = w_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+                if ok {
+                    let yw = gpu.download_f32(&d_y_wmma).expect("dl wmma");
+                    let mut worst = 0.0f32;
+                    let mut sum = 0.0f64;
+                    let mut nf = 0usize;
+                    for (a, b) in y_slot.iter().zip(&yw) {
+                        let d = (a - b).abs();
+                        worst = worst.max(d);
+                        sum += d as f64;
+                        if !b.is_finite() {
+                            nf += 1;
+                        }
+                    }
+                    println!(
+                        "  wmma  : {w_ms:8.3} ms  {:.2}x vs scalar-grouped, {:.2}x vs slot-parallel",
+                        grp_ms / w_ms,
+                        ctl_ms / w_ms
+                    );
+                    println!(
+                        "            vs slot-parallel: max {worst:e}, mean {:e}, non-finite {nf}",
+                        sum / yw.len() as f64
+                    );
+                    if nf != 0 {
+                        failures += 1;
+                    }
+                }
+            }
 
             let y_grp = gpu.download_f32(&d_y_grp).expect("dl grouped");
             let mut diff = 0usize;
