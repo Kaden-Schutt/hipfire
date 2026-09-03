@@ -22564,13 +22564,11 @@ impl Gpu {
         // argmax. One extra elementwise kernel per call against a full
         // [M, K] GEMM is not a measurable cost.
         //
-        // `HIPFIRE_FP16_X_LEGACY_CACHE=1` restores the pre-fix pointer-keyed
-        // path so the blast radius of this change is measurable in one binary;
-        // see `scratch::fp16_x_legacy_cache`.
+        // There is deliberately no env lever back to the pointer-keyed path:
+        // the measurement it existed for is recorded in commit d4dff4a26, and
+        // the only thing the lever could do now is reinstate the defect.
         let x_f16_ptr = if matches!(x.dtype, DType::F16) {
             x.buf.as_ptr()
-        } else if crate::scratch::fp16_x_legacy_cache() {
-            self.ensure_fp16_x(x, batch_size * k)?
         } else {
             self.convert_fp16_x_uncached(x, batch_size * k)?
         };
@@ -23071,13 +23069,11 @@ impl Gpu {
         // argmax. One extra elementwise kernel per call against a full
         // [M, K] GEMM is not a measurable cost.
         //
-        // `HIPFIRE_FP16_X_LEGACY_CACHE=1` restores the pre-fix pointer-keyed
-        // path so the blast radius of this change is measurable in one binary;
-        // see `scratch::fp16_x_legacy_cache`.
+        // There is deliberately no env lever back to the pointer-keyed path:
+        // the measurement it existed for is recorded in commit d4dff4a26, and
+        // the only thing the lever could do now is reinstate the defect.
         let x_f16_ptr = if matches!(x.dtype, DType::F16) {
             x.buf.as_ptr()
-        } else if crate::scratch::fp16_x_legacy_cache() {
-            self.ensure_fp16_x(x, batch_size * k)?
         } else {
             self.convert_fp16_x_uncached(x, batch_size * k)?
         };

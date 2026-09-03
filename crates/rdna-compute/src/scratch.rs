@@ -113,26 +113,6 @@ pub struct EschaPrefillScratch {
     pub y_dn: GpuTensor,
 }
 
-/// Restore the pre-fix FP16 activation-cache semantics:
-/// `convert_fp16_x_uncached` leaves `fp16_x_source_ptr` set, and
-/// `gemm_q8_0_residual_wmma` takes the pointer-keyed `ensure_fp16_x` path.
-///
-/// A DIAGNOSTIC, not a supported mode. It re-enables a read of the shared FP16
-/// scratch that can hold a different tensor's conversion — the defect that made
-/// Escha-W2 batched prefill produce finite, fluent, ~1e-1-wrong output from
-/// layer 1 onward.
-///
-/// It exists so the blast radius of that fix is a MEASUREMENT rather than an
-/// argument: run any model's prefill with and without it and diff the logits
-/// byte-for-byte. Bit-identical means that model never hit the stale read, so
-/// the fix did not change it. Doing this with one binary and two runs is
-/// strictly better evidence than two binaries, which can differ for reasons
-/// nobody enumerated.
-pub fn fp16_x_legacy_cache() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("HIPFIRE_FP16_X_LEGACY_CACHE").as_deref() == Ok("1"))
-}
-
 /// Non-owning views of exactly the LIVE prefix of an [`EschaPrefillScratch`].
 ///
 /// Returned by value so the caller does not hold a borrow of `Gpu` across the
@@ -942,10 +922,12 @@ impl ScratchState {
         )?;
         // The shared scratch no longer holds whatever `fp16_x_source_ptr`
         // says it holds. See this function's doc comment — dropping the
-        // marker is part of the contract, not an optimisation.
-        if !fp16_x_legacy_cache() {
-            self.fp16_x_source_ptr = std::ptr::null_mut();
-        }
+        // marker is part of the contract, not an optimisation, so it is
+        // unconditional. There is deliberately no lever that restores the
+        // pre-fix behaviour: the only thing it could do is reinstate a
+        // known silent-wrong-output defect, for any model with a Q8_0
+        // `wo`/`w_down` in batched prefill.
+        self.fp16_x_source_ptr = std::ptr::null_mut();
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 

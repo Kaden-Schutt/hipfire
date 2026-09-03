@@ -150,10 +150,10 @@ fn main() -> Result<(), String> {
             return Err(format!("non-finite logits after an {n}-token prefill"));
         }
         // Full final-token logits, for byte-level A/B between two runs of the
-        // SAME binary (e.g. `HIPFIRE_FP16_X_LEGACY_CACHE=1` vs not, to measure
-        // whether a given model was affected by the FP16 activation-cache fix).
-        // An argmax and a 4-decimal top logit cannot establish bit-identity;
-        // this can. Nothing else in the harness depends on it.
+        // SAME binary (e.g. `HIPFIRE_ESCHA_INDEXED=0` vs not, to check the two
+        // routed routes are bit-identical). An argmax and a 4-decimal top
+        // logit cannot establish bit-identity; this can. Nothing else in the
+        // harness depends on it.
         if let Ok(dump) = std::env::var("HIPFIRE_BENCH_LOGITS_OUT") {
             let mut bytes = Vec::with_capacity(b.config.vocab_size * 4);
             for v in logits.iter().take(b.config.vocab_size) {
