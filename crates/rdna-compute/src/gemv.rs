@@ -14403,7 +14403,24 @@ impl Gpu {
                 ),
             ));
         }
-        Ok(k <= 1536)
+        // Wide (four independent accumulator chains) vs narrow (one chain with
+        // `#pragma unroll 4`). The quad structure is what hides the weight-load
+        // latency, and it needs four blocks to fill — hence K >= 128, since a
+        // block is 32 contraction elements.
+        //
+        // This used to be `k <= 1536`, inherited from the Q8_0 twin with no
+        // stated reason, which sent the one shipped escha projection above that
+        // line — gate_up at K=2048 — down the narrow path. Measured on
+        // escha-35b, rocprof kernel trace, 40 decode tokens:
+        //
+        //   gate_up narrow  83.20 us/call
+        //   gate_up wide    75.98 us/call   -8.7%
+        //
+        // down_proj (K=512) was already wide and is unchanged at ~46 us/call.
+        // The kernel source records the same effect as 33 GB/s narrow vs
+        // 105 GB/s wide, so this is the structure working as documented, not a
+        // shape-specific fluke.
+        Ok(k >= 128)
     }
 
     /// Launch one of the six `escha_moe_gemv_native` entry points. They all
