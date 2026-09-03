@@ -28,6 +28,7 @@ pub mod config;
 pub mod cpu_router;
 #[cfg(feature = "deltanet")]
 pub mod ddtree;
+pub mod device_mesh;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
 pub mod dflash_generic;

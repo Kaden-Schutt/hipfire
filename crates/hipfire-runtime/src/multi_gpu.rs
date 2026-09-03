@@ -20,6 +20,7 @@
 //! 2. Run debug builds to catch silent mis-binds via the bind_thread invariant.
 //! 3. Pass the multi-GPU coherence gate.
 
+use crate::device_mesh::{DeviceMesh, DimKind};
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
@@ -118,6 +119,9 @@ pub struct Gpus {
     /// or `HIPFIRE_TP_USE_RCCL=0` forced the opt-out.
     rccl_comms: Option<RcclComms>,
     pub devices: Vec<Gpu>,
+    /// Pure logical device topology (PP/TP/EP axes). Carries no GPU handles,
+    /// carrier policy, or allocation state.
+    pub mesh: DeviceMesh,
     /// Per-layer device id, length = n_layers.
     pub layer_to_device: Vec<u8>,
     /// Index of the first layer of each band, length = n_devices.
@@ -235,6 +239,7 @@ impl Gpus {
         Self {
             rccl_comms: None,
             devices: vec![gpu],
+            mesh: DeviceMesh::single().expect("single-device mesh cannot overflow"),
             layer_to_device: vec![0; n_layers],
             band_starts: vec![0],
             peer_access_enabled: false,
@@ -292,6 +297,7 @@ impl Gpus {
             devices,
             layer_to_device: vec![0u8; n_layers],
             band_starts,
+            mesh: DeviceMesh::rect(&[(DimKind::Tp, tp_size)]).expect("tp mesh cannot overflow"),
             peer_access_enabled: false,
             output_device: 0,
             givens_cos_per_dev: Vec::new(),
@@ -838,6 +844,7 @@ impl Gpus {
             devices,
             layer_to_device,
             band_starts,
+            mesh: DeviceMesh::rect(&[(DimKind::Pp, n_devices)]).expect("pp mesh cannot overflow"),
             peer_access_enabled: false,
             output_device: n_devices - 1,
             givens_cos_per_dev: Vec::new(),
@@ -2084,5 +2091,51 @@ mod tests {
         let mut rows3 = vec![vec![5.0_f32, 6.0], vec![7.0, 8.0]];
         Gpus::host_reduce_rows(&mut rows3, 0);
         assert_eq!(rows3[0], vec![5.0, 6.0]);
+    }
+    #[test]
+    fn device_mesh_pp_projection_matches_uniform_split_banding() {
+        // The pure DeviceMesh PP projection must agree with the banding used
+        // by `uniform_split_counts` (the layer→stage map behind `from_parts`)
+        // on every layer, so the topology field and the legacy maps cannot
+        // drift apart.
+        fn stage_implied_by_split(split: &[usize], layer: usize) -> usize {
+            let mut start = 0;
+            for (stage, &count) in split.iter().enumerate() {
+                if layer < start + count {
+                    return stage;
+                }
+                start += count;
+            }
+            split.len() - 1
+        }
+
+        for n_devices in 1..=3 {
+            for n_layers in [n_devices, n_devices + 3] {
+                let mesh = DeviceMesh::rect(&[(DimKind::Pp, n_devices)])
+                    .expect("small pp mesh must construct");
+                let split = uniform_split_counts(n_devices, n_layers);
+                assert_eq!(split.len(), n_devices);
+                for layer in 0..n_layers {
+                    assert_eq!(
+                        mesh.stage_for_layer(layer, n_layers),
+                        stage_implied_by_split(&split, layer),
+                        "layer {layer} of {n_layers} over {n_devices} devices"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_mesh_tp_group_and_single_topology() {
+        // TP=2: the sole Tp axis groups both devices for the given row.
+        let tp = DeviceMesh::rect(&[(DimKind::Tp, 2)]).unwrap();
+        assert_eq!(tp.group_along(DimKind::Tp, &[0]).unwrap(), vec![0, 1]);
+        assert_eq!(tp.n_devices(), 2);
+
+        // Single-device topology: one device and no named axes.
+        let single = DeviceMesh::single().unwrap();
+        assert_eq!(single.n_devices(), 1);
+        assert!(single.axes().is_empty());
     }
 }
