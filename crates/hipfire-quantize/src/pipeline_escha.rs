@@ -520,10 +520,29 @@ pub(crate) enum DenseFormat {
 /// Pick the container for one dense (non-escha-coded) tensor.
 ///
 /// `HIPFIRE_ESCHA_DENSE` selects it:
-///   unset / anything else   every dense tensor stays `Q8_0` (the default)
-///   `mq6` / `mq4v2`         every dense tensor takes that format
+///   unset / `q8`            every dense tensor stays `Q8_0` — the default
+///   `mq6` / `mq4v2`         that format everywhere EXCEPT the router and the
+///                           shared expert (see `DENSE_DEFAULT_KEEP_Q8`)
 ///   `<fmt>:a,b,c`           ONLY tensors matching a listed substring
 ///   `<fmt>!a,b,c`           every tensor EXCEPT those matching one
+///
+/// `Q8_0` is the default because it is the most faithful of the three shipped
+/// recipes and the one that reproduces the upstream checkpoint's precision:
+/// Escha's own int8 is per-ROW, and this repacks it into hipfire's per-32-block
+/// `Q8_0` by replicating the row scale into every block, which is bit-exact and
+/// costs 6.25% on those tensors only (12.34 GB against upstream's 12.30 GB).
+///
+/// The two down-quants are shipped alternatives, measured on the same corpus:
+///
+///     dense   size      PPL      decode      note
+///     q8      12.34 GB  7.6864   ~46 tok/s   default, most faithful
+///     mq6     11.84 GB  7.6940   ~56 tok/s   +21% decode, +0.10% PPL
+///     mq4v2   11.39 GB  8.0643   ~62 tok/s   +35% decode, +4.9% PPL
+///
+/// `mq6` and `mq4v2` hold the router and shared expert at `Q8_0` regardless,
+/// because moving either costs batched prefill outright — see
+/// `DENSE_DEFAULT_KEEP_Q8`. Anything other than these three spellings is a
+/// research knob, not a shipped recipe.
 ///
 /// Down-quanting dense is nearly free in quality and worth ~17% of decode:
 /// the dense weights are the half of escha's per-token byte traffic that its
@@ -551,6 +570,15 @@ pub(crate) enum DenseFormat {
 /// Moving either off it costs batched prefill — measured 160 H128 launches
 /// per token and 109.5 tok/s, against 0.3 and 708.0 with both excluded — for
 /// 0.0002 KLD, since neither is where down-quanting pays.
+/// Tensors the default recipe deliberately leaves at `Q8_0`.
+///
+/// `moe_ffn_batched_admissible_for_dtypes` pins the router (`mlp.gate`) and
+/// the shared expert to `Q8_0` on the escha arm. Moving either off it costs
+/// batched prefill — measured 160 H128 launches per token and 109.5 tok/s,
+/// against 0.3 and 708.0 with both excluded — and buys 0.0002 KLD, because
+/// neither is where down-quanting pays.
+const DENSE_DEFAULT_KEEP_Q8: [&str; 2] = ["mlp.gate", "shared_expert"];
+
 fn dense_format_for(name: &str) -> DenseFormat {
     let Ok(spec) = std::env::var("HIPFIRE_ESCHA_DENSE") else {
         return DenseFormat::Q8_0;
@@ -562,10 +590,21 @@ fn dense_format_for(name: &str) -> DenseFormat {
     let fmt = match fmt {
         "mq6" => DenseFormat::Mq6,
         "mq4v2" => DenseFormat::Mq4V2,
+        // Everything else, `q8` included, is the faithful default. Spelling
+        // `q8` explicitly is supported so a build script can state the recipe
+        // rather than rely on the variable being absent.
         _ => return DenseFormat::Q8_0,
     };
     match rule {
-        None => fmt,
+        // A bare `mq6` / `mq4v2` still holds the router and shared expert at
+        // Q8_0. Losing batched prefill is never what the caller meant, and the
+        // exclusion costs 0.0002 KLD; `mq6!` with an empty list opts out.
+        None => {
+            if DENSE_DEFAULT_KEEP_Q8.iter().any(|sub| name.contains(sub)) {
+                return DenseFormat::Q8_0;
+            }
+            fmt
+        }
         Some((sep, list)) => {
             let hit = list
                 .split(',')
