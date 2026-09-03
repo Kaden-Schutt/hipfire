@@ -8,6 +8,11 @@
 //
 // A pruned output channel (rout == 0) must come out EXACTLY zero — do not
 // reorder the final multiply in a way that could produce -0.0 or a denormal.
+//
+// These kernels run on every token, on both sides of every escha matmul —
+// the hot decode path, unlike escha_decode_tiles (once per expert at load
+// time) — so the butterfly is parallel across all 128 threads of the block,
+// not a single thread doing all 7 stages serially. See h128_parallel below.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -35,43 +40,68 @@ __device__ __forceinline__ __half f2h_rne(float v) {
     return __float2half(v);
 }
 
-__device__ __forceinline__ void h128_block(float* v) {
+// Parallel 128-point Hadamard butterfly, one thread per element, 7 stages
+// with a `__syncthreads()` between each.
+//
+// Ping-pongs between two LDS buffers instead of updating `bufA` in place:
+// the naive single-thread version reads `v[j]`/`v[j+h]` and writes both
+// before any other pair is touched, so within one stage a pair's inputs are
+// always the PREVIOUS stage's outputs. Doing this in place with 128 threads
+// racing would let a "high" thread (writing v[j+h]) read v[j] after some
+// other "low" thread has already overwritten it, or vice versa. Ping-ponging
+// reads every stage entirely from the buffer the previous stage finished
+// (and `__syncthreads()`-published), so every thread's inputs are the exact
+// pre-stage values regardless of scheduling — same operand pairing as the
+// reference's sequential stage-by-stage sweep, just computed out of order,
+// and each pair's `a+b`/`a-b` depends only on that pair's own two operands.
+// Order-independence across pairs is what makes this bit-exact with the
+// naive kernel and with escha_ref: no reassociation, no changed rounding,
+// only a different (but result-identical) schedule of the same 64 adds and
+// 64 subtracts per stage.
+__device__ __forceinline__ float* h128_parallel(float* bufA, float* bufB, int t) {
+    float* cur = bufA;
+    float* nxt = bufB;
+#pragma unroll
     for (int h = 1; h < 128; h <<= 1) {
-        for (int i = 0; i < 128; i += (h << 1)) {
-            for (int j = i; j < i + h; ++j) {
-                float a = v[j], b = v[j + h];
-                v[j] = a + b;
-                v[j + h] = a - b;
-            }
-        }
+        int period = h << 1;
+        bool low = (t & (period - 1)) < h;
+        int j = low ? t : (t - h);
+        float a = cur[j];
+        float b = cur[j + h];
+        nxt[t] = low ? (a + b) : (a - b);
+        __syncthreads();
+        float* tmp = cur;
+        cur = nxt;
+        nxt = tmp;
     }
+    return cur;
 }
 
 // One block per 128-channel group. 128 threads cooperate via LDS.
 extern "C" __global__ void escha_h128_in(
     const float* __restrict__ x, const float* __restrict__ rin,
     __half* __restrict__ xh, int n) {
-    __shared__ float s[128];
+    __shared__ float bufA[128];
+    __shared__ float bufB[128];
     int g = blockIdx.x, t = threadIdx.x;
     int idx = g * 128 + t;
     if (idx >= n) return;
-    s[t] = x[idx] * rin[idx];
+    bufA[t] = x[idx] * rin[idx];
     __syncthreads();
-    if (t == 0) h128_block(s);
-    __syncthreads();
-    xh[idx] = f2h_rne(s[t] * ESCHA_RS);
+    float* out = h128_parallel(bufA, bufB, t);
+    xh[idx] = f2h_rne(out[t] * ESCHA_RS);
 }
 
 extern "C" __global__ void escha_h128_out(
     const float* __restrict__ mid, const float* __restrict__ rout,
     __half* __restrict__ y, int n) {
-    __shared__ float s[128];
+    __shared__ float bufA[128];
+    __shared__ float bufB[128];
     int g = blockIdx.x, t = threadIdx.x;
     int idx = g * 128 + t;
     if (idx >= n) return;
-    s[t] = mid[idx];
+    bufA[t] = mid[idx];
     __syncthreads();
-    if (t == 0) h128_block(s);
-    __syncthreads();
-    y[idx] = f2h_rne(s[t] * ESCHA_RS * rout[idx]);
+    float* out = h128_parallel(bufA, bufB, t);
+    y[idx] = f2h_rne(out[t] * ESCHA_RS * rout[idx]);
 }
