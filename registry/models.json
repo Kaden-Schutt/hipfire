@@ -920,9 +920,6 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
-      },
-      "dflash": {
-        "file": "qwen38-27b-dflash-mq5.hfq"
       }
     },
     "qwen3.8:27b-mq5": {
@@ -951,9 +948,6 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
-      },
-      "dflash": {
-        "file": "qwen38-27b-dflash-mq5.hfq"
       }
     },
     "qwen3.8:27b-mq5-pro": {
@@ -982,9 +976,6 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
-      },
-      "dflash": {
-        "file": "qwen38-27b-dflash-mq5.hfq"
       }
     },
     "qwen3.8:27b-mq6-xt": {
@@ -1013,9 +1004,6 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
-      },
-      "dflash": {
-        "file": "qwen38-27b-dflash-mq6.hfq"
       }
     },
     "qwen3.8:27b-mq6": {
@@ -1044,9 +1032,6 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
-      },
-      "dflash": {
-        "file": "qwen38-27b-dflash-mq6.hfq"
       }
     },
     "qwen3.8:27b-mq6-pro": {
@@ -1075,9 +1060,6 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
-      },
-      "dflash": {
-        "file": "qwen38-27b-dflash-mq6.hfq"
       }
     },
     "qwen3.5:0.8b-mq6": {
@@ -1115,10 +1097,7 @@
       "file": "qwen3.5-27b.mq6",
       "size_gb": 21.4,
       "min_vram_gb": 24,
-      "desc": "MQ6, higher quality",
-      "dflash": {
-        "file": "qwen35-27b-dflash-mq4.hfq"
-      }
+      "desc": "MQ6, higher quality"
     },
     "qwen3.5:9b-mq3": {
       "repo": "hipfire-models/qwen3.5-9b",
