@@ -316,7 +316,7 @@
         "temperature": 0.6,
         "top_p": 0.95
       },
-      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY \u2014 a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected \u2014 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) \u2014 that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training."
+      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY — a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected — 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) — that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training."
     },
     "north-mini-code": {
       "repo": "nwoolmer/hipfire-north-mini-code",
@@ -454,10 +454,10 @@
         }
       },
       "repo": "",
-      "file": "qwen3.6-35b-a3b.escha",
-      "size_gb": 12.3,
-      "min_vram_gb": 40,
-      "desc": "EschaLabs Escha-W2 2-bit trellis codec, decoded to Q8_0 experts at load. Phase 1: correctness plus a servable artifact \u2014 40 tok/s decode, 163 tok/s prefill. 12.3 GB on disk, 37.6 GB resident (measured GTT delta on gfx1151), the experts packed one buffer per (layer, projection). Local-only: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent \u2014 a locally-computed digest of a file nobody else can fetch verifies nothing and reads like a published one. They go in when the artifact does."
+      "file": "qwen3.6-35b-a3b-escha.q8",
+      "size_gb": 12.34,
+      "min_vram_gb": 16,
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Default and most faithful. Dense weights are a bit-exact repack of Escha's per-row int8 into per-32-block Q8_0. PPL 7.6864, 684 tok/s prefill, 47 tok/s decode, 12.94 GB resident. Experts are identical across all three; only the dense tensors differ. Local-only until published: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent — a digest of a file nobody can fetch verifies nothing and reads like a published one."
     },
     "qwen3.6:35b-a3b-mq3p": {
       "recommended_settings": {
@@ -1605,6 +1605,88 @@
         }
       },
       "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap."
+    },
+    "qwen3.6:35b-a3b-escha-mq6": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "",
+      "file": "qwen3.6-35b-a3b-escha.mq6",
+      "size_gb": 11.84,
+      "min_vram_gb": 15,
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ6. +17% decode for +0.10% PPL — the best speed/quality trade of the three. PPL 7.6940, KLD 0.0079 vs the q8 arm, 725 tok/s prefill, 55 tok/s decode, 12.45 GB resident. Experts are identical across all three; only the dense tensors differ. Local-only until published: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent — a digest of a file nobody can fetch verifies nothing and reads like a published one."
+    },
+    "qwen3.6:35b-a3b-escha-mq4": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "",
+      "file": "qwen3.6-35b-a3b-escha.mq4",
+      "size_gb": 11.39,
+      "min_vram_gb": 14,
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ4. Fastest, and the only one with a visible quality cost: PPL 8.0643 (+4.9%), KLD 0.0590 vs the q8 arm. 886 tok/s prefill, 63 tok/s decode, 12.04 GB resident. Experts are identical across all three; only the dense tensors differ. Local-only until published: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent — a digest of a file nobody can fetch verifies nothing and reads like a published one."
     }
   },
   "aliases": {
