@@ -355,8 +355,8 @@ hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 | `--spec` | `off`/`dflash`/`mtp`/`ngram`/`dspark`/`auto` |
 | `--backend` | `noslots` (sequential daemon) / `slots` / `batch` / `both` |
 | `--workload` | `stateless` / `multiturn` / `both` |
+| `--prompt-file PATH` | verbatim prompt bytes for the run; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars` plus a `warnings` caveat below 256 tokens |
 | `--kv-mode`, `--kv-backend` | KV format and allocator |
-| `--reasoning-on` | off by default: a reasoning model cannot close `<think>` inside the token budget, and the daemon fails that turn closed |
 
 Pin `--backend` and `--workload` explicitly for any A/B. The default is `both`,
 which measures two things at once and is not a comparison.

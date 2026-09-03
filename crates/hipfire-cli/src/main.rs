@@ -489,6 +489,10 @@ pub(crate) struct BenchArgs {
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
+    /// Read the standard-benchmark prompt verbatim from a file (raw bytes,
+    /// no trimming). Mutually exclusive with positional PROMPT words.
+    #[arg(long, conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -3615,6 +3619,53 @@ fn sample_stats(values: &[f64]) -> Option<SampleStats> {
     })
 }
 
+/// Default standard-bench prompt. Historical numbers depend on its exact
+/// bytes; do not change it.
+const BENCH_DEFAULT_PROMPT: &str = "Explain the theory of general relativity in simple terms.";
+
+/// Below this tokenized prompt length the measured `prefill_tok_s` is launch
+/// overhead, not prefill throughput (363 tok/s at ~24 tokens vs 886 at 4.4k
+/// on a 7900 XTX with the same binary).
+const BENCH_PREFILL_EVIDENCE_TOKENS: u64 = 256;
+
+/// Resolve the standard-benchmark prompt: `--prompt-file` reads the file
+/// verbatim (raw bytes, no trimming — one newline can move τ by 17%), else
+/// the positional words joined with spaces, else the historical default.
+/// The clap `conflicts_with` on `--prompt-file` covers CLI parsing; the
+/// explicit check here covers programmatically built args.
+fn resolve_bench_prompt(args: &BenchArgs) -> Result<String> {
+    if let Some(path) = args.prompt_file.as_deref() {
+        if !args.prompt.is_empty() {
+            bail!("--prompt-file cannot be combined with a positional prompt");
+        }
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
+        return String::from_utf8(bytes)
+            .with_context(|| format!("--prompt-file {} is not valid UTF-8", path.display()));
+    }
+    Ok(if args.prompt.is_empty() {
+        BENCH_DEFAULT_PROMPT.to_owned()
+    } else {
+        args.prompt.join(" ")
+    })
+}
+
+/// Hex md5 of the exact prompt bytes sent, so two bench numbers are only
+/// compared when their prompts are byte-identical.
+fn bench_prompt_md5(prompt: &str) -> String {
+    format!("{:x}", md5::compute(prompt.as_bytes()))
+}
+
+/// Short-prompt caveat: below 256 prompt tokens `prefill_tok_s` measures
+/// launch overhead, not prefill throughput.
+fn bench_prompt_warning(prompt_tokens: u64) -> Option<String> {
+    (prompt_tokens < BENCH_PREFILL_EVIDENCE_TOKENS).then(|| {
+        format!(
+            "prompt is {prompt_tokens} tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+        )
+    })
+}
+
 fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.runs == 0 {
         bail!("--runs must be positive");
@@ -3665,11 +3716,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         return bench_experimental(paths, &args);
     }
     let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None)?;
-    let prompt = if args.prompt.is_empty() {
-        "Explain the theory of general relativity in simple terms.".to_owned()
-    } else {
-        args.prompt.join(" ")
-    };
+    let prompt = resolve_bench_prompt(&args)?;
+    let prompt_md5 = bench_prompt_md5(&prompt);
+    let prompt_chars = prompt.chars().count() as u64;
     eprintln!("hipfire bench");
     eprintln!("  model:  {}", args.model);
     eprintln!(
@@ -3688,6 +3737,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     );
     eprintln!("  runs:   {}", args.runs);
     eprintln!("  max_tokens: {}", args.max_tokens);
+    eprintln!("  prompt_md5: {prompt_md5}");
+    eprintln!("  prompt_chars: {prompt_chars}");
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
@@ -3700,6 +3751,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
+        let mut prompt_tokens: Option<u64> = None;
         for _ in 0..args.runs {
             let done = bench_generate_with_reasoning(
                 &mut engine,
@@ -3707,6 +3759,11 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 args.max_tokens as u64,
                 args.reasoning_on,
             )?;
+            // Every run uses the same prompt, so the daemon's tokenized
+            // prompt length is run-invariant; keep the first report.
+            if prompt_tokens.is_none() {
+                prompt_tokens = done.get("prompt_tokens").and_then(serde_json::Value::as_u64);
+            }
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -3726,6 +3783,19 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             std::io::stderr().flush()?;
         }
         eprintln!();
+        // Below 256 prompt tokens prefill_tok_s is launch overhead, not
+        // prefill throughput — say so in the report instead of leaving a
+        // bare number that invites a wrong comparison.
+        let warnings: Vec<String> = prompt_tokens
+            .and_then(bench_prompt_warning)
+            .into_iter()
+            .collect();
+        if let Some(tokens) = prompt_tokens {
+            eprintln!("  prompt_tokens: {tokens}");
+        }
+        for warning in &warnings {
+            eprintln!("  warning: {warning}");
+        }
         let report = serde_json::json!({
             "protocol": "native-generate-v1",
             "model": args.model,
@@ -3735,6 +3805,10 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "max_tokens": args.max_tokens,
             "runs": args.runs,
             "batch": 1,
+            "prompt_tokens": prompt_tokens,
+            "prompt_md5": prompt_md5,
+            "prompt_chars": prompt_chars,
+            "warnings": warnings,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
@@ -4225,11 +4299,7 @@ fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
             bail!("--exp requires RDNA2 (gfx1030/gfx1031), detected {arch}");
         }
         let _ = bench_generate(&mut engine, "Hello", 16)?;
-        let prompt = if args.prompt.is_empty() {
-            "Explain the theory of general relativity in simple terms.".to_owned()
-        } else {
-            args.prompt.join(" ")
-        };
+        let prompt = resolve_bench_prompt(args)?;
         let mut samples = Vec::new();
         for _ in 0..args.runs {
             let done = bench_generate(&mut engine, &prompt, 128)?;
@@ -4285,6 +4355,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             backend: "both".to_owned(),
             workload: "both".to_owned(),
             prompt: Vec::new(),
+            prompt_file: None,
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
@@ -9042,6 +9113,109 @@ mod tests {
         assert!(req.get("reasoning_effort").is_none());
         // Still an ordinary benchmark generate otherwise.
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
+    }
+
+    fn bench_args_for_test(prompt: Vec<String>, prompt_file: Option<PathBuf>) -> BenchArgs {
+        BenchArgs {
+            model: "qwen:test".to_owned(),
+            runs: 1,
+            json: true,
+            exp: false,
+            matrix: false,
+            pp: vec![128],
+            ctx: vec![128],
+            tg: 128,
+            max_tokens: 128,
+            sustained_tg: None,
+            sustained_ctx: vec![128],
+            warmups: 1,
+            kv_mode: None,
+            kv_backend: None,
+            redline: false,
+            speculation: None,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
+            prompt,
+            prompt_file,
+        }
+    }
+
+    #[test]
+    fn bench_prompt_file_conflicts_with_positional_prompt() {
+        let err = Cli::try_parse_from([
+            "hipfire",
+            "bench",
+            "qwen:test",
+            "--prompt-file",
+            "prompt.txt",
+            "hello",
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--prompt-file"),
+            "conflict error should name the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_keeps_historical_default() {
+        let args = bench_args_for_test(Vec::new(), None);
+        assert_eq!(
+            resolve_bench_prompt(&args).unwrap(),
+            "Explain the theory of general relativity in simple terms."
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_joins_positional_words() {
+        let args = bench_args_for_test(vec!["hello".to_owned(), "world".to_owned()], None);
+        assert_eq!(resolve_bench_prompt(&args).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn bench_resolve_prompt_file_is_verbatim() {
+        let path = std::env::temp_dir().join("hipfire-bench-prompt-verbatim.txt");
+        // Trailing newline included: the file is read as raw bytes, never trimmed.
+        std::fs::write(&path, "repeat after me\n").unwrap();
+        let args = bench_args_for_test(Vec::new(), Some(path.clone()));
+        let prompt = resolve_bench_prompt(&args).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(prompt, "repeat after me\n");
+        assert_eq!(
+            bench_prompt_md5(&prompt),
+            format!("{:x}", md5::compute(b"repeat after me\n"))
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_rejects_file_and_positional() {
+        let args = bench_args_for_test(
+            vec!["hello".to_owned()],
+            Some(PathBuf::from("prompt.txt")),
+        );
+        assert!(resolve_bench_prompt(&args).is_err());
+    }
+
+    #[test]
+    fn bench_prompt_warning_threshold() {
+        // The default short prompt must warn; 256+ tokens must not.
+        let short = bench_prompt_warning(24).expect("24 tokens must warn");
+        assert!(short.contains("launch overhead"), "unexpected text: {short}");
+        assert!(short.contains("24"), "warning should name the count: {short}");
+        assert!(bench_prompt_warning(255).is_some());
+        assert!(bench_prompt_warning(256).is_none());
+        assert!(bench_prompt_warning(4400).is_none());
+    }
+
+    #[test]
+    fn bench_prompt_md5_is_hex_of_prompt_bytes() {
+        // md5("abc") is a fixed vector; guards against swapping in sha256.
+        assert_eq!(
+            bench_prompt_md5("abc"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
     }
 
     #[test]
