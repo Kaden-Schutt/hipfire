@@ -94,7 +94,15 @@ mod tests {
 /// comment. Diagnostic only — nothing synchronises on it.
 pub static ESCHA_H128_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Read (and optionally reset) the H128 batched-launch tally.
+/// Read the H128 batched-launch tally.
+///
+/// Monotonic for the life of the process — there is NO reset, by design (an
+/// earlier version of this doc said "and optionally reset"; no such affordance
+/// exists). Callers wanting a delta snapshot the counter before and after the
+/// region of interest, which is what every escha gate does.
+///
+/// The count reflects launches ISSUED, not completed — nothing synchronises on
+/// it. Sample it after a `device_synchronize` if that distinction matters.
 pub fn escha_h128_launches() -> u64 {
     ESCHA_H128_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }

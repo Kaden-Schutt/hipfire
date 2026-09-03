@@ -178,7 +178,7 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
     Ok(())
 }
 
-/// GPU-free pre-guard for MoE decode (#397 Ship 4c). Rejects the two
+/// GPU-free pre-guard for MoE decode (#397 Ship 4c). Rejects the
 /// truly-unsupported cases up front — *before* any GPU work — so the caller
 /// gets a clean [`DispatchError`] instead of a deep panic in the CPU-top-K
 /// fallback (`select_nth_unstable_by(k-1)` panics when `k == 0 || k > n_exp`)
@@ -196,14 +196,41 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
 ///   issue but experts are resident, the fallback runs it and its inner
 ///   `gemv.run_auto` surfaces any genuinely-unsupported dtype as its own clean
 ///   `DispatchError` — so we must NOT reject that case here.)
+/// - **(c)** an Escha-W2 layer resolved onto the indexed GPU-top-K path. See
+///   below — this one is a silent-wrong-output guard, not a panic guard.
 ///
 /// `routed_experts_resident` mirrors `!MoeParams::routed_experts.is_empty()`
 /// (false under paged residency, where only the GPU-top-K path is available).
+///
+/// # (c) — why escha must fail closed on the indexed path
+///
+/// Escha-W2 weights live in a ROTATED domain: only the escha routed executor
+/// (`pipeline::escha::escha_routed_decode`, reached from
+/// [`run_moe_decode_cpu_fallback`], the sole consumer of `MoeParams::escha`)
+/// wraps the GEMVs in the H128 pair. The indexed GPU-top-K path knows nothing
+/// about escha; running an escha layer through it omits the transforms and
+/// emits finite, fluent output that is wrong by ~1e-1 — no crash, no NaN, no
+/// test fires.
+///
+/// Today escha layers reach the executor only by a NEGATIVE invariant: the
+/// loader materialises the experts as `Q8_0`, and `Q8_0` happens to be absent
+/// from every `routed_indexable_*` arm in
+/// [`crate::families::moe::MoeResolution`], so `use_gpu_topk` comes out false.
+/// `Q8_0` is the most common dtype in this codebase; the day someone adds a
+/// `Q8_0` indexed routed arm, that invariant evaporates and every escha layer
+/// silently changes answer. This arm turns that from a silent numerical
+/// regression into a loud refusal at the top of decode.
+///
+/// It deliberately ERRORS rather than forcing `use_gpu_topk = false`. Forcing
+/// would keep escha correct while hiding the fact that a new indexed arm needs
+/// to be taught about escha (or explicitly excluded from it) — the whole point
+/// is that the next person has to make that decision consciously.
 pub fn check_moe_decode_supported(
     use_gpu_topk: bool,
     k: usize,
     n_exp: usize,
     routed_experts_resident: bool,
+    has_escha: bool,
 ) -> Result<(), DispatchError> {
     // (a) k-range — required by BOTH the GPU-top-K path and the CPU fallback's
     // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
@@ -222,6 +249,17 @@ pub fn check_moe_decode_supported(
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "decode-routed-dtype-unsupported-no-fallback",
+            arch: "",
+            quant: "",
+        });
+    }
+    // (c) escha + indexed GPU-top-K: fail closed. The indexed path never
+    // applies the H128 pair, so it would produce silently-wrong output rather
+    // than an error. See the module-level rationale on this function.
+    if has_escha && use_gpu_topk {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-experts-on-indexed-gpu-topk-path",
             arch: "",
             quant: "",
         });
@@ -645,7 +683,19 @@ pub fn run_moe_decode(
     // deep `select_nth_unstable_by` panic in the fallback into a clean error.
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
-    check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
+    //
+    // `p.has_escha()` feeds arm (c): an Escha-W2 layer that resolved onto the
+    // indexed GPU-top-K path is refused HERE, before any GPU work, because
+    // that path does not apply the H128 pair and would emit silently-wrong
+    // output. This must stay wired to the real `has_escha()` — passing a
+    // constant `false` re-opens exactly the hole it closes.
+    check_moe_decode_supported(
+        res.use_gpu_topk,
+        p.k,
+        p.n_exp,
+        !p.routed_experts.is_empty(),
+        p.has_escha(),
+    )?;
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
     // routed-combine accumulate into that zeroed partial (all-reduced by the EP

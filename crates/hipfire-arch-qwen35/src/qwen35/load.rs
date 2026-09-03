@@ -4774,7 +4774,8 @@ pub(crate) fn load_moe_ffn(
     if escha_layer && (ep_shard.is_some() || ep.is_some()) {
         return Err(HipError::new(
             0,
-            "qwen35: Escha-W2 routed experts do not support EP sharding or a REAP keep-map              (both re-map experts across the per-expert tensors escha does not have)",
+            "qwen35: Escha-W2 routed experts do not support EP sharding or a REAP keep-map \
+             (both re-map experts across the per-expert tensors escha does not have)",
         ));
     }
     let escha_tables = if escha_layer {

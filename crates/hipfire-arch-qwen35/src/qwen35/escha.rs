@@ -267,7 +267,21 @@ pub fn load_escha_moe_experts(
             n_exp * dn.1,
             resolve,
         )?,
+        // DELIBERATE DTYPE REINTERPRETATION: `ids` holds `k` 32-bit signed
+        // INTEGERS — the H128 batched kernels bind it as `const int*`. It is
+        // declared `DType::F32` only because `rdna_compute::DType` has no
+        // integer variant; F32 is the 4-byte-per-element stand-in, and the
+        // allocation size is therefore correct. This mirrors
+        // `qwen35::forward`'s `topk_indices`, which does the same thing for
+        // the same reason.
+        //
+        // Consequence: `gpu.download_f32(ids)` returns GARBAGE (int bit
+        // patterns reinterpreted as floats), and so would any f32 kernel
+        // pointed at it. Read it back with a raw byte download and
+        // `i32::from_le_bytes`. Fixing this properly means adding an integer
+        // DType to rdna-compute, which is out of scope here.
         ids: gpu.alloc_tensor(&[k], DType::F32)?,
+        // `weights` genuinely IS f32 (the f16-rounded combine scores).
         weights: gpu.alloc_tensor(&[k], DType::F32)?,
         xh_gu: gpu.alloc_tensor(&[k * gu.0], DType::F32)?,
         mid_gu: gpu.alloc_tensor(&[k * gu.1], DType::F32)?,

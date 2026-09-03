@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Escha-W2 end-to-end smoke (Task 10): load the WHOLE `.hfq` single-GPU and
-//! run a few decode steps through the production forward path.
+//! run PREFILL and then decode through the production forward paths.
 //!
 //! The G4 block gate (`escha_moe_block_gate`) calls the routed executor
 //! directly, with routing injected. That proves the maths; it does NOT prove
@@ -11,6 +11,25 @@
 //! counter, which must be exactly `4 * n_layers` per token — the batched
 //! budget. A regression to a per-expert wiring shows up here as `4 * k *
 //! n_layers` (1280 at A3B) rather than 160, with no numerical change at all.
+//!
+//! # The prefill phase, and why the launch counter is the load-bearing assert
+//!
+//! Escha layers are expected to route to the escha executor in prefill too,
+//! but by a completely different mechanism from decode. In prefill,
+//! `moe_ffn_batched_admissible_for_dtypes` admits no `Q8_0` routed arm, so
+//! `prefill_batch_pbs_eligible` comes out false for the WHOLE model and
+//! `forward_prefill_batch` falls to its per-token `forward_scratch` loop —
+//! which is byte-identical to decode and therefore reaches
+//! `run_moe_decode` → `run_moe_decode_cpu_fallback` → the escha executor.
+//!
+//! That chain was INFERRED from source, not observed, and the failure mode if
+//! the inference is wrong is silent wrong output: a batched MoE prefill body
+//! would run the Q8_0 experts with no H128 pair and produce finite, fluent,
+//! ~1e-1-wrong hidden state. Finiteness alone would not catch it. The
+//! `escha_h128_launches()` delta would: on the batched body it is ZERO, on the
+//! correct per-token path it is exactly `n_prompt * 4 * n_layers`. So the
+//! prefill phase below asserts BOTH, and the counter is what actually proves
+//! the escha executor ran for every layer of every prompt token.
 //!
 //! Token ids are arbitrary — the converter does not embed a tokenizer, so
 //! `hipfire run` cannot drive this checkpoint yet. The assertions are
@@ -83,8 +102,74 @@ fn main() -> Result<(), String> {
 
     let want_launches =
         hipfire_dispatch::pipeline::escha::escha_launches_per_token(b.config.n_layers);
+
+    // ── Phase 1: PREFILL ─────────────────────────────────────────────────
+    // 8 tokens, matching the G4 fixture width, through the real batched
+    // prefill entry point (which is expected to fall through to its per-token
+    // loop — see the module docs).
+    const PROMPT: [u32; 8] = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000];
+    let before_prefill = rdna_compute::escha_h128_launches();
+    let t = std::time::Instant::now();
+    qwen35::forward_prefill_batch(
+        ctx.gpu,
+        &b.weights,
+        &b.config,
+        &PROMPT,
+        0,
+        &mut b.kv_cache,
+        &mut b.dn_state,
+        &b.scratch,
+        None, // hidden ring
+        None, // per-token hidden out — keep last-token logits enabled
+        None, // gdn tape
+        None, // tree verify
+    )
+    .map_err(|e| format!("prefill: {e:?}"))?;
+    ctx.gpu
+        .hip
+        .device_synchronize()
+        .map_err(|e| format!("sync: {e:?}"))?;
+    let prefill_launches = rdna_compute::escha_h128_launches() - before_prefill;
+    let prefill_logits = ctx
+        .gpu
+        .download_f32(&b.scratch.logits)
+        .map_err(|e| format!("download prefill logits: {e:?}"))?;
+    let prefill_bad = prefill_logits
+        .iter()
+        .take(b.config.vocab_size)
+        .filter(|v| !v.is_finite())
+        .count();
+    eprintln!(
+        "prefill n={}: H128 launches={prefill_launches} ({} per token, want {want_launches}), \
+         non-finite logits={prefill_bad}/{}, {:?}",
+        PROMPT.len(),
+        prefill_launches / PROMPT.len() as u64,
+        b.config.vocab_size,
+        t.elapsed()
+    );
+    assert_eq!(
+        prefill_bad,
+        0,
+        "non-finite logits after an {}-token prefill",
+        PROMPT.len()
+    );
+    assert_eq!(
+        prefill_launches as usize,
+        PROMPT.len() * want_launches,
+        "PREFILL took a path that did not run the escha executor for every (layer, token). \
+         Expected {} H128 launches ({} tokens x 4 x {} layers), saw {prefill_launches}. Zero \
+         means the model was admitted to a BATCHED MoE prefill body, which has no escha \
+         awareness and would emit finite-but-~1e-1-wrong hidden state — check \
+         `moe_ffn_batched_admissible_for_dtypes` for a newly-added Q8_0 routed arm.",
+        PROMPT.len() * want_launches,
+        PROMPT.len(),
+        b.config.n_layers
+    );
+
+    // ── Phase 2: DECODE, continuing from the prefilled context ───────────
     let mut prev = rdna_compute::escha_h128_launches();
-    for (pos, &tok) in [1000u32, 2000, 3000, 4000].iter().enumerate() {
+    for (i, &tok) in [9000u32, 10000, 11000, 12000].iter().enumerate() {
+        let pos = PROMPT.len() + i;
         let t = std::time::Instant::now();
         let logits = qwen35::forward(
             ctx.gpu,
@@ -100,10 +185,10 @@ fn main() -> Result<(), String> {
         let n_bad = logits.iter().filter(|v| !v.is_finite()).count();
         let mut best = f32::NEG_INFINITY;
         let mut argmax = 0usize;
-        for (i, &v) in logits.iter().enumerate() {
+        for (j, &v) in logits.iter().enumerate() {
             if v > best {
                 best = v;
-                argmax = i;
+                argmax = j;
             }
         }
         let mean = logits.iter().sum::<f32>() / logits.len() as f32;

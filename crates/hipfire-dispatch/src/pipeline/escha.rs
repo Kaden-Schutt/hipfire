@@ -91,8 +91,19 @@ pub struct EschaRoutedRefs<'a> {
 
 /// Number of H128-family launches this executor issues per call. Pinned as a
 /// constant so the launch budget in the module docs is a checked claim rather
-/// than a comment: `escha_launches_per_token(n_layers)` is what a decode step
-/// actually costs, and `escha_routed_decode` asserts it in debug builds.
+/// than a comment.
+///
+/// It is checked by the GATES, not by this function: `escha_routed_decode`
+/// itself contains no assert (an earlier version of this doc claimed a
+/// debug-build assert that never existed). The claim is enforced by reading
+/// `rdna_compute::escha_h128_launches()` across a real forward pass —
+/// `hipfire-arch-qwen35/examples/escha_moe_block_gate.rs` (one layer, per
+/// (layer, token)) and `examples/escha_model_smoke.rs` (whole model, decode
+/// AND prefill, against `escha_launches_per_token`).
+///
+/// This is an H128-TRANSFORM budget, not the layer's whole launch cost: a
+/// decode layer at k=8 issues 22 launches in total (4 H128 + 1 SwiGLU +
+/// 1 combine + 16 GEMV). See the phase table in the module docs.
 pub const ESCHA_H128_LAUNCHES_PER_LAYER: usize = 4;
 
 /// H128 launches for a whole decode step. Independent of `k` — that is the
