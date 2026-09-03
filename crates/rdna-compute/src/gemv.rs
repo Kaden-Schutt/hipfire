@@ -14009,6 +14009,176 @@ impl Gpu {
         }
     }
 
+    /// Escha-W2 routed GEMV for the indexed (GPU-top-K) decode path: one
+    /// launch computes all `slots` experts' `y[s] = W[ids[s]] · x[s]`.
+    ///
+    /// `x_batch` is `[slots, k]`, `y_batch` is `[slots, m]`; every slot has
+    /// its own input because the escha input transform folds a per-expert
+    /// `rin_eff` row into it, and every slot keeps its own output because the
+    /// escha output transform has to run before anything is combined.
+    ///
+    /// # Numerics
+    ///
+    /// The wide/narrow choice re-uses [`Self::gemv_q8_0`]'s own `k <= 1536`
+    /// threshold, and each entry point is a verbatim transcription of the
+    /// corresponding non-indexed kernel. Both facts are load-bearing: the
+    /// escha routed path previously ran these projections through
+    /// `GemvFamily::run_auto` -> `gemv_q8_0`, and the G4 block gate's
+    /// tolerances are calibrated against those exact sums. `gemv_q8_0_wide`
+    /// folds four interleaved accumulators where `gemv_q8_0` uses one, so
+    /// choosing the other variant here would silently change the answer.
+    pub fn escha_gemv_q8_0_moe_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_gemv_q8_0_moe_k8_indexed_batched: k={k} is not a multiple of 32"),
+            ));
+        }
+        if slots == 0 || m == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_gemv_q8_0_moe_k8_indexed_batched: slots={slots} m={m}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_gemv_q8_0_moe_k8_indexed_batched: x has {} elements (need {}), y has \
+                     {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        if topk_indices.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_gemv_q8_0_moe_k8_indexed_batched: topk_indices has {} elements, need \
+                     {slots}",
+                    topk_indices.numel()
+                ),
+            ));
+        }
+        // Same rule as `gemv_q8_0`: wide kernel for small K. See the doc above
+        // — this is a NUMERICAL selection, not only a performance one.
+        let wide = k <= 1536;
+        let entry = if wide {
+            "escha_gemv_q8_0_wide_moe_k8_indexed_batched"
+        } else {
+            "escha_gemv_q8_0_moe_k8_indexed_batched"
+        };
+        self.ensure_kernel(
+            "escha_moe_gemv_k8_indexed",
+            kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
+            entry,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let (grid_x, block_x) = if wide {
+            (m.div_ceil(2) as u32, 64u32)
+        } else {
+            (m as u32, 32u32)
+        };
+        self.launch_maybe_blob(
+            entry,
+            [grid_x, slots as u32, 1],
+            [block_x, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Device-side out-of-place `f32 -> f16 -> f32` round-trip of the escha
+    /// combine weights.
+    ///
+    /// The escha combine scales each expert by `f16(score)`. The CPU-top-K
+    /// route does that on the host copy it already downloaded; the indexed
+    /// route never downloads, so it happens here. Out-of-place because
+    /// `src` is the shared `topk_weights` buffer other consumers still read
+    /// unrounded.
+    pub fn escha_round_weights_f16_rne(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if src.numel() < n || dst.numel() < n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_round_weights_f16_rne: src has {} / dst has {} elements, need {n}",
+                    src.numel(),
+                    dst.numel()
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_moe_gemv_k8_indexed",
+            kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
+            "escha_round_weights_f16_rne",
+        )?;
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let bx = 256u32;
+        self.launch_maybe_blob(
+            "escha_round_weights_f16_rne",
+            [(n as u32).div_ceil(bx), 1, 1],
+            [bx, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
     /// Load path: transpose the bare in-major `[ic, oc]` fp16 that
     /// `escha_decode_tiles` produced into hipfire's OUT-major expert slot,
     /// re-quantising to Q8_0 in the same pass. `out` must be

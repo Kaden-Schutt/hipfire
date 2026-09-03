@@ -88,6 +88,25 @@ pub struct MoeDtypes {
     pub per_expert_gate_up: Option<Vec<DType>>,
     /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
     pub per_expert_down: Option<Vec<DType>>,
+    /// This layer's routed experts came from an Escha-W2 checkpoint AND the
+    /// per-expert H128 transform tables are resident, so the escha routed
+    /// executor (`crate::pipeline::escha`) can run them.
+    ///
+    /// It is a separate flag rather than a dtype because the escha loader
+    /// decodes the trellis at load time and materialises the experts as
+    /// `Q8_0`: by the time dispatch sees the layer, NO routed dtype says
+    /// "escha" any more (that is exactly what `has_escha_experts` can no
+    /// longer see). The model sets it from `MoeFfnWeights.escha.is_some()` —
+    /// the same single source of truth that populates `MoeParams::escha`.
+    ///
+    /// It gates `routed_indexable_escha_q8`. Scoping the Q8_0 indexed arm to
+    /// escha, rather than admitting `Q8_0` routed experts in general, is
+    /// deliberate in BOTH directions: escha's indexed route is a different
+    /// executor (it wraps every GEMV in the H128 pair) that a plain-Q8_0 MoE
+    /// model must not be pulled onto, and a plain-Q8_0 MoE model must equally
+    /// not be pulled onto the generic indexed body on the strength of an arm
+    /// added for escha's benefit.
+    pub routed_escha_transforms: bool,
 }
 
 impl MoeDtypes {
@@ -204,6 +223,12 @@ pub struct MoeResolution {
     /// gate_up and down. Binds the same indexed MQ2-Lloyd kernels as qt19 but
     /// consumes x in the natural basis (`needs_x_rot_local == false`).
     pub routed_indexable_mq2lloyd_u: bool,
+    /// Escha-W2 routed experts (Q8_0 on both projections, H128 transform
+    /// tables resident). Admits the layer to GPU-resident top-K ONLY — the
+    /// routed body it reaches is `pipeline::escha::escha_routed_decode_indexed`,
+    /// never the generic indexed body, which has no escha awareness. See the
+    /// arm in `resolve_arch` and `pipeline::check_moe_decode_supported`.
+    pub routed_indexable_escha_q8: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
     /// True when a per-expert tier table is `Some` AND contains >1 distinct
@@ -315,6 +340,25 @@ impl MoeResolution {
             && routed_gate_up_e8
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
+        // Escha-W2. The routed experts are the Q8_0 the trellis decoded into,
+        // BOTH projections, and the layer carries the H128 transform tables.
+        //
+        // This arm does NOT admit the layer to the generic indexed routed body
+        // below — escha weights are in a rotated domain and that body would
+        // omit both Hadamard transforms, producing finite, fluent, ~1e-1-wrong
+        // output. What it admits is GPU-resident top-K: `run_moe_decode`
+        // branches to `pipeline::escha::escha_routed_decode_indexed` (which
+        // keeps the H128 pair) before the generic body, and
+        // `check_moe_decode_supported` refuses any escha layer that arrives on
+        // the indexed path WITHOUT those tables.
+        //
+        // Q8_0 is required on both sides for the same reason every other
+        // uniform arm requires it: the indexed GEMV decodes a 34 B/32-element
+        // block layout, and handing it a different container is silent
+        // corruption, not a fault.
+        let routed_indexable_escha_q8 =
+            d.routed_escha_transforms && d.routed_gate_up == Q8_0 && d.routed_down == Q8_0;
+
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq4v2
             || routed_indexable_mq5
@@ -327,7 +371,8 @@ impl MoeResolution {
             || routed_indexable_mq3lloyd
             || routed_indexable_mixed_lloyd
             || routed_indexable_paro
-            || routed_indexable_e8;
+            || routed_indexable_e8
+            || routed_indexable_escha_q8;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
@@ -385,6 +430,7 @@ impl MoeResolution {
             routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
+            routed_indexable_escha_q8,
             use_gpu_topk,
             needs_x_rot_local,
             mixed,
@@ -1103,6 +1149,7 @@ mod tests {
             has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
+            routed_escha_transforms: false,
         }
     }
 

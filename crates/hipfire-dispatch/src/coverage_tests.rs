@@ -439,6 +439,7 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
+            routed_escha_transforms: false,
         };
         let res = MoeResolution::resolve(&d, u.k);
         // (a) These layers MUST take the fallback, not the k8 indexed path.
@@ -499,6 +500,7 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        routed_escha_transforms: false,
     };
     let res_k4 = MoeResolution::resolve(&mq4_k4, 4);
     assert!(
@@ -512,7 +514,8 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
             4,
             /*n_exp=*/ 64,
             /*resident=*/ true,
-            /*has_escha=*/ false
+            /*has_escha=*/ false,
+            /*escha_indexed_supported=*/ false
         )
         .is_ok(),
         "MQ4G256 k=4 with resident experts is a VALID fallback case — guard must not reject it"
@@ -535,7 +538,8 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
             8,
             64,
             /*resident=*/ false,
-            /*has_escha=*/ false
+            /*has_escha=*/ false,
+            /*escha_indexed_supported=*/ false
         )
         .is_ok(),
         "GPU-top-K path is valid even under paged (non-resident) residency"
@@ -543,11 +547,11 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
 
     // (a) out-of-range k errors gracefully (no panic): k == 0 and k > n_exp.
     assert!(
-        check_moe_decode_supported(false, 0, 64, true, false).is_err(),
+        check_moe_decode_supported(false, 0, 64, true, false, false).is_err(),
         "k == 0 must be rejected (would panic select_nth_unstable_by(k-1))"
     );
     assert!(
-        check_moe_decode_supported(false, 65, 64, true, false).is_err(),
+        check_moe_decode_supported(false, 65, 64, true, false, false).is_err(),
         "k > n_exp must be rejected (would panic select_nth_unstable_by(k-1))"
     );
 
@@ -555,77 +559,112 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     assert!(
         check_moe_decode_supported(
             /*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false,
-            /*has_escha=*/ false
+            /*has_escha=*/ false, /*escha_indexed_supported=*/ false
         )
         .is_err(),
         "non-fast-path dtype with no resident experts has no runnable path — reject gracefully"
     );
 }
 
-/// LAYER 1f — Escha-W2 must FAIL CLOSED on the indexed GPU-top-K path.
+/// LAYER 1f — Escha-W2 on the indexed GPU-top-K path: SUPPORTED only in the
+/// one shape that keeps the H128 pair, and failing closed in every other.
 ///
-/// Only `run_moe_decode_cpu_fallback` consults `MoeParams::escha` and runs the
-/// H128-wrapped routed executor. The indexed GPU-top-K path has no escha
-/// awareness at all: an escha layer that took it would skip both Hadamard
+/// Escha-W2 weights live in a rotated domain. Only the executors in
+/// `pipeline::escha` wrap the routed GEMVs in the H128 pair; an escha layer
+/// that reached the GENERIC indexed routed body would skip both Hadamard
 /// transforms and emit finite, fluent output wrong by ~1e-1. Nothing would
 /// fire — not a NaN check, not a shape check, not a dtype check.
 ///
-/// Escha reaches the fallback today only by an UNGUARDED NEGATIVE INVARIANT:
-/// the loader materialises the experts as `Q8_0`, and no `routed_indexable_*`
-/// arm in `MoeResolution` admits `Q8_0`. `Q8_0` is the most common dtype in
-/// this codebase, so "someone adds a Q8_0 indexed routed arm" is a likely
-/// future change, not a hypothesis. When it happens, arm (c) of
-/// `check_moe_decode_supported` must refuse loudly instead of letting every
-/// escha layer silently change answer.
+/// This test used to assert that escha could never be on the indexed path at
+/// all, because the only thing keeping it off was a negative accident (the
+/// loader materialises the experts as `Q8_0`, and no `routed_indexable_*` arm
+/// admitted `Q8_0`). That accident has been replaced by real support:
+/// `routed_indexable_escha_q8` admits Q8_0-on-both-projections experts that
+/// carry the transform tables, and `run_moe_decode` routes them to
+/// `escha::escha_routed_decode_indexed`, which applies the same H128 pair as
+/// the CPU-top-K executor.
 ///
-/// The three cases below are the whole contract:
-///   1. escha + `use_gpu_topk == true`  → REJECTED, with the escha-named variant.
-///   2. escha + `use_gpu_topk == false` → admitted (today's production shape).
-///   3. non-escha + `use_gpu_topk == true` → admitted (every other MoE model).
+/// So the contract the guard now encodes is narrower and stronger — the
+/// SPECIFIC combination is supported and everything adjacent to it is not:
+///   1. escha + indexed + `escha_indexed_supported` → ADMITTED (production).
+///   2. escha + indexed + tables MISSING → REJECTED (the executor could not
+///      have been called; the generic body would run and drop the transforms).
+///   3. escha + indexed via some OTHER arm (non-Q8_0 routed dtype) → REJECTED.
+///      The escha indexed GEMV hard-codes the Q8_0 block layout, so this is
+///      the mirror-image silent corruption of case 2.
+///   4. escha + `use_gpu_topk == false` → admitted (the CPU-top-K route).
+///   5. non-escha + indexed → admitted (every other MoE model).
 ///
-/// Case 3 is what stops the guard being over-broad; case 1 is what goes red if
-/// arm (c) is deleted.
+/// Cases 2 and 3 are what go red if arm (c) is weakened to `true`; case 1 is
+/// what goes red if it is left as the old blanket refusal.
 #[test]
 fn escha_layer_must_not_take_the_indexed_gpu_topk_path() {
     use crate::pipeline::check_moe_decode_supported;
 
-    // The future-change simulation: an escha layer whose routed dtype HAS
-    // become indexable. `MoeResolution` is asked for the real answer rather
-    // than hand-set, so this stays honest if the arms are reworked.
-    let indexable = MoeDtypes {
+    let base = MoeDtypes {
         router: Q8_0,
         shared_gate: Q8_0,
         shared_expert_gate: Q8_0,
         shared_expert_up: Q8_0,
         shared_expert_down: Q8_0,
-        experts_all_gate_up_mq4: true,
-        routed_gate_up: MQ4G256,
-        routed_down: MQ4G256,
+        experts_all_gate_up_mq4: false,
+        routed_gate_up: Q8_0,
+        routed_down: Q8_0,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        routed_escha_transforms: false,
     };
-    let res = MoeResolution::resolve(&indexable, 8);
+
+    // ── 1. Production shape: Q8_0 experts + resident transform tables ──────
+    // `MoeResolution` is asked for the real answer rather than hand-set, so
+    // this stays honest if the arms are reworked.
+    let escha_q8 = MoeDtypes {
+        routed_escha_transforms: true,
+        per_expert_gate_up: None,
+        per_expert_down: None,
+        ..base
+    };
+    let res_escha = MoeResolution::resolve(&escha_q8, 8);
     assert!(
-        res.use_gpu_topk,
-        "fixture precondition: this dtype/k pair must resolve to the indexed path"
+        res_escha.routed_indexable_escha_q8,
+        "Q8_0-on-both-projections experts with resident H128 tables ARE the escha indexed arm"
+    );
+    assert!(
+        res_escha.use_gpu_topk,
+        "the escha arm must admit the layer to GPU-resident top-K — that is the whole point of \
+         it (no per-layer topk D2H, no per-expert GEMV launch storm, hipGraph-capturable)"
+    );
+    assert!(
+        check_moe_decode_supported(
+            res_escha.use_gpu_topk,
+            8,
+            /*n_exp=*/ 64,
+            /*resident=*/ true,
+            /*has_escha=*/ true,
+            /*escha_indexed_supported=*/ true,
+        )
+        .is_ok(),
+        "escha on the indexed path WITH the escha executor behind it is the supported \
+         production shape — the guard must admit it. If this is red the guard is still the old \
+         blanket refusal and escha is stuck on the CPU-top-K route."
     );
 
-    // 1. escha ON the indexed path → refused, and refused for the RIGHT reason.
+    // ── 2. Tables missing: the executor could not run, so refuse ───────────
     let err = check_moe_decode_supported(
-        res.use_gpu_topk,
+        res_escha.use_gpu_topk,
         8,
-        /*n_exp=*/ 64,
+        64,
         /*resident=*/ true,
         /*has_escha=*/ true,
+        /*escha_indexed_supported=*/ false,
     )
     .expect_err(
-        "an escha layer resolved onto the indexed GPU-top-K path MUST be refused: that path \
-         never applies the H128 pair, so it would emit finite, fluent, ~1e-1-wrong output with \
-         nothing to catch it. Escha reaches the correct executor today only because Q8_0 is \
-         absent from every routed_indexable_* arm — if you just added one, teach the indexed \
-         path about escha (or exclude escha from it) rather than deleting this guard.",
+        "an escha layer on the indexed path WITHOUT its transform tables MUST be refused: the \
+         escha executor cannot be called, so the generic indexed body would run the experts \
+         with no H128 pair and emit finite, fluent, ~1e-1-wrong output with nothing to catch \
+         it.",
     );
     match err {
         DispatchError::UnsupportedVariant {
@@ -641,9 +680,88 @@ fn escha_layer_must_not_take_the_indexed_gpu_topk_path() {
         other => panic!("expected UnsupportedVariant, got {other:?}"),
     }
 
-    // 2. Today's production shape: escha experts materialised as Q8_0, which
-    //    resolves OFF the indexed path → the fallback runs them → admitted.
-    let q8_escha = MoeDtypes {
+    // ── 3. Indexable through a DIFFERENT arm while still escha ─────────────
+    // A future graded/mixed escha file whose representative routed dtype is
+    // not Q8_0 would resolve indexable via the MQ4 arm. The escha indexed
+    // GEMV hard-codes the Q8_0 34 B/32-element block layout, so dispatching
+    // it there is silent corruption; so is letting the generic body have it.
+    let escha_via_mq4 = MoeDtypes {
+        experts_all_gate_up_mq4: true,
+        routed_gate_up: MQ4G256,
+        routed_down: MQ4G256,
+        routed_escha_transforms: true,
+        per_expert_gate_up: None,
+        per_expert_down: None,
+        ..base
+    };
+    let res_mq4 = MoeResolution::resolve(&escha_via_mq4, 8);
+    assert!(
+        res_mq4.use_gpu_topk && !res_mq4.routed_indexable_escha_q8,
+        "fixture precondition: indexable, but NOT through the escha arm"
+    );
+    assert!(
+        check_moe_decode_supported(
+            res_mq4.use_gpu_topk,
+            8,
+            64,
+            true,
+            /*has_escha=*/ true,
+            // What `run_moe_decode` computes: the escha arm did not fire, so
+            // the escha executor is not the one that would run.
+            /*escha_indexed_supported=*/
+            res_mq4.routed_indexable_escha_q8,
+        )
+        .is_err(),
+        "an escha layer that reached the indexed path through a NON-escha arm must be refused — \
+         the escha executor only decodes Q8_0, and the generic body applies no transforms"
+    );
+
+    // ── 4. CPU-top-K route stays admitted ──────────────────────────────────
+    let escha_k4 = MoeDtypes {
+        routed_escha_transforms: true,
+        per_expert_gate_up: None,
+        per_expert_down: None,
+        ..base
+    };
+    let res_k4 = MoeResolution::resolve(&escha_k4, 4);
+    assert!(
+        !res_k4.use_gpu_topk,
+        "k != 8 has no indexed kernel on any arm, escha included"
+    );
+    assert!(
+        check_moe_decode_supported(res_k4.use_gpu_topk, 4, 64, true, true, false).is_ok(),
+        "escha on the CPU-top-K fallback is still a supported shape — the guard must not \
+         reject it"
+    );
+
+    // ── 5. Non-escha models on the indexed path are untouched ──────────────
+    assert!(
+        check_moe_decode_supported(
+            res_mq4.use_gpu_topk,
+            8,
+            64,
+            true,
+            /*has_escha=*/ false,
+            /*escha_indexed_supported=*/ false
+        )
+        .is_ok(),
+        "the escha guard must not affect any non-escha MoE model"
+    );
+}
+
+/// LAYER 1f (companion) — the Q8_0 indexed arm must stay ESCHA-SCOPED.
+///
+/// `routed_indexable_escha_q8` is the first arm in `MoeResolution` that
+/// admits `Q8_0` routed experts, and `Q8_0` is the most common dtype in this
+/// codebase. If the escha gate on it were ever dropped, every plain-Q8_0 MoE
+/// model in the tree would silently move from the CPU-top-K fallback onto an
+/// indexed path — either the generic body (whose kernels expect a different
+/// container for the projections that arm implies) or, worse, the escha
+/// executor, which would apply a Hadamard pair those weights were never
+/// packed in. Both are fluent wrong output, not a fault.
+#[test]
+fn plain_q8_0_routed_experts_stay_off_the_indexed_path() {
+    let plain_q8 = MoeDtypes {
         router: Q8_0,
         shared_gate: Q8_0,
         shared_expert_gate: Q8_0,
@@ -656,22 +774,19 @@ fn escha_layer_must_not_take_the_indexed_gpu_topk_path() {
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        // The ONLY difference from the escha production fixture above.
+        routed_escha_transforms: false,
     };
-    let res_q8 = MoeResolution::resolve(&q8_escha, 8);
+    let res = MoeResolution::resolve(&plain_q8, 8);
     assert!(
-        !res_q8.use_gpu_topk,
-        "Q8_0 routed experts must stay off the indexed path (this is the invariant the guard \
-         above exists to make explicit)"
+        !res.routed_indexable_escha_q8,
+        "the Q8_0 indexed arm must require the escha transform tables"
     );
     assert!(
-        check_moe_decode_supported(res_q8.use_gpu_topk, 8, 64, true, /*has_escha=*/ true).is_ok(),
-        "escha on the CPU-top-K fallback is the SUPPORTED shape — the guard must not reject it"
-    );
-
-    // 3. Non-escha models on the indexed path are untouched.
-    assert!(
-        check_moe_decode_supported(res.use_gpu_topk, 8, 64, true, /*has_escha=*/ false).is_ok(),
-        "the escha guard must not affect any non-escha MoE model"
+        !res.use_gpu_topk,
+        "a plain Q8_0 MoE model must keep taking the CPU-top-K fallback. If this is red, the \
+         escha gate came off the Q8_0 arm and every Q8_0 MoE model in the tree just changed \
+         execution path (and, on the escha executor, answer)."
     );
 }
 
@@ -1501,6 +1616,7 @@ fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes {
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        routed_escha_transforms: false,
     }
 }
 

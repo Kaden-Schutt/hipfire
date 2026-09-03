@@ -3516,6 +3516,11 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
+        // Escha-W2. Prefill for an escha model falls through to the per-token
+        // decode path (no Q8_0 routed arm is admitted to the batched MoE
+        // body), so this snapshot must agree with the decode one or the two
+        // routes would resolve the same layer differently.
+        routed_escha_transforms: ffn.escha.is_some() && super::escha::escha_indexed_route_enabled(),
     };
 
     let paro_gate_up =

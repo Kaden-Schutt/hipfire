@@ -621,6 +621,12 @@ fn moe_ffn_decode_impl(
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
+        // Escha-W2: same single source of truth as `MoeParams::escha` below.
+        // The loader has already turned the trellis experts into Q8_0, so the
+        // transform tables are the ONLY remaining evidence that this layer is
+        // escha — and they are also what makes the escha indexed executor
+        // callable, which is exactly what the resolver's Q8_0 arm gates on.
+        routed_escha_transforms: ffn.escha.is_some() && super::escha::escha_indexed_route_enabled(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
     // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.

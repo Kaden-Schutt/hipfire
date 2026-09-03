@@ -40,7 +40,9 @@
 
 use hipfire_arch_qwen35::qwen35::escha::{load_escha_moe_experts, EschaWeightStore};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::escha::{escha_launches_per_token, escha_routed_decode};
+use hipfire_dispatch::pipeline::escha::{
+    escha_launches_per_token, escha_routed_decode, escha_routed_decode_indexed, EschaIndexedRouting,
+};
 use hipfire_quantize::float16::f16_to_f32;
 use hipfire_runtime::hfq::{load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{weight_gemv, WeightTensor};
@@ -126,6 +128,21 @@ struct ArmResult {
     max_abs: f32,
     mean_abs: f32,
     got: Vec<f32>,
+    /// `Some(n)` when the indexed (GPU-top-K) route was cross-checked on this
+    /// arm: the number of ROUTED-ONLY output floats that did NOT match the
+    /// CPU-top-K route bit-for-bit, across every token. Must be 0.
+    indexed_mismatches: Option<usize>,
+}
+
+/// Device pointer table over the loaded experts, in the `[n_exp]` packed-u64
+/// layout every indexed MoE GEMV consumes. Built here the same way
+/// `qwen35::load` builds it for production, because the indexed executor
+/// reaches the weights ONLY through this table — a gate that passed its own
+/// hand-rolled table would not be gating the production addressing.
+fn expert_ptr_table(gpu: &Gpu, ptrs: &[u64]) -> GpuTensor {
+    let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    gpu.upload_raw(&bytes, &[2 * ptrs.len()])
+        .expect("ptr table")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,6 +189,42 @@ fn run_arm(
     let zeros = vec![0.0f32; hidden];
     let mut got = vec![0.0f32; n_tok * hidden];
 
+    // ── Indexed (GPU-top-K) route cross-check ────────────────────────────
+    //
+    // Production decode and prefill take `escha_routed_decode_indexed`, not
+    // the host-routed executor this gate was originally written against. The
+    // two must agree BIT-FOR-BIT: they are the same eight phases over the
+    // same weights, differing only in where the routing lives, so any
+    // difference at all is a defect (a changed GEMV accumulate order, a
+    // device-vs-host disagreement in the f16 score rounding, a wrong slot
+    // stride) — not a tolerance question. Asserting equality rather than a
+    // bound is what lets the golden tolerances below keep meaning ONE thing
+    // for both routes.
+    //
+    // Q8_0 only: the indexed GEMV decodes the Q8_0 34 B/32-element block
+    // layout, so the F32 weight-exact control arm has no indexed counterpart
+    // (and needs none — it exists to isolate wiring, which both routes share).
+    let indexed = if matches!(store, EschaWeightStore::Q8_0) {
+        let gu_ptrs: Vec<u64> = experts
+            .iter()
+            .map(|e| e.gate_up.buf.buf.as_ptr() as u64)
+            .collect();
+        let dn_ptrs: Vec<u64> = experts
+            .iter()
+            .map(|e| e.down.buf.buf.as_ptr() as u64)
+            .collect();
+        Some((
+            expert_ptr_table(gpu, &gu_ptrs),
+            expert_ptr_table(gpu, &dn_ptrs),
+            gpu.alloc_tensor(&[top_k], DType::F32).unwrap(), // ids (i32 bits)
+            gpu.alloc_tensor(&[top_k], DType::F32).unwrap(), // raw scores
+            gpu.alloc_tensor(&[hidden], DType::F32).unwrap(), // routed-only out
+        ))
+    } else {
+        None
+    };
+    let mut indexed_mismatches = indexed.as_ref().map(|_| 0usize);
+
     for t in 0..n_tok {
         let x_gpu = upload_f32(gpu, &x[t * hidden..(t + 1) * hidden]);
         gpu.hip
@@ -190,6 +243,57 @@ fn run_arm(
         )
         .expect("escha routed decode");
 
+        if let (Some((gu_tbl, dn_tbl, ids_dev, wts_dev, out_idx)), Some(bad)) =
+            (indexed.as_ref(), indexed_mismatches.as_mut())
+        {
+            // Routing goes up ONCE, as the device buffers the GPU top-K
+            // kernel would have written: ids as i32 bits in an F32 tensor,
+            // scores UNROUNDED (the executor's own kernel does the f16
+            // round-trip — that is part of what is being gated).
+            let id_bytes: Vec<u8> = slot_ids
+                .iter()
+                .flat_map(|&i| (i as i32).to_le_bytes())
+                .collect();
+            gpu.hip.memcpy_htod(&ids_dev.buf, &id_bytes).unwrap();
+            let w_bytes: Vec<u8> = slot_w.iter().flat_map(|w| w.to_le_bytes()).collect();
+            gpu.hip.memcpy_htod(&wts_dev.buf, &w_bytes).unwrap();
+            gpu.hip
+                .memcpy_htod(&out_idx.buf, unsafe {
+                    std::slice::from_raw_parts(zeros.as_ptr() as *const u8, hidden * 4)
+                })
+                .unwrap();
+
+            escha_routed_decode_indexed(
+                gpu,
+                &refs,
+                &EschaIndexedRouting {
+                    expert_gate_up_ptrs: gu_tbl,
+                    expert_down_ptrs: dn_tbl,
+                    topk_indices: ids_dev,
+                    topk_weights: wts_dev,
+                    gate_up_m: 2 * mi,
+                    gate_up_k: hidden,
+                    down_m: hidden,
+                    down_k: mi,
+                },
+                out_idx,
+                &x_gpu,
+                hidden,
+                mi,
+                top_k,
+            )
+            .expect("escha routed decode (indexed)");
+
+            gpu.hip.device_synchronize().unwrap();
+            let host_route = gpu.download_f32(&out).unwrap();
+            let idx_route = gpu.download_f32(out_idx).unwrap();
+            *bad += host_route[..hidden]
+                .iter()
+                .zip(idx_route[..hidden].iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+
         run_shared_expert(gpu, shared, &x_gpu, &out, smi, hidden);
 
         gpu.hip.device_synchronize().unwrap();
@@ -207,6 +311,11 @@ fn run_arm(
     let mean_abs = diffs.iter().sum::<f32>() / diffs.len() as f32;
 
     let _ = gpu.free_tensor(out);
+    if let Some((gu_tbl, dn_tbl, ids_dev, wts_dev, out_idx)) = indexed {
+        for t in [gu_tbl, dn_tbl, ids_dev, wts_dev, out_idx] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
     for e in experts {
         e.gate_up.free_all(gpu);
         e.down.free_all(gpu);
@@ -217,6 +326,7 @@ fn run_arm(
         max_abs,
         mean_abs,
         got,
+        indexed_mismatches,
     }
 }
 
@@ -345,6 +455,34 @@ fn main() {
     println!(
         "MoE block [Q8_0 experts, production]:  max|diff|={:.3e} mean|diff|={:.3e}",
         q8_arm.max_abs, q8_arm.mean_abs
+    );
+
+    // ── Indexed route == host route, bit-for-bit ─────────────────────────
+    // Production decode/prefill run `escha_routed_decode_indexed`. The
+    // tolerances asserted below were measured on the host-routed executor, so
+    // they only describe production if the two routes are the SAME numbers —
+    // which they are by construction (identical phases, identical GEMV
+    // accumulate order, the f16 score rounding moved from host to kernel) and
+    // must therefore be provable exactly, not to a tolerance.
+    let n_indexed = q8_arm
+        .indexed_mismatches
+        .expect("the Q8_0 arm must cross-check the indexed route");
+    println!("indexed route vs host route: {n_indexed} differing floats (want 0)");
+    assert_eq!(
+        n_indexed, 0,
+        "the indexed (GPU-top-K) escha route disagreed with the CPU-top-K route on \
+         {n_indexed} routed-output floats. These must be BIT-identical: same phases, same \
+         weights, same H128 pair, same GEMV accumulate order. Look at (1) the wide-vs-narrow \
+         Q8_0 kernel choice in `escha_gemv_q8_0_moe_k8_indexed_batched` — it must reuse \
+         `gemv_q8_0`'s `k <= 1536` rule, because the wide kernel folds four interleaved \
+         accumulators and the narrow one a single sum; (2) `escha_round_weights_f16_rne` \
+         against the host's `half::f16::from_f32`; (3) the per-slot x/y strides. Until this is \
+         0 the tolerances below describe a route production does not take."
+    );
+    assert!(
+        f32_arm.indexed_mismatches.is_none(),
+        "the F32 control arm has no indexed counterpart (the indexed GEMV is Q8_0-only) — a \
+         Some here means the cross-check silently ran against the wrong container"
     );
 
     let dq: Vec<f32> = q8_arm

@@ -196,30 +196,40 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
 ///   issue but experts are resident, the fallback runs it and its inner
 ///   `gemv.run_auto` surfaces any genuinely-unsupported dtype as its own clean
 ///   `DispatchError` — so we must NOT reject that case here.)
-/// - **(c)** an Escha-W2 layer resolved onto the indexed GPU-top-K path. See
-///   below — this one is a silent-wrong-output guard, not a panic guard.
+/// - **(c)** an Escha-W2 layer on the indexed GPU-top-K path WITHOUT the escha
+///   indexed executor behind it. See below — this one is a silent-wrong-output
+///   guard, not a panic guard.
 ///
 /// `routed_experts_resident` mirrors `!MoeParams::routed_experts.is_empty()`
 /// (false under paged residency, where only the GPU-top-K path is available).
 ///
-/// # (c) — why escha must fail closed on the indexed path
+/// # (c) — why escha must fail closed on an UNSUPPORTED indexed path
 ///
-/// Escha-W2 weights live in a ROTATED domain: only the escha routed executor
-/// (`pipeline::escha::escha_routed_decode`, reached from
-/// [`run_moe_decode_cpu_fallback`], the sole consumer of `MoeParams::escha`)
-/// wraps the GEMVs in the H128 pair. The indexed GPU-top-K path knows nothing
-/// about escha; running an escha layer through it omits the transforms and
-/// emits finite, fluent output that is wrong by ~1e-1 — no crash, no NaN, no
-/// test fires.
+/// Escha-W2 weights live in a ROTATED domain: only the escha routed executors
+/// in [`crate::pipeline::escha`] wrap the GEMVs in the H128 pair. The GENERIC
+/// indexed routed body in [`run_moe_decode`] knows nothing about escha;
+/// running an escha layer through it omits the transforms and emits finite,
+/// fluent output that is wrong by ~1e-1 — no crash, no NaN, no test fires.
 ///
-/// Today escha layers reach the executor only by a NEGATIVE invariant: the
-/// loader materialises the experts as `Q8_0`, and `Q8_0` happens to be absent
-/// from every `routed_indexable_*` arm in
-/// [`crate::families::moe::MoeResolution`], so `use_gpu_topk` comes out false.
-/// `Q8_0` is the most common dtype in this codebase; the day someone adds a
-/// `Q8_0` indexed routed arm, that invariant evaporates and every escha layer
-/// silently changes answer. This arm turns that from a silent numerical
-/// regression into a loud refusal at the top of decode.
+/// Escha is now a SUPPORTED indexed variant: `routed_indexable_escha_q8`
+/// admits a layer whose experts are Q8_0 on both projections and whose H128
+/// transform tables are resident, and `run_moe_decode` branches such a layer
+/// to `escha::escha_routed_decode_indexed` before the generic body ever runs.
+/// `escha_indexed_supported` is the caller's assertion that BOTH halves of
+/// that hold for this layer.
+///
+/// What arm (c) still catches is every way escha could arrive on the indexed
+/// path other than through that arm:
+///
+///  * transform tables missing (`MoeParams::escha == None`) while the layer
+///    is still marked escha by dtype — the executor could not be called;
+///  * an escha layer that resolved indexable through some OTHER arm, e.g. a
+///    future graded/mixed escha file whose representative routed dtype is not
+///    Q8_0. The escha indexed executor hard-codes the Q8_0 block decode, so
+///    dispatching it on a non-Q8_0 container is silent corruption too — this
+///    hazard is the mirror image of the original one, and both are refused
+///    here by requiring the *specific* supported combination rather than
+///    merely "escha, somehow, on the indexed path".
 ///
 /// It deliberately ERRORS rather than forcing `use_gpu_topk = false`. Forcing
 /// would keep escha correct while hiding the fact that a new indexed arm needs
@@ -231,6 +241,7 @@ pub fn check_moe_decode_supported(
     n_exp: usize,
     routed_experts_resident: bool,
     has_escha: bool,
+    escha_indexed_supported: bool,
 ) -> Result<(), DispatchError> {
     // (a) k-range — required by BOTH the GPU-top-K path and the CPU fallback's
     // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
@@ -253,10 +264,12 @@ pub fn check_moe_decode_supported(
             quant: "",
         });
     }
-    // (c) escha + indexed GPU-top-K: fail closed. The indexed path never
-    // applies the H128 pair, so it would produce silently-wrong output rather
-    // than an error. See the module-level rationale on this function.
-    if has_escha && use_gpu_topk {
+    // (c) escha on the indexed GPU-top-K path WITHOUT the escha indexed
+    // executor behind it: fail closed. The generic indexed body never applies
+    // the H128 pair, and the escha indexed executor hard-codes Q8_0 — either
+    // mismatch is silently-wrong output rather than an error. See the
+    // module-level rationale on this function.
+    if has_escha && use_gpu_topk && !escha_indexed_supported {
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "escha-routed-experts-on-indexed-gpu-topk-path",
@@ -684,17 +697,26 @@ pub fn run_moe_decode(
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
     //
-    // `p.has_escha()` feeds arm (c): an Escha-W2 layer that resolved onto the
-    // indexed GPU-top-K path is refused HERE, before any GPU work, because
-    // that path does not apply the H128 pair and would emit silently-wrong
-    // output. This must stay wired to the real `has_escha()` — passing a
-    // constant `false` re-opens exactly the hole it closes.
+    // `p.has_escha()` feeds arm (c): an Escha-W2 layer on the indexed
+    // GPU-top-K path is refused HERE, before any GPU work, UNLESS it is the
+    // one supported shape — resolved through `routed_indexable_escha_q8` AND
+    // carrying the transform tables the escha indexed executor needs. Both
+    // arguments must stay wired to the real values; a constant re-opens
+    // exactly the hole they close.
+    //
+    // `escha_indexed_supported` is deliberately the AND of the resolver's
+    // escha arm and the tables' presence, and it is computed once here so the
+    // guard and the dispatch below cannot drift apart — the branch to
+    // `escha_routed_decode_indexed` re-reads THIS binding rather than
+    // recomputing the predicate.
+    let escha_indexed_supported = res.routed_indexable_escha_q8 && p.escha.is_some();
     check_moe_decode_supported(
         res.use_gpu_topk,
         p.k,
         p.n_exp,
         !p.routed_experts.is_empty(),
         p.has_escha(),
+        escha_indexed_supported,
     )?;
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
@@ -1207,6 +1229,73 @@ pub fn run_moe_decode(
                 quant: "",
             });
         }
+    }
+
+    // ── Escha-W2 routed experts, indexed (device-resident) routing ───────────
+    // Escha weights are in a rotated domain; the generic indexed body below
+    // would run them without the H128 pair and emit ~1e-1-wrong output with
+    // nothing to catch it. This branch runs the escha executor instead — same
+    // eight phases and the same transforms as the CPU-top-K route, with the
+    // routing never leaving the device.
+    //
+    // It returns rather than falling through: it has already accumulated the
+    // routed contribution into `out_target`, so the generic body must not run.
+    if escha_indexed_supported {
+        let escha = p
+            .escha
+            .as_ref()
+            .expect("escha_indexed_supported implies escha tables");
+        // Same refusals the CPU-top-K escha branch makes, for the same
+        // reasons: the executor has no AWQ / graded-tier arm, and Hessian
+        // capture keyed on `x_norm` would record the H128 outputs instead of
+        // the raw pre-rotation activations and silently poison the Hessians.
+        if p.expert_down_awq_ptrs.is_some() || p.expert_dtype_tags.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-with-awq-or-graded-tiers",
+                arch: "",
+                quant: "",
+            });
+        }
+        if gpu.hessian_capture.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-hessian-capture-unsupported",
+                arch: "",
+                quant: "",
+            });
+        }
+        // The escha executor always folds the weighted combine into the layer
+        // (phase 8). `defer_routed_combine` promises the caller an EXPANDED,
+        // uncombined `down_expanded` it will fold itself — honouring the flag
+        // is not possible here, and ignoring it would double-count.
+        if p.defer_routed_combine {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-cannot-defer-combine",
+                arch: "",
+                quant: "",
+            });
+        }
+        return crate::pipeline::escha::escha_routed_decode_indexed(
+            gpu,
+            escha,
+            &crate::pipeline::escha::EschaIndexedRouting {
+                expert_gate_up_ptrs: p.expert_gate_up_ptrs,
+                expert_down_ptrs: p.expert_down_ptrs,
+                topk_indices: p.topk_indices,
+                topk_weights: p.topk_weights,
+                gate_up_m: 2 * p.mi,
+                gate_up_k: p.routed_gate_up_k,
+                down_m: p.routed_down_m,
+                down_k: p.routed_down_k,
+            },
+            out_target,
+            p.x_norm,
+            p.hidden,
+            p.mi,
+            p.k,
+        );
     }
 
     // ── Indexed routed experts ────────────────────────────────────────────────

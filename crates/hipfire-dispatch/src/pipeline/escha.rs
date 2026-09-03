@@ -1,12 +1,37 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
-//! Escha-W2 routed-expert decode executor (Task 10).
+//! Escha-W2 routed-expert decode executors (Tasks 10 and 11).
 //!
-//! This replaces step 4 (the per-expert routed loop) of
-//! [`super::run_moe_decode_cpu_fallback`] for layers whose routed experts came
-//! from an Escha-W2 checkpoint. Everything around it — the router GEMV, the
-//! f16 logit rounding, top-k selection, and the shared expert — is unchanged
-//! arch-6 code.
+//! Two entry points, one for each of the two routes into a routed MoE layer.
+//! Both apply the SAME phase structure and the SAME H128 pair; they differ
+//! only in where the routing lives.
+//!
+//! * [`escha_routed_decode`] — CPU-top-K route. `topk_ids` / `topk_weights`
+//!   arrive on the HOST, already downloaded by
+//!   [`super::run_moe_decode_cpu_fallback`]. Used when the layer is not
+//!   admitted to the indexed path (k != 8, F32 control experts in the G4
+//!   gate, …).
+//! * [`escha_routed_decode_indexed`] — GPU-top-K route, the production
+//!   decode/prefill path. Routing stays on the device end to end: the ids
+//!   feed the transforms and the GEMVs as a device buffer, the combine
+//!   weights are f16-rounded by a device kernel, and there is no D2H
+//!   anywhere in the layer.
+//!
+//! Everything around them — the router GEMV, the f16 logit rounding, top-k
+//! selection, and the shared expert — is unchanged arch-6 code.
+//!
+//! # Why the indexed route exists (Task 11, measured)
+//!
+//! `rocprofv3 --kernel-trace` over a warm 40-layer decode token on gfx1151:
+//! 22.0 ms of GPU-busy against a 29.7 ms wall (profiled; 26.0 ms unprofiled),
+//! of which the routed experts were 6.5 ms of kernel time, ~2.1 ms of
+//! launch-gap across their 640 per-expert GEMV launches, and ~2.1 ms of
+//! copy/stall around the per-layer `topk_indices` + `topk_weights` D2H and the
+//! ids/weights H2D that followed it. The host round trip alone did NOT
+//! dominate — but the round trip and the launch storm together were the whole
+//! addressable overhead, and the round trip is also what made the layer
+//! non-capturable under hipGraph. This route removes both: 640 routed GEMV
+//! launches per token become 80, and the per-layer sync disappears.
 //!
 //! # Why the routed loop needs replacing at all
 //!
@@ -29,18 +54,25 @@
 //! all inputs transformed, then all GEMVs, then all outputs transformed — is
 //! **4 H128-family launches per layer, 160 per token, 0.38 ms**.
 //!
-//! Phase order (per layer, decode, one token):
+//! Phase order (per layer, decode, one token). The `host` column is
+//! [`escha_routed_decode`], `idx` is [`escha_routed_decode_indexed`]:
 //!
-//! | # | launches | what |
-//! |---|----------|------|
-//! | 1 | 1 | `escha_h128_in_batched` — gate_up input side, x broadcast |
-//! | 2 | k | Q8_0 gate_up GEMV per selected expert |
-//! | 3 | 1 | `escha_h128_out_batched` — gate_up output side |
-//! | 4 | 1 | `escha_swiglu_batched` |
-//! | 5 | 1 | `escha_h128_in_batched` — down input side, per-slot x |
-//! | 6 | k | Q8_0 down GEMV per selected expert |
-//! | 7 | 1 | `escha_h128_out_batched` — down output side |
-//! | 8 | 1 | `moe_down_combine_k8_batched` with f16-rounded scores |
+//! | # | host | idx | what |
+//! |---|------|-----|------|
+//! | 0 | 0 (host-side rounding) | 1 | `escha_round_weights_f16_rne` |
+//! | 1 | 1 | 1 | `escha_h128_in_batched` — gate_up input side, x broadcast |
+//! | 2 | k | 1 | Q8_0 gate_up GEMV (per expert / all experts indexed) |
+//! | 3 | 1 | 1 | `escha_h128_out_batched` — gate_up output side |
+//! | 4 | 1 | 1 | `escha_swiglu_batched` |
+//! | 5 | 1 | 1 | `escha_h128_in_batched` — down input side, per-slot x |
+//! | 6 | k | 1 | Q8_0 down GEMV (per expert / all experts indexed) |
+//! | 7 | 1 | 1 | `escha_h128_out_batched` — down output side |
+//! | 8 | 1 | 1 | `moe_down_combine_k8_batched` with f16-rounded scores |
+//!
+//! At k=8 that is 22 launches + 2 H2D + (2 D2H upstream) per layer on the
+//! host route against 9 launches and no host transfer at all on the indexed
+//! one. The H128 budget — 4 per layer — is identical on both, which is why
+//! `escha_launches_per_token` and the gates that read it are route-agnostic.
 //!
 //! The per-expert `rin_eff` / `rout_eff` rows are an extra index into the
 //! already-resident `[E, IC]` / `[E, OC]` tensors — the batching is a kernel
@@ -256,6 +288,178 @@ pub fn escha_routed_decode(
         e.mid_dn,
         e.down_rout,
         e.ids,
+        e.y_dn,
+        hidden,
+        k,
+        true,
+    ))?;
+
+    // ── 8. weighted combine into the residual, ONE launch ─────────────────
+    hip!(gpu.moe_down_combine_k8_batched(e.y_dn, e.weights, out, hidden, k, 1))?;
+    Ok(())
+}
+
+/// Device-resident routing for [`escha_routed_decode_indexed`].
+///
+/// These are the buffers the GPU top-K kernel wrote. Nothing here is ever
+/// read by the host: that is the point of the route.
+pub struct EschaIndexedRouting<'a> {
+    /// `[n_exp]` u64 weight-base pointers for the Q8_0 gate_up slots, packed
+    /// into an F32 tensor (2 f32 per pointer) — the same table the other
+    /// indexed MoE GEMVs consume.
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    /// `[n_exp]` u64 weight-base pointers for the Q8_0 down slots.
+    pub expert_down_ptrs: &'a GpuTensor,
+    /// `[k]` selected expert ids as i32 (stored in an F32 tensor — same
+    /// 4 B/elem — exactly as `moe_topk_renorm_k8` and friends write them).
+    pub topk_indices: &'a GpuTensor,
+    /// `[k]` combine weights, NOT yet f16-rounded. Left untouched; the
+    /// rounded copy goes into the layer's own `weights` scratch.
+    pub topk_weights: &'a GpuTensor,
+    /// Rows of the gate_up weight matrix (`2 * mi`).
+    pub gate_up_m: usize,
+    /// Columns of the gate_up weight matrix (`hidden`).
+    pub gate_up_k: usize,
+    /// Rows of the down weight matrix (`hidden`).
+    pub down_m: usize,
+    /// Columns of the down weight matrix (`mi`).
+    pub down_k: usize,
+}
+
+/// Run the routed half of one Escha-W2 MoE layer for one token, with the
+/// routing left on the device.
+///
+/// Same eight phases as [`escha_routed_decode`] and the same H128 pair; the
+/// only differences are that phases 2 and 6 are ONE indexed GEMV launch each
+/// instead of `k`, and that the f16 rounding of the combine weights happens
+/// in a kernel rather than on the host copy.
+///
+/// `out` is accumulated into, never overwritten.
+///
+/// # Why this is not just "the indexed path with escha bolted on"
+///
+/// The generic indexed routed body in [`super::run_moe_decode`] is not
+/// reachable for escha and must never become reachable: it feeds the raw
+/// activation straight into the expert GEMVs and combines the raw result, so
+/// it would omit both Hadamard transforms and emit finite, fluent output
+/// wrong by ~1e-1. `run_moe_decode` therefore branches to THIS function
+/// before that body, and `check_moe_decode_supported` refuses any escha layer
+/// that reaches the indexed path without the transform tables that make this
+/// function callable at all.
+#[allow(clippy::too_many_arguments)]
+pub fn escha_routed_decode_indexed(
+    gpu: &mut Gpu,
+    e: &EschaRoutedRefs<'_>,
+    r: &EschaIndexedRouting<'_>,
+    out: &GpuTensor,
+    x_norm: &GpuTensor,
+    hidden: usize,
+    mi: usize,
+    k: usize,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($ex:expr) => {
+            $ex.map_err(|err| DispatchError::Hip(err.to_string()))
+        };
+    }
+    // Same hard k<=8 bound as the host route: `moe_down_combine_k8_batched`
+    // unrolls to 8 slots and silently DROPS the rest rather than failing.
+    if k == 0 || k > 8 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-decode-supports-k<=8",
+            arch: "",
+            quant: "",
+        });
+    }
+    // The GEMVs read `expert_ptrs[topk_indices[slot]]` on device, so a
+    // mis-sized weight table is an out-of-bounds READ (undefined behaviour),
+    // not a wrong answer. Both projections' shapes must also agree with the
+    // scratch the transforms were sized for — a mismatch there would have the
+    // GEMV write past the end of `mid_gu` / `mid_dn`.
+    if r.gate_up_m != 2 * mi || r.gate_up_k != hidden || r.down_m != hidden || r.down_k != mi {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-indexed-routed-shape-mismatch",
+            arch: "",
+            quant: "",
+        });
+    }
+
+    // ── 0. f16-round the combine weights, ONE launch, out-of-place ────────
+    // `f16(score)` is one of the three load-bearing rounding points of the
+    // format. The host route does this on the downloaded copy; here it is a
+    // kernel, writing the layer's own scratch so `topk_weights` stays intact
+    // for any other consumer.
+    hip!(gpu.escha_round_weights_f16_rne(r.topk_weights, e.weights, k))?;
+
+    // ── 1. gate_up input transform, all k slots, ONE launch ───────────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        x_norm,
+        e.gate_up_rin,
+        r.topk_indices,
+        e.xh_gu,
+        hidden,
+        k,
+        false,
+    ))?;
+
+    // ── 2. gate_up GEMV for ALL k experts, ONE launch ─────────────────────
+    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+        r.expert_gate_up_ptrs,
+        r.topk_indices,
+        e.xh_gu,
+        e.mid_gu,
+        r.gate_up_m,
+        r.gate_up_k,
+        k,
+    ))?;
+
+    // ── 3. gate_up output transform, ONE launch ───────────────────────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_out_batched",
+        e.mid_gu,
+        e.gate_up_rout,
+        r.topk_indices,
+        e.y_gu,
+        2 * mi,
+        k,
+        true,
+    ))?;
+
+    // ── 4. SwiGLU on the f16-rounded merged output, gate = FIRST half ─────
+    hip!(gpu.escha_swiglu_batched(e.y_gu, e.h, mi, k))?;
+
+    // ── 5. down input transform, ONE launch (per-slot activation) ─────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        e.h,
+        e.down_rin,
+        r.topk_indices,
+        e.xh_dn,
+        mi,
+        k,
+        true,
+    ))?;
+
+    // ── 6. down GEMV for ALL k experts, ONE launch ────────────────────────
+    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+        r.expert_down_ptrs,
+        r.topk_indices,
+        e.xh_dn,
+        e.mid_dn,
+        r.down_m,
+        r.down_k,
+        k,
+    ))?;
+
+    // ── 7. down output transform, ONE launch ──────────────────────────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_out_batched",
+        e.mid_dn,
+        e.down_rout,
+        r.topk_indices,
         e.y_dn,
         hidden,
         k,

@@ -1058,6 +1058,7 @@ fn dtypes_all_mq4() -> MoeDtypes {
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        routed_escha_transforms: false,
     }
 }
 
@@ -2283,6 +2284,7 @@ fn moe_dtypes_mq4() -> MoeDtypes {
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        routed_escha_transforms: false,
     }
 }
 

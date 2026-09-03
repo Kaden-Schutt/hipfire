@@ -854,6 +854,7 @@ pub fn forward_batch(
                         routed_has_mixed_experts: false,
                         per_expert_gate_up: None,
                         per_expert_down: None,
+                        routed_escha_transforms: false,
                         has_paro_shared: false,
                     },
                     batch_size: b,

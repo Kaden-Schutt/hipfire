@@ -4830,6 +4830,18 @@ pub const ESCHA_H128_SRC: &str = include_str!("../../../kernels/src/escha_h128.h
 pub const ESCHA_BARE_TO_OUTMAJOR_SRC: &str =
     include_str!("../../../kernels/src/escha_bare_to_outmajor.hip");
 
+/// Escha-W2 routed-expert GEMVs for the GPU-top-K (indexed) decode path, plus
+/// the device-side f16 round-trip of the combine weights. Three entry points:
+/// `escha_gemv_q8_0_moe_k8_indexed_batched`,
+/// `escha_gemv_q8_0_wide_moe_k8_indexed_batched` and
+/// `escha_round_weights_f16_rne`. The two GEMVs are per-slot-in/per-slot-out
+/// (both escha phases need that shape) verbatim transcriptions of `gemv_q8_0`
+/// / `gemv_q8_0_wide` — see the header of the .hip for why the pre-existing
+/// indexed Q8_0 MoE kernels cannot serve escha and why the accumulate order
+/// is copied rather than improved.
+pub const ESCHA_MOE_GEMV_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemv_k8_indexed.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the

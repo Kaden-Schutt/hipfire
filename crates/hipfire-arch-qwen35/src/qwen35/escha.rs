@@ -129,6 +129,30 @@ impl EschaMoeTables {
     }
 }
 
+/// Kill switch for the escha INDEXED (GPU-resident top-K) routed route.
+///
+/// `HIPFIRE_ESCHA_INDEXED=0` withholds `MoeDtypes::routed_escha_transforms`,
+/// which drops `routed_indexable_escha_q8`, which drops `use_gpu_topk`, which
+/// sends the layer back down the CPU-top-K route and its host-routed escha
+/// executor. Everything stays consistent on the way — including
+/// `check_moe_decode_supported`, which sees a non-indexed escha layer and
+/// admits it — so this is a genuine A/B of the two routes in ONE build, not a
+/// half-disabled state.
+///
+/// It exists because the two routes are BIT-IDENTICAL (gated by
+/// `examples/escha_moe_block_gate.rs`) and differ only in cost, so the
+/// performance claim for the indexed route is checkable at any time without a
+/// rebuild or a revert. It is also the escape hatch if the indexed route ever
+/// needs to be taken out of service in the field.
+///
+/// Default ON. Read once.
+pub fn escha_indexed_route_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_ESCHA_INDEXED").as_deref() != Ok("0")
+    })
+}
+
 /// `.hfq` tensor name for one of the six escha MoE leaves of a layer, BEFORE
 /// candidate expansion. `p` is the bare layer prefix `load.rs` uses
 /// (`layers.N`); the caller's `resolve` is what turns that into the

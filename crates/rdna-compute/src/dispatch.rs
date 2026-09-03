@@ -4277,6 +4277,10 @@ impl Gpu {
             "escha_bare_to_outmajor",
             kernels::ESCHA_BARE_TO_OUTMAJOR_SRC.to_string(),
         ));
+        specs.push((
+            "escha_moe_gemv_k8_indexed",
+            kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC.to_string(),
+        ));
 
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
@@ -4620,6 +4624,11 @@ impl Gpu {
                     "escha_swiglu_batched",
                 ],
                 "escha_bare_to_outmajor" => vec!["escha_bare_to_q8_0", "escha_bare_to_f32"],
+                "escha_moe_gemv_k8_indexed" => vec![
+                    "escha_gemv_q8_0_moe_k8_indexed_batched",
+                    "escha_gemv_q8_0_wide_moe_k8_indexed_batched",
+                    "escha_round_weights_f16_rne",
+                ],
                 other => vec![other],
             };
             // Compile and ensure the module is loaded once.

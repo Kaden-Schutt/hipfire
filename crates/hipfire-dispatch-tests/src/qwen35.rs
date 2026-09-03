@@ -144,6 +144,7 @@ fn mq4_dtypes() -> MoeDtypes {
         has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
+        routed_escha_transforms: false,
     }
 }
 
