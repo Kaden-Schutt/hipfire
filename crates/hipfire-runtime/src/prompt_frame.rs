@@ -1568,8 +1568,7 @@ pub fn template_emits_history_primer(frame: &JinjaChatFrame, primer: &[u32]) -> 
     else {
         return false;
     };
-    tokens[start..].starts_with(primer)
-        && tokens[start + primer.len()..].starts_with(&sentinel_ids)
+    tokens[start..].starts_with(primer) && tokens[start + primer.len()..].starts_with(&sentinel_ids)
 }
 
 /// Jinja-native analogue of [`build_cached_history`]: render the conversation
