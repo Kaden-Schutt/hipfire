@@ -1023,6 +1023,17 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP3G32E8
             | MFP2G32E8
             | ParoQ4G128
+            // Escha-W2. Its plan is `RotationPlan::EschaH128` (see
+            // `dtype_rotation_plan` above), so it MUST answer true here.
+            // The two functions disagreeing is precisely the state in which
+            // one caller applies the H128 pair and another skips it — an
+            // unrotated activation through a rotated-domain weight, which is
+            // finite, fluent, wrong output rather than a crash.
+            // `rotation_plan_matches_legacy_needs_fwht` in dispatch-tests
+            // enforces the agreement; both types are in its
+            // `QUANTIZED_DTYPES` list so the enforcement is not vacuous.
+            | Escha2T16
+            | Escha3T16
     )
 }
 

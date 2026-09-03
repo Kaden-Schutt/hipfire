@@ -27,6 +27,13 @@ const QUANTIZED_DTYPES: &[DType] = &[
     DType::HFQ2G128,
     DType::HFQ6G256,
     DType::ParoQ4G128,
+    // Escha-W2. Listed so `rotation_plan_matches_legacy_needs_fwht` actually
+    // covers the two dtypes whose rotation plan is `EschaH128`. This branch
+    // reflowed that list without adding them, which let
+    // `dtype_needs_rotation` return false for an `EschaH128` dtype with no
+    // test to catch it.
+    DType::Escha2T16,
+    DType::Escha3T16,
     DType::Raw,
 ];
 
@@ -143,6 +150,14 @@ fn rotation_plan_covers_every_dtype() {
         RotationPlan::Mq8Internal
     );
     assert_eq!(dtype_rotation_plan(DType::ParoQ4G128), RotationPlan::Givens);
+    assert_eq!(
+        dtype_rotation_plan(DType::Escha2T16),
+        RotationPlan::EschaH128
+    );
+    assert_eq!(
+        dtype_rotation_plan(DType::Escha3T16),
+        RotationPlan::EschaH128
+    );
 }
 
 #[test]
