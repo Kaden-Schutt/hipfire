@@ -2842,7 +2842,7 @@ impl Drop for Qwen35DenseTpStaging {
 }
 
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
-/// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
+/// (`Gpus::init_ep` + per-arch sharded weight load), wrapped in a staging guard so
 /// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
 /// at the call site left intact). ds4 (arch_id 9) and MiniMax (arch_id 10) only.
 ///
@@ -2991,11 +2991,11 @@ fn load_model_ep_ds4(
     let rec = hfq.recommended_sampling();
 
     let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+        Gpus::init_ep(tp, config.num_hidden_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
@@ -3219,11 +3219,11 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let rec = hfq.recommended_sampling();
 
     let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+        Gpus::init_ep(tp, config.num_hidden_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
@@ -3358,11 +3358,11 @@ fn load_model_ep_qwen35(
     let n_exp = config.num_experts;
     let chat_template = resolve_chat_template(&hfq_probe, path);
     let rec = hfq_probe.recommended_sampling();
-    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus = Gpus::init_ep(tp, config.n_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
     for (idx, dev) in gpus.devices.iter().enumerate() {
