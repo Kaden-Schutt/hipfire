@@ -517,44 +517,66 @@ pub(crate) enum DenseFormat {
 /// `<substr>` — used to isolate WHICH path a quality regression comes from,
 /// since a whole-model number cannot distinguish "this format costs accuracy"
 /// from "this one path is not applying the activation rotation MQ requires".
+/// Pick the container for one dense (non-escha-coded) tensor.
+///
+/// `HIPFIRE_ESCHA_DENSE` selects it:
+///   unset / anything else   every dense tensor stays `Q8_0` (the default)
+///   `mq6` / `mq4v2`         every dense tensor takes that format
+///   `<fmt>:a,b,c`           ONLY tensors matching a listed substring
+///   `<fmt>!a,b,c`           every tensor EXCEPT those matching one
+///
+/// Down-quanting dense is nearly free in quality and worth ~17% of decode:
+/// the dense weights are the half of escha's per-token byte traffic that its
+/// 2-bit experts already win handily. KLD against the int8-dense build on the
+/// same corpus (self-control 0.000000, baseline PPL 7.6769):
+///
+///     lm_head                    0.000838   PPL 7.6984
+///     self_attn                  0.005879   PPL 7.6782
+///     linear_attn (GDN, all 4)   0.004637   PPL 7.6633
+///     everything                 0.009785   PPL 7.6965
+///
+/// An earlier reading of this table had GDN at 0.448186 (PPL 13.41) and a
+/// lone MQ6 `in_proj_qkv` at 12.639980 (PPL 2.4M), and concluded GDN's
+/// recurrent state compounds quantisation error along the sequence where
+/// attention's does not. That conclusion was WRONG. Those numbers were a
+/// mixed-rotation bug in this converter: `in_proj_a` / `in_proj_b` are F16 in
+/// the checkpoint and fell through to the passthrough branch, so quantising
+/// their siblings FWHT-rotated the shared normed x out from under them. Once
+/// all four projections share a container, GDN quantises better than baseline.
+/// The tell was that `out_proj` was unharmed (0.0076) — it consumes the GDN
+/// output, not the shared input.
+///
+/// The `!` form exists because `moe_ffn_batched_admissible_for_dtypes` pins
+/// the router (`mlp.gate`) and the shared expert to `Q8_0` on the escha arm.
+/// Moving either off it costs batched prefill — measured 160 H128 launches
+/// per token and 109.5 tok/s, against 0.3 and 708.0 with both excluded — for
+/// 0.0002 KLD, since neither is where down-quanting pays.
 fn dense_format_for(name: &str) -> DenseFormat {
-    match std::env::var("HIPFIRE_ESCHA_DENSE").ok().as_deref() {
-        Some("mq6") => DenseFormat::Mq6,
-        Some("mq4v2") => DenseFormat::Mq4V2,
-        Some(v) if v.starts_with("mq4v2:") && name.contains(&v[6..]) => DenseFormat::Mq4V2,
-        Some(v) if v.starts_with("mq4v2:") => DenseFormat::Q8_0,
-        Some(v) if v.starts_with("mq6:") => {
-            if name.contains(&v[4..]) {
-                DenseFormat::Mq6
+    let Ok(spec) = std::env::var("HIPFIRE_ESCHA_DENSE") else {
+        return DenseFormat::Q8_0;
+    };
+    let (fmt, rule) = match spec.find(['!', ':']) {
+        Some(i) => (&spec[..i], Some((spec.as_bytes()[i], &spec[i + 1..]))),
+        None => (spec.as_str(), None),
+    };
+    let fmt = match fmt {
+        "mq6" => DenseFormat::Mq6,
+        "mq4v2" => DenseFormat::Mq4V2,
+        _ => return DenseFormat::Q8_0,
+    };
+    match rule {
+        None => fmt,
+        Some((sep, list)) => {
+            let hit = list
+                .split(',')
+                .any(|sub| !sub.is_empty() && name.contains(sub));
+            // `:` = allow-list (hit takes fmt), `!` = deny-list (hit stays Q8).
+            if hit == (sep == b':') {
+                fmt
             } else {
                 DenseFormat::Q8_0
             }
         }
-        // `mq6!<substr>` — everything EXCEPT tensors matching <substr>.
-        //
-        // The measured reason this exists: down-quantising the GatedDeltaNet
-        // projections is catastrophic while everything else is nearly free.
-        // KLD against the int8-dense build, same corpus, zero self-control:
-        //     lm_head      0.000838   (PPL 7.6769 -> 7.6984)
-        //     self_attn    0.005879   (PPL 7.6782)
-        //     linear_attn  0.448186   (PPL 13.4100)   <-- 76x worse
-        // Same format and the same 2.8% weight RMS error in all three. GDN
-        // carries a recurrent state, so its error compounds along the
-        // sequence where attention's does not.
-        // `mq6!a,b,c` — MQ6 everywhere EXCEPT tensors whose name contains any
-        // listed substring. Used to hold the router (`mlp.gate`) and the shared
-        // expert at Q8_0: `moe_ffn_batched_admissible_for_dtypes` pins both to
-        // Q8_0 on the escha arm, and moving either off it drops prefill to the
-        // per-token fallback. They are also the two places down-quanting buys
-        // least, so excluding them keeps batched prefill for almost no size.
-        Some(v) if v.starts_with("mq6!") => {
-            if v[4..].split(',').any(|sub| !sub.is_empty() && name.contains(sub)) {
-                DenseFormat::Q8_0
-            } else {
-                DenseFormat::Mq6
-            }
-        }
-        _ => DenseFormat::Q8_0,
     }
 }
 
