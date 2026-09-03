@@ -153,7 +153,6 @@ __device__ __forceinline__ void escha_decode_tile_lds(
         const int ntiles = M / 16;                                             \
                                                                                \
         __shared__ _Float16 w_lds[16 * 17];                                    \
-        __shared__ _Float16 x_lds[NT][16 * 17];                                \
                                                                                \
         for (int base = g_start; base < g_end; base += 16 * NT) {              \
             float8_t acc[NT];                                                  \
@@ -170,33 +169,31 @@ __device__ __forceinline__ void escha_decode_tile_lds(
                    inside the NT loop against one shared x_lds; that serialised\
                    the staging and measured 2.4x SLOWER than NT=1 (13.06 vs    \
                    5.40 ms) even though the numerics were identical. */        \
-                _Pragma("unroll") for (int t = 0; t < NT; ++t) {               \
-                    if (lane < 16) {                                           \
-                        const int p = base + t * 16 + lane;                    \
-                        const int s = (p < g_end) ? sorted_slot_index[p] : -1;  \
-                        const float* xr =                                      \
-                            (s >= 0) ? (x_batch + (size_t)s * K + kt * 16)     \
-                                     : nullptr;                                \
-                        _Float16* xd = x_lds[t] + lane * 17;                   \
-                        _Pragma("unroll") for (int i = 0; i < 16; ++i)         \
-                            xd[i] = xr ? (_Float16)xr[i] : (_Float16)0.f;      \
-                    }                                                          \
-                }                                                              \
                 __syncthreads();                                               \
-                                                                               \
                 const int m_lane = lane & 15;                                  \
                 half16_t a_frag;                                               \
                 _Pragma("unroll") for (int i = 0; i < 16; ++i)                 \
                     a_frag[i] = w_lds[i * 17 + m_lane]; /* column = out col */ \
                                                                                \
-                /* ONE decode feeds NT slot-tiles — the whole point. The       \
-                   trellis decode is ~40 scalar ops per lane against a single  \
-                   WMMA instruction, so decoding once per slot-tile leaves the \
-                   matrix cores idle (measured 1.01x over scalar at NT=1). */  \
+                /* B comes STRAIGHT FROM GLOBAL, not via LDS. Lane `l` needs   \
+                   x[slot_l, kt*16 .. +16] — already contiguous, and each lane \
+                   wants a different slot, so there is nothing to share and    \
+                   nothing to transpose. Staging it through LDS was measured   \
+                   to cost 0.52 G LDS instructions against the scalar kernel's \
+                   0.05 G, which exactly cancelled the 2.2x VALU saving WMMA   \
+                   bought (busy cycles 1.48 G vs 1.47 G). */                   \
                 _Pragma("unroll") for (int t = 0; t < NT; ++t) {               \
+                    const int p = base + t * 16 + m_lane;                      \
+                    const int s = (p < g_end) ? sorted_slot_index[p] : -1;      \
                     half16_t b_frag;                                           \
-                    _Pragma("unroll") for (int i = 0; i < 16; ++i)             \
-                        b_frag[i] = x_lds[t][m_lane * 17 + i];                 \
+                    if (s >= 0) {                                              \
+                        const float* xr = x_batch + (size_t)s * K + kt * 16;   \
+                        _Pragma("unroll") for (int i = 0; i < 16; ++i)         \
+                            b_frag[i] = (_Float16)xr[i];                       \
+                    } else {                                                   \
+                        _Pragma("unroll") for (int i = 0; i < 16; ++i)         \
+                            b_frag[i] = (_Float16)0.f;                         \
+                    }                                                          \
                     acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(       \
                         a_frag, b_frag, acc[t]);                               \
                 }                                                              \

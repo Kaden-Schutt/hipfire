@@ -279,7 +279,22 @@ fn escha_routed_gemm_grouped(
         rows,
     ))?;
 
-    hip!(gpu.escha_gemm_native_moe_grouped(
+    // WMMA by default. Measured against the scalar grouped kernel on the
+    // shipped projection shapes: 2.18x (K=2) and 2.49x (K=3), i.e. 5.6-6.2x
+    // over the slot-parallel GEMV.
+    //
+    // The first WMMA attempt measured only 1.02x, and hardware counters said
+    // why: it staged the activation fragment through LDS, which cost 0.52 G
+    // LDS instructions against the scalar kernel's 0.05 G and cancelled the
+    // 2.2x VALU saving cycle-for-cycle (busy 1.48 G vs 1.47 G). Reading B
+    // straight from global — each lane wants a different slot's contiguous
+    // 16-float run, so there is nothing to share — is what unlocked it.
+    if std::env::var("HIPFIRE_ESCHA_GROUPED_SCALAR").is_ok() {
+        return hip!(gpu.escha_gemm_native_moe_grouped(
+            expert_ptrs, &offsets, &sorted, x, y, m, k, slots, n_exp, trellis_k,
+        ));
+    }
+    hip!(gpu.escha_gemm_native_moe_grouped_wmma(
         expert_ptrs,
         &offsets,
         &sorted,
