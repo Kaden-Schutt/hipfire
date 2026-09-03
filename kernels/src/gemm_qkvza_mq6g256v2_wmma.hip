@@ -101,14 +101,21 @@ extern "C" __global__ void gemm_qkvza_mq6g256v2_wmma(
             unsigned int d0a = *(const unsigned int*)(dp_a);
             unsigned int d1a = *(const unsigned int*)(dp_a + 3);
             unsigned int d2a = *(const unsigned int*)(dp_a + 6);
-            unsigned int d3a = *(const unsigned int*)(dp_a + 9);
+                        // Bytes 9,10,11 of the tile, NOT a dword at +9 — see the same fix
+            // in gemm_qkv_mq6g256v2_wmma.hip. The four 6-bit values this feeds
+            // sit at shifts 0/6/12/18, so only bits 0..23 are ever used and
+            // byte 12 is read then discarded. At kt=15 a +9 dword reads one
+            // byte past the 200-byte group, and on the last group of the last
+            // row that is one byte past the weight tensor. Load at +8 and
+            // shift down: identical bits 0..23, never leaves the tile.
+            unsigned int d3a = (*(const unsigned int*)(dp_a + 8)) >> 8;
 
             const int byte_off_b = (kt + 1) * 12;
             const unsigned char* dp_b = (const unsigned char*)(gp + 8 + byte_off_b);
             unsigned int d0b = *(const unsigned int*)(dp_b);
             unsigned int d1b = *(const unsigned int*)(dp_b + 3);
             unsigned int d2b = *(const unsigned int*)(dp_b + 6);
-            unsigned int d3b = *(const unsigned int*)(dp_b + 9);
+            unsigned int d3b = (*(const unsigned int*)(dp_b + 8)) >> 8;  // see d3a
 
             half16_t b_a = *(const half16_t*)(x_base + kt * 16);
             half16_t b_b = *(const half16_t*)(x_base + (kt + 1) * 16);

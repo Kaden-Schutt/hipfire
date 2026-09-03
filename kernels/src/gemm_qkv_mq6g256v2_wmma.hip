@@ -97,14 +97,25 @@ extern "C" __global__ void gemm_qkv_mq6g256v2_wmma(
             unsigned int d0a = *(const unsigned int*)(dp_a);
             unsigned int d1a = *(const unsigned int*)(dp_a + 3);
             unsigned int d2a = *(const unsigned int*)(dp_a + 6);
-            unsigned int d3a = *(const unsigned int*)(dp_a + 9);
+            // Bytes 9,10,11 of the tile, NOT a dword at +9. The four 6-bit
+            // values this dword feeds live at shifts 0/6/12/18, so only bits
+            // 0..23 — bytes 9,10,11 — are ever used; byte 12 is read and
+            // discarded. Reading at +9 therefore touches one byte PAST the
+            // 12-byte K-tile, and for kt=15 that is one byte past the whole
+            // 200-byte group. On the last group of the last row that runs off
+            // the end of the weight tensor: measured as an illegal memory
+            // access on escha-35b (q_m=8192, k=2048) for any N < 96, which is
+            // exactly where this base kernel is reached — N >= 96 routes to
+            // the batch-tile path and hid the bug. Load the dword at +8 and
+            // shift down instead: same bits 0..23, never leaves the tile.
+            unsigned int d3a = (*(const unsigned int*)(dp_a + 8)) >> 8;
 
             const int byte_off_b = (kt + 1) * 12;
             const unsigned char* dp_b = (const unsigned char*)(gp + 8 + byte_off_b);
             unsigned int d0b = *(const unsigned int*)(dp_b);
             unsigned int d1b = *(const unsigned int*)(dp_b + 3);
             unsigned int d2b = *(const unsigned int*)(dp_b + 6);
-            unsigned int d3b = *(const unsigned int*)(dp_b + 9);
+            unsigned int d3b = (*(const unsigned int*)(dp_b + 8)) >> 8;  // see d3a
 
             half16_t b_a = *(const half16_t*)(x_base + kt * 16);
             half16_t b_b = *(const half16_t*)(x_base + (kt + 1) * 16);
