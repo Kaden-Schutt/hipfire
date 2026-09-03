@@ -633,6 +633,18 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_KV_ADAPTIVE"),
         "Runtime VRAM-fit KV precision policy."
     ),
+    // Process-scoped: the preflight guards snapshot this once at startup, and
+    // a mid-serve flip would make the refusal policy depend on which load ran
+    // last — dishonest for a long-lived daemon.
+    process_bool_field!(
+        "memory.oom_guard",
+        "oom_guard",
+        Memory,
+        true,
+        false,
+        "HIPFIRE_OOM_GUARD",
+        "Memory preflight OOM guard. Default on: on unified-memory APUs (Strix Halo) GPU memory is system RAM with no swap, so an overshoot is a global OOM that kills the desktop, not this process. Set false (HIPFIRE_OOM_GUARD=0) on discrete-GPU boxes, where an overshoot is a plain failed hipMalloc."
+    ),
     field!(
         "model.deepseek4_experts_per_token",
         "deepseek4_experts_per_token",
@@ -3226,6 +3238,29 @@ pub fn process_value(name: &str) -> Option<String> {
     active_or_local_process_config().legacy_value(name)
 }
 
+/// Resolve the memory preflight OOM guard (`memory.oom_guard`, compat
+/// `HIPFIRE_OOM_GUARD`). Default ON: the guard exists because on
+/// unified-memory APUs (Strix Halo) GPU allocations come out of system RAM
+/// with no swap, so a bad admission takes the desktop down with a global
+/// OOM rather than failing one request. Opting out — discrete-GPU boxes
+/// where an overshoot is a plain failed `hipMalloc`, or deliberate
+/// multi-daemon development setups — is the operator's informed trade.
+pub fn oom_guard_enabled() -> bool {
+    oom_guard_enabled_for(process_value("HIPFIRE_OOM_GUARD").as_deref())
+}
+
+/// Pure form of [`oom_guard_enabled`] so the off-spellings have tests without
+/// pinning the process-wide config snapshot.
+fn oom_guard_enabled_for(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
 /// Compatibility-shaped access for experimental code while its public policy
 /// is being consolidated. Values come exclusively from the process snapshot.
 pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarError> {
@@ -4443,6 +4478,31 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn oom_guard_defaults_on_and_parses_off_spellings() {
+        // Unset and explicit-on spellings keep the guard up.
+        assert!(oom_guard_enabled_for(None));
+        assert!(oom_guard_enabled_for(Some("1")));
+        assert!(oom_guard_enabled_for(Some("true")));
+        assert!(oom_guard_enabled_for(Some("ON")));
+        // A garbage value must not silently disable a safety guard.
+        assert!(oom_guard_enabled_for(Some("banana")));
+        // The typed bool renders "0"; raw compat spellings also count.
+        assert!(!oom_guard_enabled_for(Some("0")));
+        assert!(!oom_guard_enabled_for(Some("false")));
+        assert!(!oom_guard_enabled_for(Some("off")));
+        assert!(!oom_guard_enabled_for(Some("OFF")));
+        assert!(!oom_guard_enabled_for(Some("no")));
+    }
+
+    #[test]
+    fn oom_guard_schema_field_is_process_scoped_with_env_compat() {
+        let field = field("memory.oom_guard").expect("oom_guard schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_OOM_GUARD"));
+        assert!(matches!(field.default.to_value(), ConfigValue::Bool(true)));
+        assert!(!field.include_builtin_in_process_config);
     }
 
     #[test]

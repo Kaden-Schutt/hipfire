@@ -258,6 +258,12 @@ pub fn build_tiles(slot_query_counts: &[usize], br: usize) -> (Vec<i32>, Vec<i32
 // us). This function is the first line of defence: refuse cheaply and clearly
 // BEFORE allocating, so a bad configuration reports itself instead of dying
 // half-way through and leaving the GPU in an unknown state.
+//
+// The defence is Strix-shaped, so it is configurable: `memory.oom_guard=false`
+// (compat `HIPFIRE_OOM_GUARD=0`) opts out. On a discrete GPU an overshoot is
+// a plain failed hipMalloc — failing one request, not the desktop — so a dev
+// box that deliberately runs multiple daemons/serves can turn the guard off.
+// Leave it ON on unified-memory APUs.
 
 /// Default deployment-target budget: the R9700 has 32 GB. A configuration that
 /// does not fit here cannot ship, regardless of what this 125 GiB dev box can
@@ -282,6 +288,12 @@ pub fn mem_available_bytes() -> Option<u64> {
 /// Refuse a planned allocation that would either exceed the deployment target's
 /// VRAM or leave this box without enough headroom to stay responsive.
 ///
+/// Skipped entirely when `memory.oom_guard=false` (`HIPFIRE_OOM_GUARD=0`):
+/// the deployment-target ceiling and the headroom check both assume GPU
+/// memory comes from system RAM, which is true on unified-memory APUs and
+/// false on a discrete-GPU dev box. The skip prints once to stderr so a
+/// disabled guard is visible in a log instead of reading as a pass.
+///
 /// `planned_bytes` must be the TOTAL the caller is about to hold live at once,
 /// not a single buffer. Returns `Err` with an actionable message; callers should
 /// skip the configuration rather than proceed.
@@ -293,6 +305,17 @@ pub fn mem_available_bytes() -> Option<u64> {
 /// forbidden by scripts/check-env-docs.py. Harnesses live in `examples/`,
 /// which is exempt, so they read any override there and pass it in.
 pub fn preflight_alloc(planned_bytes: u64, budget_bytes: u64, what: &str) -> Result<(), String> {
+    if !hipfire_config::oom_guard_enabled() {
+        static SKIP_NOTE: std::sync::Once = std::sync::Once::new();
+        SKIP_NOTE.call_once(|| {
+            eprintln!(
+                "[kv_slots] memory preflight guard disabled (memory.oom_guard=false); \
+                 allocations will not be refused before allocate"
+            );
+        });
+        return Ok(());
+    }
+
     let budget = budget_bytes;
 
     let gib = |b: u64| b as f64 / 1073741824.0;

@@ -3877,7 +3877,16 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 /// a leaked first model would show up: if the slots engine did not actually
 /// release its weights, `MemAvailable` is still depressed here and this stops
 /// the sweep instead of taking the box down.
+///
+/// `memory.oom_guard=false` (`HIPFIRE_OOM_GUARD=0`) opts out: on a
+/// discrete-GPU box an overshoot is a plain failed hipMalloc, not a desktop
+/// kill, and a sweep that wants to probe past the headroom is the operator's
+/// call.
 fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    if !hipfire_config::oom_guard_enabled() {
+        eprintln!("memory headroom guard disabled (memory.oom_guard=false)");
+        return Ok(());
+    }
     let registry = load_registry(&paths.registry).registry;
     let Some(path) = find_model_path(paths, &registry, model) else {
         return Ok(());
