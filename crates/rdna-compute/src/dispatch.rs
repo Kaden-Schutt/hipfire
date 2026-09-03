@@ -4301,6 +4301,10 @@ impl Gpu {
             "escha_moe_gemv_k8_indexed",
             kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC.to_string(),
         ));
+        specs.push((
+            "escha_moe_gemv_native",
+            kernels::ESCHA_MOE_GEMV_NATIVE_SRC.to_string(),
+        ));
 
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
@@ -4652,6 +4656,14 @@ impl Gpu {
                     "escha_gemv_q8_0_moe_k8_indexed_batched",
                     "escha_gemv_q8_0_wide_moe_k8_indexed_batched",
                     "escha_round_weights_f16_rne",
+                ],
+                "escha_moe_gemv_native" => vec![
+                    "escha_gemv_native_k2_moe_k8_indexed_batched",
+                    "escha_gemv_native_k3_moe_k8_indexed_batched",
+                    "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
+                    "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
+                    "escha_gemv_f16_moe_k8_indexed_batched",
+                    "escha_gemv_f16_wide_moe_k8_indexed_batched",
                 ],
                 other => vec![other],
             };

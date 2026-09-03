@@ -4842,6 +4842,18 @@ pub const ESCHA_BARE_TO_OUTMAJOR_SRC: &str =
 pub const ESCHA_MOE_GEMV_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/escha_moe_gemv_k8_indexed.hip");
 
+/// Escha-W2 routed-expert GEMVs that read the TRELLIS CODE DIRECTLY — the
+/// Phase-2 fused kernels. Six entry points: the four
+/// `escha_gemv_native_k{2,3}[_wide]_moe_k8_indexed_batched` production kernels
+/// and the two `escha_gemv_f16[_wide]_moe_k8_indexed_batched` reference arms
+/// they are gated bit-exactly against. Same lane mapping, accumulator count
+/// and reduction as [`ESCHA_MOE_GEMV_K8_INDEXED_SRC`]; the only difference is
+/// that the weight is decoded in-register from the code instead of read from
+/// an expanded Q8_0 copy. See the .hip header for why a block has to own a
+/// whole 16-wide tile column to reach the format's 0.25 B/weight floor.
+pub const ESCHA_MOE_GEMV_NATIVE_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemv_native.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the

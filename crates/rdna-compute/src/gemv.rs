@@ -14182,6 +14182,244 @@ impl Gpu {
         )
     }
 
+    /// Escha-W2 routed GEMV that reads the TRELLIS CODE DIRECTLY — the Phase-2
+    /// fused kernel. Same signature and same launch shape contract as
+    /// [`Self::escha_gemv_q8_0_moe_k8_indexed_batched`], so the executor swaps
+    /// one for the other and nothing else moves.
+    ///
+    /// `expert_ptrs` here point at the raw `[in/16, out/16, 16*trellis_k]`
+    /// int16 code stream of each expert slot — the bytes that came off disk,
+    /// never an expanded copy. `trellis_k` is 2 (`Escha2T16`, hfq qt=42) or 3
+    /// (`Escha3T16`, qt=43); the two have structurally different bit geometry
+    /// and get separate kernels rather than a runtime branch.
+    ///
+    /// # Numerics
+    ///
+    /// The wide/narrow choice re-uses the SAME `k <= 1536` threshold as the
+    /// Q8_0 sibling, and each entry point reproduces that sibling's lane
+    /// mapping, accumulator count, loop order and final reduction exactly. The
+    /// result is therefore bit-identical to running the Q8_0 kernel's
+    /// arithmetic on exactly-decoded fp16 weights — asserted against both
+    /// [`Self::escha_gemv_f16_moe_k8_indexed_batched`] and `escha_ref` by
+    /// `rdna-compute/examples/test_escha_native_gemv_gpu_vs_cpu.rs`.
+    ///
+    /// # Shape
+    ///
+    /// Grid `(m/16, slots)`, block 512: a block owns a whole 16-wide tile
+    /// column so that every tile it reads is used in full (see the .hip
+    /// header). Hence the extra `m % 16 == 0` requirement the Q8_0 sibling
+    /// does not have — satisfied by every escha projection (`2*mi` and
+    /// `hidden` are both multiples of 16), and rejected loudly rather than
+    /// silently dropping the tail rows if it ever is not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemv_native_moe_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        trellis_k: u32,
+    ) -> HipResult<()> {
+        let wide = self.escha_indexed_gemv_preflight(
+            "escha_gemv_native_moe_k8_indexed_batched",
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+        )?;
+        let entry = match (trellis_k, wide) {
+            (2, false) => "escha_gemv_native_k2_moe_k8_indexed_batched",
+            (2, true) => "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
+            (3, false) => "escha_gemv_native_k3_moe_k8_indexed_batched",
+            (3, true) => "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
+            (other, _) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "escha_gemv_native_moe_k8_indexed_batched: trellis_k={other}, expected \
+                         2 (Escha2T16) or 3 (Escha3T16)"
+                    ),
+                ))
+            }
+        };
+        self.escha_launch_native_family(
+            entry,
+            expert_ptrs,
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+        )
+    }
+
+    /// The F16 reference arm of [`Self::escha_gemv_native_moe_k8_indexed_batched`].
+    ///
+    /// Reads an OUT-major `[m, k]` fp16 expert slot — what `escha_bare_to_f16`
+    /// writes, i.e. the exactly-decoded weights with nothing re-quantised —
+    /// through the identical grid, lane mapping, accumulator structure and
+    /// reduction. It exists so "decoding inside the GEMV changes nothing" is a
+    /// checkable claim about the DECODE rather than about floating point.
+    ///
+    /// It is a GATE arm, not a production route: `EschaWeightStore::F16` still
+    /// runs host-routed, because that arm is what the published G5 KLD
+    /// reference is built from and changing its GEMV would move a published
+    /// number.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemv_f16_moe_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        let wide = self.escha_indexed_gemv_preflight(
+            "escha_gemv_f16_moe_k8_indexed_batched",
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+        )?;
+        let entry = if wide {
+            "escha_gemv_f16_wide_moe_k8_indexed_batched"
+        } else {
+            "escha_gemv_f16_moe_k8_indexed_batched"
+        };
+        self.escha_launch_native_family(
+            entry,
+            expert_ptrs,
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+        )
+    }
+
+    /// Shared argument validation for the fused-native GEMV family. Returns
+    /// `wide` — the SAME `k <= 1536` variant choice the Q8_0 sibling makes,
+    /// restated here rather than duplicated as a literal so the two cannot
+    /// drift apart silently (they must agree: it is a numerical selection).
+    #[allow(clippy::too_many_arguments)]
+    fn escha_indexed_gemv_preflight(
+        &mut self,
+        what: &str,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<bool> {
+        self.bind_thread()?;
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: k={k} is not a multiple of 32"),
+            ));
+        }
+        // A block owns a 16-wide tile column, so a non-multiple-of-16 `m`
+        // would leave the tail rows uncomputed — reading whatever `y` held.
+        if m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: m={m} is not a multiple of 16"),
+            ));
+        }
+        if slots == 0 || m == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: slots={slots} m={m}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: x has {} elements (need {}), y has {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        if topk_indices.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: topk_indices has {} elements, need {slots}",
+                    topk_indices.numel()
+                ),
+            ));
+        }
+        Ok(k <= 1536)
+    }
+
+    /// Launch one of the six `escha_moe_gemv_native` entry points. They all
+    /// share a kernarg list and a grid, so the launch is written once.
+    #[allow(clippy::too_many_arguments)]
+    fn escha_launch_native_family(
+        &mut self,
+        entry: &str,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "escha_moe_gemv_native",
+            kernels::ESCHA_MOE_GEMV_NATIVE_SRC,
+            entry,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            entry,
+            [(m / 16) as u32, slots as u32, 1],
+            [512, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
     /// Device-side out-of-place `f32 -> f16 -> f32` round-trip of the escha
     /// combine weights.
     ///
