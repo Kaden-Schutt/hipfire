@@ -1083,14 +1083,19 @@ fn load_mtp_moe_ffn(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
 
-    Ok(Qwen35MtpMoeFfnWeights {
+    let ffn = Qwen35MtpMoeFfnWeights {
         router,
         shared_expert,
         shared_expert_gate,
         experts,
         expert_gate_up_ptrs,
         expert_down_ptrs,
-    })
+    };
+    // Fail at LOAD, not at the first speculative step: a head that this
+    // forward cannot run correctly must not be reported as loaded.
+    // See `mtp_moe_refuse_unsupported_rotation`.
+    mtp_moe_refuse_unsupported_rotation(&ffn)?;
+    Ok(ffn)
 }
 
 /// Cross-check the on-disk shape against the caller's expected (m, k).
@@ -1716,6 +1721,70 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     Ok(())
 }
 
+/// Refuse any MTP MoE weight whose dtype needs a rotation this function does
+/// not apply.
+///
+/// # Why this exists
+///
+/// [`mtp_moe_ffn_decode`] below is a SECOND, independent MoE forward: it does
+/// not go through `hipfire_dispatch::pipeline::run_moe_decode`, so none of the
+/// escha guards there (`check_moe_decode_supported` arm (c), the escha branch
+/// that routes to `pipeline::escha`) protect it. It applies exactly one
+/// rotation, `rotate_x_mq_for`'s FWHT, and combines the raw expert outputs.
+///
+/// An Escha-W2 layer here would therefore skip BOTH Hadamard transforms and
+/// multiply rotated-domain weights by an unrotated activation — finite,
+/// fluent, ~1e-1-wrong draft tokens. Speculative decoding would then verify
+/// them against a correct trunk and reject nearly all of them: the failure
+/// would present as "the speculator is useless", not as "the speculator is
+/// wrong", which is the shape of bug that survives a release.
+///
+/// It is unreachable today by two accidents, neither of which is a decision:
+/// the MTP loader reads per-expert `moe_experts.{i}.{gate_up,down}` tensor
+/// names that an escha checkpoint does not contain, and the escha SKU ships no
+/// MTP sidecar at all. Wiring a speculator to escha must fail loudly, here.
+///
+/// The `match` is deliberately EXHAUSTIVE — no `_` arm. A new `RotationPlan`
+/// variant will not compile until someone decides whether this forward
+/// implements it or refuses it.
+fn mtp_moe_refuse_unsupported_rotation(ffn: &Qwen35MtpMoeFfnWeights) -> HipResult<()> {
+    use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
+
+    let mut check = |label: &str, dt: DType| -> HipResult<()> {
+        match dtype_rotation_plan(dt) {
+            // Applied by `rotate_x_mq_for` / folded into the kernels below.
+            RotationPlan::None
+            | RotationPlan::FwhtG256
+            | RotationPlan::FwhtG128
+            | RotationPlan::Mq8Internal
+            | RotationPlan::Givens => Ok(()),
+            RotationPlan::EschaH128 => Err(HipError::new(
+                0,
+                &format!(
+                    "MTP head: {label} is {dt:?}, whose rotation plan is EschaH128. The MTP \
+                     MoE forward is a separate implementation from run_moe_decode and applies \
+                     NO H128 pair, so it would multiply rotated-domain weights by an \
+                     unrotated activation and emit finite, fluent, ~1e-1-wrong draft tokens. \
+                     Refusing. To wire a speculator to Escha-W2, teach this forward the H128 \
+                     transforms (see hipfire_dispatch::pipeline::escha) — do not delete this \
+                     check."
+                ),
+            )),
+        }
+    };
+
+    check("moe_router", ffn.router.gpu_dtype)?;
+    check("moe_shared_expert_gate", ffn.shared_expert_gate.gpu_dtype)?;
+    check("moe_shared_gate", ffn.shared_expert.gate.gpu_dtype)?;
+    check("moe_shared_up", ffn.shared_expert.up.gpu_dtype)?;
+    check("moe_shared_down", ffn.shared_expert.down.gpu_dtype)?;
+    for (i, e) in ffn.experts.iter().enumerate() {
+        check(&format!("moe_experts.{i}.gate_up"), e.gate_up.gpu_dtype)?;
+        check(&format!("moe_experts.{i}.down"), e.down.gpu_dtype)?;
+    }
+    Ok(())
+}
+
 fn mtp_moe_ffn_decode(
     gpu: &mut Gpu,
     ffn: &Qwen35MtpMoeFfnWeights,
@@ -1724,6 +1793,12 @@ fn mtp_moe_ffn_decode(
     cfg: &Qwen35MtpHeadConfig,
     scratch: &Qwen35MtpHeadScratch,
 ) -> HipResult<()> {
+    // Before any GPU work. `load_mtp_moe_ffn` makes the same call so an escha
+    // sidecar is refused at LOAD rather than at the first speculative step;
+    // this one is the guard at the point of danger, and it is what protects a
+    // `Qwen35MtpMoeFfnWeights` built by any future path that skips the loader.
+    mtp_moe_refuse_unsupported_rotation(ffn)?;
+
     let dim = cfg.n_embd;
     let mi = cfg.moe_intermediate_size;
     let smi = cfg.shared_expert_intermediate_size;
