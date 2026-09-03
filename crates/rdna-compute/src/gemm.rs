@@ -28036,20 +28036,31 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
+        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
+        // base kernel (one wave32 per 16x16 tile) launches too few waves to
+        // cover 96 CUs. Capture-SAFE (unlike the mw_lds tier below): the
+        // kernel is deterministic (fixed wave-order LDS reduction, no
+        // atomics), launches via launch_maybe_blob (blob ABI recorded under
+        // capture), and its symbols carry the replay.rs kernarg contract, so
+        // verify-graph capture bakes ks4_lds and every replayed cycle keeps
+        // the win. Only Redline tape recording keeps the base contract.
+        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 (flags.residual_ksplit_off).
+        if !self.replay.is_recording()
+            && !self.flags.residual_ksplit_off
+            && self.arch_caps.is_gfx1100()
+            && self.arch == "gfx1100"
+            && batch_size <= 16
+        {
+            if let Some(kw) = Self::residual_ksplit_kw(k) {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, kw,
+                );
+            }
+        }
         // Exact gfx1100 production multi-wave policy: MW4 for N 416..463
         // and MW8 for N>=464. Smaller measured ranges retain BT4/6/8.
         // Capture/replay keep the fixed historical base launch contract.
-        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
-        // base kernel (one wave32 per 16x16 tile) launches too few waves to
-        // cover 96 CUs. Capture/replay keep the fixed historical base launch.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
-            if self.arch_caps.is_gfx1100() && self.arch == "gfx1100" && batch_size <= 16 {
-                if let Some(kw) = Self::residual_ksplit_kw(k) {
-                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
-                        a_raw, x, y, m, k, batch_size, kw,
-                    );
-                }
-            }
             if self.arch_caps.is_gfx1100() && self.arch == "gfx1100" {
                 if (416..=463).contains(&batch_size) {
                     return self.gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds(

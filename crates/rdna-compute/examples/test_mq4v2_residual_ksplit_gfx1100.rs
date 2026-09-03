@@ -6,8 +6,8 @@
 //! Loads REAL weight bytes for layer-0 out_proj (M=5120,K=6144) and down_proj
 //! (M=5120,K=17408) from qwen3.8-27b.mq4, random finite F32 X at N=1,8,16,
 //! identical nonzero Y init on both arms. Reference: the historical base
-//! `gemm_mq4g256v2_residual_wmma` forced via capture_mode (skips the
-//! production ksplit tier). Each runnable kw in {2,4,8} (skipped when
+//! `gemm_mq4g256v2_residual_wmma` forced via the residual_ksplit_off kill
+//! switch (the tier is capture-safe, so capture_mode no longer diverts it).
 //! (K/256) % kw != 0, by kernel-design contract): relL2, max-abs, finite
 //! check, then timing (32 warmups, 200 launches/sample, 3 samples interleaved
 //! arm-by-arm, min+median). Exit nonzero on any relL2(ks, base) > 5e-5 or
@@ -453,15 +453,20 @@ fn main() {
             let d_x = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc x");
             htod_f32(&gpu, &d_x, &x_host);
 
-            // Reference: historical base kernel, production ksplit skipped
-            // via capture_mode for this launch only.
+            // Reference: historical base kernel. The ksplit tier is
+            // capture-safe now, so capture_mode no longer forces the base;
+            // force it via the HIPFIRE_RESIDUAL_KSPLIT_OFF kill switch
+            // (flags Arc swap for this launch only).
             let d_y_ref = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y ref");
             htod_f32(&gpu, &d_y_ref, &y_init);
-            let saved_capture = gpu.graphs.capture_mode;
-            gpu.graphs.capture_mode = true;
+            let saved_flags = gpu.flags.clone();
+            gpu.flags = std::sync::Arc::new(rdna_compute::FeatureFlags {
+                residual_ksplit_off: true,
+                ..(*saved_flags).clone()
+            });
             sync(&gpu);
             let r = gpu.gemm_mq4g256v2_residual_wmma(&d_a, &d_x, &d_y_ref, m, k, n);
-            gpu.graphs.capture_mode = saved_capture;
+            gpu.flags = saved_flags;
             r.expect("base gemm_mq4g256v2_residual_wmma failed");
             sync(&gpu);
             let y_ref = gpu.download_f32(&d_y_ref).expect("download ref");
