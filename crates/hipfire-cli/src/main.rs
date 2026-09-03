@@ -3666,6 +3666,18 @@ fn bench_prompt_warning(prompt_tokens: u64) -> Option<String> {
     })
 }
 
+/// Prompt length as the daemon reports it on the `done` event:
+/// `prefill_tokens` (rows actually prefilled) plus `cached_tokens` (prefix
+/// served from the prompt cache). `None` when the event carries neither.
+fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
+    let prefill = done.get("prefill_tokens").and_then(serde_json::Value::as_u64);
+    let cached = done.get("cached_tokens").and_then(serde_json::Value::as_u64);
+    match (prefill, cached) {
+        (None, None) => None,
+        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
+    }
+}
+
 fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.runs == 0 {
         bail!("--runs must be positive");
@@ -3760,11 +3772,12 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 args.reasoning_on,
             )?;
             // Every run uses the same prompt, so the daemon's tokenized
-            // prompt length is run-invariant; keep the first report.
+            // prompt length is run-invariant; keep the first report. The
+            // done event reports the prompt as `prefill_tokens` (rows the
+            // engine actually prefilled) plus `cached_tokens` (prefix served
+            // from the prompt cache); the prompt is their sum.
             if prompt_tokens.is_none() {
-                prompt_tokens = done
-                    .get("prompt_tokens")
-                    .and_then(serde_json::Value::as_u64);
+                prompt_tokens = bench_prompt_tokens_from_done(&done);
             }
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
@@ -9212,6 +9225,18 @@ mod tests {
         assert!(bench_prompt_warning(255).is_some());
         assert!(bench_prompt_warning(256).is_none());
         assert!(bench_prompt_warning(4400).is_none());
+    }
+
+    #[test]
+    fn bench_prompt_tokens_come_from_prefill_plus_cached() {
+        // The daemon's done event names the prompt as prefill_tokens (+ any
+        // prompt-cache hit in cached_tokens); there is no prompt_tokens key.
+        let done = serde_json::json!({"prefill_tokens": 4400, "cached_tokens": 8});
+        assert_eq!(bench_prompt_tokens_from_done(&done), Some(4408));
+        let no_cache = serde_json::json!({"prefill_tokens": 24});
+        assert_eq!(bench_prompt_tokens_from_done(&no_cache), Some(24));
+        let neither = serde_json::json!({"tokens": 128, "prompt_tokens": 99});
+        assert_eq!(bench_prompt_tokens_from_done(&neither), None);
     }
 
     #[test]
