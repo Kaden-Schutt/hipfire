@@ -229,6 +229,21 @@ pub struct MoeResolution {
     /// never the generic indexed body, which has no escha awareness. See the
     /// arm in `resolve_arch` and `pipeline::check_moe_decode_supported`.
     pub routed_indexable_escha_q8: bool,
+    /// Escha-W2 routed experts stored as the TRELLIS CODE (`Escha2T16` /
+    /// `Escha3T16` on either projection, H128 transform tables resident) — the
+    /// Phase-2 production shape. Admits the layer to exactly the same place
+    /// [`Self::routed_indexable_escha_q8`] does: GPU-resident top-K, reaching
+    /// `pipeline::escha::escha_routed_decode_indexed` and never the generic
+    /// indexed body.
+    ///
+    /// It is a SEPARATE flag rather than a widened `routed_indexable_escha_q8`
+    /// because the two select different GEMVs — the code arm dispatches
+    /// `escha_gemv_native_*` with a trellis order taken from each projection's
+    /// own dtype, the Q8_0 arm dispatches the block-decode kernels. A single
+    /// flag would leave the executor guessing from the dtype anyway, and the
+    /// fail-closed guard would no longer be able to say WHICH shape it
+    /// admitted.
+    pub routed_indexable_escha_native: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
     /// True when a per-expert tier table is `Some` AND contains >1 distinct
@@ -359,6 +374,25 @@ impl MoeResolution {
         let routed_indexable_escha_q8 =
             d.routed_escha_transforms && d.routed_gate_up == Q8_0 && d.routed_down == Q8_0;
 
+        // Escha-W2, Phase 2: the routed experts are the TRELLIS CODE itself and
+        // the fused GEMV decodes it in-register. Everything the Q8_0 arm above
+        // says applies unchanged — this admits GPU-resident top-K only, and the
+        // executor it reaches is still `escha_routed_decode_indexed` with its
+        // H128 pair, never the generic indexed body.
+        //
+        // Either escha dtype is accepted on either projection rather than
+        // hard-coding today's (K=2 gate_up, K=3 down) pairing: the trellis
+        // order is a per-projection property that the executor reads back off
+        // the SAME dtype to pick the kernel, so a file that allocated the bits
+        // the other way round is served correctly instead of being silently
+        // refused. What is NOT accepted is a mix with any other container —
+        // the fused kernel's bit geometry is the format's, and handing it
+        // anything else is silent corruption rather than a fault.
+        let is_escha_code = |dt: DType| matches!(dt, Escha2T16 | Escha3T16);
+        let routed_indexable_escha_native = d.routed_escha_transforms
+            && is_escha_code(d.routed_gate_up)
+            && is_escha_code(d.routed_down);
+
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq4v2
             || routed_indexable_mq5
@@ -372,7 +406,8 @@ impl MoeResolution {
             || routed_indexable_mixed_lloyd
             || routed_indexable_paro
             || routed_indexable_e8
-            || routed_indexable_escha_q8;
+            || routed_indexable_escha_q8
+            || routed_indexable_escha_native;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
@@ -431,6 +466,7 @@ impl MoeResolution {
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
             routed_indexable_escha_q8,
+            routed_indexable_escha_native,
             use_gpu_topk,
             needs_x_rot_local,
             mixed,

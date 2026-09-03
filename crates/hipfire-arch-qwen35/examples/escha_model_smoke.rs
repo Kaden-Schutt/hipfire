@@ -94,15 +94,27 @@ fn main() -> Result<(), String> {
     let mut b = hipfire_arch_qwen35::load_qwen35_bundle(src, &mut ctx)?;
     eprintln!("loaded in {:?}", t0.elapsed());
 
-    // Layer 0 must have come through the escha loader, and its experts must be
-    // the Q8_0 the trellis decoded into — not whatever the generic per-expert
-    // path would have found.
+    // Layer 0 must have come through the escha loader, and its experts must
+    // hold one of the containers that loader produces — not whatever the
+    // generic per-expert path would have found.
+    //
+    // The exact container depends on `HIPFIRE_ESCHA_EXPERT_STORE` and is not
+    // what this gate is about, so it is asserted as a SET rather than pinned
+    // to one value. It is asserted at all because the failure it catches is
+    // "the escha loader did not run and some other path filled these slots",
+    // which is a different bug from a wrong store.
     match &b.weights.layers[0] {
         qwen35::LayerWeights::DeltaNetMoe(l) => {
             assert!(l.ffn.escha.is_some(), "layer 0 carries no escha tables");
-            assert_eq!(
-                l.ffn.experts[0].gate_up.gpu_dtype,
-                rdna_compute::DType::Q8_0
+            assert!(
+                matches!(
+                    l.ffn.experts[0].gate_up.gpu_dtype,
+                    rdna_compute::DType::Escha2T16
+                        | rdna_compute::DType::Escha3T16
+                        | rdna_compute::DType::Q8_0
+                ),
+                "layer 0 routed experts are {:?}, which no escha store produces",
+                l.ffn.experts[0].gate_up.gpu_dtype
             );
             eprintln!(
                 "layer0: escha=Some experts={} gate_up dtype={:?} m={} k={}",

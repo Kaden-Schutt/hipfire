@@ -14401,10 +14401,14 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
+        // Grid (m/16, slots), block 256: a block owns a 16-wide tile column,
+        // and each of its EIGHT warps owns two of that column's output rows
+        // (`w` and `w + 8`) because those two share a decode window. See the
+        // .hip header.
         self.launch_maybe_blob(
             entry,
             [(m / 16) as u32, slots as u32, 1],
-            [512, 1, 1],
+            [256, 1, 1],
             0,
             &mut params,
             || {

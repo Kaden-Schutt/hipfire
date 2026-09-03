@@ -144,6 +144,55 @@ pub fn escha_launches_per_token(n_layers: usize) -> usize {
     n_layers * ESCHA_H128_LAUNCHES_PER_LAYER
 }
 
+/// Run one routed GEMV phase against whichever container this layer's expert
+/// slots hold.
+///
+/// Both arms compute the SAME sum in the SAME order — the fused native kernels
+/// are transcriptions of the Q8_0 ones with only the weight's provenance
+/// changed (see `kernels/src/escha_moe_gemv_native.hip`). They do not produce
+/// the same NUMBERS, because Q8_0 is a lossy re-quantisation of the weights
+/// the code decodes to; the native arm is the weight-exact one.
+///
+/// The `_ =>` arm is load-bearing and must stay an error. `expert_ptrs` are
+/// raw device addresses with no length or type attached, so dispatching the
+/// wrong kernel at one of them reads a different byte geometry out of the same
+/// bytes: finite, plausible, wrong. `MoeResolution` should already have
+/// refused anything that lands here, which is exactly why this is the place to
+/// notice that it did not.
+fn escha_routed_gemv(
+    gpu: &mut Gpu,
+    dtype: rdna_compute::DType,
+    expert_ptrs: &GpuTensor,
+    ids: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    slots: usize,
+) -> Result<(), DispatchError> {
+    use rdna_compute::DType;
+    let r = match dtype {
+        DType::Escha2T16 => {
+            gpu.escha_gemv_native_moe_k8_indexed_batched(expert_ptrs, ids, x, y, m, k, slots, 2)
+        }
+        DType::Escha3T16 => {
+            gpu.escha_gemv_native_moe_k8_indexed_batched(expert_ptrs, ids, x, y, m, k, slots, 3)
+        }
+        DType::Q8_0 => {
+            gpu.escha_gemv_q8_0_moe_k8_indexed_batched(expert_ptrs, ids, x, y, m, k, slots)
+        }
+        _ => {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-expert-container-not-code-or-q8_0",
+                arch: "",
+                quant: "",
+            })
+        }
+    };
+    r.map_err(|err| DispatchError::Hip(err.to_string()))
+}
+
 /// SAFETY: `src` is a device buffer of at least `offset_elems + len_elems`
 /// f32; the returned view is non-owning and must not outlive `src`.
 unsafe fn view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> GpuTensor {
@@ -316,6 +365,19 @@ pub struct EschaIndexedRouting<'a> {
     /// `[k]` combine weights, NOT yet f16-rounded. Left untouched; the
     /// rounded copy goes into the layer's own `weights` scratch.
     pub topk_weights: &'a GpuTensor,
+    /// Container of the gate_up expert slots the pointers above address:
+    /// `Escha2T16` / `Escha3T16` (Phase 2 — the trellis code, decoded inside
+    /// the GEMV) or `Q8_0` (Phase 1 — decoded at load). This is read off the
+    /// layer's own routed dtype, the SAME fact
+    /// `MoeResolution::routed_indexable_escha_{native,q8}` admitted the layer
+    /// on, so the kernel choice and the admission decision cannot disagree.
+    /// Anything else is refused by [`escha_routed_gemv`] rather than
+    /// mis-decoded.
+    pub gate_up_dtype: rdna_compute::DType,
+    /// Container of the down expert slots. Independent of `gate_up_dtype`: the
+    /// shipped A3B file allocates K=2 to gate_up and K=3 to down, and a file
+    /// that allocated them the other way round is equally valid.
+    pub down_dtype: rdna_compute::DType,
     /// Rows of the gate_up weight matrix (`2 * mi`).
     pub gate_up_m: usize,
     /// Columns of the gate_up weight matrix (`hidden`).
@@ -406,7 +468,9 @@ pub fn escha_routed_decode_indexed(
     ))?;
 
     // ── 2. gate_up GEMV for ALL k experts, ONE launch ─────────────────────
-    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+    escha_routed_gemv(
+        gpu,
+        r.gate_up_dtype,
         r.expert_gate_up_ptrs,
         r.topk_indices,
         e.xh_gu,
@@ -414,7 +478,7 @@ pub fn escha_routed_decode_indexed(
         r.gate_up_m,
         r.gate_up_k,
         k,
-    ))?;
+    )?;
 
     // ── 3. gate_up output transform, ONE launch ───────────────────────────
     hip!(gpu.escha_h128_batched(
@@ -444,7 +508,9 @@ pub fn escha_routed_decode_indexed(
     ))?;
 
     // ── 6. down GEMV for ALL k experts, ONE launch ────────────────────────
-    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+    escha_routed_gemv(
+        gpu,
+        r.down_dtype,
         r.expert_down_ptrs,
         r.topk_indices,
         e.xh_dn,
@@ -452,7 +518,7 @@ pub fn escha_routed_decode_indexed(
         r.down_m,
         r.down_k,
         k,
-    ))?;
+    )?;
 
     // ── 7. down output transform, ONE launch ──────────────────────────────
     hip!(gpu.escha_h128_batched(
@@ -626,7 +692,9 @@ pub fn escha_routed_prefill_indexed(
     ))?;
 
     // ── 2. gate_up GEMV for ALL slots, ONE launch ─────────────────────────
-    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+    escha_routed_gemv(
+        gpu,
+        r.gate_up_dtype,
         r.expert_gate_up_ptrs,
         &ids,
         xh_gu,
@@ -634,7 +702,7 @@ pub fn escha_routed_prefill_indexed(
         r.gate_up_m,
         r.gate_up_k,
         slots,
-    ))?;
+    )?;
 
     // ── 3. gate_up output transform, ONE launch ───────────────────────────
     hip!(gpu.escha_h128_batched(
@@ -664,7 +732,9 @@ pub fn escha_routed_prefill_indexed(
     ))?;
 
     // ── 6. down GEMV for ALL slots, ONE launch ────────────────────────────
-    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+    escha_routed_gemv(
+        gpu,
+        r.down_dtype,
         r.expert_down_ptrs,
         &ids,
         xh_dn,
@@ -672,7 +742,7 @@ pub fn escha_routed_prefill_indexed(
         r.down_m,
         r.down_k,
         slots,
-    ))?;
+    )?;
 
     // ── 7. down output transform, ONE launch ──────────────────────────────
     hip!(gpu.escha_h128_batched(

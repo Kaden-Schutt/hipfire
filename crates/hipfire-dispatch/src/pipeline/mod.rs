@@ -212,25 +212,34 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
 /// running an escha layer through it omits the transforms and emits finite,
 /// fluent output that is wrong by ~1e-1 — no crash, no NaN, no test fires.
 ///
-/// Escha is now a SUPPORTED indexed variant: `routed_indexable_escha_q8`
-/// admits a layer whose experts are Q8_0 on both projections and whose H128
-/// transform tables are resident, and `run_moe_decode` branches such a layer
-/// to `escha::escha_routed_decode_indexed` before the generic body ever runs.
-/// `escha_indexed_supported` is the caller's assertion that BOTH halves of
-/// that hold for this layer.
+/// Escha now has TWO supported indexed variants, and arm (c) is the assertion
+/// that the layer is one of them:
 ///
-/// What arm (c) still catches is every way escha could arrive on the indexed
-/// path other than through that arm:
+///  * `routed_indexable_escha_native` (Phase 2, production) — the routed
+///    experts are the trellis CODE (`Escha2T16` / `Escha3T16`) and the fused
+///    `escha_gemv_native_*` decodes it inside the GEMV;
+///  * `routed_indexable_escha_q8` (Phase 1, the A/B arm) — the experts are the
+///    Q8_0 the trellis decoded into at load.
+///
+/// Both additionally require the H128 transform tables to be resident, and
+/// both reach `escha::escha_routed_decode_indexed`, which `run_moe_decode`
+/// branches to before the generic body ever runs. `escha_indexed_supported` is
+/// the caller's assertion that a supported container AND the tables hold for
+/// this layer.
+///
+/// The arm was WIDENED for Phase 2 rather than removed, and it is still the
+/// specific-combination test it always was. What it catches is every way escha
+/// could arrive on the indexed path other than through those two arms:
 ///
 ///  * transform tables missing (`MoeParams::escha == None`) while the layer
 ///    is still marked escha by dtype — the executor could not be called;
 ///  * an escha layer that resolved indexable through some OTHER arm, e.g. a
-///    future graded/mixed escha file whose representative routed dtype is not
-///    Q8_0. The escha indexed executor hard-codes the Q8_0 block decode, so
-///    dispatching it on a non-Q8_0 container is silent corruption too — this
-///    hazard is the mirror image of the original one, and both are refused
-///    here by requiring the *specific* supported combination rather than
-///    merely "escha, somehow, on the indexed path".
+///    future graded/mixed escha file whose representative routed dtype is
+///    neither escha-coded nor Q8_0. Each escha GEMV hard-codes its container's
+///    bit geometry, so dispatching one on a different container is silent
+///    corruption too — this hazard is the mirror image of the original one,
+///    and both are refused here by requiring the *specific* supported
+///    combinations rather than merely "escha, somehow, on the indexed path".
 ///
 /// It deliberately ERRORS rather than forcing `use_gpu_topk = false`. Forcing
 /// would keep escha correct while hiding the fact that a new indexed arm needs
@@ -267,9 +276,9 @@ pub fn check_moe_decode_supported(
     }
     // (c) escha on the indexed GPU-top-K path WITHOUT the escha indexed
     // executor behind it: fail closed. The generic indexed body never applies
-    // the H128 pair, and the escha indexed executor hard-codes Q8_0 — either
-    // mismatch is silently-wrong output rather than an error. See the
-    // module-level rationale on this function.
+    // the H128 pair, and each escha GEMV hard-codes one container's bit
+    // geometry — either mismatch is silently-wrong output rather than an
+    // error. See the module-level rationale on this function.
     if has_escha && use_gpu_topk && !escha_indexed_supported {
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
@@ -745,18 +754,21 @@ pub fn run_moe_decode(
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
     //
     // `p.has_escha()` feeds arm (c): an Escha-W2 layer on the indexed
-    // GPU-top-K path is refused HERE, before any GPU work, UNLESS it is the
-    // one supported shape — resolved through `routed_indexable_escha_q8` AND
-    // carrying the transform tables the escha indexed executor needs. Both
-    // arguments must stay wired to the real values; a constant re-opens
-    // exactly the hole they close.
+    // GPU-top-K path is refused HERE, before any GPU work, UNLESS it is one of
+    // the two supported shapes — resolved through
+    // `routed_indexable_escha_native` (Phase 2: the trellis code, fused GEMV)
+    // or `routed_indexable_escha_q8` (Phase 1: the decoded Q8_0) AND carrying
+    // the transform tables the escha indexed executor needs. Both arguments
+    // must stay wired to the real values; a constant re-opens exactly the hole
+    // they close.
     //
     // `escha_indexed_supported` is deliberately the AND of the resolver's
     // escha arm and the tables' presence, and it is computed once here so the
     // guard and the dispatch below cannot drift apart — the branch to
     // `escha_routed_decode_indexed` re-reads THIS binding rather than
     // recomputing the predicate.
-    let escha_indexed_supported = res.routed_indexable_escha_q8 && p.escha.is_some();
+    let escha_indexed_supported =
+        (res.routed_indexable_escha_q8 || res.routed_indexable_escha_native) && p.escha.is_some();
     check_moe_decode_supported(
         res.use_gpu_topk,
         p.k,
@@ -1338,6 +1350,13 @@ pub fn run_moe_decode(
                 expert_down_ptrs: p.expert_down_ptrs,
                 topk_indices: p.topk_indices,
                 topk_weights: p.topk_weights,
+                // The container the expert slots hold, straight off the layer's
+                // routed dtype — the same fact `escha_indexed_supported` was
+                // resolved from, so the GEMV the executor picks and the arm the
+                // guard admitted are the same decision read twice, not two
+                // decisions that could drift.
+                gate_up_dtype: p.dtypes.routed_gate_up,
+                down_dtype: p.dtypes.routed_down,
                 gate_up_m: 2 * p.mi,
                 gate_up_k: p.routed_gate_up_k,
                 down_m: p.routed_down_m,
@@ -3497,6 +3516,11 @@ pub fn run_moe_prefill(
                 expert_down_ptrs: p.expert_down_ptrs,
                 topk_indices: p.topk_indices,
                 topk_weights: p.topk_weights,
+                // See the decode branch: the container comes off the layer's
+                // own routed dtype, which is what the batched-prefill
+                // admission arm keyed on too.
+                gate_up_dtype: p.dtypes.routed_gate_up,
+                down_dtype: p.dtypes.routed_down,
                 gate_up_m: 2 * mi,
                 gate_up_k,
                 down_m,

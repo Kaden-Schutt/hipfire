@@ -4361,26 +4361,37 @@ fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
 /// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
 /// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
-/// Escha-W2 expert storage. Production is `Q8_0`. The two other values select
-/// weight-exact arms, so the Q8_0 re-quantisation cost can be measured rather
-/// than assumed:
+/// Escha-W2 expert storage. Production (Phase 2) is `Native` — the trellis
+/// code itself, 0.25/0.375 B/weight, decoded inside the routed GEMV. The three
+/// other values select DECODING stores, each of which exists to make a
+/// specific measurement possible rather than to be run:
 ///
-/// * `HIPFIRE_ESCHA_EXPERT_STORE=f16` — 2 B/weight. The decode already
-///   produced fp16, so this is exact, and because per-expert buffers are
-///   rounded to 2 MiB granules it costs the same 60 GiB the Q8_0 arm already
-///   costs. This is the arm the G5 KLD reference is built with; it is the only
-///   weight-exact arm that fits the 35B.
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=q8_0` (also `q8`) — Phase 1: transpose +
+///   Q8_0 re-quantise, 1.0625 B/weight, 37.55 GB resident. This is the A/B arm
+///   for every Phase-2 performance claim, and the arm every published Phase-1
+///   number (G4's Q8_0 arm, the G5 KLD headline) was measured on. It is also
+///   the only routed store that works on the per-expert HOST route, so it is
+///   what `HIPFIRE_ESCHA_INDEXED=0` needs.
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=f16` — 2 B/weight, weight-exact, ~64 GB of
+///   experts. The arm the G5 KLD reference is built with.
 /// * `HIPFIRE_ESCHA_EXPERT_STORE=f32` — 4 B/weight, ~129 GB of experts on the
 ///   35B. Equally exact and does NOT fit; small-layer diagnostic only (the G4
 ///   block gate uses it).
 ///
-/// Both lose the indexed GPU-top-K path and run host-routed. See
-/// `qwen35/escha.rs`.
+/// `f16` and `f32` lose the indexed GPU-top-K path and run host-routed;
+/// `native` REQUIRES it — there is no per-expert native GEMV, so an escha
+/// layer that reaches the host route with this store fails loudly in
+/// `GemvFamily::run_auto` (no plain GEMV exists for `RotationPlan::EschaH128`)
+/// instead of running unrotated. See `qwen35/escha.rs`.
+///
+/// An unrecognised value falls through to production rather than erroring,
+/// matching every other developer var in this loader.
 fn escha_weight_store() -> EschaWeightStore {
     match hipfire_config::developer_var("HIPFIRE_ESCHA_EXPERT_STORE").as_deref() {
         Ok("f32") | Ok("F32") => EschaWeightStore::F32,
         Ok("f16") | Ok("F16") => EschaWeightStore::F16,
-        _ => EschaWeightStore::Q8_0,
+        Ok("q8_0") | Ok("Q8_0") | Ok("q8") | Ok("Q8") => EschaWeightStore::Q8_0,
+        _ => EschaWeightStore::Native,
     }
 }
 
@@ -4806,9 +4817,13 @@ pub(crate) fn load_moe_ffn(
         )?;
         if layer_idx == 0 {
             eprintln!(
-                "  Escha-W2 routed experts: {} experts decoded from the trellis, stored {store:?}, \
-                 {} per-expert weight buffers -> 2 layer blobs",
+                "  Escha-W2 routed experts: {} experts, store {store:?} ({}), {} per-expert \
+                 weight buffers -> 2 layer blobs",
                 experts.len(),
+                match store {
+                    EschaWeightStore::Native => "trellis code kept verbatim, decoded in the GEMV",
+                    _ => "decoded from the trellis at load",
+                },
                 2 * experts.len()
             );
         }

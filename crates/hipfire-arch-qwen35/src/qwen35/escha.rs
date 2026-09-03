@@ -21,21 +21,34 @@
 //! out_features]`**. hipfire's expert slots are **OUT-MAJOR** —
 //! `experts[X].gate_up` is `[2*moe_intermediate, hidden]` (see
 //! `weights.rs:69`) and every hipfire GEMV walks K contiguously along a row.
-//! So a transpose happens, and it happens exactly once, folded into the
-//! quantise pass (`Gpu::escha_bare_to_q8_0`). A wrong orientation still
-//! yields a full-rank, plausible weight matrix, so it is gated by the G4
-//! block gate, never by "the output looks sane".
+//! So on the three DECODING stores a transpose happens, and it happens exactly
+//! once, folded into the store pass (`Gpu::escha_bare_to_q8_0` and friends). A
+//! wrong orientation still yields a full-rank, plausible weight matrix, so it
+//! is gated by the G4 block gate, never by "the output looks sane".
+//!
+//! [`EschaWeightStore::Native`] keeps escha's in-major grid instead, because
+//! it stores the code and never materialises a matrix at all; the fused GEMV
+//! addresses the in-major tile grid directly. Same hazard, same gate.
 //!
 //! hipfire's `gate_up` slot is already FUSED (gate ‖ up), matching escha's
 //! single fused `gate_up_proj`, so there is no concat step.
 //!
-//! ## Why the weights land as `Q8_0`
+//! ## Why production stores the CODE (Phase 2)
 //!
-//! The decoded weight is bare fp16. Storing it as fp16 for the whole model is
-//! 60 GiB of experts; `Q8_0` is 32 GiB. The re-quantisation is NOT free — it
-//! is the dominant error term in the G4 block gate, measured there against a
-//! weight-exact F32 control arm. [`EschaWeightStore::F32`] exists to make that
-//! measurement possible; it is a diagnostic, not a way to run the 35B model.
+//! Phase 1 decoded to `Q8_0` at load: 1.0625 B/weight, 34.2 GB of routed
+//! experts, 37.55 GB resident, and 1.07 GB of routed-expert traffic on every
+//! decode token. That put a hard 69 tok/s roofline on a box measured at
+//! 209 GB/s — under the 71.8 tok/s the comparable `qwen3.6:35b-a3b-mq4r` SKU
+//! already reaches, so Q8_0 could not have won at any efficiency.
+//!
+//! [`EschaWeightStore::Native`] stores the trellis code verbatim (2.00 bpw for
+//! the K=2 gate_up, 3.00 for the K=3 down) and decodes it inside the routed
+//! GEMV. It is both smaller AND weight-exact — the `Q8_0` re-quantisation that
+//! dominates the G4 block gate's error simply does not happen. The remaining
+//! decoding stores are measurement arms: [`EschaWeightStore::Q8_0`] is Phase 1,
+//! kept because every published Phase 1 number was measured on it,
+//! [`EschaWeightStore::F16`] is the G5 KLD reference, and
+//! [`EschaWeightStore::F32`] is a small-layer weight-exact control.
 
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -51,7 +64,36 @@ use super::weights::PackedExpertOwners;
 /// How the decoded fp16 expert weight is stored in the expert slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EschaWeightStore {
-    /// Production: transpose + Q8_0 re-quantise (1.0625 B/weight).
+    /// PRODUCTION (Phase 2): the trellis code, verbatim, not decoded at all.
+    /// 0.25 B/weight at K=2 and 0.375 at K=3 — a quarter of Q8_0 — and the
+    /// routed GEMV decodes it in-register
+    /// (`Gpu::escha_gemv_native_moe_k8_indexed_batched`).
+    ///
+    /// This is the arm that makes the port fast, and it is fast for exactly
+    /// one reason: the expanded copy stops existing, so it stops crossing the
+    /// bus. At A3B shapes the routed half of a decode token moves 0.294 GB
+    /// instead of 1.07 GB, and the whole model 2.23 GB/token instead of 3.01
+    /// — a 94 tok/s roofline instead of 69 on this box's measured 209 GB/s.
+    /// Q8_0's 69 was BELOW the 71.8 the comparable `qwen3.6:35b-a3b-mq4r` SKU
+    /// already achieves, so no amount of efficiency could have closed it.
+    ///
+    /// It is also weight-EXACT: the fused GEMV consumes the same fp16 values
+    /// `escha_decode_tiles` would have produced, so unlike [`Self::Q8_0`] it
+    /// carries no re-quantisation error at all. Gated bit-for-bit against the
+    /// F16 store and against `escha_ref` by
+    /// `rdna-compute/examples/test_escha_native_gemv_gpu_vs_cpu.rs`.
+    ///
+    /// Requires the indexed (GPU-top-K) route: there is no per-expert
+    /// native GEMV, so `HIPFIRE_ESCHA_INDEXED=0` with this store fails loudly
+    /// in `GemvFamily::run_auto` (`RotationPlan::EschaH128` has no plain GEMV)
+    /// rather than running unrotated. The A/B lever for this store is
+    /// `HIPFIRE_ESCHA_EXPERT_STORE=q8_0`, which restores Phase 1 entirely.
+    Native,
+    /// Phase 1 production, now the A/B arm: transpose + Q8_0 re-quantise
+    /// (1.0625 B/weight). Kept because it is what every published Phase 1
+    /// number was measured on — including the G4 block gate's Q8_0 arm and the
+    /// G5 KLD headline — and because it is the only routed store that also
+    /// works through the per-expert host route.
     Q8_0,
     /// Diagnostic control arm: transpose only, F32 store (4 B/weight), so a
     /// caller can separate "the H128 wiring is wrong" from "Q8_0 costs this
@@ -391,12 +433,33 @@ pub fn load_escha_moe_experts(
 /// store. `(elems_per_slot, dtype)` — `sub_offset` counts in `dtype.size()`
 /// units, and `DType::Q8_0::size()` is 1, so the Q8_0 arm's "elements" are
 /// bytes. Pure, so the packing arithmetic is checkable without a GPU.
-fn slot_extent(store: EschaWeightStore, ic: usize, oc: usize) -> (usize, DType) {
+fn slot_extent(store: EschaWeightStore, ic: usize, oc: usize, trellis_k: usize) -> (usize, DType) {
     match store {
+        // Native holds the code stream itself: `(ic/16) * (oc/16)` tiles of
+        // `16 * trellis_k` int16. `Escha{2,3}T16::size()` is 1 (a byte dtype,
+        // like Q8_0), so these "elements" are BYTES.
+        EschaWeightStore::Native => (
+            (ic / 16) * (oc / 16) * 16 * trellis_k * 2,
+            escha_dtype(trellis_k),
+        ),
         // Q8_0 rows are `ic/32` blocks of 34 B (32 int8 + one f16 scale).
         EschaWeightStore::Q8_0 => (oc * (ic / 32) * 34, DType::Q8_0),
         EschaWeightStore::F32 => (ic * oc, DType::F32),
         EschaWeightStore::F16 => (ic * oc, DType::F16),
+    }
+}
+
+/// The `DType` that names a trellis order. This is the dtype the routed expert
+/// slot CARRIES under [`EschaWeightStore::Native`], and it is what
+/// `MoeResolution::routed_indexable_escha_native` and the batched-prefill
+/// admission arm key on — so the layer's route is decided by the same fact the
+/// GEMV's bit geometry is decided by, not by two independently-maintained
+/// flags.
+fn escha_dtype(trellis_k: usize) -> DType {
+    if trellis_k == 2 {
+        DType::Escha2T16
+    } else {
+        DType::Escha3T16
     }
 }
 
@@ -459,11 +522,48 @@ fn decode_projection(
 
     // ONE buffer for the whole projection. See `PackedExpertOwners`: the 2 MiB
     // allocation granule is charged once here instead of once per expert.
-    let (slot_elems, slot_dtype) = slot_extent(store, ic, oc);
+    let (slot_elems, slot_dtype) = slot_extent(store, ic, oc, k as usize);
     let total_elems = slot_elems
         .checked_mul(expert_ids.len())
         .ok_or_else(|| HipError::new(0, &format!("escha: {name} packed size overflow")))?;
     let owner = gpu.alloc_tensor(&[total_elems], slot_dtype)?;
+
+    // ── Native: there is nothing to decode ────────────────────────────────
+    // The slot IS the code. No `escha_decode_tiles`, no transpose, no
+    // requantise, no staging buffers — the bytes go from the file to their
+    // final resting place and the GEMV decodes them per token. This is also
+    // why an escha model loads faster on this store than on Q8_0: the decode
+    // that used to run 20 480 times at load does not run at all.
+    //
+    // The code keeps escha's own IN-major `[ic/16, oc/16, 16*k]` tile grid.
+    // The out-major transpose the other three stores fold in is not skipped
+    // here so much as absorbed: the fused GEMV addresses tiles in the in-major
+    // grid directly (see `escha_moe_gemv_native.hip`).
+    if store == EschaWeightStore::Native {
+        debug_assert_eq!(slot_elems, bytes_per_expert);
+        let mut out = Vec::with_capacity(expert_ids.len());
+        for (slot, &x) in expert_ids.iter().enumerate() {
+            let src = &data[x * bytes_per_expert..(x + 1) * bytes_per_expert];
+            let buf = owner.sub_offset(slot * slot_elems, slot_elems);
+            if let Err(error) = gpu.hip.memcpy_htod(&buf.buf, src) {
+                let _ = gpu.free_tensor(owner);
+                return Err(error);
+            }
+            out.push(WeightTensor {
+                buf,
+                gpu_dtype: slot_dtype,
+                // `m` / `k` stay the LOGICAL matrix shape, exactly as on every
+                // other store, because that is what the executor passes to the
+                // GEMV. The dtype is what says the bytes are trellis code.
+                m: oc,
+                k: ic,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        return Ok((out, owner));
+    }
 
     // `escha_decode_tiles` validates `code.numel()` in SHORTS, so the staging
     // tensor's logical length must be the i16 count (F16 gives the right
@@ -503,6 +603,8 @@ fn decode_projection(
                 EschaWeightStore::Q8_0 => gpu.escha_bare_to_q8_0(&bare, &buf, ic, oc)?,
                 EschaWeightStore::F32 => gpu.escha_bare_to_f32(&bare, &buf, ic, oc)?,
                 EschaWeightStore::F16 => gpu.escha_bare_to_f16(&bare, &buf, ic, oc)?,
+                // Returned above, before any staging buffer was allocated.
+                EschaWeightStore::Native => unreachable!("native store returns before decoding"),
             }
             out.push(WeightTensor {
                 buf,
@@ -540,15 +642,46 @@ mod tests {
     #[test]
     fn q8_0_slot_extent_matches_the_a3b_projection_sizes() {
         // gate_up: ic = hidden = 2048, oc = 2*mi = 1024.
-        let (gu, gu_dtype) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024);
+        let (gu, gu_dtype) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024, 2);
         assert_eq!(gu_dtype, DType::Q8_0);
         assert_eq!(gu, 2_228_224, "gate_up slot is 2.125 MiB");
         // down: ic = mi = 512, oc = hidden = 2048.
-        let (dn, _) = slot_extent(EschaWeightStore::Q8_0, 512, 2048);
+        let (dn, _) = slot_extent(EschaWeightStore::Q8_0, 512, 2048, 3);
         assert_eq!(dn, 1_114_112, "down slot is 1.0625 MiB");
         // 256 experts x 40 layers x both projections = the 34.2 GB of real
         // weight bytes the 67.9 GB of granules was hiding.
         assert_eq!((gu + dn) * 256 * 40, 34_225_520_640);
+    }
+
+    /// The Native (Phase 2) store's slot arithmetic, at the real A3B shapes,
+    /// against the code sizes on disk. These are the numbers the whole Phase-2
+    /// memory claim rests on, so they are asserted rather than asserted-about:
+    /// a wrong stride would place every expert after slot 0 at a wrong offset
+    /// and — because trellis code decodes to *something* from any bit pattern
+    /// — produce finite, plausible, wrong weights rather than a fault.
+    #[test]
+    fn native_slot_extent_matches_the_a3b_code_sizes() {
+        // gate_up: ic = hidden = 2048, oc = 2*mi = 1024, K=2.
+        let (gu, gu_dtype) = slot_extent(EschaWeightStore::Native, 2048, 1024, 2);
+        assert_eq!(gu_dtype, DType::Escha2T16);
+        assert_eq!(gu_dtype.size(), 1, "escha code offsets are byte offsets");
+        assert_eq!(gu, 524_288, "gate_up code is 512 KiB (2.00 bpw)");
+        // down: ic = mi = 512, oc = hidden = 2048, K=3.
+        let (dn, dn_dtype) = slot_extent(EschaWeightStore::Native, 512, 2048, 3);
+        assert_eq!(dn_dtype, DType::Escha3T16);
+        assert_eq!(dn, 393_216, "down code is 384 KiB (3.00 bpw)");
+
+        // Exactly 2.00 / 3.00 bits per weight — the format's own figures, so
+        // this also catches a tile-count or word-count slip.
+        assert_eq!(gu * 8, 2048 * 1024 * 2);
+        assert_eq!(dn * 8, 512 * 2048 * 3);
+
+        // 256 experts x 40 layers x both projections. The Q8_0 store's 34.2 GB
+        // of the same weights is 3.73x this.
+        assert_eq!((gu + dn) * 256 * 40, 9_395_240_960);
+        let (q8_gu, _) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024, 2);
+        let (q8_dn, _) = slot_extent(EschaWeightStore::Q8_0, 512, 2048, 3);
+        assert!((q8_gu + q8_dn) > 3 * (gu + dn));
     }
 
     /// `sub_offset` counts in `dtype.size()` units. Q8_0 is a byte dtype, so
@@ -556,17 +689,17 @@ mod tests {
     /// counts. Getting that wrong scales every offset by 2 or 4.
     #[test]
     fn slot_extent_is_in_dtype_units_not_bytes() {
-        let (f32_elems, f32_dtype) = slot_extent(EschaWeightStore::F32, 2048, 1024);
+        let (f32_elems, f32_dtype) = slot_extent(EschaWeightStore::F32, 2048, 1024, 2);
         assert_eq!(f32_dtype, DType::F32);
         assert_eq!(f32_elems, 2048 * 1024);
         assert_eq!(f32_elems * DType::F32.size(), 8 * 1024 * 1024);
 
-        let (f16_elems, f16_dtype) = slot_extent(EschaWeightStore::F16, 2048, 1024);
+        let (f16_elems, f16_dtype) = slot_extent(EschaWeightStore::F16, 2048, 1024, 2);
         assert_eq!(f16_dtype, DType::F16);
         assert_eq!(f16_elems, 2048 * 1024);
         assert_eq!(f16_elems * DType::F16.size(), 4 * 1024 * 1024);
 
-        let (q8_elems, q8_dtype) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024);
+        let (q8_elems, q8_dtype) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024, 2);
         assert_eq!(q8_dtype.size(), 1, "Q8_0 offsets are byte offsets");
         assert_eq!(q8_elems * q8_dtype.size(), 2_228_224);
     }
@@ -577,7 +710,7 @@ mod tests {
     #[test]
     fn a3b_slot_strides_are_widely_aligned() {
         for (ic, oc) in [(2048usize, 1024usize), (512, 2048)] {
-            let (elems, dtype) = slot_extent(EschaWeightStore::Q8_0, ic, oc);
+            let (elems, dtype) = slot_extent(EschaWeightStore::Q8_0, ic, oc, 2);
             assert_eq!(elems * dtype.size() % 1024, 0, "{ic}x{oc} stride alignment");
         }
     }

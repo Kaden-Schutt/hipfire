@@ -76,13 +76,30 @@ __device__ __forceinline__ __half escha_native_cba(unsigned short state) {
     return __hadd(lo, hi);  // fp16 RNE add — matches the reference exactly
 }
 
-// Load tile word `i` (a little-endian pair of int16s), as in
-// `escha_decode_tiles::escha_load_word`. `off` is the word's SHORT offset
-// (`2 * i`), precomputed once per lane because it is loop-invariant.
-__device__ __forceinline__ unsigned int escha_native_word(
-    const short* __restrict__ tile, int off) {
-    return ((unsigned int)(unsigned short)tile[off]) |
-           (((unsigned int)(unsigned short)tile[off + 1]) << 16);
+// Load tile word `i` — the little-endian pair of int16s
+// `escha_decode_tiles::escha_load_word` assembles from two `short` reads.
+//
+// ONE dword load, not two ushort loads. It is the same value on any
+// little-endian target, and it is 2x fewer memory INSTRUCTIONS per weight,
+// which is what this kernel is actually short of: at the shapes that matter it
+// moves 4 MiB per launch and is nowhere near bandwidth-bound, so the vector
+// memory issue rate is the limit. The compiler cannot make this merge itself —
+// it would have to prove the short offset is even.
+//
+// Alignment: a tile begins at `(kt*tn + nt) * 32*TRELLIS_K` bytes from the
+// expert's base, which is a multiple of 64 (K=2) or 96 (K=3), and every expert
+// slot is at a multiple of the whole projection's byte size. So the dword view
+// is always 4-byte aligned.
+//
+// ADDRESS SPACE 1, explicitly. `expert_ptrs[...]` is a 64-bit integer loaded at
+// runtime, so the compiler cannot prove the pointer it becomes is global and
+// emits `flat_load_b32` — which on gfx1151 pays an aperture check the whole
+// inner loop then waits on. The cast makes it `global_load_b32`. Measured on
+// the shipped gate_up projection this was worth 1.6x on its own.
+typedef __attribute__((address_space(1))) const unsigned int* EschaCodePtr;
+
+__device__ __forceinline__ unsigned int escha_native_word(EschaCodePtr tile, int i) {
+    return tile[i];
 }
 
 // Where the state for tile element (row, col) lives.
@@ -117,14 +134,14 @@ __device__ __forceinline__ int escha_native_j_of(int row, int col) {
 // the widest total is 30, and 30 + 16 <= 64, so the truncation to
 // `unsigned short` selects the identical bits.
 __device__ __forceinline__ void escha_native_slot_k2(
-    int row, int col, int* off_a, int* off_b, int* shift) {
+    int row, int col, int* word_a, int* word_b, int* shift) {
     const int lane = escha_native_lane_of(row, col);
     const int j = escha_native_j_of(row, col);
     const int t_off = lane * 8;
     const int i1 = t_off >> 4;
     const int i0 = (i1 + 15) & 15;
-    *off_a = 2 * i0;                        // the high half of `merged`
-    *off_b = 2 * i1;                        // the low half
+    *word_a = i0;                           // the high half of `merged`
+    *word_b = i1;                           // the low half
     *shift = (((~t_off) & 8) << 1) + 2 * (7 - j);
 }
 
@@ -137,7 +154,7 @@ __device__ __forceinline__ void escha_native_slot_k2(
 // shift is 32 + 12 + 9 = 53 — under 64, so composing is defined, and the bits
 // past 63 that the original's 32-bit truncation dropped are zeros either way.
 __device__ __forceinline__ void escha_native_slot_k3(
-    int row, int col, int* off_a, int* off_b, int* shift) {
+    int row, int col, int* word_a, int* word_b, int* shift) {
     const int BITS = 3;
     const int lane = escha_native_lane_of(row, col);
     const int j = escha_native_j_of(row, col);
@@ -148,8 +165,8 @@ __device__ __forceinline__ void escha_native_slot_k3(
     const int i0 = b0 >> 5;
     const int i2 = (b2 - 1) >> 5;
     const int s2 = ((i2 + 1) << 5) - b2;
-    *off_a = 2 * (i0 % 24);                 // the high half of `merged`
-    *off_b = 2 * (i2 % 24);                 // the low half
+    *word_a = i0 % 24;                      // the high half of `merged`
+    *word_b = i2 % 24;                      // the low half
     *shift = s2 + (j < 4 ? BITS * 4 : 0) + BITS * (3 - (j & 3));
 }
 
@@ -168,13 +185,14 @@ __device__ __forceinline__ void escha_native_slot_k3(
 
 template <int TRELLIS_K>
 __device__ __forceinline__ void escha_native_slot(
-    int row, int col, int* off_a, int* off_b, int* shift) {
-    if (TRELLIS_K == 2) escha_native_slot_k2(row, col, off_a, off_b, shift);
-    else                escha_native_slot_k3(row, col, off_a, off_b, shift);
+    int row, int col, int* word_a, int* word_b, int* shift) {
+    if (TRELLIS_K == 2) escha_native_slot_k2(row, col, word_a, word_b, shift);
+    else                escha_native_slot_k3(row, col, word_a, word_b, shift);
 }
 
 // Narrow form (Q8_0 twin: `escha_gemv_q8_0_moe_k8_indexed_batched`, K > 1536).
-// One accumulator; lane `t` owns contraction indices t, t+32, t+64, ...
+// One accumulator per output row; lane `t` owns contraction indices
+// t, t+32, t+64, ...
 template <int TRELLIS_K>
 __device__ __forceinline__ void escha_gemv_native_narrow_body(
     const unsigned long long* __restrict__ expert_ptrs,
@@ -185,12 +203,13 @@ __device__ __forceinline__ void escha_gemv_native_narrow_body(
 ) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 16 + warp;
-    if (row >= M) return;
+    // Two output rows per warp: tile columns `warp` and `warp + 8`.
+    const int row_lo = blockIdx.x * 16 + warp;
+    const int row_hi = row_lo + 8;
+    if (row_hi >= M) return;
     const int krank = blockIdx.y;
 
-    const short* __restrict__ code =
-        reinterpret_cast<const short*>(expert_ptrs[topk_indices[krank]]);
+    EschaCodePtr code = (EschaCodePtr)(expert_ptrs[topk_indices[krank]]);
     const float* __restrict__ x = x_batch + (size_t)krank * K;
     float* __restrict__ y = y_batch + (size_t)krank * M;
 
@@ -202,36 +221,69 @@ __device__ __forceinline__ void escha_gemv_native_narrow_body(
     const int nt = blockIdx.x;
     const int in_row = lane & 15;
     const int tile_hi = lane >> 4;
-    int off_a, off_b, shift;
-    escha_native_slot<TRELLIS_K>(in_row, warp, &off_a, &off_b, &shift);
-
-    // Tile `kt` of column `nt` starts at `(kt*tn + nt) * 16*TRELLIS_K` shorts.
-    // This lane's tile in iteration `bi` is `kt = bi*2 + tile_hi`, so the base
-    // is a loop-invariant origin plus `bi` times two strips.
-    const size_t strip = (size_t)tn * (16 * TRELLIS_K);
-    const short* __restrict__ strip0 =
-        code + (size_t)nt * (16 * TRELLIS_K) + (size_t)tile_hi * strip;
-
-    const int blocks_per_row = K / 32;
-    float sum = 0.0f;
-    for (int bi = 0; bi < blocks_per_row; bi++) {
-        const short* __restrict__ tile = strip0 + (size_t)bi * 2 * strip;
-        const unsigned long long merged =
-            ((unsigned long long)escha_native_word(tile, off_a) << 32) |
-            escha_native_word(tile, off_b);
-        const __half w = escha_native_cba((unsigned short)(merged >> shift));
-        sum += __half2float(w) * x[bi * 32 + lane];
+    int word_a, word_b, shift_lo, shift_hi;
+    int word_a2, word_b2;
+    escha_native_slot<TRELLIS_K>(in_row, warp, &word_a, &word_b, &shift_lo);
+    escha_native_slot<TRELLIS_K>(in_row, warp + 8, &word_a2, &word_b2, &shift_hi);
+    // Columns `c` and `c + 8` share a window — see the comment on this
+    // function's grid, and the algebra: the lane index the tile decoder uses is
+    // `((col>>1)&3)*8 + (col&1)*4 + ((row&7)>>1)`, and `(col>>1)&3` is
+    // unchanged by +8 while `col&1` is unchanged outright. Only `j` moves, by
+    // 4, which is a shift. If that ever stops holding, the two columns would
+    // silently read each other's weights, so poison the output loudly instead:
+    // every escha gate asserts finiteness, and nothing else in the pipeline
+    // manufactures a NaN.
+    if (word_a2 != word_a || word_b2 != word_b) {
+        if (lane == 0) { y[row_lo] = __builtin_nanf(""); y[row_hi] = __builtin_nanf(""); }
+        return;
     }
 
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
-    if (lane == 0) y[row] = sum;
+    // Tile `kt` of column `nt` starts at `(kt*tn + nt) * 8*TRELLIS_K` DWORDS.
+    // This lane's tile in iteration `bi` is `kt = bi*2 + tile_hi`, so the base
+    // is a loop-invariant origin plus `bi` times two strips.
+    const size_t strip = (size_t)tn * (8 * TRELLIS_K);
+    EschaCodePtr strip0 = code + (size_t)nt * (8 * TRELLIS_K) + (size_t)tile_hi * strip;
+
+    const int blocks_per_row = K / 32;
+    float sum_lo = 0.0f, sum_hi = 0.0f;
+    // UNROLL 4 is not cosmetic. Un-unrolled, the compiler emits the two code
+    // loads and then `s_waitcnt vmcnt(1)` in the same iteration: the loop has
+    // exactly one memory round trip of latency to hide per 42 instructions and
+    // nothing to hide it with. Unrolling puts eight loads in flight before the
+    // first wait. It does NOT touch the arithmetic: `sum_lo`/`sum_hi` stay a
+    // single sequential FMA chain each, in `bi` order, which is what the
+    // bit-exactness contract is about.
+    //
+    // The wide form needs no such pragma — its quad structure already carries
+    // four independent iterations, which is exactly why it was measured at
+    // 105 GB/s while this one sat at 33.
+    #pragma unroll 4
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        EschaCodePtr tile = strip0 + (size_t)bi * 2 * strip;
+        const unsigned long long merged =
+            ((unsigned long long)escha_native_word(tile, word_a) << 32) |
+            escha_native_word(tile, word_b);
+        const __half w_lo = escha_native_cba((unsigned short)(merged >> shift_lo));
+        const __half w_hi = escha_native_cba((unsigned short)(merged >> shift_hi));
+        const float xv = x[bi * 32 + lane];
+        sum_lo += __half2float(w_lo) * xv;
+        sum_hi += __half2float(w_hi) * xv;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_lo += __shfl_down(sum_lo, offset);
+        sum_hi += __shfl_down(sum_hi, offset);
+    }
+    if (lane == 0) {
+        y[row_lo] = sum_lo;
+        y[row_hi] = sum_hi;
+    }
 }
 
 // Wide form (Q8_0 twin: `escha_gemv_q8_0_wide_moe_k8_indexed_batched`,
-// K <= 1536). Four interleaved accumulators with the `(acc0+acc1)+(acc2+acc3)`
-// fold. The tail's `acc[t]` assignment is copied verbatim, including the fact
-// that `t == 3` is unreachable.
+// K <= 1536). Four interleaved accumulators per output row with the
+// `(acc0+acc1)+(acc2+acc3)` fold. The tail's `acc[t]` assignment is copied
+// verbatim, including the fact that `t == 3` is unreachable.
 template <int TRELLIS_K>
 __device__ __forceinline__ void escha_gemv_native_wide_body(
     const unsigned long long* __restrict__ expert_ptrs,
@@ -242,12 +294,12 @@ __device__ __forceinline__ void escha_gemv_native_wide_body(
 ) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 16 + warp;
-    if (row >= M) return;
+    const int row_lo = blockIdx.x * 16 + warp;
+    const int row_hi = row_lo + 8;
+    if (row_hi >= M) return;
     const int krank = blockIdx.y;
 
-    const short* __restrict__ code =
-        reinterpret_cast<const short*>(expert_ptrs[topk_indices[krank]]);
+    EschaCodePtr code = (EschaCodePtr)(expert_ptrs[topk_indices[krank]]);
     const float* __restrict__ x = x_batch + (size_t)krank * K;
     float* __restrict__ y = y_batch + (size_t)krank * M;
 
@@ -255,74 +307,96 @@ __device__ __forceinline__ void escha_gemv_native_wide_body(
     const int nt = blockIdx.x;
     const int in_row = lane & 15;
     const int tile_hi = lane >> 4;
-    int off_a, off_b, shift;
-    escha_native_slot<TRELLIS_K>(in_row, warp, &off_a, &off_b, &shift);
+    int word_a, word_b, shift_lo, shift_hi;
+    int word_a2, word_b2;
+    escha_native_slot<TRELLIS_K>(in_row, warp, &word_a, &word_b, &shift_lo);
+    escha_native_slot<TRELLIS_K>(in_row, warp + 8, &word_a2, &word_b2, &shift_hi);
+    // See the narrow form: columns `c` and `c + 8` provably share a window.
+    if (word_a2 != word_a || word_b2 != word_b) {
+        if (lane == 0) { y[row_lo] = __builtin_nanf(""); y[row_hi] = __builtin_nanf(""); }
+        return;
+    }
 
-    const size_t strip = (size_t)tn * (16 * TRELLIS_K);
-    const short* __restrict__ strip0 =
-        code + (size_t)nt * (16 * TRELLIS_K) + (size_t)tile_hi * strip;
+    const size_t strip = (size_t)tn * (8 * TRELLIS_K);
+    EschaCodePtr strip0 = code + (size_t)nt * (8 * TRELLIS_K) + (size_t)tile_hi * strip;
 
     const int blocks_per_row = K / 32;
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float lo0 = 0.0f, lo1 = 0.0f, lo2 = 0.0f, lo3 = 0.0f;
+    float hi0 = 0.0f, hi1 = 0.0f, hi2 = 0.0f, hi3 = 0.0f;
     const int quads = blocks_per_row >> 2;
     const int tail = blocks_per_row & 3;
 
     for (int q = 0; q < quads; q++) {
         const int bi = q << 2;
-        const short* __restrict__ t0 = strip0 + (size_t)(bi + 0) * 2 * strip;
-        const short* __restrict__ t1 = strip0 + (size_t)(bi + 1) * 2 * strip;
-        const short* __restrict__ t2 = strip0 + (size_t)(bi + 2) * 2 * strip;
-        const short* __restrict__ t3 = strip0 + (size_t)(bi + 3) * 2 * strip;
+        EschaCodePtr t0 = strip0 + (size_t)(bi + 0) * 2 * strip;
+        EschaCodePtr t1 = strip0 + (size_t)(bi + 1) * 2 * strip;
+        EschaCodePtr t2 = strip0 + (size_t)(bi + 2) * 2 * strip;
+        EschaCodePtr t3 = strip0 + (size_t)(bi + 3) * 2 * strip;
 
         const unsigned long long m0 =
-            ((unsigned long long)escha_native_word(t0, off_a) << 32) |
-            escha_native_word(t0, off_b);
+            ((unsigned long long)escha_native_word(t0, word_a) << 32) |
+            escha_native_word(t0, word_b);
         const unsigned long long m1 =
-            ((unsigned long long)escha_native_word(t1, off_a) << 32) |
-            escha_native_word(t1, off_b);
+            ((unsigned long long)escha_native_word(t1, word_a) << 32) |
+            escha_native_word(t1, word_b);
         const unsigned long long m2 =
-            ((unsigned long long)escha_native_word(t2, off_a) << 32) |
-            escha_native_word(t2, off_b);
+            ((unsigned long long)escha_native_word(t2, word_a) << 32) |
+            escha_native_word(t2, word_b);
         const unsigned long long m3 =
-            ((unsigned long long)escha_native_word(t3, off_a) << 32) |
-            escha_native_word(t3, off_b);
+            ((unsigned long long)escha_native_word(t3, word_a) << 32) |
+            escha_native_word(t3, word_b);
 
-        const __half w0 = escha_native_cba((unsigned short)(m0 >> shift));
-        const __half w1 = escha_native_cba((unsigned short)(m1 >> shift));
-        const __half w2 = escha_native_cba((unsigned short)(m2 >> shift));
-        const __half w3 = escha_native_cba((unsigned short)(m3 >> shift));
+        const float x0 = x[(bi + 0) * 32 + lane];
+        const float x1 = x[(bi + 1) * 32 + lane];
+        const float x2 = x[(bi + 2) * 32 + lane];
+        const float x3 = x[(bi + 3) * 32 + lane];
 
-        acc0 += __half2float(w0) * x[(bi + 0) * 32 + lane];
-        acc1 += __half2float(w1) * x[(bi + 1) * 32 + lane];
-        acc2 += __half2float(w2) * x[(bi + 2) * 32 + lane];
-        acc3 += __half2float(w3) * x[(bi + 3) * 32 + lane];
+        lo0 += __half2float(escha_native_cba((unsigned short)(m0 >> shift_lo))) * x0;
+        lo1 += __half2float(escha_native_cba((unsigned short)(m1 >> shift_lo))) * x1;
+        lo2 += __half2float(escha_native_cba((unsigned short)(m2 >> shift_lo))) * x2;
+        lo3 += __half2float(escha_native_cba((unsigned short)(m3 >> shift_lo))) * x3;
+
+        hi0 += __half2float(escha_native_cba((unsigned short)(m0 >> shift_hi))) * x0;
+        hi1 += __half2float(escha_native_cba((unsigned short)(m1 >> shift_hi))) * x1;
+        hi2 += __half2float(escha_native_cba((unsigned short)(m2 >> shift_hi))) * x2;
+        hi3 += __half2float(escha_native_cba((unsigned short)(m3 >> shift_hi))) * x3;
     }
 
     for (int t = 0; t < tail; t++) {
         const int bi = (quads << 2) + t;
-        const short* __restrict__ tp = strip0 + (size_t)bi * 2 * strip;
+        EschaCodePtr tp = strip0 + (size_t)bi * 2 * strip;
         const unsigned long long m =
-            ((unsigned long long)escha_native_word(tp, off_a) << 32) |
-            escha_native_word(tp, off_b);
-        const __half w = escha_native_cba((unsigned short)(m >> shift));
-        const float contrib = __half2float(w) * x[bi * 32 + lane];
-        if (t == 0) acc0 += contrib;
-        else if (t == 1) acc1 += contrib;
-        else if (t == 2) acc2 += contrib;
+            ((unsigned long long)escha_native_word(tp, word_a) << 32) |
+            escha_native_word(tp, word_b);
+        const float xv = x[bi * 32 + lane];
+        const float c_lo =
+            __half2float(escha_native_cba((unsigned short)(m >> shift_lo))) * xv;
+        const float c_hi =
+            __half2float(escha_native_cba((unsigned short)(m >> shift_hi))) * xv;
+        if (t == 0) { lo0 += c_lo; hi0 += c_hi; }
+        else if (t == 1) { lo1 += c_lo; hi1 += c_hi; }
+        else if (t == 2) { lo2 += c_lo; hi2 += c_hi; }
     }
 
-    float sum = (acc0 + acc1) + (acc2 + acc3);
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
-    if (lane == 0) y[row] = sum;
+    float sum_lo = (lo0 + lo1) + (lo2 + lo3);
+    float sum_hi = (hi0 + hi1) + (hi2 + hi3);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_lo += __shfl_down(sum_lo, offset);
+        sum_hi += __shfl_down(sum_hi, offset);
+    }
+    if (lane == 0) {
+        y[row_lo] = sum_lo;
+        y[row_hi] = sum_hi;
+    }
 }
 
 // ── entry points ─────────────────────────────────────────────────────────────
-// Grid: (M/16, slots, 1). Block: 512 (16 warps, one per column of the strip).
-// The host wrapper enforces `M % 16 == 0` and `K % 32 == 0`.
+// Grid: (M/16, slots, 1). Block: 256 — EIGHT warps, each covering two columns
+// of the 16-wide strip (`w` and `w + 8`), which share a decode window. The
+// host wrapper enforces `M % 16 == 0` and `K % 32 == 0`.
 
 #define ESCHA_NATIVE_GEMV(NAME, FORM, TK)                                      \
-    __launch_bounds__(512)                                                  \
+    __launch_bounds__(256)                                                  \
     extern "C" __global__ void NAME(                                           \
         const unsigned long long* __restrict__ expert_ptrs,                    \
         const int* __restrict__ topk_indices,                                  \
@@ -367,55 +441,59 @@ __device__ __forceinline__ void escha_gemv_f16_body(
 ) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 16 + warp;
-    if (row >= M) return;
     const int krank = blockIdx.y;
 
     const __half* __restrict__ A =
         reinterpret_cast<const __half*>(expert_ptrs[topk_indices[krank]]);
     const float* __restrict__ x = x_batch + (size_t)krank * K;
     float* __restrict__ y = y_batch + (size_t)krank * M;
-    const __half* __restrict__ row_data = A + (size_t)row * K;
 
-    const int blocks_per_row = K / 32;
-    float sum = 0.0f;
-    if (!WIDE) {
-        for (int bi = 0; bi < blocks_per_row; bi++) {
-            const __half w = row_data[bi * 32 + lane];
-            sum += __half2float(w) * x[bi * 32 + lane];
+    // Same two-rows-per-warp geometry as the fused kernels, so the two are
+    // launch-compatible and differ ONLY in where the weight comes from.
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int row = blockIdx.x * 16 + warp + half * 8;
+        if (row >= M) continue;
+        const __half* __restrict__ row_data = A + (size_t)row * K;
+        const int blocks_per_row = K / 32;
+        float sum = 0.0f;
+        if (!WIDE) {
+            for (int bi = 0; bi < blocks_per_row; bi++) {
+                const __half w = row_data[bi * 32 + lane];
+                sum += __half2float(w) * x[bi * 32 + lane];
+            }
+        } else {
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            const int quads = blocks_per_row >> 2;
+            const int tail = blocks_per_row & 3;
+            for (int q = 0; q < quads; q++) {
+                const int bi = q << 2;
+                const __half w0 = row_data[(bi + 0) * 32 + lane];
+                const __half w1 = row_data[(bi + 1) * 32 + lane];
+                const __half w2 = row_data[(bi + 2) * 32 + lane];
+                const __half w3 = row_data[(bi + 3) * 32 + lane];
+                acc0 += __half2float(w0) * x[(bi + 0) * 32 + lane];
+                acc1 += __half2float(w1) * x[(bi + 1) * 32 + lane];
+                acc2 += __half2float(w2) * x[(bi + 2) * 32 + lane];
+                acc3 += __half2float(w3) * x[(bi + 3) * 32 + lane];
+            }
+            for (int t = 0; t < tail; t++) {
+                const int bi = (quads << 2) + t;
+                const __half w = row_data[bi * 32 + lane];
+                const float contrib = __half2float(w) * x[bi * 32 + lane];
+                if (t == 0) acc0 += contrib;
+                else if (t == 1) acc1 += contrib;
+                else if (t == 2) acc2 += contrib;
+            }
+            sum = (acc0 + acc1) + (acc2 + acc3);
         }
-    } else {
-        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-        const int quads = blocks_per_row >> 2;
-        const int tail = blocks_per_row & 3;
-        for (int q = 0; q < quads; q++) {
-            const int bi = q << 2;
-            const __half w0 = row_data[(bi + 0) * 32 + lane];
-            const __half w1 = row_data[(bi + 1) * 32 + lane];
-            const __half w2 = row_data[(bi + 2) * 32 + lane];
-            const __half w3 = row_data[(bi + 3) * 32 + lane];
-            acc0 += __half2float(w0) * x[(bi + 0) * 32 + lane];
-            acc1 += __half2float(w1) * x[(bi + 1) * 32 + lane];
-            acc2 += __half2float(w2) * x[(bi + 2) * 32 + lane];
-            acc3 += __half2float(w3) * x[(bi + 3) * 32 + lane];
-        }
-        for (int t = 0; t < tail; t++) {
-            const int bi = (quads << 2) + t;
-            const __half w = row_data[bi * 32 + lane];
-            const float contrib = __half2float(w) * x[bi * 32 + lane];
-            if (t == 0) acc0 += contrib;
-            else if (t == 1) acc1 += contrib;
-            else if (t == 2) acc2 += contrib;
-        }
-        sum = (acc0 + acc1) + (acc2 + acc3);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0) y[row] = sum;
     }
-
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
-    if (lane == 0) y[row] = sum;
 }
 
-__launch_bounds__(512)
+__launch_bounds__(256)
 extern "C" __global__ void escha_gemv_f16_moe_k8_indexed_batched(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ topk_indices,
@@ -426,7 +504,7 @@ extern "C" __global__ void escha_gemv_f16_moe_k8_indexed_batched(
     escha_gemv_f16_body<false>(expert_ptrs, topk_indices, x_batch, y_batch, M, K);
 }
 
-__launch_bounds__(512)
+__launch_bounds__(256)
 extern "C" __global__ void escha_gemv_f16_wide_moe_k8_indexed_batched(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ topk_indices,

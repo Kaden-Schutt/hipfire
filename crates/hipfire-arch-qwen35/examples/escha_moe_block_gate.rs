@@ -214,10 +214,19 @@ fn run_arm(
     // bound is what lets the golden tolerances below keep meaning ONE thing
     // for both routes.
     //
-    // Q8_0 only: the indexed GEMV decodes the Q8_0 34 B/32-element block
-    // layout, so the F32 weight-exact control arm has no indexed counterpart
-    // (and needs none — it exists to isolate wiring, which both routes share).
-    let indexed = if matches!(store, EschaWeightStore::Q8_0) {
+    // Q8_0 and Native only: the indexed GEMVs decode one specific container
+    // each (a 34 B/32-element Q8_0 block, or a 16x16 trellis tile), so the F32
+    // weight-exact control arm has no indexed counterpart — and needs none, it
+    // exists to isolate wiring, which every route shares.
+    //
+    // Native is the reverse case: it has no HOST counterpart. There is no
+    // per-expert native GEMV (`GemvFamily::run_auto` refuses an escha dtype
+    // outright, which is the fail-closed behaviour that keeps escha off a
+    // Plain GEMV), so for that store the indexed route is not a cross-check —
+    // it IS the route, and its output is what the golden comparison is made
+    // against. `host_route_supported` is the one flag that distinguishes them.
+    let host_route_supported = !matches!(store, EschaWeightStore::Native);
+    let indexed = if matches!(store, EschaWeightStore::Q8_0 | EschaWeightStore::Native) {
         let gu_ptrs: Vec<u64> = experts
             .iter()
             .map(|e| e.gate_up.buf.buf.as_ptr() as u64)
@@ -236,7 +245,12 @@ fn run_arm(
     } else {
         None
     };
-    let mut indexed_mismatches = indexed.as_ref().map(|_| 0usize);
+    // Only meaningful when there are two routes to compare.
+    let mut indexed_mismatches = indexed
+        .as_ref()
+        .filter(|_| host_route_supported)
+        .map(|_| 0usize);
+    let (gu_dtype, dn_dtype) = (experts[0].gate_up.gpu_dtype, experts[0].down.gpu_dtype);
     let mut per_token_indexed: Vec<f32> = Vec::new();
 
     for t in 0..n_tok {
@@ -252,14 +266,14 @@ fn run_arm(
             .map(|&v| v as usize)
             .collect();
         let slot_w = &scores[t * top_k..(t + 1) * top_k];
-        escha_routed_decode(
-            &ctx, gpu, &refs, &routed, &slot_ids, slot_w, &x_gpu, &out, hidden, mi,
-        )
-        .expect("escha routed decode");
+        if host_route_supported {
+            escha_routed_decode(
+                &ctx, gpu, &refs, &routed, &slot_ids, slot_w, &x_gpu, &out, hidden, mi,
+            )
+            .expect("escha routed decode");
+        }
 
-        if let (Some((gu_tbl, dn_tbl, ids_dev, wts_dev, out_idx)), Some(bad)) =
-            (indexed.as_ref(), indexed_mismatches.as_mut())
-        {
+        if let Some((gu_tbl, dn_tbl, ids_dev, wts_dev, out_idx)) = indexed.as_ref() {
             // Routing goes up ONCE, as the device buffers the GPU top-K
             // kernel would have written: ids as i32 bits in an F32 tensor,
             // scores UNROUNDED (the executor's own kernel does the f16
@@ -285,6 +299,8 @@ fn run_arm(
                     expert_down_ptrs: dn_tbl,
                     topk_indices: ids_dev,
                     topk_weights: wts_dev,
+                    gate_up_dtype: gu_dtype,
+                    down_dtype: dn_dtype,
                     gate_up_m: 2 * mi,
                     gate_up_k: hidden,
                     down_m: hidden,
@@ -299,13 +315,22 @@ fn run_arm(
             .expect("escha routed decode (indexed)");
 
             gpu.hip.device_synchronize().unwrap();
-            let host_route = gpu.download_f32(&out).unwrap();
             let idx_route = gpu.download_f32(out_idx).unwrap();
-            *bad += host_route[..hidden]
-                .iter()
-                .zip(idx_route[..hidden].iter())
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
+            if let Some(bad) = indexed_mismatches.as_mut() {
+                let host_route = gpu.download_f32(&out).unwrap();
+                *bad += host_route[..hidden]
+                    .iter()
+                    .zip(idx_route[..hidden].iter())
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            } else {
+                // Native: the indexed route is the only route, so its routed
+                // output is what the shared expert accumulates onto and what
+                // the golden comparison sees.
+                gpu.hip
+                    .memcpy_dtod_at(&out.buf, 0, &out_idx.buf, 0, hidden * 4)
+                    .unwrap();
+            }
             // Keep the per-token indexed result as the oracle for the batched
             // executor below.
             per_token_indexed.extend_from_slice(&idx_route[..hidden]);
@@ -358,6 +383,8 @@ fn run_arm(
                 expert_down_ptrs: dn_tbl,
                 topk_indices: &ids_dev,
                 topk_weights: &wts_dev,
+                gate_up_dtype: gu_dtype,
+                down_dtype: dn_dtype,
                 gate_up_m: 2 * mi,
                 gate_up_k: hidden,
                 down_m: hidden,
@@ -544,6 +571,37 @@ fn main() {
         q8_arm.max_abs, q8_arm.mean_abs
     );
 
+    // ── Arm 3: production (Native — the trellis code, fused GEMV) ────────
+    //
+    // Phase 2's production store. It is WEIGHT-EXACT: the fused GEMV consumes
+    // the same fp16 values `escha_decode_tiles` produces, so this arm carries
+    // no re-quantisation error at all and its bounds are the F32 arm's, not
+    // the Q8_0 arm's. That is the assertion below, and it is the point of
+    // running it here rather than trusting the kernel-level gate: if the store
+    // or the executor wiring lost the exactness that G7 proved at the GEMV,
+    // this arm lands on the Q8_0 arm's numbers instead of the F32 arm's.
+    let native_arm = run_arm(
+        &mut gpu,
+        &hfq,
+        layer_prefix,
+        &shared,
+        EschaWeightStore::Native,
+        &x,
+        &want,
+        &ids,
+        &scores,
+        n_tok,
+        top_k,
+        n_exp,
+        hidden,
+        mi,
+        smi,
+    );
+    println!(
+        "MoE block [Native code, fused GEMV]:   max|diff|={:.3e} mean|diff|={:.3e}",
+        native_arm.max_abs, native_arm.mean_abs
+    );
+
     // ── Indexed route == host route, bit-for-bit ─────────────────────────
     // Production decode/prefill run `escha_routed_decode_indexed`. The
     // tolerances asserted below were measured on the host-routed executor, so
@@ -568,8 +626,14 @@ fn main() {
     );
     assert!(
         f32_arm.indexed_mismatches.is_none(),
-        "the F32 control arm has no indexed counterpart (the indexed GEMV is Q8_0-only) — a \
-         Some here means the cross-check silently ran against the wrong container"
+        "the F32 control arm has no indexed counterpart (each indexed GEMV decodes one specific \
+         container) — a Some here means the cross-check silently ran against the wrong container"
+    );
+    assert!(
+        native_arm.indexed_mismatches.is_none(),
+        "the Native arm has no HOST counterpart (there is no per-expert native GEMV) — a Some \
+         here means the host route ran on trellis code, which `GemvFamily::run_auto` is supposed \
+         to refuse outright"
     );
 
     // ── Batched-prefill route == per-token indexed route, bit-for-bit ────
@@ -598,7 +662,26 @@ fn main() {
     );
     assert!(
         f32_arm.batched_mismatches.is_none(),
-        "the F32 control arm has no batched counterpart (the indexed GEMV is Q8_0-only)"
+        "the F32 control arm has no batched counterpart (each indexed GEMV decodes one specific \
+         container)"
+    );
+    // The same slot-parallel invariance has to hold for the fused kernels. It
+    // is not free: they are the only escha GEMVs whose BLOCK spans 16 output
+    // rows, so a `blockIdx`/slot mix-up would show up here and nowhere else.
+    let n_batched_native = native_arm
+        .batched_mismatches
+        .expect("the Native arm must cross-check the batched-prefill route");
+    println!(
+        "batched prefill route vs per-token indexed route [Native]: {n_batched_native} differing \
+         floats (want 0)"
+    );
+    assert_eq!(
+        n_batched_native, 0,
+        "the batched-prefill escha route disagreed with the per-token indexed route on \
+         {n_batched_native} routed-output floats with the fused native GEMV. Same three \
+         suspects as the Q8_0 case, plus one specific to these kernels: their grid is \
+         (m/16, slots) with a 512-thread block, so check that `blockIdx.y` is still the slot \
+         and that `m % 16 == 0` held."
     );
 
     let dq: Vec<f32> = q8_arm
@@ -699,6 +782,46 @@ fn main() {
     assert!(
         dq_mean <= 5e-5,
         "Q8_0 re-quantisation cost {dq_mean:.3e} exceeds 5e-5 — the quantiser regressed"
+    );
+
+    // ── Arm 3 bounds: weight-exact, so the F32 arm's bounds ──────────────
+    //
+    // Deliberately NOT the Q8_0 arm's looser 4e-4 / 6e-5. The fused GEMV
+    // decodes to the same fp16 the F32 store holds, so the only thing between
+    // this arm and the F32 arm is f32 summation ORDER (the indexed kernels'
+    // lane-strided partials against `gemv_f32`'s), which moves the last bit —
+    // not the fourth digit. Holding it to the F32 bounds is what makes "the
+    // Q8_0 re-quantisation error is gone" a checked claim rather than a hope.
+    assert!(
+        native_arm.max_abs <= 2e-4,
+        "Native arm max|diff| {:.3e} exceeds 2e-4 (the WEIGHT-EXACT bound). If this sits near \
+         the Q8_0 arm's 2.6e-4 instead, the layer is not running the fused native GEMV at all \
+         — check that the store resolved to Native, that \
+         `MoeResolution::routed_indexable_escha_native` admitted the layer, and that \
+         `escha_routed_gemv` dispatched on the escha dtype rather than falling through to the \
+         Q8_0 arm.",
+        native_arm.max_abs
+    );
+    assert!(
+        native_arm.mean_abs <= 1.2e-5,
+        "Native arm mean|diff| {:.3e} exceeds 1.2e-5 (the WEIGHT-EXACT bound; see the F32 arm's \
+         derivation of that figure)",
+        native_arm.mean_abs
+    );
+    // And state the relationship directly rather than leaving it to two
+    // separate bounds: the fused arm must be no worse than the weight-exact
+    // control, and strictly better than the re-quantised one.
+    println!(
+        "weight-exactness: native mean {:.3e} vs F32 {:.3e} vs Q8_0 {:.3e}",
+        native_arm.mean_abs, f32_arm.mean_abs, q8_arm.mean_abs
+    );
+    assert!(
+        native_arm.mean_abs < q8_arm.mean_abs,
+        "the Native arm's mean|diff| {:.3e} is not better than the Q8_0 arm's {:.3e}. The fused \
+         GEMV uses exactly-decoded weights and Q8_0 re-quantises them, so this can only mean \
+         the Native arm did not actually run the fused path.",
+        native_arm.mean_abs,
+        q8_arm.mean_abs
     );
 
     println!("G4 PASS");

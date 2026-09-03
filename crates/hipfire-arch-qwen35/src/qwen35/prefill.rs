@@ -2425,12 +2425,28 @@ fn moe_ffn_batched_admissible_for_dtypes(
     // body above serves; a different shared dtype would be a different model
     // and should get its own arm rather than silently borrow this one.
     //
-    // Q8_0 on both routed sides is load-bearing for the same reason as every
-    // other uniform arm: the indexed GEMV decodes a 34 B/32-element block
-    // layout and any other container is silent corruption, not a fault.
+    // The ROUTED side admits exactly the two containers the escha indexed
+    // executor has a GEMV for, and the pair must be uniform-in-kind:
+    //
+    //   * `Escha2T16` / `Escha3T16` — Phase 2 production. The routed experts
+    //     are the trellis CODE and `escha_gemv_native_*` decodes it inside the
+    //     GEMV. Either order on either projection (the shipped file is K=2
+    //     gate_up / K=3 down; the reverse allocation is equally valid), which
+    //     is exactly what `MoeResolution::routed_indexable_escha_native`
+    //     admits on the decode side — this is its prefill twin and the two
+    //     must agree or a layer batches in prefill and does not in decode.
+    //   * `Q8_0` on both — Phase 1, the A/B arm.
+    //
+    // The container is load-bearing for the same reason as every other uniform
+    // arm: each escha GEMV hard-codes one bit geometry (a 34 B/32-element Q8_0
+    // block, or a 16x16 trellis tile) and handing it the other reads different
+    // weights out of the same bytes — silent corruption, not a fault.
+    let escha_routed_ok = (dtypes.expert_gate_up == DType::Q8_0
+        && dtypes.expert_down == DType::Q8_0)
+        || (matches!(dtypes.expert_gate_up, DType::Escha2T16 | DType::Escha3T16)
+            && matches!(dtypes.expert_down, DType::Escha2T16 | DType::Escha3T16));
     if dtypes.escha
-        && dtypes.expert_gate_up == DType::Q8_0
-        && dtypes.expert_down == DType::Q8_0
+        && escha_routed_ok
         && dtypes.shared_expert_gate == DType::Q8_0
         && dtypes.shared_expert_up == DType::Q8_0
         && dtypes.shared_expert_down == DType::Q8_0
