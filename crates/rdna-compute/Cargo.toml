@@ -50,6 +50,9 @@ required-features = ["lab"]
 [[example]]
 name = "bench_decode_attention"
 required-features = ["lab"]
+[[example]]
+name = "bench_dflash_verify_shapes"
+required-features = ["lab"]
 
 [[example]]
 name = "bench_dispatch_floor"
