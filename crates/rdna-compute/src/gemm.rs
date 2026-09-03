@@ -28036,21 +28036,37 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
-        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
-        // base kernel (one wave32 per 16x16 tile) launches too few waves to
+        // Exact gfx1100 DFlash verify tier: LDS-staged residual for N<=16, where
+        // the base kernel (one wave32 per 16x16 tile) launches too few waves to
         // cover 96 CUs. Capture-SAFE (unlike the mw_lds tier below): the
         // kernel is deterministic (fixed wave-order LDS reduction, no
         // atomics), launches via launch_maybe_blob (blob ABI recorded under
         // capture), and its symbols carry the replay.rs kernarg contract, so
-        // verify-graph capture bakes ks4_lds and every replayed cycle keeps
+        // verify-graph capture bakes ldsstage and every replayed cycle keeps
         // the win. Only Redline tape recording keeps the base contract.
-        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 (flags.residual_ksplit_off).
+        // Kill switches: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the
+        // ldsstage and ksplit kernels (flags.residual_ksplit_off);
+        // HIPFIRE_RESIDUAL_LDSSTAGE_OFF=1 forces ks4 for A/B
+        // (flags.residual_ldsstage_off).
         if !self.replay.is_recording()
             && !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && batch_size <= 16
         {
+            if !self.flags.residual_ldsstage_off && k % 512 == 0 && k > 0 {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+                    a_raw, x, y, m, k, batch_size,
+                );
+            }
+            if self.flags.residual_ldsstage_off {
+                let g = k / 256;
+                if k % 256 == 0 && g >= 4 && g % 4 == 0 {
+                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                        a_raw, x, y, m, k, batch_size, 4,
+                    );
+                }
+            }
             if let Some(kw) = Self::residual_ksplit_kw(k) {
                 return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
                     a_raw, x, y, m, k, batch_size, kw,
@@ -28452,6 +28468,102 @@ impl Gpu {
         }
         result
     }
+    /// MQ4V2 gfx1100 LDS-staged residual — DFlash verify tier (N<=16).
+    ///
+    /// gfx1100 port of the gfx12 ldsstage design: one 16x16 output tile per
+    /// 8-wave block, cooperative 16-row x 512-K RAW slab staging, per-wave
+    /// 64-wide K slices consumed from LDS as gfx11 WMMA fragments, wave-0
+    /// fixed-order reduce with a single Y +=. Exact gfx1100 only. Grid:
+    /// ceil(M/16) x ceil(N/16); block 256; FP16 X once; blob-safe ABI +
+    /// profile timer. Preserves fused `Y += W@X`. Requires K % 512 == 0;
+    /// otherwise falls back to ks4 (or the ks table / base when ks4 cannot
+    /// run), so direct callers never observe an Err for odd-K shapes.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if k % 512 != 0 {
+            let g = k / 256;
+            if k % 256 == 0 && g >= 4 && g % 4 == 0 {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, 4,
+                );
+            }
+            if let Some(kw) = Self::residual_ksplit_kw(k) {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, kw,
+                );
+            }
+            return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage: exact gfx1100 required (got {})",
+                    self.arch
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage";
+        const FUNC: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC,
+            FUNC,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4V2 gfx1151 residual batch-tile (BT4/6/8) — default-off.
     ///
     /// Direct harness entry for exact gfx1151. Reuses the same portable gfx11
