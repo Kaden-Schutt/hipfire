@@ -1965,6 +1965,16 @@ fn finish_qwen35_load(
                 Some(s)
             }
             Err(e) => {
+                if ctx.spec.dflash == Some(true) {
+                    return Err(rollback_unfinished_qwen35(
+                        format!(
+                            "DFlash draft required (dflash_mode=on) but failed to load ({dp}): {e}"
+                        ),
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
                 eprintln!(
                     "  DFlash draft load failed ({}): {} — falling back to AR only",
                     dp, e
