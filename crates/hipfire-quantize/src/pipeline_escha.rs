@@ -272,16 +272,104 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
         }
     }
 
-    // `config` is the parsed config.json verbatim: `config_from_metadata_json`
-    // (hipfire-arch-qwen35) requires it to reconstruct the arch config at load
-    // time, and it self-detects the nested `text_config`/`vision_config` these
-    // VL-shaped checkpoints carry — do not flatten or pre-process it here.
+    let metadata = build_metadata(src_dir, &cfg, version, method)?;
+    write_hfq(out, arch, &metadata, &tensors, None).map_err(|e| e.to_string())
+}
+
+/// Build the HFQ `metadata_json` envelope.
+///
+/// The envelope shape is NOT free-form. It mirrors `pipeline.rs`'s envelope
+/// key-for-key and only ADDS the `escha` provenance key:
+///
+/// * `config` — the parsed config.json verbatim. `config_from_metadata_json`
+///   (hipfire-arch-qwen35) requires it to reconstruct the arch config at load
+///   time, and it self-detects the nested `text_config`/`vision_config` these
+///   VL-shaped checkpoints carry — do not flatten or pre-process it here.
+/// * `tokenizer` — tokenizer.json verbatim as a STRING, not a nested object.
+///   That is what `Tokenizer::from_hfq_metadata` expects; anything else and it
+///   returns `MetadataMissing { field: "tokenizer | gguf_meta" }`. vocab.json
+///   and merges.txt are NOT carried separately — tokenizer.json already holds
+///   the BPE vocab and merge table, and no reader looks for the sidecars.
+/// * `tokenizer_config` — carries `chat_template`, the ONLY key
+///   `HfqFile::chat_template()` reads and hence the only source
+///   `resolve_chat_template` has for arch 5/6.
+/// * `generation_config` — authoritative bos/eos ids. Escha's is an ARRAY eos
+///   `[248046, 248044]`, so `from_hfq_metadata` keeps its heuristic eos; the
+///   bos scalar 248044 still overrides.
+fn build_metadata(
+    src_dir: &Path,
+    cfg: &serde_json::Value,
+    version: &str,
+    method: &str,
+) -> Result<String, String> {
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        std::fs::read_to_string(src_dir.join(name))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    };
+
+    let tokenizer_str = std::fs::read_to_string(src_dir.join("tokenizer.json")).ok();
+    if tokenizer_str.is_none() {
+        return Err(format!(
+            "escha: no tokenizer.json in {} — the .hfq would convert cleanly and \
+             then be unservable (Tokenizer::from_hfq_metadata would fail). \
+             Refusing to write a model that cannot be driven.",
+            src_dir.display()
+        ));
+    }
+
+    // Some checkpoints ship the Jinja template in a `chat_template.jinja`
+    // sidecar rather than inside tokenizer_config.json. Fold it in only when
+    // tokenizer_config lacks one — an existing template wins, same rule as
+    // `pipeline.rs`.
+    let tokenizer_config = {
+        let mut tc = read_json("tokenizer_config.json");
+        let jinja_path = src_dir.join("chat_template.jinja");
+        if jinja_path.exists() {
+            let has_template = tc
+                .as_ref()
+                .and_then(|v| v.get("chat_template"))
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !has_template {
+                if let Ok(jinja) = std::fs::read_to_string(&jinja_path) {
+                    let n = jinja.len();
+                    let obj = tc.get_or_insert_with(|| serde_json::json!({}));
+                    if let Some(map) = obj.as_object_mut() {
+                        map.insert(
+                            "chat_template".to_string(),
+                            serde_json::Value::String(jinja),
+                        );
+                        eprintln!(
+                            "  embedded chat_template.jinja into tokenizer_config ({n} bytes)"
+                        );
+                    }
+                }
+            }
+        }
+        tc
+    };
+    if tokenizer_config
+        .as_ref()
+        .and_then(|v| v.get("chat_template"))
+        .and_then(|v| if v.is_null() { None } else { Some(v) })
+        .is_none()
+    {
+        eprintln!(
+            "escha: warning: no chat_template in tokenizer_config.json and no \
+             chat_template.jinja sidecar — the daemon will fall back to a \
+             hand-rolled frame for this instruct model"
+        );
+    }
+
     let metadata = serde_json::json!({
         "config": cfg,
+        "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
+        "tokenizer_config": tokenizer_config,
+        "generation_config": read_json("generation_config.json"),
         "escha": { "format_version": version, "quant_method": method },
-    })
-    .to_string();
-    write_hfq(out, arch, &metadata, &tensors, None).map_err(|e| e.to_string())
+    });
+    serde_json::to_string(&metadata).map_err(|e| format!("serialize metadata: {e}"))
 }
 
 /// Escha's int8 is per-output-ROW; hipfire's `Q8_0` is per-32-element block
@@ -493,6 +581,25 @@ mod convert_escha_tests {
         });
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
 
+        // A real escha checkpoint always ships these; without them the .hfq
+        // converts cleanly and is then unservable, which is the regression
+        // `tokenizer_and_chat_template_land_in_metadata` pins.
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},"added_tokens":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"add_bos_token":false,"chat_template":"ESCHA_TEMPLATE"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("generation_config.json"),
+            r#"{"bos_token_id":1,"eos_token_id":[1,0]}"#,
+        )
+        .unwrap();
+
         let code = code_bytes();
 
         let rin: Vec<u16> = (0..4).map(|i| f16_rne(1.0 + i as f32 * 0.1)).collect();
@@ -582,5 +689,52 @@ mod convert_escha_tests {
             .tensor_data("layers.0.mlp.up_proj.escha_code")
             .expect("escha_code tensor must survive conversion");
         assert_eq!(out_code, code_bytes().as_slice());
+    }
+
+    /// The converter originally emitted only `config` + `escha`, so the .hfq
+    /// carried no tokenizer, no chat template and no generation_config: it
+    /// converted cleanly, passed G1, and could not be served at all. Pin the
+    /// exact keys the readers use — `Tokenizer::from_hfq_metadata` wants
+    /// `tokenizer` as a STRING, and `HfqFile::chat_template()` reads ONLY
+    /// `tokenizer_config.chat_template`.
+    #[test]
+    fn tokenizer_and_chat_template_land_in_metadata() {
+        let src = TempCheckpointDir::new("tok");
+        build_fixture(&src.0);
+        let out = src.0.join("out.hfq");
+        convert_escha(&src.0, &out).expect("conversion must succeed");
+        let hf = HfqFile::open(&out).expect("output must parse");
+
+        let meta: serde_json::Value = serde_json::from_str(&hf.metadata_json).unwrap();
+        let tok = meta["tokenizer"]
+            .as_str()
+            .expect("`tokenizer` must be a STRING holding tokenizer.json verbatim");
+        assert!(tok.contains("\"vocab\""), "tokenizer.json must be verbatim");
+        assert_eq!(meta["tokenizer_config"]["add_bos_token"], false);
+        assert_eq!(meta["generation_config"]["bos_token_id"], 1);
+        // The provenance key must survive alongside the new siblings.
+        assert_eq!(meta["escha"]["quant_method"], "eschamoe");
+
+        // The reader paths themselves, not just the raw keys.
+        assert_eq!(
+            hf.chat_template().as_deref(),
+            Some("ESCHA_TEMPLATE"),
+            "resolve_chat_template (arch 5|6) reads this and nothing else"
+        );
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hf.metadata_json)
+            .expect("the embedded metadata must build a working Tokenizer");
+    }
+
+    /// A checkpoint with no tokenizer.json cannot produce a servable model.
+    /// Fail at convert time rather than shipping a 12 GB file that only fails
+    /// when someone tries to run it — same fail-closed rule this converter
+    /// applies to unknown escha leaves and incomplete linears.
+    #[test]
+    fn missing_tokenizer_is_rejected() {
+        let src = TempCheckpointDir::new("notok");
+        build_fixture(&src.0);
+        std::fs::remove_file(src.0.join("tokenizer.json")).unwrap();
+        let err = convert_escha(&src.0, &src.0.join("out.hfq")).unwrap_err();
+        assert!(err.contains("no tokenizer.json"), "{err}");
     }
 }
