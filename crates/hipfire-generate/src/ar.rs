@@ -1160,13 +1160,15 @@ pub fn generate(
             // eager dense (ModelState::Gemma4) and lowered/MoE
             // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
             // lowered load must fail loudly here rather than silently run eager
-            // against lowered weights.
+            // against lowered weights. Admission now refuses lowered loads
+            // before any device allocation; this arm stays as the fail-closed
+            // net. Message is shared with the admission refusal by construction.
             if m.gemma4_lowered_mut().is_some() {
                 emit_error_with_id(
-                stdout,
-                id,
-                "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant",
-            );
+                    stdout,
+                    id,
+                    hipfire_arch_gemma4::LOWERED_GENERATE_REFUSAL,
+                );
                 return;
             }
             let _ = (
