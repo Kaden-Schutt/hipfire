@@ -71,6 +71,29 @@ pub struct EpSampling {
     pub min_p: Option<f32>,
 }
 
+/// Which EP serve body owns an arch_id. Pure so the dispatch contract is
+/// unit-testable. Archs without an `EpArch` (LFM2, Cohere2, anything new) must
+/// NOT reach a serve body: the old `_ => ep_serve_ds4` fallthrough ran the
+/// DeepSeek4 EP protocol against foreign weights instead of refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpServeTarget {
+    Minimax,
+    Qwen35DenseTp,
+    Deepseek4,
+    UnsupportedArch(u32),
+}
+
+/// EP serve dispatch by arch_id. 9/10/5|6 keep their existing servers;
+/// anything else is an explicit refusal, never a wrong-server fallthrough.
+pub fn ep_serve_target(arch_id: u32) -> EpServeTarget {
+    match arch_id {
+        10 => EpServeTarget::Minimax,
+        5 | 6 => EpServeTarget::Qwen35DenseTp,
+        9 => EpServeTarget::Deepseek4,
+        other => EpServeTarget::UnsupportedArch(other),
+    }
+}
+
 pub fn generate_ep(
     m: &mut LoadedModel,
     stdout: &mut std::io::Stdout,
@@ -225,8 +248,8 @@ pub fn generate_ep(
         hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
-    match m.arch_id {
-        10 => ep_serve_minimax(
+    match ep_serve_target(m.arch_id) {
+        EpServeTarget::Minimax => ep_serve_minimax(
             m,
             stdout,
             id,
@@ -237,7 +260,7 @@ pub fn generate_ep(
             primed_think,
             sampling,
         ),
-        5 | 6 => ep_serve_qwen35_dense_tp(
+        EpServeTarget::Qwen35DenseTp => ep_serve_qwen35_dense_tp(
             m,
             stdout,
             id,
@@ -249,7 +272,7 @@ pub fn generate_ep(
             primed_think,
             sampling,
         ),
-        _ => ep_serve_ds4(
+        EpServeTarget::Deepseek4 => ep_serve_ds4(
             m,
             stdout,
             id,
@@ -261,6 +284,26 @@ pub fn generate_ep(
             stop,
             sampling,
         ),
+        EpServeTarget::UnsupportedArch(arch) => {
+            // Fail closed: no EpArch exists for this arch_id (LFM2, Cohere2,
+            // anything new), so there is no correct server to call. Name the
+            // arch rather than running another arch's EP protocol against
+            // foreign weights.
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "EP generate not supported for arch_id={arch} \
+                     (only 9/DeepSeek4, 10/MiniMax and dense 5|6 Qwen3.5 \
+                     have an EP serve path)"
+                ),
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 }
 
@@ -6310,3 +6353,23 @@ mod deepseek4_reasoning_prefix_tests {
 }
 
 // --- iter appended ---
+
+#[cfg(test)]
+mod ep_serve_target_tests {
+    use super::{ep_serve_target, EpServeTarget};
+
+    #[test]
+    fn known_ep_archs_keep_their_servers_but_all_others_refuse() {
+        // Adjacent supported: DS4, MiniMax and dense Qwen3.5 keep their servers.
+        assert_eq!(ep_serve_target(9), EpServeTarget::Deepseek4);
+        assert_eq!(ep_serve_target(10), EpServeTarget::Minimax);
+        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35DenseTp);
+        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35DenseTp);
+        // No EpArch exists for these: explicit refusal naming the arch,
+        // never the old wrong-server DS4 fallthrough.
+        assert_eq!(ep_serve_target(11), EpServeTarget::UnsupportedArch(11));
+        assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
+        assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
+        assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    }
+}

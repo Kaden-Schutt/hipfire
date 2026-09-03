@@ -2858,6 +2858,27 @@ pub fn qwen35_ep_moe_refusal(arch_id: u32, num_experts: usize) -> Option<String>
     }
 }
 
+/// Message constructor shared by [`ep_admission`] and the per-entry match
+/// backstops so the refusal text cannot drift between the two.
+fn ep_unsupported_arch_message(arch_id: u32) -> String {
+    format!(
+        "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+    )
+}
+
+/// EP load admission by arch_id. Only archs with an `EpArch` variant may enter
+/// expert-parallel load (9/DeepSeek4, 10/MiniMax, 5|6/Qwen3.5); LFM2 (11),
+/// Cohere2 (12) and anything else must fail here — right after the host-side
+/// HFQ probe, before any device init — otherwise they would reach
+/// `generate_ep` with no correct server. Pure so the contract is
+/// unit-testable; both `load_model_ep_*` entries call it before dispatching.
+pub fn ep_admission(arch_id: u32) -> Result<(), String> {
+    match arch_id {
+        5 | 6 | 9 | 10 => Ok(()),
+        id => Err(ep_unsupported_arch_message(id)),
+    }
+}
+
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
 /// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
 /// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
@@ -2926,6 +2947,8 @@ pub fn load_model_ep_with_kv_mode(
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    // Admission: refuse archs with no `EpArch` before any per-arch device init.
+    ep_admission(hfq.arch_id)?;
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
     let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
@@ -2943,9 +2966,10 @@ pub fn load_model_ep_with_kv_mode(
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
         5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
+        // Backstop: `ep_admission` above already refused these; route through the
+        // shared constructor (not `unreachable!`) so the refusal survives a
+        // future edit that drops the early call.
+        id => Err(ep_unsupported_arch_message(id)),
     }
 }
 
@@ -2959,6 +2983,8 @@ pub fn load_model_ep_with_compressor_cache(
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    // Admission: refuse archs with no `EpArch` before any per-arch device init.
+    ep_admission(hfq.arch_id)?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache),
         10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
@@ -2969,9 +2995,10 @@ pub fn load_model_ep_with_compressor_cache(
             load_model_ep_qwen35(path, max_seq, tp, None, None, None)
         }
         5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
+        // Backstop: `ep_admission` above already refused these; route through the
+        // shared constructor (not `unreachable!`) so the refusal survives a
+        // future edit that drops the early call.
+        id => Err(ep_unsupported_arch_message(id)),
     }
 }
 
@@ -3893,7 +3920,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod ep_admission_tests {
-    use super::qwen35_ep_moe_refusal;
+    use super::{ep_admission, qwen35_ep_moe_refusal};
+
     #[test]
     fn qwen35_moe_ep_refuses_before_load_but_dense_admits() {
         // Arch 6 MoE under EP: refused with the combination named.
@@ -3907,6 +3935,23 @@ mod ep_admission_tests {
         // Adjacent supported: dense Qwen3.5 (either arch id) keeps its EP path.
         assert_eq!(qwen35_ep_moe_refusal(5, 0), None);
         assert_eq!(qwen35_ep_moe_refusal(6, 0), None);
+    }
+
+    #[test]
+    fn ep_without_eparch_refuses_but_served_archs_admit() {
+        // LFM2 (11), Cohere2 (12) and anything else with no `EpArch` variant:
+        for arch in [11u32, 12, 13, 0, 99] {
+            let err = match ep_admission(arch) {
+                Ok(()) => panic!("arch {arch} + EP must refuse"),
+                Err(e) => e,
+            };
+            assert!(err.contains("EP not supported"), "reason: {err}");
+            assert!(err.contains(&arch.to_string()), "reason names the arch: {err}");
+        }
+        // Adjacent supported: DS4, MiniMax and Qwen3.5 keep their EP entries.
+        for arch in [5u32, 6, 9, 10] {
+            assert!(ep_admission(arch).is_ok(), "arch {arch} + EP must admit");
+        }
     }
 }
 
