@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! MQ4V2 residual split-K LDS parity + timing sweep on exact gfx1100.
+//! MQ4V2 residual split-K LDS parity + timing sweep on exact gfx1100, plus the
+//! LDS-staged (gfx12-port) `ldsstage` arm.
 //!
 //! Loads REAL weight bytes for layer-0 out_proj (M=5120,K=6144) and down_proj
 //! (M=5120,K=17408) from qwen3.8-27b.mq4, random finite F32 X at N=1,8,16,
@@ -12,7 +13,9 @@
 //! check, then timing (32 warmups, 200 launches/sample, 3 samples interleaved
 //! arm-by-arm, min+median). Exit nonzero on any relL2(ks, base) > 5e-5 or
 //! non-finite. Split-K changes fp32 association order, so bit-exactness is
-//! NOT required.
+//! NOT required. The `ldsstage` arm (kw column prints `lds`, requires
+//! K % 512 == 0) runs the same gate and the same timing discipline against
+//! the same base reference and f64 floor.
 //!
 //! Association-floor documentation: for each (shape, N) the harness also
 //! builds an f64 host reference — real weights dequantized with the exact
@@ -613,13 +616,71 @@ fn main() {
                     p.label, n, kw, r2, ma, finite, r_base_f64, r_ks_f64, ma_ks_f64, rms_ref, bigfrac, us[0], med
                 );
             }
+            // LDS-stage arm (gfx1100 port of the gfx12 ldsstage design): same
+            // f64 floor + relL2 <= 5e-5 gate, same timing discipline (32
+            // warmups, 200 launches/sample, 3 samples, min+median).
+            if k % 512 == 0 {
+                let d_y_lds = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y lds");
+                htod_f32(&gpu, &d_y_lds, &y_init);
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(&d_a, &d_x, &d_y_lds, m, k, n)
+                    .unwrap_or_else(|e| panic!("ldsstage launch failed: {e:?}"));
+                sync(&gpu);
+                let y_lds = gpu.download_f32(&d_y_lds).expect("download ldsstage");
+                let finite_lds = is_finite(&y_lds);
+                let r_lds_base = rel_l2(&y_lds, &y_ref);
+                let ma_lds = max_abs_diff(&y_lds, &y_ref);
+                let y_lds64: Vec<f64> = y_lds.iter().map(|&v| v as f64).collect();
+                let r_lds_f64 = rel_l2_f64(&y_lds64, &y_f64);
+                let ma_lds_f64 = y_lds64
+                    .iter()
+                    .zip(y_f64.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f64, f64::max);
+                let bigfrac_lds = y_lds
+                    .iter()
+                    .zip(y_ref.iter())
+                    .filter(|(a, b)| (**a - **b).abs() as f64 > BIG_DIFF)
+                    .count() as f64
+                    / y_lds.len() as f64;
+                let ok_lds = finite_lds && r_lds_base <= PARITY_TOL;
+                if !ok_lds {
+                    all_ok = false;
+                    eprintln!("  FAIL parity {} N={n} ldsstage: relL2(lds,base)={r_lds_base:.3e} maxAbs={ma_lds:.3e} finite={finite_lds}", p.label);
+                }
+                htod_f32(&gpu, &d_y_lds, &y_init);
+                for _ in 0..WARMUP {
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(&d_a, &d_x, &d_y_lds, m, k, n)
+                        .unwrap();
+                }
+                sync(&gpu);
+                let mut us_lds: Vec<f64> = Vec::with_capacity(SAMPLES);
+                for _ in 0..SAMPLES {
+                    htod_f32(&gpu, &d_y_lds, &y_init);
+                    us_lds.push(time_batch(&mut gpu, &mut |gm: &mut Gpu| {
+                        gm.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(&d_a, &d_x, &d_y_lds, m, k, n)
+                            .unwrap()
+                    }));
+                }
+                us_lds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med_lds = median(us_lds.clone());
+                let status_lds = if ok_lds { "OK" } else { "FAIL" };
+                println!(
+                    "{:>10} {:>3} {:>4} {:>12.3e} {:>12.3e} {:>7} {:>12.3e} {:>12.3e} {:>12.3e} {:>12.3e} {:>9.2e} {:>10.1} {:>10.1} [{status_lds}]",
+                    p.label, n, "lds", r_lds_base, ma_lds, finite_lds, r_base_f64, r_lds_f64, ma_lds_f64, rms_ref, bigfrac_lds, us_lds[0], med_lds
+                );
+            } else {
+                println!(
+                    "{:>10} {:>3} {:>4}  SKIP (K % 512 != 0, ldsstage requires K % 512 == 0)",
+                    p.label, n, "lds"
+                );
+            }
         }
     }
 
     if all_ok {
-        eprintln!("\nPASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, all finite, Y+=W@X preserved");
+        eprintln!("\nPASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, ldsstage relL2(lds,base)<=5e-5, all finite, Y+=W@X preserved");
     } else {
-        eprintln!("\nFAIL: one or more parity checks violated relL2(ks,base)<=5e-5 or finiteness");
+        eprintln!("\nFAIL: one or more parity checks violated relL2<=5e-5 or finiteness");
         std::process::exit(1);
     }
 }

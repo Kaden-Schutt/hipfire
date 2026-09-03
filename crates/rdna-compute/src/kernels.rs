@@ -3173,6 +3173,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC: &str =
 /// 16x16 tile and reduce fp32 accs through KW KiB LDS in fixed wave order.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_KSPLIT_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds.hip");
+/// Exact-gfx1100 LDS-staged residual (DFlash verify tier, symbol ldsstage).
+/// gfx1100 port of the gfx12 `gemm_mq4g256v2_residual_wmma_gfx12_ldsstage`
+/// design: 8-wave workgroup cooperatively stages one 16-row x 512-K RAW slab
+/// (4352 B) and each wave consumes its own 64-wide K slice from LDS as
+/// 4 x 16-wide gfx11 WMMA fragments; wave-0 fixed-order reduce. Requires
+/// K % 512 == 0; the launcher falls back to ks4 otherwise.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage.hip");
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma_gfx12_bt.hip");
