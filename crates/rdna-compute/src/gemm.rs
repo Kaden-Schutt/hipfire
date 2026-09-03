@@ -28059,9 +28059,8 @@ impl Gpu {
             && batch_size <= 16
         {
             if self.flags.residual_ldsstage && k % 512 == 0 && k > 0 {
-                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
-                    a_raw, x, y, m, k, batch_size,
-                );
+                return self
+                    .gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(a_raw, x, y, m, k, batch_size);
             }
             if let Some(kw) = Self::residual_ksplit_kw(k) {
                 return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
