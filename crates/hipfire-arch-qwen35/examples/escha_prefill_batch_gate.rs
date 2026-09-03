@@ -25,18 +25,25 @@
 //! layers. That is a summation-order difference, not a defect.
 //!
 //! So the whole-model claim this gate can make is: the final-token logits
-//! agree to a bound consistent with f32 accumulation reordering, and the
-//! ARGMAX does not move.
+//! agree to a MEASURED bound, and the ARGMAX does not move.
+//!
+//! The measured values at n=64 on escha-35b are `max|delta| = 4.393e-1` and
+//! `mean|delta| = 7.160e-2`, and both are now asserted rather than printed.
+//! Note that these are two orders of magnitude ABOVE what pure accumulation
+//! reordering would give: the dominant term is not reordering at all but the
+//! expert-selection divergence documented below, which is 24.1% of (token,
+//! layer) decisions over the whole stack. A token whose expert set differs
+//! computes a different hidden state, and that compounds with depth. An
+//! earlier version of this file quoted "~1e-3" here; that figure describes
+//! two arms with identical routing, which these are not.
 //!
 //! **The argmax assertion is the load-bearing one.** Do not relax this gate to
 //! "max delta < tol" and stop there. A dropped H128 transform, a stale
 //! activation cache, or a wrong expert-slot stride all produce finite, fluent
-//! output that is wrong by ~1e-1 — orders of magnitude above the accumulation
-//! noise but still finite — and a tolerance chosen loosely enough to absorb
-//! the real reordering can absorb those too. The argmax moving, or the delta
-//! exceeding the recorded bound by an order of magnitude, is the signal.
-//! (When this port's stale-FP16-activation bug was live, this gate's max delta
-//! was ~1e+1 and the argmax moved from 25760 to 220.)
+//! output that is wrong by ~1e-1 per element — and a tolerance chosen loosely
+//! enough to absorb the real divergence can absorb those too. The argmax
+//! moving is the signal. (When this port's stale-FP16-activation bug was live,
+//! this gate's max delta was ~1e+1 and the argmax moved from 25760 to 220.)
 //!
 //! # The expert-selection divergence
 //!
@@ -426,16 +433,67 @@ fn main() -> Result<(), String> {
          set rate divided by k. The routes are picking genuinely different experts."
     );
 
+    // ── The logit-delta bound ────────────────────────────────────────────
+    //
+    // Until now `max_d` and `mean_d` were computed and only PRINTED, so the
+    // bound the module docs call load-bearing was enforced by a human reading
+    // stdout. That is not enforcement, and the defect this gate exists to
+    // catch produced ~1e+1 in exactly this quantity.
+    //
+    // THE BOUNDS BELOW ARE MEASURED, not derived from the "~1e-3" figure this
+    // file used to quote. At n=64 on this model the actual values are
+    //
+    //     max|delta|  = 4.393e-1        mean|delta| = 7.160e-2
+    //
+    // reproduced identically across builds. The old ~1e-3 estimate described
+    // pure accumulation reordering with IDENTICAL routing on both arms, and
+    // that is not what these two arms do: 24.1% of (token, layer) routing
+    // decisions differ between them (see the divergence report above). A
+    // token routed to a different expert set computes a genuinely different
+    // hidden state, and 40 layers of that lands two orders of magnitude above
+    // the reordering-only figure. The estimate was wrong, not the run.
+    //
+    // So the headroom here is real but narrow: 4.4e-1 measured against the
+    // ~1e+1 the stale-FP16-activation bug produced is a factor of ~23, and the
+    // bound has to sit inside it. 2.0 is ~4.6x above the measurement and ~5x
+    // below the known-bad value — the honest split. The mean is the steadier
+    // statistic (it is an average over 248 320 logits rather than one extreme
+    // order statistic), so it is bounded more tightly at ~7x headroom.
+    //
+    // This bound is NOT what makes the gate work; the argmax assertion below
+    // is. What it adds is a trip-wire for a structural error that happens not
+    // to move the argmax on this one prompt.
+    const MAX_ABS_LOGIT_DELTA: f32 = 2.0;
+    const MAX_MEAN_LOGIT_DELTA: f64 = 5e-1;
+    assert!(
+        max_d < MAX_ABS_LOGIT_DELTA,
+        "final-token logit max|delta| {max_d:.3e} exceeds {MAX_ABS_LOGIT_DELTA:.1}. Measured \
+         on this model at n=64: 4.393e-1, from f32 accumulation reordering compounded by the \
+         24% prefill-vs-decode expert-selection divergence reported above. A value near 1e+1 \
+         is the signature of a structural error — a dropped H128 transform, a stale \
+         activation-conversion cache, or a wrong expert-slot stride — every one of which \
+         stays finite and fluent. Check the divergence percentages above first: if THEY are \
+         unchanged and this moved, the dense half changed."
+    );
+    assert!(
+        mean_d < MAX_MEAN_LOGIT_DELTA,
+        "final-token logit mean|delta| {mean_d:.3e} exceeds {MAX_MEAN_LOGIT_DELTA:.1e}. \
+         Measured on this model at n=64: 7.160e-2. The mean is averaged over the whole \
+         vocabulary, so unlike max|delta| it does not move on a single outlier logit — a \
+         mean this far out means the two routes disagree broadly, not at one index."
+    );
+
     // The load-bearing assertion. See the module docs: a tolerance alone would
     // absorb the failure class this port keeps catching.
     assert_eq!(
         arg_a, arg_b,
         "batched prefill chose a different next token than the per-token route \
          (batched {arg_a} @ {best_a}, per-token {arg_b} @ {best_b}). The dense half is not \
-         bit-identical by design (batched WMMA vs batch-1 GEMV accumulation order), but that \
-         difference is ~1e-3 on these logits and must never move the argmax. A moved argmax \
-         means a structural error — a dropped H128 transform, a stale activation-conversion \
-         cache, or a wrong expert-slot stride — all of which stay finite and fluent."
+         bit-identical by design (batched WMMA vs batch-1 GEMV accumulation order) and the \
+         routing genuinely diverges on ~24% of decisions, which together move these logits by \
+         ~4e-1 — but that must never move the argmax. A moved argmax means a structural \
+         error — a dropped H128 transform, a stale activation-conversion cache, or a wrong \
+         expert-slot stride — all of which stay finite and fluent."
     );
 
     println!("G6 PASS");

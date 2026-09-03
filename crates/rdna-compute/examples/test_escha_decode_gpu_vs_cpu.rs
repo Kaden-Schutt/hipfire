@@ -1,9 +1,8 @@
 //! G2: GPU tile decode must match escha_ref::reconstruct EXACTLY in fp16,
-//! for both K. Also covers the gate-widening and device-resident-vs-host
-//! equivalence checks from the Task 7 review. Run:
+//! for both K, at the golden shapes AND at production shapes up to 89M
+//! elements. Run:
 //!   cargo run --release -p rdna-compute --example test_escha_decode_gpu_vs_cpu
 use hipfire_quantize::escha_ref;
-use rdna_compute::DType;
 
 /// xorshift64* — same tiny inline PRNG convention used by the other GPU
 /// parity examples in this crate (no `rand` dependency).
@@ -73,53 +72,22 @@ fn main() {
     }
     println!("wide-shape gate PASS");
 
-    // Device-resident vs. host-roundtrip equivalence (Task 7, Finding 4):
-    // the load path decodes weights that are already resident on the GPU,
-    // with no host round trip. Prove the device-resident `escha_decode_tiles`
-    // and the host-roundtrip `escha_decode_tiles_host` (which now calls it
-    // internally) produce bit-identical output for the same input.
-    {
-        let (ic, oc, k) = (2048usize, 1024usize, 2usize);
-        let path = format!(
-            "{}/../hipfire-quantize/tests/data/escha/packed_gu_e0_k2.i16",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw = std::fs::read(&path).expect("run fetch-goldens.sh first");
-        let code: Vec<i16> = raw
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect();
-
-        let mut gpu = rdna_compute::Gpu::init().expect("gpu");
-        let host_result = gpu
-            .escha_decode_tiles_host(&code, ic as u32, oc as u32, k as u32)
-            .expect("host-roundtrip decode");
-
-        let code_bytes: Vec<u8> = code.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let d_code = gpu
-            .upload_raw(&code_bytes, &[code.len()])
-            .expect("upload code");
-        let d_bare = gpu
-            .alloc_tensor(&[ic * oc], DType::F16)
-            .expect("alloc bare");
-        gpu.escha_decode_tiles(&d_code, &d_bare, ic as u32, oc as u32, k as u32)
-            .expect("device-resident decode");
-        let mut raw_out = vec![0u8; ic * oc * 2];
-        gpu.hip
-            .memcpy_dtoh(&mut raw_out, &d_bare.buf)
-            .expect("copy back device-resident result");
-        let device_result: Vec<u16> = raw_out
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-
-        assert_eq!(
-            host_result, device_result,
-            "device-resident escha_decode_tiles diverges from escha_decode_tiles_host"
-        );
-        println!(
-            "device-resident vs host equivalence PASS ({} elements identical)",
-            device_result.len()
-        );
-    }
+    // The "device-resident vs host-roundtrip equivalence" check that used to
+    // sit here has been DELETED, not moved.
+    //
+    // It compared `escha_decode_tiles_host(...)` against a hand-rolled
+    // upload -> `escha_decode_tiles` -> download of the same input. But
+    // `escha_decode_tiles_host` IS that sequence — it calls
+    // `escha_decode_tiles` internally — so both sides ran the same kernel on
+    // the same bytes. The only thing it could ever have caught is kernel
+    // nondeterminism, while its message claimed to prove the two entry points
+    // equivalent. A check that cannot fail for the reason it names is worse
+    // than no check: it reads as coverage.
+    //
+    // The real gate for the device-resident path is the G2 arm at the top of
+    // this file. `escha_decode_tiles_host` is a thin wrapper over
+    // `escha_decode_tiles`, so asserting bit-exactness against
+    // `escha_ref::reconstruct` — the frozen oracle — already asserts it for
+    // the device kernel, at both K and at production shapes up to 89M
+    // elements. Nothing was lost.
 }
