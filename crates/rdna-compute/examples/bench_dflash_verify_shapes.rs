@@ -435,7 +435,7 @@ fn main() {
         },
         Arm {
             label: "L0 out_proj (residual)".into(),
-            entry: "gpu.gemm_mq4g256v2_residual_wmma".into(),
+            entry: "gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)".into(),
             w_bytes: d("L0 out_proj").w_bytes,
             k: d("L0 out_proj").k,
             ms: vec![d("L0 out_proj").m],
@@ -453,7 +453,7 @@ fn main() {
         },
         Arm {
             label: "L0 down_proj (residual)".into(),
-            entry: "gpu.gemm_mq4g256v2_residual_wmma".into(),
+            entry: "gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)".into(),
             w_bytes: d("L0 down_proj").w_bytes,
             k: d("L0 down_proj").k,
             ms: vec![d("L0 down_proj").m],
@@ -481,7 +481,7 @@ fn main() {
         },
         Arm {
             label: format!("L{fa_layer} o_proj (residual)"),
-            entry: "gpu.gemm_mq4g256v2_residual_wmma".into(),
+            entry: "gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)".into(),
             w_bytes: d(&format!("L{fa_layer} o_proj")).w_bytes,
             k: d(&format!("L{fa_layer} o_proj")).k,
             ms: vec![d(&format!("L{fa_layer} o_proj")).m],
@@ -506,7 +506,7 @@ fn main() {
         },
         Arm {
             label: format!("L{fa_layer} down_proj (residual)"),
-            entry: "gpu.gemm_mq4g256v2_residual_wmma".into(),
+            entry: "gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)".into(),
             w_bytes: d(&format!("L{fa_layer} down_proj")).w_bytes,
             k: d(&format!("L{fa_layer} down_proj")).k,
             ms: vec![d(&format!("L{fa_layer} down_proj")).m],
@@ -564,7 +564,7 @@ fn main() {
         let x = &live[ai].xs[n16];
         let sym = match arm.kind {
             0 => profile_symbol(&mut gpu, &mut |g: &mut Gpu| {
-                g.gemm_mq4g256v2_residual_wmma(&ws[0], x, &yg[0], arm.ms[0], arm.k, 16)
+                g.gemm_hfq4g256_residual_mq4v2(&ws[0], x, &yg[0], arm.ms[0], arm.k, 16)
                     .unwrap()
             }),
             1 => profile_symbol(&mut gpu, &mut |g: &mut Gpu| {
@@ -607,7 +607,7 @@ fn main() {
             let x = &live[ai].xs[n16];
             match arm.kind {
                 0 => gpu
-                    .gemm_mq4g256v2_residual_wmma(&ws[0], x, &yg[0], arm.ms[0], arm.k, 16)
+                    .gemm_hfq4g256_residual_mq4v2(&ws[0], x, &yg[0], arm.ms[0], arm.k, 16)
                     .unwrap(),
                 1 => gpu
                     .gemm_gate_up_hfq4g256_mq4v2(
@@ -660,7 +660,7 @@ fn main() {
                 let x = &live[ai].xs[ni];
                 let us = match arm.kind {
                     0 => time_batch(&mut gpu, &mut |g: &mut Gpu| {
-                        g.gemm_mq4g256v2_residual_wmma(&ws[0], x, &yg[0], arm.ms[0], arm.k, n)
+                        g.gemm_hfq4g256_residual_mq4v2(&ws[0], x, &yg[0], arm.ms[0], arm.k, n)
                             .unwrap()
                     }),
                     1 => time_batch(&mut gpu, &mut |g: &mut Gpu| {
