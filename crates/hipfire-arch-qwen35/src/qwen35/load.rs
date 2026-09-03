@@ -4409,7 +4409,30 @@ pub(crate) fn load_moe_ffn(
         .reap_keep
         .as_ref()
         .map(|r| r.expert_plan(layer_idx as usize));
+    // Detect Escha-W2 BEFORE the EP-shard block. An escha layer carries one
+    // trellis code tensor per projection for all experts, not the per-expert
+    // `experts.{x}.gate_up_proj.weight` tensors the EP path fishes out by
+    // index — so if the EP block runs first it panics on a tensor that does
+    // not exist, and the escha refusal further down is never reached. The
+    // daemon sets an EP shard even on a single GPU, which is exactly how that
+    // happened: `hipfire bench` panicked with
+    // "tensor not found: layers.0.mlp.experts.0.gate_up_proj.weight".
+    //
+    // A single-rank shard splits nothing, so escha simply ignores it; only a
+    // genuine multi-rank split is refused (below, and again after the router
+    // load for the REAP keep-map case).
+    let escha_layer = escha::layer_is_escha(hfq, p, qwen35_tensor_name_candidates);
     let ep_shard = current_ep_expert_shard();
+    let ep_shard = match (escha_layer, ep_shard) {
+        (true, Some((ref sc, _))) if sc.tp_size > 1 => {
+            return Err(HipError::new(
+                0,
+                "qwen35: Escha-W2 routed experts do not support EP sharding across >1 rank                  (it re-maps experts across the per-expert tensors escha does not have)",
+            ))
+        }
+        (true, _) => None,
+        (_, other) => other,
+    };
     if ep.is_some() && ep_shard.is_some() {
         return Err(HipError::new(
             0,
@@ -4793,7 +4816,6 @@ pub(crate) fn load_moe_ffn(
     // all experts, not the per-expert `experts.{x}.gate_up_proj.weight`
     // tensors every other path fishes out by index, so it bypasses both the
     // packed-MQ4 fast path and the generic per-expert loop below.
-    let escha_layer = escha::layer_is_escha(hfq, p, qwen35_tensor_name_candidates);
     if escha_layer && (ep_shard.is_some() || ep.is_some()) {
         return Err(HipError::new(
             0,
