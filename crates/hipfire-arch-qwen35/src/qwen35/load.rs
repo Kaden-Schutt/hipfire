@@ -4770,7 +4770,7 @@ pub(crate) fn load_moe_ffn(
     // all experts, not the per-expert `experts.{x}.gate_up_proj.weight`
     // tensors every other path fishes out by index, so it bypasses both the
     // packed-MQ4 fast path and the generic per-expert loop below.
-    let escha_layer = escha::layer_is_escha(hfq, p);
+    let escha_layer = escha::layer_is_escha(hfq, p, qwen35_tensor_name_candidates);
     if escha_layer && (ep_shard.is_some() || ep.is_some()) {
         return Err(HipError::new(
             0,
@@ -4789,6 +4789,7 @@ pub(crate) fn load_moe_ffn(
             mi,
             config.num_experts_per_tok,
             store,
+            qwen35_tensor_name_candidates,
         )?;
         if layer_idx == 0 {
             eprintln!(

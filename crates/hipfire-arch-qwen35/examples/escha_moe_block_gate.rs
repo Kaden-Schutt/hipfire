@@ -157,6 +157,7 @@ fn run_arm(
         mi,
         top_k,
         store,
+        exact_or_prefixed,
     )
     .expect("escha expert load");
 
@@ -251,7 +252,7 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("gpu");
     assert!(
-        hipfire_arch_qwen35::qwen35::escha::layer_is_escha(&hfq, layer_prefix),
+        hipfire_arch_qwen35::qwen35::escha::layer_is_escha(&hfq, layer_prefix, exact_or_prefixed),
         "layer 0 of {path} does not carry Escha-W2 routed experts"
     );
 

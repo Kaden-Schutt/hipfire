@@ -129,25 +129,57 @@ impl EschaMoeTables {
     }
 }
 
-/// `.hfq` tensor name for one of the six escha MoE leaves of a layer.
-/// `p` is the layer prefix the rest of `load.rs` uses (already
-/// `model.language_model.layers.N` for this checkpoint family).
+/// `.hfq` tensor name for one of the six escha MoE leaves of a layer, BEFORE
+/// candidate expansion. `p` is the bare layer prefix `load.rs` uses
+/// (`layers.N`); the caller's `resolve` is what turns that into the
+/// checkpoint's actual `model.language_model.layers.N…` name, exactly as
+/// every other tensor in this loader is resolved.
 pub fn escha_leaf(p: &str, proj: &str, leaf: &str) -> String {
     format!("{p}.mlp.experts.{proj}_proj.escha_{leaf}")
+}
+
+/// Candidate-expanding lookup. Mirrors `hfq::load_weight_tensor`'s contract so
+/// an escha layer resolves through the same name aliasing as everything else
+/// in the checkpoint (`layers.0.…` -> `model.language_model.layers.0.…`).
+pub type NameResolver = fn(&str) -> Vec<String>;
+
+/// `tensor_data_vec`, NOT `tensor_data`: on a unified-memory APU the qwen35
+/// loader drops the mmap in `prepare()` (mapped pages cannot be evicted while
+/// the mapping exists, and they starve `hipMalloc`), after which
+/// `tensor_data` returns `None` for every tensor while `find_tensor_info`
+/// keeps working. Reading through the mmap here therefore fails only on the
+/// full-model path and not in a single-layer probe — exactly the shape of bug
+/// that ships. `tensor_data_vec` takes the pread + `FADV_DONTNEED` route the
+/// rest of the loader uses.
+fn find<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+    resolve: NameResolver,
+) -> Option<(&'a hipfire_runtime::hfq::HfqTensorInfo, Vec<u8>)> {
+    resolve(name)
+        .into_iter()
+        .find_map(|c| hfq.tensor_data_vec(&c))
 }
 
 /// True iff this layer's routed experts are Escha-W2 coded. Keyed on the
 /// `gate_up` code tensor's presence AND its quant type, so a checkpoint that
 /// happened to carry a same-named tensor of another format is rejected by the
 /// loader rather than mis-decoded.
-pub fn layer_is_escha(hfq: &HfqFile, p: &str) -> bool {
-    hfq.find_tensor_info(&escha_leaf(p, "gate_up", "code"))
+pub fn layer_is_escha(hfq: &HfqFile, p: &str, resolve: NameResolver) -> bool {
+    resolve(&escha_leaf(p, "gate_up", "code"))
+        .into_iter()
+        .find_map(|c| hfq.find_tensor_info(&c))
         .is_some_and(|i| i.quant_type == 42 || i.quant_type == 43)
 }
 
-fn read_f32_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, want: usize) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data(name)
+fn read_f32_tensor(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    want: usize,
+    resolve: NameResolver,
+) -> HipResult<GpuTensor> {
+    let (info, data) = find(hfq, name, resolve)
         .ok_or_else(|| HipError::new(0, &format!("escha: tensor not found: {name}")))?;
     if info.quant_type != 2 {
         return Err(HipError::new(
@@ -168,7 +200,7 @@ fn read_f32_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, want: usize) -> HipResu
             ),
         ));
     }
-    gpu.upload_raw(data, &[want])
+    gpu.upload_raw(&data, &[want])
 }
 
 /// K (trellis order) implied by the on-disk quant type.
@@ -200,21 +232,41 @@ pub fn load_escha_moe_experts(
     mi: usize,
     k: usize,
     store: EschaWeightStore,
+    resolve: NameResolver,
 ) -> HipResult<(Vec<ExpertWeights>, EschaMoeTables)> {
     // gate_up: [ic = hidden, oc = 2*mi]; down: [ic = mi, oc = hidden].
     let gu = (hidden, 2 * mi);
     let dn = (mi, hidden);
 
     let tables = EschaMoeTables {
-        gate_up_rin: read_f32_tensor(hfq, gpu, &escha_leaf(p, "gate_up", "rin_eff"), n_exp * gu.0)?,
+        gate_up_rin: read_f32_tensor(
+            hfq,
+            gpu,
+            &escha_leaf(p, "gate_up", "rin_eff"),
+            n_exp * gu.0,
+            resolve,
+        )?,
         gate_up_rout: read_f32_tensor(
             hfq,
             gpu,
             &escha_leaf(p, "gate_up", "rout_eff"),
             n_exp * gu.1,
+            resolve,
         )?,
-        down_rin: read_f32_tensor(hfq, gpu, &escha_leaf(p, "down", "rin_eff"), n_exp * dn.0)?,
-        down_rout: read_f32_tensor(hfq, gpu, &escha_leaf(p, "down", "rout_eff"), n_exp * dn.1)?,
+        down_rin: read_f32_tensor(
+            hfq,
+            gpu,
+            &escha_leaf(p, "down", "rin_eff"),
+            n_exp * dn.0,
+            resolve,
+        )?,
+        down_rout: read_f32_tensor(
+            hfq,
+            gpu,
+            &escha_leaf(p, "down", "rout_eff"),
+            n_exp * dn.1,
+            resolve,
+        )?,
         ids: gpu.alloc_tensor(&[k], DType::F32)?,
         weights: gpu.alloc_tensor(&[k], DType::F32)?,
         xh_gu: gpu.alloc_tensor(&[k * gu.0], DType::F32)?,
@@ -229,8 +281,10 @@ pub fn load_escha_moe_experts(
         k,
     };
 
-    let mut gate_ups = decode_projection(hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store)?;
-    let mut downs = decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store)?;
+    let mut gate_ups = decode_projection(
+        hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store, resolve,
+    )?;
+    let mut downs = decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve)?;
 
     let experts = gate_ups
         .drain(..)
@@ -257,11 +311,11 @@ fn decode_projection(
     n_exp: usize,
     shape: (usize, usize),
     store: EschaWeightStore,
+    resolve: NameResolver,
 ) -> HipResult<Vec<WeightTensor>> {
     let (ic, oc) = shape;
     let name = escha_leaf(p, proj, "code");
-    let (info, data) = hfq
-        .tensor_data(&name)
+    let (info, data) = find(hfq, &name, resolve)
         .ok_or_else(|| HipError::new(0, &format!("escha: tensor not found: {name}")))?;
     let k = k_from_quant_type(info.quant_type, &name)?;
 
