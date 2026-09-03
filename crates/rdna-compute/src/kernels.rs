@@ -3167,6 +3167,12 @@ pub const GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC: &str =
 /// 136 B dual-half headers, static 8 KiB tile-major LDS, symbols mw{4,8}_lds.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds.hip");
+/// Exact-gfx1100 split-K LDS residual (DFlash verify tier, symbols ks{2,4,8}_lds).
+/// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC: same dual-half
+/// header contract and interleaved-C mapping, but KW waves split K over one
+/// 16x16 tile and reduce fp32 accs through KW KiB LDS in fixed wave order.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_KSPLIT_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds.hip");
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma_gfx12_bt.hip");
