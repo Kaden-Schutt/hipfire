@@ -424,10 +424,18 @@ impl RegistryV1 {
         if self.models.contains_key(&qwen) {
             return qwen;
         }
+        // A bare file name matches its entry; so does a path whose final
+        // component is that file name (`hipfire serve --model ~/.hipfire/models/x.mq4`
+        // must see the same sidecars as `hipfire serve --model <tag>`).
+        let file_name = std::path::Path::new(input)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(input);
         self.models
             .iter()
             .find_map(|(tag, entry)| {
-                (entry.file == normalized || entry.file == input).then(|| tag.clone())
+                (entry.file == normalized || entry.file == input || entry.file == file_name)
+                    .then(|| tag.clone())
             })
             .unwrap_or(normalized)
     }
@@ -1072,6 +1080,16 @@ mod tests {
             "qwen3.8:27b-mq4-xt"
         );
         assert_eq!(registry.resolve_tag("qwen3.8:fast"), "qwen3.8:27b-mq4-xt");
+        // A path to the artifact resolves like its file name, so `serve
+        // --model ~/.hipfire/models/<file>` sees the entry's sidecars.
+        assert_eq!(
+            registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq5"),
+            "qwen3.8:27b-mq5"
+        );
+        assert_eq!(
+            registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq4"),
+            "qwen3.8:27b"
+        );
 
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
