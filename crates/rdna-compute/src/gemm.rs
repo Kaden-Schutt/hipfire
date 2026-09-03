@@ -28039,7 +28039,17 @@ impl Gpu {
         // Exact gfx1100 production multi-wave policy: MW4 for N 416..463
         // and MW8 for N>=464. Smaller measured ranges retain BT4/6/8.
         // Capture/replay keep the fixed historical base launch contract.
+        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
+        // base kernel (one wave32 per 16x16 tile) launches too few waves to
+        // cover 96 CUs. Capture/replay keep the fixed historical base launch.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if self.arch_caps.is_gfx1100() && self.arch == "gfx1100" && batch_size <= 16 {
+                if let Some(kw) = Self::residual_ksplit_kw(k) {
+                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                        a_raw, x, y, m, k, batch_size, kw,
+                    );
+                }
+            }
             if self.arch_caps.is_gfx1100() && self.arch == "gfx1100" {
                 if (416..=463).contains(&batch_size) {
                     return self.gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds(
@@ -28288,6 +28298,131 @@ impl Gpu {
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [(32 * waves) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Split-K width for the exact-gfx1100 DFlash verify tier (N<=16).
+    ///
+    /// Returns None when split-K cannot run (K not a multiple of 256 or no
+    /// KW in {2,4,8} divides G = K/256 with G >= KW); the caller then falls
+    /// through to the base kernel. Initial table from the verify-shape bench
+    /// (verify-shapes-v2-run2.txt): kw=4 for K<=8192, kw=8 for K>8192, each
+    /// relaxed to the next smaller dividing KW. Re-tune from the ksplit
+    /// parity example's timing sweep; update this table, not the call sites.
+    fn residual_ksplit_kw(k: usize) -> Option<usize> {
+        if k % 256 != 0 || k == 0 {
+            return None;
+        }
+        let g = k / 256;
+        let want = if k <= 8192 { 4 } else { 8 };
+        [want, 4, 2]
+            .into_iter()
+            .filter(|&kw| kw <= want)
+            .find(|&kw| g >= kw && g % kw == 0)
+    }
+
+    /// MQ4V2 gfx1100 split-K LDS residual (KS2/KS4/KS8) — DFlash verify tier.
+    ///
+    /// One 16x16 output tile per block, `kw` waves splitting K, fp32 accs
+    /// reduced through LDS in fixed wave order by wave 0 with a single Y +=.
+    /// Exact gfx1100 only. Grid: ceil(M/16) x ceil(N/16); block 32*kw; FP16 X
+    /// once; blob-safe ABI + profile timer. Preserves fused `Y += W@X`.
+    /// `kw` accepts only 2/4/8 with (K/256) % kw == 0; otherwise Err.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        kw: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: K must be divisible by 256 (got {k})"
+                ),
+            ));
+        }
+        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: exact gfx1100 required (got {})",
+                    self.arch
+                ),
+            ));
+        }
+        let func_name = match kw {
+            2 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
+            4 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
+            8 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: kw must be 2, 4, or 8",
+                ));
+            }
+        };
+        if (k / 256) % kw != 0 || k / 256 < kw {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: K/256 must be >= kw and divisible by kw (got K={k}, kw={kw})"
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_KSPLIT_LDS_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [(32 * kw) as u32, 1, 1],
             0,
             &mut params,
             || {
