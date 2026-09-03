@@ -175,6 +175,11 @@ pub struct FeatureFlags {
     pub graph_ar: bool,
     pub graph_moe: bool,
     pub force_blob_path: bool,
+    /// `HIPFIRE_RESIDUAL_KSPLIT_OFF=1` disables the exact-gfx1100 split-K LDS
+    /// residual tier (N<=16 DFlash verify) and restores the historical base
+    /// kernel on the policy path. Default OFF (tier live). Test harnesses use
+    /// this to force the base oracle now that the tier is capture-safe.
+    pub residual_ksplit_off: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -499,6 +504,7 @@ impl FeatureFlags {
             graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
+            residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -741,6 +747,7 @@ impl FeatureFlags {
             graph_ar: true,
             graph_moe: true,
             force_blob_path: false,
+            residual_ksplit_off: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,
