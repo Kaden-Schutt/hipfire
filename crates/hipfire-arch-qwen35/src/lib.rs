@@ -131,7 +131,15 @@ pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
 /// pick for this GPU's arch — the fused `moe_router_softmax_topk_k8_wave64_exact`
 /// on gfx1100/gfx1151, or the reference two-launch `softmax_f32` +
 /// `moe_topk_renorm_k8` everywhere else). No selection math is duplicated
-/// here; only the same arch check the pipeline itself uses to pick a kernel.
+/// here; the kernel-choice arch check itself is
+/// `hipfire_dispatch::pipeline::exact_wave64_router_predicate` — the exact
+/// function `run_moe_decode` calls, not a copy of its logic — so this
+/// helper cannot silently drift from production's actual gate.
+///
+/// This test model's `.hfq` (`gate.weight` quant_type=1/F16) does not carry
+/// escha routed-expert dtypes, so it never exercises the escha-only f16
+/// router-logits round-trip (review Fix 1); this helper intentionally omits
+/// that step to stay a pure probe of the pre-existing selection kernels.
 #[cfg(feature = "deltanet")]
 pub fn escha_router_topk_for_test(
     hfq_path: &str,
@@ -161,12 +169,23 @@ pub fn escha_router_topk_for_test(
 
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     let ctx = DispatchCtx::new(&gpu);
-    // Same arch predicate `run_moe_decode` (hipfire-dispatch/src/pipeline/mod.rs)
+    // The *actual* predicate `run_moe_decode` (hipfire-dispatch/src/pipeline/mod.rs)
     // uses to pick the fused exact-wave64 router kernel over the reference
-    // two-launch path. HIPFIRE_MOE_ROUTER_SHARED_FUSE-gated shared-expert
-    // fusion is a pure perf variant of the same math and is left out here —
-    // it doesn't change which experts get selected.
-    let use_exact_wave64 = ctx.arch.is_gfx1151() || ctx.arch.is_gfx1100();
+    // two-launch path — extracted to `exact_wave64_router_predicate` so this
+    // helper cannot silently drift from production's real gate (review Fix 2:
+    // the previous `is_gfx1151() || is_gfx1100()` copy here happened to agree
+    // with production for this model/GPU, but wasn't actually the same check —
+    // production also requires `n_exp == 256` and honors the
+    // `HIPFIRE_GFX1100_ROUTER_W64` override on gfx1100).
+    // HIPFIRE_MOE_ROUTER_SHARED_FUSE-gated shared-expert fusion is a pure perf
+    // variant of the same math and is left out here — it doesn't change which
+    // experts get selected.
+    let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let use_exact_wave64 = hipfire_dispatch::pipeline::exact_wave64_router_predicate(
+        n_exp,
+        &ctx.arch,
+        gfx1100_router_mode.as_deref(),
+    );
 
     fn exact_name(s: &str) -> Vec<String> {
         vec![s.to_string()]

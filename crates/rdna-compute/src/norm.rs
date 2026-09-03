@@ -1805,6 +1805,53 @@ impl Gpu {
         result
     }
 
+    /// In-place F32 → f16 → F32 round-trip on MoE router logits
+    /// (round-to-nearest-even). Escha-only precision-matching step: see
+    /// `kernels/src/router_logits_round_f16_rne.hip` for why and
+    /// `hipfire_dispatch::families::moe::MoeDtypes::has_escha_experts` for
+    /// the gate. Callers other than the escha decode path must not call
+    /// this — every other model's router logits stay F32 end-to-end.
+    pub fn router_logits_round_f16_rne(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "router_logits_round_f16_rne",
+            kernels::ROUTER_LOGITS_ROUND_F16_RNE_SRC,
+            "router_logits_round_f16_rne",
+        )?;
+        let xp = x.buf.as_ptr();
+        let n = x.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let grid = (((n as u32) + block_size - 1) / block_size).max(1);
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "router_logits_round_f16_rne",
+            "router_logits_round_f16_rne",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "router_logits_round_f16_rne",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.

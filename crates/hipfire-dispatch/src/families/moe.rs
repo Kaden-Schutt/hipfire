@@ -104,6 +104,30 @@ impl MoeDtypes {
         // the gfx1151 MQ4-i8 grouped fence via `force_mq4_grouped_fp16`.
         .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
     }
+
+    /// True iff this layer's routed experts carry an Escha-W2 dtype
+    /// (`Escha2T16` gate_up / `Escha3T16` down, today's only pairing —
+    /// checked on both `routed_*` and, defensively, any per-expert tier
+    /// table, in case a future graded-tier layer mixes escha in). Drives
+    /// the escha-only router-logits f16 round-trip in `run_moe_decode`
+    /// (see `kernels/src/router_logits_round_f16_rne.hip`): EschaLabs'
+    /// runtime rounds router logits to f16 before top-k, hipfire keeps them
+    /// F32 end-to-end everywhere else, and this flag scopes the rounding to
+    /// exactly the models that need to match Escha's f16 selection —
+    /// `qwen3.6:35b-a3b-*` and every other arch-6 SKU must stay bit-exact.
+    pub fn has_escha_experts(&self) -> bool {
+        let is_escha = |dt: DType| matches!(dt, DType::Escha2T16 | DType::Escha3T16);
+        is_escha(self.routed_gate_up)
+            || is_escha(self.routed_down)
+            || self
+                .per_expert_gate_up
+                .as_ref()
+                .is_some_and(|v| v.iter().copied().any(is_escha))
+            || self
+                .per_expert_down
+                .as_ref()
+                .is_some_and(|v| v.iter().copied().any(is_escha))
+    }
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the

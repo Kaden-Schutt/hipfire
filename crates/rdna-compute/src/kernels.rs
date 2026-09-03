@@ -5812,6 +5812,16 @@ pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f3
 /// points. See `kernels/src/bf16_round_trip.hip`.
 pub const BF16_ROUND_TRIP_SRC: &str = include_str!("../../../kernels/src/bf16_round_trip.hip");
 
+/// In-place F32 router-logits round-trip through f16 (round-to-nearest-even).
+/// Escha-only: EschaLabs' runtime selects MoE top-k from f16-rounded router
+/// logits; hipfire keeps logits F32 end-to-end everywhere else. Applied to
+/// `router_logits` before top-k ONLY when the layer's routed experts are
+/// Escha2T16/Escha3T16 (see `MoeDtypes::has_escha_experts` in
+/// hipfire-dispatch and `run_moe_decode`'s call site). See
+/// `kernels/src/router_logits_round_f16_rne.hip`.
+pub const ROUTER_LOGITS_ROUND_F16_RNE_SRC: &str =
+    include_str!("../../../kernels/src/router_logits_round_f16_rne.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]

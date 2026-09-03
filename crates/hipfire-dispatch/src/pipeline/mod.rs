@@ -576,6 +576,32 @@ pub fn run_uniform_moe_down_expanded(
     }
 }
 
+/// The exact arch predicate `run_moe_decode` uses to pick the fused
+/// exact-wave64 router kernel (`moe_router_softmax_topk_k8_wave64_exact`)
+/// over the reference two-launch (`softmax_f32` + `moe_topk_renorm_k8`)
+/// path. Extracted to a standalone function — rather than left inline —
+/// so any caller that needs to reproduce production's kernel choice (today:
+/// the escha router-contract test helper in hipfire-arch-qwen35) calls the
+/// real predicate instead of a hand-copied approximation that can silently
+/// drift from it.
+///
+/// `gfx1100_router_mode` is `HIPFIRE_GFX1100_ROUTER_W64`'s value (pass
+/// `hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok().as_deref()`
+/// to match production exactly): `"0"`/`"approx"` opt the gfx1100 production
+/// path back out to the reference two-launch kernel or the old
+/// non-bit-exact research kernel, respectively; anything else (including
+/// unset) keeps the fused exact kernel on gfx1100. gfx1151 always takes the
+/// fused exact kernel unconditionally.
+pub fn exact_wave64_router_predicate(
+    n_exp: usize,
+    arch: &rdna_compute::arch_caps::ArchCaps,
+    gfx1100_router_mode: Option<&str>,
+) -> bool {
+    n_exp == 256
+        && ((arch.is_gfx1100() && !matches!(gfx1100_router_mode, Some("0" | "approx")))
+            || arch.is_gfx1151())
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
@@ -882,15 +908,29 @@ pub fn run_moe_decode(
         }
     }
     let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
-    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
-    let exact_wave64_router = p.n_exp == 256
-        && ((ctx.arch.is_gfx1100()
-            // The exact fused router is the production gfx1100 path. `0` retains
-            // the two-launch reference path for A/B diagnosis; `approx` retains
-            // the old non-bit-exact research kernel without exposing it by
-            // accident through the former `1` opt-in.
-            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
-            || gfx1151_radiowave_fusions);
+    let exact_wave64_router =
+        exact_wave64_router_predicate(p.n_exp, &ctx.arch, gfx1100_router_mode.as_deref());
+    // Escha-only router-logits f16 round-trip (review Fix 1). EschaLabs'
+    // runtime computes router logits as f16(x @ gate_w.T) and only then
+    // widens to F32 to select top-k; hipfire keeps logits F32 end-to-end.
+    // The two selections differ whenever two experts' F32 logits round to
+    // the same f16 value AND straddle the top-k boundary (measured ~0.42%
+    // of router decisions across 11 layers). Escha's recovery fine-tune was
+    // trained against the f16-rounding runtime, so this model family must
+    // reproduce that rounding to avoid a silent, unexplained divergence
+    // from Escha's own expert choice.
+    //
+    // Gated on `MoeDtypes::has_escha_experts` — a model-state property fixed
+    // at load time by the routed-expert dtype actually on disk, never a
+    // global env var — so every `qwen3.6:35b-a3b-*` SKU and every other
+    // arch-6 model takes the branch below as a no-op and keeps its current
+    // selection bit-for-bit. Applied to the shared `router_logits` buffer
+    // BEFORE the kernel-selection `if`/`else` below, so both routes (the
+    // fused exact-wave64 kernel and the softmax_f32 + moe_topk_renorm_k8
+    // fallback pair) see identically-rounded logits.
+    if p.dtypes.has_escha_experts() {
+        hip!(gpu.router_logits_round_f16_rne(p.router_logits))?;
+    }
     static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
     let router_shared_fuse = exact_wave64_router
         && p.batch_size == 1
