@@ -1718,34 +1718,51 @@ Add to `crates/rdna-compute/src/gemv.rs` beside `gemv_q8_0` (line 13563), follow
         out_features: u32,
         k: u32,
     ) -> HipResult<Vec<u16>> {
+        self.bind_thread()?;
+        let n_elems = (in_features as usize) * (out_features as usize);
+        let n_tiles = (in_features / 16) * (out_features / 16);
+        let code_bytes: Vec<u8> = code.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_code = self.upload_raw(&code_bytes, &[code.len()])?;
+        let d_bare = self.alloc_tensor(&[n_elems], DType::F16)?;
         self.ensure_kernel(
             "escha_decode_tiles",
             kernels::ESCHA_DECODE_TILES_SRC,
             "escha_decode_tiles",
         )?;
-        let n_tiles = (in_features / 16) * (out_features / 16);
-        let d_code = self.upload_raw(
-            &code.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
-            &[code.len()],
-        )?;
-        let d_bare = self.alloc_tensor(
-            &[(in_features as usize) * (out_features as usize)],
-            DType::F16,
-        )?;
-        self.launch_kernel(
-            "escha_decode_tiles",
-            (n_tiles, 1, 1),
-            (32, 1, 1),
-            &[
-                &d_code.buf, &d_bare.buf,
-                &(in_features as i32), &(out_features as i32), &(k as i32),
-            ],
-        )?;
-        let mut out = vec![0u8; (in_features as usize) * (out_features as usize) * 2];
+
+        let mut code_ptr = d_code.buf.as_ptr();
+        let mut bare_ptr = d_bare.buf.as_ptr();
+        let mut ic = in_features as i32;
+        let mut oc = out_features as i32;
+        let mut kk = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut code_ptr as *mut _ as *mut c_void,
+            &mut bare_ptr as *mut _ as *mut c_void,
+            &mut ic as *mut _ as *mut c_void,
+            &mut oc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_decode_tiles"];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [n_tiles, 1, 1], [32, 1, 1], 0, None, &mut params)?;
+        }
+
+        let mut out = vec![0u8; n_elems * 2];
         self.hip.memcpy_dtoh(&mut out, &d_bare.buf)?;
-        Ok(out.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+        Ok(out
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
     }
 ```
+
+This follows the launch convention used throughout `gemv.rs` (see `gemv_q8_0`
+at line 13563): `bind_thread` → `upload_raw`/`alloc_tensor` → `ensure_kernel` →
+build a `Vec<*mut c_void>` of `&mut` locals → look the function up in
+`self.functions` → `unsafe { self.hip.launch_kernel(...) }`. There is no
+`Gpu::launch_kernel(name, ...)` helper taking buffers directly; do not invent
+one. `c_void` is already imported in `gemv.rs`.
 
 - [ ] **Step 6: Run the parity gate (G2)**
 
@@ -1931,32 +1948,48 @@ Add to `crates/rdna-compute/src/gemv.rs`:
         &mut self,
         entry: &str,
         a: &[f32],
-        vec: &[f32],
+        vec_in: &[f32],
     ) -> HipResult<Vec<u16>> {
-        assert_eq!(a.len(), vec.len());
+        assert_eq!(a.len(), vec_in.len());
         assert_eq!(a.len() % 128, 0, "H128 needs a multiple of 128");
-        self.ensure_kernel("escha_h128", kernels::ESCHA_H128_SRC, entry)?;
+        self.bind_thread()?;
         let n = a.len();
-        let d_a = self.upload_raw(
-            &a.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
-            &[n],
-        )?;
-        let d_v = self.upload_raw(
-            &vec.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
-            &[n],
-        )?;
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v_bytes: Vec<u8> = vec_in.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_a = self.upload_raw(&a_bytes, &[n])?;
+        let d_v = self.upload_raw(&v_bytes, &[n])?;
         let d_out = self.alloc_tensor(&[n], DType::F16)?;
-        self.launch_kernel(
-            entry,
-            ((n / 128) as u32, 1, 1),
-            (128, 1, 1),
-            &[&d_a.buf, &d_v.buf, &d_out.buf, &(n as i32)],
-        )?;
+        self.ensure_kernel("escha_h128", kernels::ESCHA_H128_SRC, entry)?;
+
+        let mut a_ptr = d_a.buf.as_ptr();
+        let mut v_ptr = d_v.buf.as_ptr();
+        let mut o_ptr = d_out.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[entry];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [(n / 128) as u32, 1, 1], [128, 1, 1], 0, None, &mut params)?;
+        }
+
         let mut raw = vec![0u8; n * 2];
         self.hip.memcpy_dtoh(&mut raw, &d_out.buf)?;
-        Ok(raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+        Ok(raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
     }
 ```
+
+Note `ensure_kernel(module, SRC, entry)` is called once per entry point — the
+two entries live in the same `.hip` source but are separate device functions,
+so each needs its own `ensure_kernel` call and its own `self.functions` lookup
+key.
 
 - [ ] **Step 6: Run the parity gate (G3)**
 
