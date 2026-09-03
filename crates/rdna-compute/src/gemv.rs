@@ -13637,6 +13637,54 @@ impl Gpu {
         result
     }
 
+    /// Decode an escha code stream to a bare fp16 weight matrix `[ic, oc]`.
+    /// Host-side helper used by the G2 parity gate; the load path uses the
+    /// device-resident form.
+    pub fn escha_decode_tiles_host(
+        &mut self,
+        code: &[i16],
+        in_features: u32,
+        out_features: u32,
+        k: u32,
+    ) -> HipResult<Vec<u16>> {
+        self.bind_thread()?;
+        let n_elems = (in_features as usize) * (out_features as usize);
+        let n_tiles = (in_features / 16) * (out_features / 16);
+        let code_bytes: Vec<u8> = code.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_code = self.upload_raw(&code_bytes, &[code.len()])?;
+        let d_bare = self.alloc_tensor(&[n_elems], DType::F16)?;
+        self.ensure_kernel(
+            "escha_decode_tiles",
+            kernels::ESCHA_DECODE_TILES_SRC,
+            "escha_decode_tiles",
+        )?;
+
+        let mut code_ptr = d_code.buf.as_ptr();
+        let mut bare_ptr = d_bare.buf.as_ptr();
+        let mut ic = in_features as i32;
+        let mut oc = out_features as i32;
+        let mut kk = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut code_ptr as *mut _ as *mut c_void,
+            &mut bare_ptr as *mut _ as *mut c_void,
+            &mut ic as *mut _ as *mut c_void,
+            &mut oc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_decode_tiles"];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [n_tiles, 1, 1], [32, 1, 1], 0, None, &mut params)?;
+        }
+
+        let mut out = vec![0u8; n_elems * 2];
+        self.hip.memcpy_dtoh(&mut out, &d_bare.buf)?;
+        Ok(out
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,

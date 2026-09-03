@@ -4265,6 +4265,14 @@ impl Gpu {
             _ => {}
         }
 
+        // Escha-W2 tile decode: standalone utility, not gated on weight_quant
+        // (it runs ahead of the normal GEMV dispatch to materialize bare fp16
+        // weights from the packed trellis code).
+        specs.push((
+            "escha_decode_tiles",
+            kernels::ESCHA_DECODE_TILES_SRC.to_string(),
+        ));
+
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
         specs.push((

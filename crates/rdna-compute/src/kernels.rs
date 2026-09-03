@@ -4809,6 +4809,13 @@ pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 
+/// Escha-W2 one-shot tile decode: packed trellis code -> bare fp16 weights.
+/// No codebook LUT (65536 fp16 entries would be 128 KB, gfx1151 LDS is 64 KB);
+/// the codebook is computed inline per element. See the file for the G2 gate
+/// rationale (deliberately duplicates escha_ref.rs's lane maths in Rust).
+pub const ESCHA_DECODE_TILES_SRC: &str =
+    include_str!("../../../kernels/src/escha_decode_tiles.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the

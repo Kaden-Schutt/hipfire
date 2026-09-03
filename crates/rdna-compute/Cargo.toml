@@ -21,6 +21,12 @@ rayon = "1"
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
+# G2 parity gate only (test_escha_decode_gpu_vs_cpu): escha_ref::reconstruct is
+# the CPU oracle the GPU tile decode is asserted bit-exact against. Note
+# hipfire-quantize already carries a dev-dependency back on rdna-compute (for
+# its own GL-codebook parity test); Cargo permits a dev-dependency cycle since
+# dev-deps are excluded from the normal build graph.
+hipfire-quantize = { path = "../hipfire-quantize" }
 
 # ---------------------------------------------------------------------------
 # Archived research probes.

@@ -2707,6 +2707,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hipfire-quantize",
  "libloading",
  "radiowave",
  "rayon",
