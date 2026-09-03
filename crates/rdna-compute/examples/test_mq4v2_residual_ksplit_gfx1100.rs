@@ -50,9 +50,7 @@ fn u32le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 fn u64le(b: &[u8]) -> u64 {
-    u64::from_le_bytes([
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-    ])
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 /// Minimal HFQ index parse mirroring HfqFile::open_at_offset (hfq.rs:445+).
@@ -123,7 +121,12 @@ fn parse_hfq_index(path: &std::path::Path) -> (String, Vec<HfqTensor>) {
         pos += 4; // group_size
         let data_len = u64le(&region[pos..pos + 8]) as usize;
         pos += 8;
-        tensors.push(HfqTensor { name, shape, data_off: cum, data_len });
+        tensors.push(HfqTensor {
+            name,
+            shape,
+            data_off: cum,
+            data_len,
+        });
         cum += data_len;
     }
     (canon.display().to_string(), tensors)
@@ -237,7 +240,11 @@ fn f32_to_f16_bits_rne(v: f32) -> u16 {
     } else {
         (m32 >> sh, m32 & ((1u64 << sh) - 1))
     };
-    let half_bit = if sh == 0 || sh > 64 { 0 } else { 1u64 << (sh - 1) };
+    let half_bit = if sh == 0 || sh > 64 {
+        0
+    } else {
+        1u64 << (sh - 1)
+    };
     let round_up = if sh == 0 {
         false
     } else if sh > 64 {
@@ -265,7 +272,11 @@ fn f16_to_f64(bits: u16) -> f64 {
     } else {
         (m + 1024.0) * 2f64.powi(e - 15 - 10)
     };
-    if s == 0.0 { v } else { -v }
+    if s == 0.0 {
+        v
+    } else {
+        -v
+    }
 }
 
 fn rel_l2_f64(a: &[f64], b: &[f64]) -> f64 {
@@ -299,12 +310,22 @@ fn rms_f64(v: &[f64]) -> f64 {
 /// gp+4), nibble unpacking (kt*16+i, pk0/pk1 at gp+8+k_off/2), weight =
 /// sc*nibble+zp evaluated in f64. X is f16-rounded (RN-even, as the staging
 /// kernel does), Y init is exact, accumulation is f64 in ascending-K order.
-fn host_f64_ref(payload: &[u8], x_host: &[f32], y_init: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
+fn host_f64_ref(
+    payload: &[u8],
+    x_host: &[f32],
+    y_init: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f64> {
     assert_eq!(x_host.len(), n * k);
     assert_eq!(y_init.len(), n * m);
     let g = k / 256;
     // X through the same f16 rounding the device staging kernel applies.
-    let xr: Vec<f64> = x_host.iter().map(|&v| f16_to_f64(f32_to_f16_bits_rne(v))).collect();
+    let xr: Vec<f64> = x_host
+        .iter()
+        .map(|&v| f16_to_f64(f32_to_f16_bits_rne(v)))
+        .collect();
     let mut y: Vec<f64> = y_init.iter().map(|&v| v as f64).collect();
     let mut w256 = [0f64; 256];
     for r in 0..m {
@@ -366,10 +387,9 @@ fn sync(gpu: &Gpu) {
 
 fn htod_f32(gpu: &Gpu, t: &rdna_compute::GpuTensor, v: &[f32]) {
     gpu.hip
-        .memcpy_htod(
-            &t.buf,
-            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) },
-        )
+        .memcpy_htod(&t.buf, unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+        })
         .expect("htod f32");
     sync(gpu);
 }
@@ -421,13 +441,35 @@ fn main() {
         k: usize,
     }
     let projs = [
-        Proj { label: "out_proj", suffix: "layers.0.linear_attn.out_proj.weight", m: 5120, k: 6144 },
-        Proj { label: "down_proj", suffix: "layers.0.mlp.down_proj.weight", m: 5120, k: 17408 },
+        Proj {
+            label: "out_proj",
+            suffix: "layers.0.linear_attn.out_proj.weight",
+            m: 5120,
+            k: 6144,
+        },
+        Proj {
+            label: "down_proj",
+            suffix: "layers.0.mlp.down_proj.weight",
+            m: 5120,
+            k: 17408,
+        },
     ];
 
     println!(
         "{:>10} {:>3} {:>4} {:>12} {:>12} {:>7} {:>12} {:>12} {:>12} {:>12} {:>9} {:>10} {:>10}",
-        "proj", "N", "kw", "r(ks,base)", "maxAbs", "finite", "r(base,f64)", "r(ks,f64)", "mx(ks,f64)", "rmsRef", "fr>1e-3", "min_us", "med_us"
+        "proj",
+        "N",
+        "kw",
+        "r(ks,base)",
+        "maxAbs",
+        "finite",
+        "r(base,f64)",
+        "r(ks,f64)",
+        "mx(ks,f64)",
+        "rmsRef",
+        "fr>1e-3",
+        "min_us",
+        "med_us"
     );
 
     let mut all_ok = true;
@@ -438,13 +480,20 @@ fn main() {
         assert_eq!(m, p.m, "{}: M {m} != {}", p.label, p.m);
         assert_eq!(k, p.k, "{}: K {k} != {}", p.label, p.k);
         let expect = m * (k / 256) * 136;
-        assert_eq!(t.data_len, expect, "{}: size {} != {expect}", p.label, t.data_len);
+        assert_eq!(
+            t.data_len, expect,
+            "{}: size {} != {expect}",
+            p.label, t.data_len
+        );
         eprintln!("{}: {} M={m} K={k} bytes={}", p.label, t.name, t.data_len);
         let payload = read_tensor_bytes(&canon, t);
         let d_a = gpu.upload_raw(&payload, &[m, k]).expect("upload weights");
         let g = k / 256;
-        let runnable: Vec<usize> =
-            KWS.iter().copied().filter(|&kw| g >= kw && g % kw == 0).collect();
+        let runnable: Vec<usize> = KWS
+            .iter()
+            .copied()
+            .filter(|&kw| g >= kw && g % kw == 0)
+            .collect();
 
         for &n in &NS {
             let x_host = random_f32(n * k, 0x1234_9E37 + k as u64, -1.0, 1.0);
@@ -479,7 +528,11 @@ fn main() {
             let y_ref64: Vec<f64> = y_ref.iter().map(|&v| v as f64).collect();
             let r_base_f64 = rel_l2_f64(&y_ref64, &y_f64);
             let rms_ref = rms_f64(&y_f64);
-            let ma_base_f64 = y_ref64.iter().zip(y_f64.iter()).map(|(a, b)| (a - b).abs()).fold(0f64, f64::max);
+            let ma_base_f64 = y_ref64
+                .iter()
+                .zip(y_f64.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f64, f64::max);
             eprintln!("  f64 truth {} N={n}: relL2(base,f64)={r_base_f64:.3e} maxAbs(base,f64)={ma_base_f64:.3e} rmsRef={rms_ref:.3e} ({f64_ms:.0} ms host)", p.label);
 
             // One Y tensor per runnable kw arm (kept for the timing phase).
@@ -504,8 +557,17 @@ fn main() {
                 let ma = max_abs_diff(&y_got, &y_ref);
                 let y_got64: Vec<f64> = y_got.iter().map(|&v| v as f64).collect();
                 let r_ks_f64 = rel_l2_f64(&y_got64, &y_f64);
-                let ma_ks_f64 = y_got64.iter().zip(y_f64.iter()).map(|(a, b)| (a - b).abs()).fold(0f64, f64::max);
-                let bigfrac = y_got.iter().zip(y_ref.iter()).filter(|(a, b)| (**a - **b).abs() as f64 > BIG_DIFF).count() as f64 / y_got.len() as f64;
+                let ma_ks_f64 = y_got64
+                    .iter()
+                    .zip(y_f64.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f64, f64::max);
+                let bigfrac = y_got
+                    .iter()
+                    .zip(y_ref.iter())
+                    .filter(|(a, b)| (**a - **b).abs() as f64 > BIG_DIFF)
+                    .count() as f64
+                    / y_got.len() as f64;
                 let ok = finite && r2 <= PARITY_TOL;
                 if !ok {
                     all_ok = false;
@@ -520,8 +582,10 @@ fn main() {
                 let kw = par[i].0;
                 htod_f32(&gpu, d_y, &y_init);
                 for _ in 0..WARMUP {
-                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(&d_a, &d_x, d_y, m, k, n, kw)
-                        .unwrap();
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                        &d_a, &d_x, d_y, m, k, n, kw,
+                    )
+                    .unwrap();
                 }
             }
             sync(&gpu);
@@ -531,8 +595,10 @@ fn main() {
                     let kw = par[i].0;
                     htod_f32(&gpu, d_y, &y_init);
                     samples[i].push(time_batch(&mut gpu, &mut |gm: &mut Gpu| {
-                        gm.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(&d_a, &d_x, d_y, m, k, n, kw)
-                            .unwrap()
+                        gm.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                            &d_a, &d_x, d_y, m, k, n, kw,
+                        )
+                        .unwrap()
                     }));
                 }
             }
