@@ -181,10 +181,12 @@ pub struct FeatureFlags {
     /// this to force the base oracle now that the tier is capture-safe.
     /// Disables BOTH the ksplit and ldsstage kernels.
     pub residual_ksplit_off: bool,
-    /// `HIPFIRE_RESIDUAL_LDSSTAGE_OFF=1` forces the ks4 split-K kernel for A/B
-    /// on the exact-gfx1100 N<=16 tier instead of the default ldsstage kernel.
-    /// Default OFF (ldsstage live wherever K % 512 == 0).
-    pub residual_ldsstage_off: bool,
+    /// `HIPFIRE_RESIDUAL_LDSSTAGE=1` opts the exact-gfx1100 N<=16 tier into
+    /// the ldsstage kernel wherever K % 512 == 0. Default OFF (ks table wins):
+    /// ldsstage beats ks4 by ~8% (53% vs 48% of roofline on hipx) but missed
+    /// the 70% gate — 126 VGPRs cap it at 1 WG/CU — so ks4 stays the default
+    /// until register pressure is addressed.
+    pub residual_ldsstage: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -510,7 +512,7 @@ impl FeatureFlags {
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
-            residual_ldsstage_off: value("HIPFIRE_RESIDUAL_LDSSTAGE_OFF").ok().as_deref() == Some("1"),
+            residual_ldsstage: value("HIPFIRE_RESIDUAL_LDSSTAGE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -754,7 +756,7 @@ impl FeatureFlags {
             graph_moe: true,
             force_blob_path: false,
             residual_ksplit_off: false,
-            residual_ldsstage_off: false,
+            residual_ldsstage: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,

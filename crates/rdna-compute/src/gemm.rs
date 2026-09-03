@@ -28036,36 +28036,32 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
-        // Exact gfx1100 DFlash verify tier: LDS-staged residual for N<=16, where
-        // the base kernel (one wave32 per 16x16 tile) launches too few waves to
+        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
+        // base kernel (one wave32 per 16x16 tile) launches too few waves to
         // cover 96 CUs. Capture-SAFE (unlike the mw_lds tier below): the
         // kernel is deterministic (fixed wave-order LDS reduction, no
         // atomics), launches via launch_maybe_blob (blob ABI recorded under
         // capture), and its symbols carry the replay.rs kernarg contract, so
-        // verify-graph capture bakes ldsstage and every replayed cycle keeps
+        // verify-graph capture bakes ks4_lds and every replayed cycle keeps
         // the win. Only Redline tape recording keeps the base contract.
-        // Kill switches: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the
-        // ldsstage and ksplit kernels (flags.residual_ksplit_off);
-        // HIPFIRE_RESIDUAL_LDSSTAGE_OFF=1 forces ks4 for A/B
-        // (flags.residual_ldsstage_off).
+        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the ksplit
+        // and ldsstage kernels (flags.residual_ksplit_off) and restores the
+        // base oracle. The ldsstage kernel (gfx1100 port of the gfx12
+        // ldsstage design) is opt-in via HIPFIRE_RESIDUAL_LDSSTAGE=1
+        // (flags.residual_ldsstage) wherever K % 512 == 0: it beats ks4 by
+        // ~8% on hipx (53% vs 48% of roofline) but missed the 70% gate — 126
+        // VGPRs cap it at 1 WG/CU — so ks4 stays the default until register
+        // pressure is addressed.
         if !self.replay.is_recording()
             && !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && batch_size <= 16
         {
-            if !self.flags.residual_ldsstage_off && k % 512 == 0 && k > 0 {
+            if self.flags.residual_ldsstage && k % 512 == 0 && k > 0 {
                 return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
                     a_raw, x, y, m, k, batch_size,
                 );
-            }
-            if self.flags.residual_ldsstage_off {
-                let g = k / 256;
-                if k % 256 == 0 && g >= 4 && g % 4 == 0 {
-                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
-                        a_raw, x, y, m, k, batch_size, 4,
-                    );
-                }
             }
             if let Some(kw) = Self::residual_ksplit_kw(k) {
                 return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
