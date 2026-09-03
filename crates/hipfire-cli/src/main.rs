@@ -3762,7 +3762,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             // Every run uses the same prompt, so the daemon's tokenized
             // prompt length is run-invariant; keep the first report.
             if prompt_tokens.is_none() {
-                prompt_tokens = done.get("prompt_tokens").and_then(serde_json::Value::as_u64);
+                prompt_tokens = done
+                    .get("prompt_tokens")
+                    .and_then(serde_json::Value::as_u64);
             }
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
@@ -9191,10 +9193,7 @@ mod tests {
 
     #[test]
     fn bench_resolve_prompt_rejects_file_and_positional() {
-        let args = bench_args_for_test(
-            vec!["hello".to_owned()],
-            Some(PathBuf::from("prompt.txt")),
-        );
+        let args = bench_args_for_test(vec!["hello".to_owned()], Some(PathBuf::from("prompt.txt")));
         assert!(resolve_bench_prompt(&args).is_err());
     }
 
@@ -9202,8 +9201,14 @@ mod tests {
     fn bench_prompt_warning_threshold() {
         // The default short prompt must warn; 256+ tokens must not.
         let short = bench_prompt_warning(24).expect("24 tokens must warn");
-        assert!(short.contains("launch overhead"), "unexpected text: {short}");
-        assert!(short.contains("24"), "warning should name the count: {short}");
+        assert!(
+            short.contains("launch overhead"),
+            "unexpected text: {short}"
+        );
+        assert!(
+            short.contains("24"),
+            "warning should name the count: {short}"
+        );
         assert!(bench_prompt_warning(255).is_some());
         assert!(bench_prompt_warning(256).is_none());
         assert!(bench_prompt_warning(4400).is_none());
@@ -9212,10 +9217,7 @@ mod tests {
     #[test]
     fn bench_prompt_md5_is_hex_of_prompt_bytes() {
         // md5("abc") is a fixed vector; guards against swapping in sha256.
-        assert_eq!(
-            bench_prompt_md5("abc"),
-            "900150983cd24fb0d6963f7d28e17f72"
-        );
+        assert_eq!(bench_prompt_md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
     }
 
     #[test]
