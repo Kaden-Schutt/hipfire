@@ -3670,8 +3670,12 @@ fn bench_prompt_warning(prompt_tokens: u64) -> Option<String> {
 /// `prefill_tokens` (rows actually prefilled) plus `cached_tokens` (prefix
 /// served from the prompt cache). `None` when the event carries neither.
 fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
-    let prefill = done.get("prefill_tokens").and_then(serde_json::Value::as_u64);
-    let cached = done.get("cached_tokens").and_then(serde_json::Value::as_u64);
+    let prefill = done
+        .get("prefill_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let cached = done
+        .get("cached_tokens")
+        .and_then(serde_json::Value::as_u64);
     match (prefill, cached) {
         (None, None) => None,
         (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
