@@ -1618,6 +1618,7 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("TriAttention", entry.triattn.as_ref()),
         ("MTP", entry.mtp.as_ref()),
         ("DSpark", entry.dspark.as_ref()),
+        ("DFlash", entry.dflash.as_ref()),
     ] {
         let Some(sidecar) = sidecar else {
             continue;
@@ -1779,7 +1780,7 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
     let mut targets = BTreeSet::from([path.clone()]);
     if let Some((_, entry)) = resolved {
         targets.extend(
-            [&entry.triattn, &entry.mtp, &entry.dspark]
+            [&entry.triattn, &entry.mtp, &entry.dspark, &entry.dflash]
                 .into_iter()
                 .flatten()
                 .map(|sidecar| paths.models.join(&sidecar.file))

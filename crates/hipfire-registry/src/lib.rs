@@ -188,6 +188,8 @@ pub struct ModelEntry {
     #[serde(default)]
     pub dspark: Option<Sidecar>,
     #[serde(default)]
+    pub dflash: Option<Sidecar>,
+    #[serde(default)]
     pub default_tool_format: Option<String>,
     #[serde(default)]
     pub default_kv_mode: Option<String>,
@@ -364,7 +366,7 @@ impl RegistryV1 {
                 return Err(fail(format!("model '{tag}' has invalid size metadata")));
             }
             validate_digest(entry.sha256.as_deref(), tag).map_err(fail)?;
-            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark]
+            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark, &entry.dflash]
                 .into_iter()
                 .flatten()
             {
@@ -1027,6 +1029,30 @@ mod tests {
             preview_rs.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
         );
+    }
+    #[test]
+    fn bundled_dflash_sidecars_name_pullable_files() {
+        // Every `dflash.file` must name a file that some registry entry's
+        // `file` also names, so `hipfire pull <target>` fetching the sidecar
+        // always lands a file that `hipfire pull <tag>-draft` could fetch too.
+        let registry = bundled().unwrap();
+        let files: std::collections::BTreeSet<&str> = registry
+            .models
+            .values()
+            .map(|entry| entry.file.as_str())
+            .collect();
+        let mut paired = 0;
+        for (tag, entry) in &registry.models {
+            if let Some(sidecar) = entry.dflash.as_ref() {
+                assert!(
+                    files.contains(sidecar.file.as_str()),
+                    "model '{tag}' declares dflash sidecar '{}' with no matching entry file",
+                    sidecar.file
+                );
+                paired += 1;
+            }
+        }
+        assert!(paired > 0, "bundled registry should pair at least one dflash sidecar");
     }
 
     #[test]
