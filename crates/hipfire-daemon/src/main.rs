@@ -1338,10 +1338,7 @@ fn main() {
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
-                    // DFlash draft: the CLI lowers `speculation` into a
-                    // `dflash_mode` string. off→Some(false) (skip load),
-                    // on→Some(true) (fail closed on missing/unloadable draft),
-                    // auto/absent→None (load-if-present, log-and-AR fallback).
+                    // DFlash mirrors mtp: on = fail closed on a missing/unloadable draft.
                     dflash: match dflash_mode {
                         "on" => Some(true),
                         "off" => Some(false),
