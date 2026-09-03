@@ -1970,7 +1970,13 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `run --spec dflash`); a
     // no-op when load_params already resolved or an explicit draft won.
-    resolve_dflash_sidecar(&mut params, entry, &paths.models, &model_path, canonical.as_deref())?;
+    resolve_dflash_sidecar(
+        &mut params,
+        entry,
+        &paths.models,
+        &model_path,
+        canonical.as_deref(),
+    )?;
     if let Some(window) = args.draft_max {
         if !(1..=32).contains(&window) {
             bail!("--draft-max must be between 1 and 32");
@@ -4075,7 +4081,13 @@ fn open_bench_engine(
     }
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).
-    resolve_dflash_sidecar(&mut params, entry.as_ref(), &paths.models, &path, tag.as_deref())?;
+    resolve_dflash_sidecar(
+        &mut params,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        tag.as_deref(),
+    )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
@@ -6331,7 +6343,11 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &defaults,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             None,
             None,
@@ -6353,7 +6369,11 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &enabled,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             None,
             None,
@@ -6371,7 +6391,11 @@ mod tests {
     pub(crate) fn load_params_forwards_explicit_vmm_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params = load_params(&defaults, None, &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             Some("vmm"),
@@ -6386,7 +6410,11 @@ mod tests {
     pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params = load_params(&defaults, None, &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -6688,7 +6716,11 @@ mod tests {
 
         // Also verify load_params respects explicit kv_backend override over configured vmm.
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params = load_params(&resolved, Some(entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             Some("contiguous"),
@@ -6698,7 +6730,11 @@ mod tests {
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         // Without explicit override, load_params uses the resolved vmm.
-        let params2 = load_params(&resolved, Some(entry), &model_path.parent().unwrap(), &model_path,
+        let params2 = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -6804,7 +6840,11 @@ mod tests {
     pub(crate) fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
         let model_path = PathBuf::from("/tmp/test-model.mq2r");
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, None, &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -6826,7 +6866,11 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&resolved, None, &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -6851,7 +6895,11 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&resolved, None, Path::new("/tmp/test-model.mq2r").parent().unwrap(), Path::new("/tmp/test-model.mq2r"),
+        let params = load_params(
+            &resolved,
+            None,
+            Path::new("/tmp/test-model.mq2r").parent().unwrap(),
+            Path::new("/tmp/test-model.mq2r"),
             64,
             Some("q8"),
             None,
@@ -6878,7 +6926,11 @@ mod tests {
         .unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
-        let params = load_params(&resolved, None, &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -6934,7 +6986,11 @@ mod tests {
         fs::write(&draft_path, b"draft").unwrap();
         let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
         let resolved = resolved_with_dflash_mode("auto", None);
-        let params = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -6968,7 +7024,10 @@ mod tests {
         let resolved = resolved_with_dflash_mode("on", None);
         // What serve/run actually pass: the canonicalized path.
         let canonical = fs::canonicalize(paths.models.join("qwen3.5-9b.mq4")).unwrap();
-        assert_eq!(canonical.parent().unwrap(), elsewhere.canonicalize().unwrap());
+        assert_eq!(
+            canonical.parent().unwrap(),
+            elsewhere.canonicalize().unwrap()
+        );
         let params = load_params(
             &resolved,
             Some(&entry),
@@ -6994,7 +7053,11 @@ mod tests {
         fs::write(&model_path, b"model").unwrap();
         let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
         let resolved = resolved_with_dflash_mode("on", None);
-        let error = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -7017,7 +7080,11 @@ mod tests {
         fs::write(&model_path, b"model").unwrap();
         let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
         let resolved = resolved_with_dflash_mode("auto", None);
-        let params = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -7045,7 +7112,11 @@ mod tests {
         let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
         let explicit = "/tmp/custom-draft.hfq";
         let resolved = resolved_with_dflash_mode("auto", Some(explicit));
-        let params = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -7069,7 +7140,11 @@ mod tests {
         fs::write(&draft_path, b"draft").unwrap();
         let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
         let resolved = resolved_with_dflash_mode("off", None);
-        let params = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -7085,7 +7160,11 @@ mod tests {
 
         // Resolve under auto, then a final off selector drops it.
         let resolved = resolved_with_dflash_mode("auto", None);
-        let mut params = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let mut params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -7114,7 +7193,11 @@ mod tests {
         fs::write(&model_path, b"model").unwrap();
         let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
         let resolved = resolved_with_dflash_mode("on", None);
-        let params = load_params(&resolved, Some(&entry), &model_path.parent().unwrap(), &model_path,
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
@@ -7146,7 +7229,11 @@ mod tests {
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
         // load_params alone must not carry the draft while config mode is off.
-        let mut params = load_params(&resolved, None, &model_path.parent().unwrap(), &model_path,
+        let mut params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
             64,
             Some("q8"),
             None,
