@@ -4,6 +4,7 @@
 //! Code streams are copied byte-for-byte; `memcmp` on the round-trip is a
 //! post-condition. See docs/plans/escha-w2-port-design.md.
 
+use hipfire_quantize::float16::f16_to_f32;
 use crate::hfq::QuantType;
 use std::path::Path;
 
@@ -242,13 +243,73 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                 let oc = m.shape[0];
                 let ic = m.shape[1];
                 let w8: Vec<i8> = d.iter().map(|&b| b as i8).collect();
-                let q8 = int8_rows_to_q8_0(&w8, &as_u16(sd), oc, ic)?;
+                // The embedding TABLE stays Q8_0 regardless: only one row is
+                // read per token, so down-quantising it saves nothing per
+                // token, and the embedding loader supports a fixed format set
+                // (qt 15 is not in it — it errors with "unsupported embedding
+                // quant_type 15"). lm_head is a different matter: it IS read
+                // in full every token (0.54 GB, 22% of the budget).
+                let is_embed = prefix.contains("embed_tokens") || prefix.contains("token_embd");
+                let fmt = if is_embed { DenseFormat::Q8_0 } else { dense_format_for(prefix) };
+                let (data, qt, gs) = match fmt {
+                    DenseFormat::Q8_0 => (
+                        int8_rows_to_q8_0(&w8, &as_u16(sd), oc, ic)?,
+                        QuantType::Q8F16,
+                        32u32,
+                    ),
+                    // Down-quantise the tensors Escha did NOT trellis-code.
+                    // They are int8 in the checkpoint and are 88% of the bytes
+                    // touched per decode token (the 2-bit experts are only
+                    // 12%), so this is the only large lever left on decode —
+                    // at the cost of a SECOND quantisation on top of escha's
+                    // own. Measured relative RMS weight error on
+                    // layers.0.linear_attn.in_proj_qkv: MQ6 2.8%, MQ5 5.9%,
+                    // MQ4V2 9.9%.
+                    DenseFormat::Mq4V2 | DenseFormat::Mq6 => {
+                        let scales = as_u16(sd);
+                        let mut f32_data = Vec::with_capacity(oc * ic);
+                        for o in 0..oc {
+                            let s = f16_to_f32(scales[o]);
+                            for i in 0..ic {
+                                f32_data.push(w8[o * ic + i] as f32 * s);
+                            }
+                        }
+                        let s1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+                        let s2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+                        // MQ6G256**V2**, not MQ6G256. `fused_qkvza_key_for`
+                        // (forward_slots.rs) matches only the V2 MQ variants
+                        // and has a `_ => FusedQkvzaHfq4G256` catch-all, so a
+                        // plain MQ6G256 QKVZA weight dispatches a 4-bit HFQ4
+                        // kernel over 6-bit MQ6 bytes: finite output, garbage
+                        // values. Measured with MQ6G256 on the GDN input
+                        // projections: KLD 12.6, PPL 2,375,141 — while
+                        // out_proj, which is not on the fused path, was fine
+                        // at KLD 0.0076.
+                        if fmt == DenseFormat::Mq4V2 {
+                            (
+                                crate::quant_fwht::quantize_mq4g256v2(
+                                    &f32_data, oc, ic, &s1, &s2,
+                                ),
+                                QuantType::MQ4G256V2,
+                                256u32,
+                            )
+                        } else {
+                            (
+                                crate::quant_fwht::quantize_mq6g256v2(
+                                    &f32_data, oc, ic, &s1, &s2,
+                                ),
+                                QuantType::MQ6G256V2,
+                                256u32,
+                            )
+                        }
+                    }
+                };
                 tensors.push(HfqTensor {
                     name: format!("{prefix}.weight"),
-                    quant_type: QuantType::Q8F16,
+                    quant_type: qt,
                     shape: vec![oc as u32, ic as u32],
-                    group_size: 32,
-                    data: q8,
+                    group_size: gs,
+                    data,
                     spilled_len: 0,
                 });
             }
@@ -380,6 +441,70 @@ fn build_metadata(
 ///
 /// Do NOT recompute per-block scales from the dequantised values. That is a
 /// second quantisation and adds avoidable error.
+
+/// Container for the tensors Escha did NOT trellis-code (`weight_int8` in the
+/// checkpoint: linear-attention projections, attention q/k/v/o, shared expert,
+/// router, embeddings, lm_head).
+///
+/// These are 88% of the bytes touched per decode token — the 2-bit routed
+/// experts are only 12% — so they, not the codec, set decode speed. Measured
+/// per-token totals on the shipped 35B: 2.448 GB at Q8_0 against a comparable
+/// MQ4 SKU's 1.886 GB, i.e. escha reads 1.30x more DESPITE being 12.33 GB on
+/// disk against 19.00 GB.
+///
+/// Default is `Q8_0`, which preserves escha's shipped int8 exactly (the repack
+/// is bit-exact — see `int8_rows_to_q8_0`). Anything else is a SECOND
+/// quantisation and changes the model; it must be justified by a KLD number,
+/// not by the byte saving alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseFormat {
+    Q8_0,
+    Mq6,
+    /// MQ4G256V2 — the container the comparable mq4 SKU uses for exactly
+    /// these tensors, and the one with the widest kernel coverage.
+    Mq4V2,
+}
+
+/// `HIPFIRE_ESCHA_DENSE=mq6` down-quantises every non-embedding int8 tensor.
+/// `HIPFIRE_ESCHA_DENSE=mq6:<substr>` limits it to tensors whose name contains
+/// `<substr>` — used to isolate WHICH path a quality regression comes from,
+/// since a whole-model number cannot distinguish "this format costs accuracy"
+/// from "this one path is not applying the activation rotation MQ requires".
+fn dense_format_for(name: &str) -> DenseFormat {
+    match std::env::var("HIPFIRE_ESCHA_DENSE").ok().as_deref() {
+        Some("mq6") => DenseFormat::Mq6,
+        Some("mq4v2") => DenseFormat::Mq4V2,
+        Some(v) if v.starts_with("mq4v2:") && name.contains(&v[6..]) => DenseFormat::Mq4V2,
+        Some(v) if v.starts_with("mq4v2:") => DenseFormat::Q8_0,
+        Some(v) if v.starts_with("mq6:") => {
+            if name.contains(&v[4..]) {
+                DenseFormat::Mq6
+            } else {
+                DenseFormat::Q8_0
+            }
+        }
+        // `mq6!<substr>` — everything EXCEPT tensors matching <substr>.
+        //
+        // The measured reason this exists: down-quantising the GatedDeltaNet
+        // projections is catastrophic while everything else is nearly free.
+        // KLD against the int8-dense build, same corpus, zero self-control:
+        //     lm_head      0.000838   (PPL 7.6769 -> 7.6984)
+        //     self_attn    0.005879   (PPL 7.6782)
+        //     linear_attn  0.448186   (PPL 13.4100)   <-- 76x worse
+        // Same format and the same 2.8% weight RMS error in all three. GDN
+        // carries a recurrent state, so its error compounds along the
+        // sequence where attention's does not.
+        Some(v) if v.starts_with("mq6!") => {
+            if name.contains(&v[4..]) {
+                DenseFormat::Q8_0
+            } else {
+                DenseFormat::Mq6
+            }
+        }
+        _ => DenseFormat::Q8_0,
+    }
+}
+
 pub(crate) fn int8_rows_to_q8_0(
     w8: &[i8],
     scale_f16: &[u16],
