@@ -1143,6 +1143,7 @@ impl ServeRuntime {
             let mut params = load_params(
                 &resolved,
                 entry,
+                &self.paths.models,
                 &path,
                 max_tokens,
                 self.kv_override.as_deref(),
