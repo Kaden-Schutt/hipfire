@@ -94,9 +94,7 @@ fn u32le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 fn u64le(b: &[u8]) -> u64 {
-    u64::from_le_bytes([
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-    ])
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 /// Minimal HFQ index parse mirroring HfqFile::open_at_offset (hfq.rs:445+).
@@ -309,14 +307,8 @@ fn main() {
 
     let layer_types = parse_layer_types(&meta);
     let n_layers = layer_types.len();
-    let n_la = layer_types
-        .iter()
-        .filter(|s| s.contains("linear"))
-        .count();
-    let n_fa = layer_types
-        .iter()
-        .filter(|s| s.contains("full"))
-        .count();
+    let n_la = layer_types.iter().filter(|s| s.contains("linear")).count();
+    let n_fa = layer_types.iter().filter(|s| s.contains("full")).count();
     emit(&format!(
         "layers: {n_layers} ({n_la} linear_attention, {n_fa} full_attention)"
     ));
@@ -339,21 +331,66 @@ fn main() {
     }
     let la = 0usize;
     let projs = vec![
-        Proj { label: "L0 in_proj_qkv".into(), suffix: format!("layers.{la}.linear_attn.in_proj_qkv.weight") },
-        Proj { label: "L0 in_proj_z".into(), suffix: format!("layers.{la}.linear_attn.in_proj_z.weight") },
-        Proj { label: "L0 in_proj_a".into(), suffix: format!("layers.{la}.linear_attn.in_proj_a.weight") },
-        Proj { label: "L0 in_proj_b".into(), suffix: format!("layers.{la}.linear_attn.in_proj_b.weight") },
-        Proj { label: "L0 out_proj".into(), suffix: format!("layers.{la}.linear_attn.out_proj.weight") },
-        Proj { label: "L0 gate_proj".into(), suffix: format!("layers.{la}.mlp.gate_proj.weight") },
-        Proj { label: "L0 up_proj".into(), suffix: format!("layers.{la}.mlp.up_proj.weight") },
-        Proj { label: "L0 down_proj".into(), suffix: format!("layers.{la}.mlp.down_proj.weight") },
-        Proj { label: format!("L{fa_layer} q_proj"), suffix: format!("layers.{fa_layer}.self_attn.q_proj.weight") },
-        Proj { label: format!("L{fa_layer} k_proj"), suffix: format!("layers.{fa_layer}.self_attn.k_proj.weight") },
-        Proj { label: format!("L{fa_layer} v_proj"), suffix: format!("layers.{fa_layer}.self_attn.v_proj.weight") },
-        Proj { label: format!("L{fa_layer} o_proj"), suffix: format!("layers.{fa_layer}.self_attn.o_proj.weight") },
-        Proj { label: format!("L{fa_layer} gate_proj"), suffix: format!("layers.{fa_layer}.mlp.gate_proj.weight") },
-        Proj { label: format!("L{fa_layer} up_proj"), suffix: format!("layers.{fa_layer}.mlp.up_proj.weight") },
-        Proj { label: format!("L{fa_layer} down_proj"), suffix: format!("layers.{fa_layer}.mlp.down_proj.weight") },
+        Proj {
+            label: "L0 in_proj_qkv".into(),
+            suffix: format!("layers.{la}.linear_attn.in_proj_qkv.weight"),
+        },
+        Proj {
+            label: "L0 in_proj_z".into(),
+            suffix: format!("layers.{la}.linear_attn.in_proj_z.weight"),
+        },
+        Proj {
+            label: "L0 in_proj_a".into(),
+            suffix: format!("layers.{la}.linear_attn.in_proj_a.weight"),
+        },
+        Proj {
+            label: "L0 in_proj_b".into(),
+            suffix: format!("layers.{la}.linear_attn.in_proj_b.weight"),
+        },
+        Proj {
+            label: "L0 out_proj".into(),
+            suffix: format!("layers.{la}.linear_attn.out_proj.weight"),
+        },
+        Proj {
+            label: "L0 gate_proj".into(),
+            suffix: format!("layers.{la}.mlp.gate_proj.weight"),
+        },
+        Proj {
+            label: "L0 up_proj".into(),
+            suffix: format!("layers.{la}.mlp.up_proj.weight"),
+        },
+        Proj {
+            label: "L0 down_proj".into(),
+            suffix: format!("layers.{la}.mlp.down_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} q_proj"),
+            suffix: format!("layers.{fa_layer}.self_attn.q_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} k_proj"),
+            suffix: format!("layers.{fa_layer}.self_attn.k_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} v_proj"),
+            suffix: format!("layers.{fa_layer}.self_attn.v_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} o_proj"),
+            suffix: format!("layers.{fa_layer}.self_attn.o_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} gate_proj"),
+            suffix: format!("layers.{fa_layer}.mlp.gate_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} up_proj"),
+            suffix: format!("layers.{fa_layer}.mlp.up_proj.weight"),
+        },
+        Proj {
+            label: format!("L{fa_layer} down_proj"),
+            suffix: format!("layers.{fa_layer}.mlp.down_proj.weight"),
+        },
     ];
     emit(&format!(
         "\n{:>22} {:>4} {:>6} {:>6} {:>12} {:>12}  {}",
@@ -392,7 +429,13 @@ fn main() {
         );
         assert_eq!(t.shape.len(), 2, "{}: expected 2D shape", p.label);
         let payload = read_tensor_bytes(&canon, t);
-        dims.push(Dim { label: p.label.clone(), m, k, w_bytes: t.data_len, payload });
+        dims.push(Dim {
+            label: p.label.clone(),
+            m,
+            k,
+            w_bytes: t.data_len,
+            payload,
+        });
     }
     // FILE REALITY NOTE: qwen3.8-27b.mq4 stores its dense projections as qt=13
     // (MQ4G256 v1), not qt=44. The v1 and v2 layouts share the identical
@@ -404,7 +447,10 @@ fn main() {
     emit(&format!(
         "NOTE: file dense-projection quants seen on benched tensors: {saw_qt:?} (expected 44 per ticket; file holds v1 qt=13 — same 136 B/group stride, sizes asserted equal)"
     ));
-    assert_eq!(skipped, 0, "some projections failed the v2 size check — see SKIPPED rows");
+    assert_eq!(
+        skipped, 0,
+        "some projections failed the v2 size check — see SKIPPED rows"
+    );
     let d = |label: &str| dims.iter().find(|x| x.label == label).unwrap();
     // Shared-X consistency: the fused qkvza arm feeds ONE x [N x dim] to all
     // four weights, so qkv/z/a/b must share K (out_proj is a separate arm with
@@ -429,9 +475,19 @@ fn main() {
                 + d("L0 in_proj_a").w_bytes
                 + d("L0 in_proj_b").w_bytes,
             k: d("L0 in_proj_qkv").k,
-            ms: vec![d("L0 in_proj_qkv").m, d("L0 in_proj_z").m, d("L0 in_proj_a").m, d("L0 in_proj_b").m],
+            ms: vec![
+                d("L0 in_proj_qkv").m,
+                d("L0 in_proj_z").m,
+                d("L0 in_proj_a").m,
+                d("L0 in_proj_b").m,
+            ],
             kind: 3,
-            w_names: vec!["L0 in_proj_qkv".into(), "L0 in_proj_z".into(), "L0 in_proj_a".into(), "L0 in_proj_b".into()],
+            w_names: vec![
+                "L0 in_proj_qkv".into(),
+                "L0 in_proj_z".into(),
+                "L0 in_proj_a".into(),
+                "L0 in_proj_b".into(),
+            ],
         },
         Arm {
             label: "L0 out_proj (residual)".into(),
@@ -525,7 +581,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ROOFLINE_GBS);
     let mut gpu = Gpu::init_with_device(device).expect("Gpu init");
-    emit(&format!("\narch: {} (device {device}, roofline {roofline_gbs:.0} GB/s)", gpu.arch));
+    emit(&format!(
+        "\narch: {} (device {device}, roofline {roofline_gbs:.0} GB/s)",
+        gpu.arch
+    ));
 
     // Upload real weights once; X per (arm, N) once.
     struct Live {
@@ -544,7 +603,10 @@ fn main() {
         }
         let mut xs = Vec::new();
         for (ni, n) in NS.iter().enumerate() {
-            let xv = random_x(n * arm.k, 0x1234 + (ai as u64) * 7919 + (ni as u64) * 104729);
+            let xv = random_x(
+                n * arm.k,
+                0x1234 + (ai as u64) * 7919 + (ni as u64) * 104729,
+            );
             xs.push(gpu.upload_f32(&xv, &[*n, arm.k]).expect("upload x"));
         }
         live.push(Live { ws, xs });
@@ -575,15 +637,15 @@ fn main() {
             }),
             2 => profile_symbol(&mut gpu, &mut |g: &mut Gpu| {
                 g.gemm_qkv_hfq4g256_mq4v2(
-                    &ws[0], &ws[1], &ws[2], x, &yg[0], &yg[1], &yg[2],
-                    arm.ms[0], arm.ms[1], arm.ms[2], arm.k, 16,
+                    &ws[0], &ws[1], &ws[2], x, &yg[0], &yg[1], &yg[2], arm.ms[0], arm.ms[1],
+                    arm.ms[2], arm.k, 16,
                 )
                 .unwrap()
             }),
             _ => profile_symbol(&mut gpu, &mut |g: &mut Gpu| {
                 g.gemm_qkvza_hfq4g256_mq4v2(
-                    &ws[0], &ws[1], &ws[2], &ws[3], x, &yg[0], &yg[1], &yg[2], &yg[3],
-                    arm.ms[0], arm.ms[1], arm.ms[2], arm.ms[3], arm.k, 16,
+                    &ws[0], &ws[1], &ws[2], &ws[3], x, &yg[0], &yg[1], &yg[2], &yg[3], arm.ms[0],
+                    arm.ms[1], arm.ms[2], arm.ms[3], arm.k, 16,
                 )
                 .unwrap()
             }),
@@ -616,8 +678,8 @@ fn main() {
                     .unwrap(),
                 2 => gpu
                     .gemm_qkv_hfq4g256_mq4v2(
-                        &ws[0], &ws[1], &ws[2], x, &yg[0], &yg[1], &yg[2],
-                        arm.ms[0], arm.ms[1], arm.ms[2], arm.k, 16,
+                        &ws[0], &ws[1], &ws[2], x, &yg[0], &yg[1], &yg[2], arm.ms[0], arm.ms[1],
+                        arm.ms[2], arm.k, 16,
                     )
                     .unwrap(),
                 _ => gpu
@@ -671,8 +733,8 @@ fn main() {
                     }),
                     2 => time_batch(&mut gpu, &mut |g: &mut Gpu| {
                         g.gemm_qkv_hfq4g256_mq4v2(
-                            &ws[0], &ws[1], &ws[2], x, &yg[0], &yg[1], &yg[2],
-                            arm.ms[0], arm.ms[1], arm.ms[2], arm.k, n,
+                            &ws[0], &ws[1], &ws[2], x, &yg[0], &yg[1], &yg[2], arm.ms[0],
+                            arm.ms[1], arm.ms[2], arm.k, n,
                         )
                         .unwrap()
                     }),
