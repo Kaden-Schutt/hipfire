@@ -13768,6 +13768,87 @@ impl Gpu {
             .collect())
     }
 
+    /// Launch one of the two H128 activation-transform entry points on
+    /// already GPU-resident buffers. `entry` selects `escha_h128_in` (scale
+    /// THEN transform) or `escha_h128_out` (transform THEN scale) — see
+    /// `kernels/src/escha_h128.hip`. This is the load-bearing form for the
+    /// forward path: `escha_h128_in_host`/`escha_h128_out_host` below are
+    /// the host-roundtrip convenience wrappers used by the G3 parity gate
+    /// and the benchmark; they call this rather than duplicating the launch.
+    pub fn escha_h128(
+        &mut self,
+        entry: &str,
+        a: &GpuTensor,
+        vec_in: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let n = a.numel();
+        assert_eq!(n, vec_in.numel(), "escha_h128: a/vec_in length mismatch");
+        assert_eq!(n, out.numel(), "escha_h128: a/out length mismatch");
+        assert_eq!(n % 128, 0, "H128 needs a multiple of 128");
+        self.ensure_kernel("escha_h128", kernels::ESCHA_H128_SRC, entry)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut v_ptr = vec_in.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[entry];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(n / 128) as u32, 1, 1],
+                [128, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// `xh = f16( H128(x * rin) * RS )` on device. Host-side helper for the
+    /// G3 parity gate; the forward path uses the device-resident form above.
+    pub fn escha_h128_in_host(&mut self, x: &[f32], rin: &[f32]) -> HipResult<Vec<u16>> {
+        self.escha_h128_host_impl("escha_h128_in", x, rin)
+    }
+
+    /// `y = f16( H128(mid) * RS * rout )` on device.
+    pub fn escha_h128_out_host(&mut self, mid: &[f32], rout: &[f32]) -> HipResult<Vec<u16>> {
+        self.escha_h128_host_impl("escha_h128_out", mid, rout)
+    }
+
+    fn escha_h128_host_impl(
+        &mut self,
+        entry: &str,
+        a: &[f32],
+        vec_in: &[f32],
+    ) -> HipResult<Vec<u16>> {
+        assert_eq!(a.len(), vec_in.len());
+        assert_eq!(a.len() % 128, 0, "H128 needs a multiple of 128");
+        self.bind_thread()?;
+        let n = a.len();
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v_bytes: Vec<u8> = vec_in.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_a = self.upload_raw(&a_bytes, &[n])?;
+        let d_v = self.upload_raw(&v_bytes, &[n])?;
+        let d_out = self.alloc_tensor(&[n], DType::F16)?;
+
+        self.escha_h128(entry, &d_a, &d_v, &d_out)?;
+
+        let mut raw = vec![0u8; n * 2];
+        self.hip.memcpy_dtoh(&mut raw, &d_out.buf)?;
+        Ok(raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,

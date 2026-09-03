@@ -4272,6 +4272,7 @@ impl Gpu {
             "escha_decode_tiles",
             kernels::ESCHA_DECODE_TILES_SRC.to_string(),
         ));
+        specs.push(("escha_h128", kernels::ESCHA_H128_SRC.to_string()));
 
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));

@@ -4816,6 +4816,11 @@ pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip
 pub const ESCHA_DECODE_TILES_SRC: &str =
     include_str!("../../../kernels/src/escha_decode_tiles.hip");
 
+/// Escha-W2 activation transforms: the 128-point Walsh-Hadamard applied to
+/// both sides of every escha matmul (`escha_h128_in`, `escha_h128_out`). Two
+/// entry points sharing one source file — see `ensure_kernel` call sites.
+pub const ESCHA_H128_SRC: &str = include_str!("../../../kernels/src/escha_h128.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
