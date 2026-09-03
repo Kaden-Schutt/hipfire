@@ -3110,15 +3110,25 @@ pub fn generate_spec(
     let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
         Ok(e) => e,
         Err(e) => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("{}", e),
-                "validation",
-                false,
-                false,
+            // Post-prefill failure: the target's KV/DeltaNet/drafter hidden
+            // already advanced and host seq_pos/conversation_tokens were
+            // cleared on a cold start. Fail closed like every other
+            // post-prefill error exit (prefill/step Err, realign, forced
+            // terminal): live rollback first, then one correlated error —
+            // otherwise the next turn LCPs against a dirty GPU
+            // (audit-Dflash Broken 4).
+            let msg = format!("make_spec_emitter: {e}");
+            let ep = production_fail_closed_rollback_live(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                slot,
+                spec.as_mut(),
             );
-            let _ = stdout.flush();
+            emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
             return None;
         }
     };
