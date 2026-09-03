@@ -1259,6 +1259,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-quantize",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
