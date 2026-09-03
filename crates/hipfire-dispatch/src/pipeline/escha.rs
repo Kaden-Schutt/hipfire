@@ -236,7 +236,16 @@ fn escha_routed_gemm_grouped(
     };
 
     let (rows, _ctiles) = rdna_compute::escha_grouped_tile(m);
-    if slots < n_exp * rows {
+    // Grouping pays as soon as an expert has more than about one slot to
+    // amortise its code read over — that is independent of the tile HEIGHT.
+    // Keying on `n_exp * rows` was a bug: it silently disabled grouping for
+    // any tile with rows >= 16 at the 256-token prefill chunk (2048 slots),
+    // which measured as a clean fall back to the un-grouped 223 tok/s.
+    //
+    // Decode has `slots == k` (8), far below `2 * n_exp`, so this is also what
+    // keeps the decode route on the slot-parallel GEMV.
+    let _ = rows;
+    if slots < 2 * n_exp {
         return escha_routed_gemv(gpu, dtype, expert_ptrs, ids, x, y, m, k, slots);
     }
 
