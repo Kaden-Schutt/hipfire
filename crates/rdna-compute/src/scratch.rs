@@ -62,6 +62,26 @@ pub struct ScratchState {
     pub sample_partials_bytes: usize,
 }
 
+/// Restore the pre-fix FP16 activation-cache semantics:
+/// `convert_fp16_x_uncached` leaves `fp16_x_source_ptr` set, and
+/// `gemm_q8_0_residual_wmma` takes the pointer-keyed `ensure_fp16_x` path.
+///
+/// A DIAGNOSTIC, not a supported mode. It re-enables a read of the shared FP16
+/// scratch that can hold a different tensor's conversion — the defect that made
+/// Escha-W2 batched prefill produce finite, fluent, ~1e-1-wrong output from
+/// layer 1 onward.
+///
+/// It exists so the blast radius of that fix is a MEASUREMENT rather than an
+/// argument: run any model's prefill with and without it and diff the logits
+/// byte-for-byte. Bit-identical means that model never hit the stale read, so
+/// the fix did not change it. Doing this with one binary and two runs is
+/// strictly better evidence than two binaries, which can differ for reasons
+/// nobody enumerated.
+pub fn fp16_x_legacy_cache() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_FP16_X_LEGACY_CACHE").as_deref() == Ok("1"))
+}
+
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
 
 /// Compile and load a kernel, caching the result in `modules`/`functions`.
@@ -544,6 +564,23 @@ impl ScratchState {
     /// When either recorder is active (`capture_mode` or `replay.is_recording()`)
     /// the kernel always runs so the tape stays complete; the skip only applies
     /// to the live non-recording path. Returns the FP16 device pointer.
+    ///
+    /// # The pointer key is only sound for back-to-back same-`x` dispatches
+    ///
+    /// It identifies the SOURCE BUFFER, not its CONTENTS. A caller that hands
+    /// this a stable scratch allocation whose contents are rewritten between
+    /// calls — a per-layer activation buffer, which is most of them — gets the
+    /// first layer's conversion for every subsequent layer, silently. Two
+    /// call sites have already been bitten (the MTP lm_head, τ 1.85 → 1.01;
+    /// Escha-W2's `wo`) and both were fixed by switching to
+    /// [`Self::convert_fp16_x_uncached`].
+    ///
+    /// So: use this ONLY when the same `x` is consumed by several dispatches
+    /// with nothing writing to it in between (the Q/K/V case it was built
+    /// for). If `x` is a per-layer or per-step buffer, use
+    /// `convert_fp16_x_uncached`; one extra elementwise kernel is far cheaper
+    /// than the GEMM it feeds, and is always correct. Writers of a cached
+    /// buffer may instead call [`Self::invalidate_x_caches_for`].
     pub fn ensure_fp16_x(
         &mut self,
         hip: &HipRuntime,
@@ -630,6 +667,27 @@ impl ScratchState {
     /// every layer), where pointer-keyed caching would read stale FP16.
     /// Always launches; both recorders observe the same launch via
     /// `launch_maybe_blob`'s unified `record || capture_mode || force_blob` gate.
+    ///
+    /// # It also INVALIDATES the cache, and must
+    ///
+    /// This writes the SHARED `fp16_x_scratch` — the same buffer
+    /// [`Self::ensure_fp16_x`] hands out — so after it runs, any cached
+    /// `fp16_x_source_ptr` marker describes a buffer that no longer holds that
+    /// pointer's data. Leaving the marker set makes the very next
+    /// `ensure_fp16_x` for that pointer a CACHE HIT onto this call's
+    /// conversion of a completely different tensor.
+    ///
+    /// That is not hypothetical. On Escha-W2 batched prefill it fired every
+    /// layer: `wo` (`gemm_q8_0_residual_wmma`, cached) converted
+    /// `dn_normed_batch` in layer 0; `wqkv` (`gemm_q8_0_wmma`, uncached)
+    /// overwrote the scratch with `x_rot_batch` in layer 1; layer 1's `wo`
+    /// then hit the stale marker and multiplied its weights by the LA
+    /// rmsnorm output (magnitude ~7.5e-1) instead of the gated-norm output
+    /// (~1.9e-3) — a ~400x amplification, finite and fluent, that showed up
+    /// only as a moved argmax. The DeepSeek-V4 gfx942 call site had already
+    /// discovered this and nulls the marker by hand after calling; doing it
+    /// here makes that hand-repair unnecessary and closes the same hole for
+    /// every other caller.
     pub fn convert_fp16_x_uncached(
         &mut self,
         hip: &HipRuntime,
@@ -699,6 +757,12 @@ impl ScratchState {
                 b
             },
         )?;
+        // The shared scratch no longer holds whatever `fp16_x_source_ptr`
+        // says it holds. See this function's doc comment — dropping the
+        // marker is part of the contract, not an optimisation.
+        if !fp16_x_legacy_cache() {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+        }
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
