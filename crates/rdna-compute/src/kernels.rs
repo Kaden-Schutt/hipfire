@@ -4854,6 +4854,17 @@ pub const ESCHA_MOE_GEMV_K8_INDEXED_SRC: &str =
 pub const ESCHA_MOE_GEMV_NATIVE_SRC: &str =
     include_str!("../../../kernels/src/escha_moe_gemv_native.hip");
 
+/// Escha-W2 routed-expert GROUPED GEMM — the Phase-3 batched-prefill kernel.
+/// Same trellis decode as [`ESCHA_MOE_GEMV_NATIVE_SRC`] and the same lane ->
+/// contraction map, but `blockIdx.y` is an EXPERT rather than a (token,
+/// expert) slot: the expert's code is decoded once and spent across every
+/// token that routed to it, and a block owns `CTILES` adjacent tile columns so
+/// the activation is read once for all of them. See the .hip header for the
+/// traffic arithmetic and for which projections stay bit-identical to the
+/// slot-parallel kernel (the narrow ones) and which do not (the wide ones).
+pub const ESCHA_MOE_GEMM_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemm_grouped.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the

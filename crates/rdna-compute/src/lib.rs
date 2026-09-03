@@ -41,7 +41,7 @@ pub use dispatch::{
 };
 pub use feature_flags::FeatureFlags;
 /// Slot-to-activation mapping for `Gpu::escha_h128_batched`'s input side.
-pub use gemv::EschaXGroup;
+pub use gemv::{escha_grouped_tile, EschaXGroup};
 pub use hip_bridge::{HipError, HipResult};
 use std::sync::OnceLock;
 

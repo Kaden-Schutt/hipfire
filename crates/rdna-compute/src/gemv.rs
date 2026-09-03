@@ -202,6 +202,44 @@ impl EschaXGroup {
     }
 }
 
+/// Register-tile shape of the escha grouped GEMM: `(ROWS, CTILES)` — how many
+/// of an expert's token rows one pass holds, and how many adjacent 16-wide tile
+/// columns one block owns.
+///
+/// A lane holds `ROWS * 2 * CTILES` f32 accumulators, so this is a register
+/// budget, and it trades the two traffic terms against each other: bigger ROWS
+/// re-reads the expert code fewer times (`ceil(G_e / ROWS)` passes per expert),
+/// bigger CTILES re-reads the ACTIVATION fewer times (`m / (16*CTILES)` blocks
+/// per slot instead of `m / 16`).
+///
+/// `(8, 4)` is the swept default — see
+/// `rdna-compute/examples/bench_escha_grouped_gemm.rs`, which measures the
+/// whole instantiated set at both shipped projection shapes. `CTILES` falls
+/// back when it does not divide `m / 16`; every shipped escha projection has
+/// `m ∈ {1024, 2048}`, so the fallback is unreachable today and exists so a
+/// future shape gets a smaller tile rather than a rejected launch.
+///
+/// `HIPFIRE_ESCHA_GROUPED_TILE=RxC` overrides it. That is a TUNING knob, not a
+/// route switch: every instantiation computes the same sums in the same order,
+/// so moving it changes speed and nothing else.
+pub fn escha_grouped_tile(m: usize) -> (usize, usize) {
+    static TILE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (rows, ctiles) = *TILE.get_or_init(|| {
+        std::env::var("HIPFIRE_ESCHA_GROUPED_TILE")
+            .ok()
+            .and_then(|s| {
+                let (r, c) = s.split_once('x')?;
+                Some((r.trim().parse().ok()?, c.trim().parse().ok()?))
+            })
+            .unwrap_or((8, 4))
+    });
+    let mut c = ctiles;
+    while c > 1 && m % (16 * c) != 0 {
+        c /= 2;
+    }
+    (rows, c)
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -14415,6 +14453,208 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp);
                 b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Escha-W2 routed-expert GROUPED GEMM — decode each expert's trellis code
+    /// once per (layer, batch) and spend it across every token that routed to
+    /// it, instead of once per (token, expert) slot.
+    ///
+    /// The batched-prefill replacement for
+    /// [`Self::escha_gemv_native_moe_k8_indexed_batched`]. `expert_offsets`
+    /// (`[n_exp + 1]`, exclusive scan) and `sorted_slot_index` (`[slots]`) are
+    /// what `moe_scatter_fused_k8` writes when it is run with `block_m = 1`;
+    /// `x_batch` / `y_batch` stay in the caller's ORIGINAL token-major slot
+    /// order — the sort is an index permutation the kernel follows, nothing is
+    /// physically gathered, so every other phase of the escha layer is
+    /// untouched.
+    ///
+    /// # Numerics
+    ///
+    /// Per (token, output row) this reproduces the slot-parallel NARROW form
+    /// exactly — same lane -> contraction map, same `bi` order, one sequential
+    /// accumulator, same `__shfl_down` ladder — so for a projection the
+    /// slot-parallel path also runs narrow (`k > 1536`) the two agree bit for
+    /// bit. For a projection it runs WIDE (`k <= 1536`) they do not: that form
+    /// folds four interleaved accumulators, which would cost 4x the
+    /// accumulator registers here and force the tile back to one column. See
+    /// the .hip header, and the grouped arm of the G4 block gate for the
+    /// measured cost.
+    ///
+    /// # Shape
+    ///
+    /// Grid `(m / (16*ctiles), n_exp)`, block 256. `m % (16*ctiles) == 0` and
+    /// `k % 32 == 0` are enforced rather than truncated: a block owns whole
+    /// tile columns, so a short tail would leave rows holding whatever `y`
+    /// happened to contain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemm_native_moe_grouped(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        n_exp: usize,
+        trellis_k: u32,
+    ) -> HipResult<()> {
+        let (rows, ctiles) = escha_grouped_tile(m);
+        self.escha_gemm_native_moe_grouped_tiled(
+            expert_ptrs,
+            expert_offsets,
+            sorted_slot_index,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+            n_exp,
+            trellis_k,
+            rows,
+            ctiles,
+        )
+    }
+
+    /// [`Self::escha_gemm_native_moe_grouped`] with the register tile named
+    /// explicitly instead of taken from [`escha_grouped_tile`].
+    ///
+    /// Exists for the sweep in `bench_escha_grouped_gemm`, which has to drive
+    /// every instantiation inside ONE process: `escha_grouped_tile` memoises
+    /// its env read in a `OnceLock`, so a sweep that went through it would
+    /// silently measure the first shape six times. Production goes through the
+    /// non-`_tiled` entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemm_native_moe_grouped_tiled(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        n_exp: usize,
+        trellis_k: u32,
+        rows: usize,
+        ctiles: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let what = "escha_gemm_native_moe_grouped";
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: k={k} is not a multiple of 32"),
+            ));
+        }
+        if slots == 0 || m == 0 || n_exp == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: slots={slots} m={m} n_exp={n_exp}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: x has {} elements (need {}), y has {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        // The kernel reads `expert_offsets[e]` and `[e+1]` for every `e` on
+        // grid.y, and dereferences `sorted_slot_index` across that range. A
+        // short table is an out-of-bounds READ — undefined behaviour, not a
+        // wrong answer — so check both exactly.
+        if expert_offsets.numel() < n_exp + 1 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: expert_offsets has {} elements, need {}",
+                    expert_offsets.numel(),
+                    n_exp + 1
+                ),
+            ));
+        }
+        if sorted_slot_index.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: sorted_slot_index has {} elements, need {slots}",
+                    sorted_slot_index.numel()
+                ),
+            ));
+        }
+        if ctiles == 0 || m % (16 * ctiles) != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: m={m} is not a multiple of {}", 16 * ctiles),
+            ));
+        }
+        let entry = match (trellis_k, rows, ctiles) {
+            (2, 4, 2) => "escha_gemm_grouped_k2_r4_c2",
+            (2, 8, 2) => "escha_gemm_grouped_k2_r8_c2",
+            (2, 8, 4) => "escha_gemm_grouped_k2_r8_c4",
+            (2, 8, 8) => "escha_gemm_grouped_k2_r8_c8",
+            (2, 16, 2) => "escha_gemm_grouped_k2_r16_c2",
+            (2, 16, 4) => "escha_gemm_grouped_k2_r16_c4",
+            (3, 4, 2) => "escha_gemm_grouped_k3_r4_c2",
+            (3, 8, 2) => "escha_gemm_grouped_k3_r8_c2",
+            (3, 8, 4) => "escha_gemm_grouped_k3_r8_c4",
+            (3, 8, 8) => "escha_gemm_grouped_k3_r8_c8",
+            (3, 16, 2) => "escha_gemm_grouped_k3_r16_c2",
+            (3, 16, 4) => "escha_gemm_grouped_k3_r16_c4",
+            (tk, r, c) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{what}: no entry point for trellis_k={tk} rows={r} ctiles={c}"),
+                ))
+            }
+        };
+        self.ensure_kernel(
+            "escha_moe_gemm_grouped",
+            kernels::ESCHA_MOE_GEMM_GROUPED_SRC,
+            entry,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            entry,
+            [(m / (16 * ctiles)) as u32, n_exp as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
                 b.push_ptr(xp);
                 b.push_ptr(yp);
                 b.push_i32(m_val);

@@ -1350,6 +1350,7 @@ pub fn run_moe_decode(
                 expert_down_ptrs: p.expert_down_ptrs,
                 topk_indices: p.topk_indices,
                 topk_weights: p.topk_weights,
+                n_experts: p.n_exp,
                 // The container the expert slots hold, straight off the layer's
                 // routed dtype — the same fact `escha_indexed_supported` was
                 // resolved from, so the GEMV the executor picks and the arm the
@@ -3516,6 +3517,7 @@ pub fn run_moe_prefill(
                 expert_down_ptrs: p.expert_down_ptrs,
                 topk_indices: p.topk_indices,
                 topk_weights: p.topk_weights,
+                n_experts: p.n_exp,
                 // See the decode branch: the container comes off the layer's
                 // own routed dtype, which is what the batched-prefill
                 // admission arm keyed on too.

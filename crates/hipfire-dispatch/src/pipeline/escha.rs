@@ -193,6 +193,97 @@ fn escha_routed_gemv(
     r.map_err(|err| DispatchError::Hip(err.to_string()))
 }
 
+/// Expert-grouped routed GEMM — the prefill form of [`escha_routed_gemv`].
+///
+/// The slot-parallel GEMV reads an expert's weights once per (token, expert)
+/// SLOT, so prefill does not amortise across the batch at all. Measured on the
+/// shipped 35B before this existed: 4.832 / 4.525 / 4.440 ms/token at
+/// n = 128 / 512 / 2048 — flat across a 16x batch increase. At n=512 that is
+/// 512 tokens x 8 slots x ~0.92 MB x 40 layers = ~150 GB of routed weight
+/// traffic per batch. Loading each expert's code once per (layer, batch)
+/// instead is ~9.4 GB.
+///
+/// The grouping is the pre-existing SGLang-style scatter pipeline (histogram ->
+/// padded exclusive scan -> permute); only the GEMM is escha-specific, and it
+/// decodes the trellis code once per expert rather than once per slot.
+///
+/// NOT bit-identical to the slot-parallel route: a group sums over a different
+/// partition of the contraction, so accumulation order differs. The
+/// microbenchmark measures K=2 as bit-identical anyway and K=3 within
+/// 1.5e-5 max / 1.5e-6 mean — far inside the Q8_0 arm's 2.633e-4 / 3.027e-5.
+///
+/// Falls back to the slot-parallel GEMV for any non-trellis container (there is
+/// no grouped Q8_0 escha kernel) and for slot counts too small to pay for the
+/// grouping launches — which is also what keeps decode (slots == k) off it.
+#[allow(clippy::too_many_arguments)]
+fn escha_routed_gemm_grouped(
+    gpu: &mut Gpu,
+    dtype: rdna_compute::DType,
+    expert_ptrs: &GpuTensor,
+    ids: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    slots: usize,
+    n_exp: usize,
+) -> Result<(), DispatchError> {
+    use rdna_compute::DType;
+    let trellis_k = match dtype {
+        DType::Escha2T16 => 2u32,
+        DType::Escha3T16 => 3u32,
+        _ => return escha_routed_gemv(gpu, dtype, expert_ptrs, ids, x, y, m, k, slots),
+    };
+
+    let (rows, _ctiles) = rdna_compute::escha_grouped_tile(m);
+    if slots < n_exp * rows {
+        return escha_routed_gemv(gpu, dtype, expert_ptrs, ids, x, y, m, k, slots);
+    }
+
+    macro_rules! hip {
+        ($ex:expr) => {
+            $ex.map_err(|err| DispatchError::Hip(err.to_string()))
+        };
+    }
+
+    // Padding rounds every expert's bucket up to `rows`, so the permuted array
+    // is at most `slots + n_exp * (rows - 1)`; padded entries carry the -1
+    // sentinel the GEMM skips.
+    let m_total_max = slots + n_exp * rows;
+    let counts = hip!(gpu.alloc_tensor(&[n_exp], DType::F32))?;
+    let offsets = hip!(gpu.alloc_tensor(&[n_exp + 1], DType::F32))?;
+    let sorted = hip!(gpu.alloc_tensor(&[m_total_max], DType::F32))?;
+    let tile_ids = hip!(gpu.alloc_tensor(&[m_total_max / rows + 1], DType::F32))?;
+    let inverse = hip!(gpu.alloc_tensor(&[slots], DType::F32))?;
+
+    hip!(gpu.moe_scatter_histogram_k8(ids, &counts, slots, n_exp))?;
+    hip!(gpu.moe_scatter_offsets_k8(&counts, &offsets, n_exp, rows))?;
+    hip!(gpu.moe_scatter_permute_k8(
+        ids,
+        &offsets,
+        &sorted,
+        &tile_ids,
+        &inverse,
+        slots,
+        n_exp,
+        m_total_max,
+        rows,
+    ))?;
+
+    hip!(gpu.escha_gemm_native_moe_grouped(
+        expert_ptrs,
+        &offsets,
+        &sorted,
+        x,
+        y,
+        m,
+        k,
+        slots,
+        n_exp,
+        trellis_k,
+    ))
+}
+
 /// SAFETY: `src` is a device buffer of at least `offset_elems + len_elems`
 /// f32; the returned view is non-owning and must not outlive `src`.
 unsafe fn view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> GpuTensor {
@@ -373,6 +464,10 @@ pub struct EschaIndexedRouting<'a> {
     /// on, so the kernel choice and the admission decision cannot disagree.
     /// Anything else is refused by [`escha_routed_gemv`] rather than
     /// mis-decoded.
+    /// Number of routed experts in this layer. Needed by the grouped prefill
+    /// GEMM to size the expert-offset table and to decide whether grouping
+    /// pays for itself at this slot count.
+    pub n_experts: usize,
     pub gate_up_dtype: rdna_compute::DType,
     /// Container of the down expert slots. Independent of `gate_up_dtype`: the
     /// shipped A3B file allocates K=2 to gate_up and K=3 to down, and a file
@@ -691,8 +786,10 @@ pub fn escha_routed_prefill_indexed(
         EschaXGroup::Grouped(k),
     ))?;
 
-    // ── 2. gate_up GEMV for ALL slots, ONE launch ─────────────────────────
-    escha_routed_gemv(
+    // ── 2. gate_up GEMM for ALL slots, ONE launch ─────────────────────────
+    // Grouped by expert: at prefill batch sizes the slot-parallel form re-reads
+    // each expert's code once per slot and does not amortise at all.
+    escha_routed_gemm_grouped(
         gpu,
         r.gate_up_dtype,
         r.expert_gate_up_ptrs,
@@ -702,6 +799,7 @@ pub fn escha_routed_prefill_indexed(
         r.gate_up_m,
         r.gate_up_k,
         slots,
+        r.n_experts,
     )?;
 
     // ── 3. gate_up output transform, ONE launch ───────────────────────────
@@ -731,8 +829,8 @@ pub fn escha_routed_prefill_indexed(
         EschaXGroup::PerSlot,
     ))?;
 
-    // ── 6. down GEMV for ALL slots, ONE launch ────────────────────────────
-    escha_routed_gemv(
+    // ── 6. down GEMM for ALL slots, ONE launch ────────────────────────────
+    escha_routed_gemm_grouped(
         gpu,
         r.down_dtype,
         r.expert_down_ptrs,
@@ -742,6 +840,7 @@ pub fn escha_routed_prefill_indexed(
         r.down_m,
         r.down_k,
         slots,
+        r.n_experts,
     )?;
 
     // ── 7. down output transform, ONE launch ──────────────────────────────
