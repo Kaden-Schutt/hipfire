@@ -1427,6 +1427,28 @@ pub(crate) fn all_q8_0(dtypes: &[DType]) -> bool {
     dtypes.iter().all(|dt| matches!(dt, DType::Q8_0))
 }
 
+/// The same precondition as [`all_q8_0`], for the arms whose representative
+/// weight is an MQ-family container rather than Q8_0: every weight the ONE
+/// fused launch reads must share the container the arm was selected from.
+///
+/// `all_q8_0` was added because escha-35b stores `w_alpha` / `w_beta` as F16
+/// beside a Q8_0 `wqkv`. It fixed the Q8_0 arms and left the MQ arms — which
+/// select on `layer.wqkv.gpu_dtype` alone in exactly the same way — still able
+/// to read those F16 siblings at MQ stride.
+///
+/// Measured before this guard existed, down-quantising ONLY `in_proj_qkv` on
+/// escha-35b and scoring against the untouched build: KLD 12.63, PPL
+/// 2,375,141 against a 7.68 baseline. Identical under MQ6G256, MQ6G256V2 and
+/// MQ4G256V2, while `out_proj` — the one GDN projection not in the fused
+/// launch — was unaffected at KLD 0.0076. Finite, fluent and wrong, which is
+/// the signature this guard family exists to prevent.
+pub(crate) fn all_same_dtype(dtypes: &[DType]) -> bool {
+    match dtypes.split_first() {
+        Some((head, rest)) => rest.iter().all(|dt| dt == head),
+        None => true,
+    }
+}
+
 /// Accepts the dtypes the batched prefill path can handle (shared by the
 /// eligibility check in `forward_prefill_batch` and the per-layer dtype
 /// branches in `forward_prefill_chunk`).
@@ -4531,7 +4553,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
     }
 
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-    if is_6bit {
+    if is_6bit
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
@@ -4635,7 +4664,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.w_alpha.k,
             n,
         )?;
-    } else if is_mq3_lloyd {
+    } else if is_mq3_lloyd
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         // 112 B/group Lloyd-MQ3 stride; X is already FWHT-rotated.
         run_fused_qkvza_key(
             gpu,
@@ -4656,7 +4692,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_mq3 {
+    } else if is_mq3
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         // 104 B/group HFQ3-stride; X is already FWHT-rotated by
         // fused_rmsnorm_rotate_mq_batched above. The FusedQkvzaHfq3G256
         // run-arm replicates the call-site WMMA-vs-base arch split
@@ -4681,7 +4724,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_fp4 {
+    } else if is_fp4
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         // HFP4G32: 17-B blocks (vs HFQ4's 136-B groups), per-row 16-B header.
         // MFP4G32: same storage as HFP4 + offline-FWHT weights; X is already
         // rotated above when is_mq, so this branch handles both unrotated

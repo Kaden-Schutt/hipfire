@@ -4883,6 +4883,39 @@ fn qkv_from_prerotated_mq(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// True when all four QKVZA weights sit in the container
+/// `fused_qkvza_hfq4g256` actually reads.
+///
+/// qt=6 (HFQ4G256) and qt=13 (MQ4G256) share one 136 B group layout, so MQ4
+/// has always borrowed HFQ4's kernel and that is correct — only the
+/// activations differ, which is what `precomputed_attn_x_rot` handles. NO
+/// other MQ container shares it.
+///
+/// [`qkvza_from_prerotated_mq`] hardcodes that kernel with no dtype check, so
+/// without this predicate any other MQ container on `wqkv` — or an F16
+/// sibling, which is how escha-35b stores `w_alpha`/`w_beta` — is read at
+/// HFQ4 stride. Measured: down-quantising ONLY `in_proj_qkv` on escha-35b
+/// scored KLD 12.63 / PPL 2,375,141 against a 7.68 baseline, identically
+/// under MQ6G256, MQ6G256V2 and MQ4G256V2, while `out_proj` (not in this
+/// launch) was unaffected at KLD 0.0076. Finite, fluent, wrong.
+///
+/// Same failure family as `prefill::all_q8_0`, which was added for the Q8_0
+/// arms after escha-35b made mixed layers reachable; the per-token MQ path
+/// never got the equivalent.
+fn qkvza_hfq4_container(
+    wqkv: &WeightTensor,
+    wz: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+) -> bool {
+    [wqkv, wz, w_beta, w_alpha].iter().all(|w| {
+        matches!(
+            w.gpu_dtype,
+            rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+        )
+    })
+}
+
 fn qkvza_from_prerotated_mq(
     gpu: &mut Gpu,
     wqkv: &WeightTensor,
@@ -5038,7 +5071,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         ));
                     }
                 };
-                if self.precomputed_attn_x_rot {
+                if self.precomputed_attn_x_rot
+                    && qkvza_hfq4_container(wqkv, wz, w_beta, w_alpha)
+                {
                     qkvza_from_prerotated_mq(
                         gpu,
                         wqkv,

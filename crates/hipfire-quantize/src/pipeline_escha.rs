@@ -316,6 +316,53 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             _ => {
                 let (m, d) = find(name)
                     .ok_or_else(|| format!("{name}: passthrough tensor vanished between passes"))?;
+
+                // The GDN input projections all consume the SAME normed x.
+                // An MQ container needs that activation FWHT-rotated; F16 and
+                // Q8_0 need it un-rotated. So quantising only some of them
+                // leaves the rest reading a rotated input they were never
+                // quantised against — which is what made a single MQ
+                // `in_proj_qkv` score PPL 2.4M while `out_proj` (which
+                // consumes the GDN OUTPUT, not the shared input) was fine.
+                //
+                // in_proj_a / in_proj_b are F16 in the checkpoint, so they
+                // must be brought along or the layer stays mixed.
+                let is_gdn_in = name.contains("in_proj_a") || name.contains("in_proj_b");
+                if is_gdn_in
+                    && m.dtype == "F16"
+                    && dense_format_for(name) != DenseFormat::Q8_0
+                    && m.shape.len() == 2
+                    && m.shape[1] % 256 == 0
+                {
+                    let (oc, ic) = (m.shape[0], m.shape[1]);
+                    let f32_data: Vec<f32> = d
+                        .chunks_exact(2)
+                        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    let s1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+                    let s2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+                    let (data, qt) = if dense_format_for(name) == DenseFormat::Mq4V2 {
+                        (
+                            crate::quant_fwht::quantize_mq4g256v2(&f32_data, oc, ic, &s1, &s2),
+                            QuantType::MQ4G256V2,
+                        )
+                    } else {
+                        (
+                            crate::quant_fwht::quantize_mq6g256v2(&f32_data, oc, ic, &s1, &s2),
+                            QuantType::MQ6G256V2,
+                        )
+                    };
+                    tensors.push(HfqTensor {
+                        name: name.clone(),
+                        quant_type: qt,
+                        shape: vec![oc as u32, ic as u32],
+                        group_size: 256,
+                        data,
+                        spilled_len: 0,
+                    });
+                    continue;
+                }
+
                 tensors.push(HfqTensor {
                     name: name.clone(),
                     quant_type: match m.dtype.as_str() {
@@ -494,8 +541,14 @@ fn dense_format_for(name: &str) -> DenseFormat {
         // Same format and the same 2.8% weight RMS error in all three. GDN
         // carries a recurrent state, so its error compounds along the
         // sequence where attention's does not.
+        // `mq6!a,b,c` — MQ6 everywhere EXCEPT tensors whose name contains any
+        // listed substring. Used to hold the router (`mlp.gate`) and the shared
+        // expert at Q8_0: `moe_ffn_batched_admissible_for_dtypes` pins both to
+        // Q8_0 on the escha arm, and moving either off it drops prefill to the
+        // per-token fallback. They are also the two places down-quanting buys
+        // least, so excluding them keeps batched prefill for almost no size.
         Some(v) if v.starts_with("mq6!") => {
-            if name.contains(&v[4..]) {
+            if v[4..].split(',').any(|sub| !sub.is_empty() && name.contains(sub)) {
                 DenseFormat::Q8_0
             } else {
                 DenseFormat::Mq6
