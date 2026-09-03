@@ -6323,7 +6323,17 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path, 64, None, None, None, false).unwrap();
+        let params = load_params(
+            &defaults,
+            Some(entry),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
@@ -6338,7 +6348,17 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None, None, false).unwrap();
+        let params = load_params(
+            &enabled,
+            Some(entry),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
@@ -6349,8 +6369,17 @@ mod tests {
     pub(crate) fn load_params_forwards_explicit_vmm_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params =
-            load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm"), None, false).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            Some("vmm"),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["kv_backend"], "vmm");
     }
 
@@ -6358,7 +6387,17 @@ mod tests {
     pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None, None, false).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         assert_eq!(params["max_seq"], 32768);
     }
@@ -6666,8 +6705,17 @@ mod tests {
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         // Without explicit override, load_params uses the resolved vmm.
-        let params2 =
-            load_params(&resolved, Some(entry), &model_path, 64, Some("q8"), None, None, false).unwrap();
+        let params2 = load_params(
+            &resolved,
+            Some(entry),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params2["kv_backend"], "vmm");
         assert_eq!(params2["max_seq"], 262144);
 
@@ -6766,7 +6814,17 @@ mod tests {
     pub(crate) fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
         let model_path = PathBuf::from("/tmp/test-model.mq2r");
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None, None, false).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["deepseek4_compute_placement"], "single");
         assert!(params.get("deepseek4_experts_per_token").is_none());
 
@@ -6781,7 +6839,17 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None, None, false).unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
     }
 
@@ -6829,7 +6897,17 @@ mod tests {
         .unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
-        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None, None, false).unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["draft"], draft);
     }
 
@@ -6849,7 +6927,10 @@ mod tests {
         }
     }
 
-    fn resolved_with_dflash_mode(mode: &str, draft: Option<&str>) -> hipfire_config::ResolvedConfig {
+    fn resolved_with_dflash_mode(
+        mode: &str,
+        draft: Option<&str>,
+    ) -> hipfire_config::ResolvedConfig {
         let mut explicit = ConfigLayer::default();
         explicit.set_cli("speculation.dflash", mode).unwrap();
         if let Some(draft) = draft {
@@ -6938,7 +7019,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
-        assert!(params.get("draft").is_none(), "auto without a pulled draft runs AR");
+        assert!(
+            params.get("draft").is_none(),
+            "auto without a pulled draft runs AR"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -6993,7 +7077,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "off");
-        assert!(params.get("draft").is_none(), "off must not resolve the sidecar");
+        assert!(
+            params.get("draft").is_none(),
+            "off must not resolve the sidecar"
+        );
 
         // Resolve under auto, then a final off selector drops it.
         let resolved = resolved_with_dflash_mode("auto", None);
@@ -7012,7 +7099,10 @@ mod tests {
         apply_speculation_selector(&mut params, "off").unwrap();
         project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
         assert_eq!(params["dflash_mode"], "off");
-        assert!(params.get("draft").is_none(), "final off must drop the sidecar draft");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop the sidecar draft"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -7041,7 +7131,6 @@ mod tests {
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
-
     #[test]
     fn run_spec_dflash_projects_inherited_draft_after_config_off() {
         // Reviewer case: resolved config leaves DFlash off, but an inherited
@@ -7062,7 +7151,17 @@ mod tests {
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
         // load_params alone must not carry the draft while config mode is off.
-        let mut params = load_params(&resolved, None, &model_path, 64, Some("q8"), None, None, false).unwrap();
+        let mut params = load_params(
+            &resolved,
+            None,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(params["dflash_mode"], "off");
         assert!(
             params.get("draft").is_none(),

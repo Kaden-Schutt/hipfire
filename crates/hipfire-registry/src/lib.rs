@@ -1052,7 +1052,10 @@ mod tests {
                 paired += 1;
             }
         }
-        assert!(paired > 0, "bundled registry should pair at least one dflash sidecar");
+        assert!(
+            paired > 0,
+            "bundled registry should pair at least one dflash sidecar"
+        );
     }
 
     #[test]
