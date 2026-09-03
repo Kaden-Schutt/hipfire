@@ -402,6 +402,7 @@ fn main() {
         "NOTE: file dense-projection quants seen on benched tensors: {saw_qt:?} (expected 44 per ticket; file holds v1 qt=13 — same 136 B/group stride, sizes asserted equal)"
     ));
     assert_eq!(skipped, 0, "some projections failed the v2 size check — see SKIPPED rows");
+    let d = |label: &str| dims.iter().find(|x| x.label == label).unwrap();
     // Shared-X consistency: the fused qkvza arm feeds ONE x [N x dim] to all
     // four weights, so qkv/z/a/b must share K (out_proj is a separate arm with
     // its own X, as are gate/up). Verify, don't assume.
