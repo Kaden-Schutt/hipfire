@@ -1609,6 +1609,11 @@ mod tests {
         // Saturating arithmetic: huge budgets clamp instead of panicking
         // (debug) or wrapping (release) into a false fit.
         assert!(spec_ctx_request_fits(usize::MAX, 1, 1, usize::MAX));
-        assert!(!spec_ctx_request_fits(usize::MAX - 10, 20, 0, usize::MAX - 1));
+        assert!(!spec_ctx_request_fits(
+            usize::MAX - 10,
+            20,
+            0,
+            usize::MAX - 1
+        ));
     }
 }

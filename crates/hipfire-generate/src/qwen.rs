@@ -2075,11 +2075,7 @@ pub fn generate_dflash(
         .as_ref()
         .map(|s| s.ctx_capacity())
         .unwrap_or(usize::MAX);
-    let spec_block_size = m
-        .speculator
-        .as_ref()
-        .map(|s| s.block_size())
-        .unwrap_or(0);
+    let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
     // Shared margin with the `generate_spec` hard guard below: prompt +
     // budget + one draft block must fit, so any request the loop would refuse
     // falls back to AR here instead of erroring after `gen_start`.

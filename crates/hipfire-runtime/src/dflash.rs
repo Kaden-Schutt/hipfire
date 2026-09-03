@@ -724,12 +724,16 @@ impl DflashWeights {
         }
         macro_rules! take_t {
             ($i:expr) => {
-                live_t[$i].take().expect("dflash load: F32 slot taken twice")
+                live_t[$i]
+                    .take()
+                    .expect("dflash load: F32 slot taken twice")
             };
         }
         macro_rules! take_w {
             ($i:expr) => {
-                live_w[$i].take().expect("dflash load: weight slot taken twice")
+                live_w[$i]
+                    .take()
+                    .expect("dflash load: weight slot taken twice")
             };
         }
         let i_fc = wt!(hfq_weight(
@@ -739,8 +743,12 @@ impl DflashWeights {
             cfg.hidden,
             cfg.num_extract() * cfg.hidden,
         ));
-        let i_hidden_norm =
-            gt!(hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden]));
+        let i_hidden_norm = gt!(hfq_tensor_f32(
+            hfq,
+            gpu,
+            "hidden_norm.weight",
+            vec![cfg.hidden]
+        ));
         let i_norm = gt!(hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden]));
 
         let conv_k = cfg.conv_kernel_size.unwrap_or(2);
@@ -1581,11 +1589,7 @@ impl DflashScratch {
         // Slot indices (`take!`n at the build below).
         let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
         let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
-        let i_conv_temp = if need_conv {
-            Some(at!(&[b * h]))
-        } else {
-            None
-        };
+        let i_conv_temp = if need_conv { Some(at!(&[b * h])) } else { None };
         let i_conv_dynamic = if need_conv {
             let k = cfg.conv_kernel_size.unwrap();
             let g = cfg.conv_group_size.unwrap();
