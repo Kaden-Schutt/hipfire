@@ -44,10 +44,17 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use rdna_compute::{Gpu, GpuTensor};
+
+/// Mirror of "`sink()` currently holds a `Some`", so [`enabled`] can answer
+/// with a relaxed load instead of taking the sink mutex. Written only by
+/// `sink()`'s initialiser and by [`reopen`], both of which happen O(1) times
+/// per process; read once per MoE layer.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn sink() -> &'static Mutex<Option<File>> {
     static SINK: OnceLock<Mutex<Option<File>>> = OnceLock::new();
@@ -61,6 +68,7 @@ fn sink() -> &'static Mutex<Option<File>> {
                     None
                 }
             });
+        ACTIVE.store(f.is_some(), Ordering::Relaxed);
         Mutex::new(f)
     })
 }
@@ -81,14 +89,32 @@ pub fn reopen(path: &str) {
         }
     };
     if let Ok(mut slot) = sink().lock() {
+        ACTIVE.store(f.is_some(), Ordering::Relaxed);
         *slot = f;
     }
 }
 
 /// True when tracing is on. Callers should check this before doing anything
 /// expensive (the capture below forces a device sync).
+///
+/// This is the "one relaxed atomic load per MoE layer" the module docs
+/// promise, and it has to be: it is called from the MoE routed path on every
+/// forward of every model, tracing or not. It used to be
+/// `sink().lock().map(...)` — a mutex acquisition per layer, contending with
+/// nothing, to answer a question that changes O(1) times per process.
+///
+/// The `OnceLock` below exists only to force the lazy env-derived
+/// initialisation of `sink()` exactly once; after that the answer comes from
+/// [`ACTIVE`]. It cannot be replaced by reading the env var directly:
+/// [`reopen`] installs a sink with no env var set at all (that is how the G6
+/// gate takes two traces from one process), so "tracing was requested via the
+/// environment" is not the same predicate as "there is somewhere to write".
 pub fn enabled() -> bool {
-    sink().lock().map(|s| s.is_some()).unwrap_or(false)
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = sink();
+    });
+    ACTIVE.load(Ordering::Relaxed)
 }
 
 /// Append one layer's selection.

@@ -3970,10 +3970,41 @@ pub(crate) struct PrefillBandCtx<'a> {
 /// Layer the `HIPFIRE_DUMP_HIDDEN` stage dumps (`q_b`/`k_b`/`v_b`/`alpha_b`/
 /// `beta_b`) fire on. `HIPFIRE_DUMP_HIDDEN_LAYER`, default 0.
 pub(crate) fn dump_diag_layer() -> usize {
-    hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_LAYER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    static LAYER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LAYER.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `HIPFIRE_DUMP_HIDDEN`'s file prefix, resolved ONCE.
+///
+/// The call sites below are unconditional — every qwen35 model pays them, once
+/// per layer per chunk, not just the escha localisation runs they were written
+/// for. Read once behind a `OnceLock` (the pattern
+/// `escha::escha_indexed_route_enabled` and `route_trace` already use) so the
+/// steady-state cost is one relaxed atomic load rather than an environment
+/// lookup and a `String` allocation. Mid-run env mutation is not honoured, in
+/// common with every other developer var in this crate.
+fn dump_hidden_prefix() -> Option<&'static str> {
+    static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PREFIX
+        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").ok())
+        .as_deref()
+}
+
+/// `HIPFIRE_DUMP_HIDDEN_POS` (default 0), resolved once. See
+/// [`dump_hidden_prefix`].
+fn dump_hidden_pos() -> usize {
+    static POS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *POS.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 pub(crate) fn dump_hidden_localize(
@@ -3985,14 +4016,12 @@ pub(crate) fn dump_hidden_localize(
     layer_idx: usize,
     tag: &str,
 ) {
-    let prefix = match hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
-        Ok(p) => p,
-        Err(_) => return,
+    // One relaxed atomic load in the (overwhelmingly common) off case — this
+    // is called unconditionally, per layer per chunk, for EVERY qwen35 model.
+    let Some(prefix) = dump_hidden_prefix() else {
+        return;
     };
-    let target: usize = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let target: usize = dump_hidden_pos();
     if target < abs_pos_of_row0 {
         return;
     }

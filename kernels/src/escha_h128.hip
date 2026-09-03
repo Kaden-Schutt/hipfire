@@ -115,28 +115,39 @@ __device__ __forceinline__ float* h128_parallel(float* bufA, float* bufB, int t)
 }
 
 // One block per 128-channel group. 128 threads cooperate via LDS.
+//
+// NO `if (idx >= n) return;` BOUNDS GUARD, deliberately. `Gpu::escha_h128`
+// asserts `n % 128 == 0` and launches exactly `n / 128` blocks of 128
+// threads, so `idx` is in range for every thread of every block — the guard
+// could never fire. If it ever DID, an early `return` before the
+// `__syncthreads()` below is a divergent barrier: undefined behaviour, and on
+// RDNA a hang or silently wrong LDS contents rather than the clean truncation
+// it looks like. The batched forms further down correctly have no such guard.
+// `n` is still taken as a parameter so the signature matches the batched
+// kernels and the host launcher.
 extern "C" __global__ void escha_h128_in(
     const float* __restrict__ x, const float* __restrict__ rin,
     __half* __restrict__ xh, int n) {
+    (void)n;
     __shared__ float bufA[128];
     __shared__ float bufB[128];
     int g = blockIdx.x, t = threadIdx.x;
     int idx = g * 128 + t;
-    if (idx >= n) return;
     bufA[t] = x[idx] * rin[idx];
     __syncthreads();
     float* out = h128_parallel(bufA, bufB, t);
     xh[idx] = f2h_rne(out[t] * ESCHA_RS);
 }
 
+// No bounds guard, for the reason spelled out on `escha_h128_in` above.
 extern "C" __global__ void escha_h128_out(
     const float* __restrict__ mid, const float* __restrict__ rout,
     __half* __restrict__ y, int n) {
+    (void)n;
     __shared__ float bufA[128];
     __shared__ float bufB[128];
     int g = blockIdx.x, t = threadIdx.x;
     int idx = g * 128 + t;
-    if (idx >= n) return;
     bufA[t] = mid[idx];
     __syncthreads();
     float* out = h128_parallel(bufA, bufB, t);
