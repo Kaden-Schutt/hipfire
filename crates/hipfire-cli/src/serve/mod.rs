@@ -1210,9 +1210,19 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
+            // Report the model the way it was requested. A path-form
+            // request now resolves its registry entry (for sidecars and
+            // tag policy), but clients — serve_harness's warm probe among
+            // them — compare `/health.model` against the path they asked
+            // for; a tag only stands in when the request was a tag.
+            let served_name = if Path::new(model).is_absolute() || model.contains('/') {
+                model.to_owned()
+            } else {
+                tag.unwrap_or_else(|| model.to_owned())
+            };
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .current_model = Some(tag.unwrap_or_else(|| model.to_owned()));
+                .current_model = Some(served_name);
         }
         Ok(resolved)
     }
