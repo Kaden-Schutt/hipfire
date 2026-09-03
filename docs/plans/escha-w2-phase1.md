@@ -2218,7 +2218,30 @@ In `crates/hipfire-arch-qwen35/src/qwen35/weights.rs`, extend the expert loader 
 3. Quantise to `Q8_0` per output row and store in the existing `experts[X].gate_up` / `.down` slots — hipfire is out-major, escha's grid is in-major, so this is where the transpose lands.
 4. Keep `escha_rin_eff` / `escha_rout_eff` as f32 device tensors alongside.
 
-In the MoE forward path, wrap each expert projection: the device-resident `escha_h128_in` before the `Q8_0` GEMV, `escha_h128_out` after. SwiGLU consumes the **f16-rounded** merged `gate_up` output; the combine multiplies by `f16(score)`.
+In the MoE forward path, wrap each expert projection: the device-resident
+`escha_h128_in` before the `Q8_0` GEMV, `escha_h128_out` after.
+
+**BATCH THE TRANSFORMS ACROSS EXPERTS — this is a hard requirement, not an
+optimisation.** Task 8 measured the H128 kernels to be *launch-bound*, not
+bandwidth-bound: an empty kernel at the same grid/block costs 1.74–1.78 us,
+which is 70–75% of the 2.4 us a real launch takes, and the overhead-subtracted
+time stays nearly flat (0.59 → 0.69 us) from 16 to 136 blocks.
+
+A naive one-launch-per-expert-per-projection wiring costs
+`40 layers x 8 experts x 4 transforms = 1280` launches per token:
+
+| wiring | launches/token | H128 cost | ceiling from H128 alone |
+|---|---|---|---|
+| per-expert (naive) | 1280 | 3.07 ms | **326 tok/s** |
+| batched across experts | 160 | 0.38 ms | ~2600 tok/s |
+
+326 tok/s is a hard ceiling *before any GEMV work*, which would make Phase 1
+pointless even as a correctness baseline. Issue ONE launch per (layer,
+projection, side) covering all `top_k` experts — the per-expert `rin_eff` /
+`rout_eff` rows are just an extra index into the already-resident
+`[E, IC]` / `[E, OC]` tensors, so this is an indexing change in the kernel and
+a grid change on the host, not new maths. Verify the batched form against
+`escha_ref` exactly as the per-expert form was. SwiGLU consumes the **f16-rounded** merged `gate_up` output; the combine multiplies by `f16(score)`.
 
 - [ ] **Step 5: Run the G4 gate**
 
