@@ -2996,7 +2996,9 @@ pub fn load_model_ep_with_compressor_cache(
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
             load_model_ep_qwen35(path, max_seq, tp, None, None, None)
         }
-        5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
+        5 | 6 => {
+            Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
+        }
         // Backstop: `ep_admission` above already refused these; route through the
         // shared constructor (not `unreachable!`) so the refusal survives a
         // future edit that drops the early call.
@@ -3948,7 +3950,10 @@ mod ep_admission_tests {
                 Err(e) => e,
             };
             assert!(err.contains("EP not supported"), "reason: {err}");
-            assert!(err.contains(&arch.to_string()), "reason names the arch: {err}");
+            assert!(
+                err.contains(&arch.to_string()),
+                "reason names the arch: {err}"
+            );
         }
         // Adjacent supported: DS4, MiniMax and Qwen3.5 keep their EP entries.
         for arch in [5u32, 6, 9, 10] {
@@ -3974,7 +3979,12 @@ mod lfm2_batch_admission_tests {
         // Adjacent supported: qwen35 5|6 still admit continuous batching.
         assert!(continuous_batch_route(5).is_some());
         assert!(continuous_batch_route(6).is_some());
-        assert!(carrier_for(5).expect("qwen35 carrier").caps().supports_continuous_batch);
+        assert!(
+            carrier_for(5)
+                .expect("qwen35 carrier")
+                .caps()
+                .supports_continuous_batch
+        );
     }
 }
 

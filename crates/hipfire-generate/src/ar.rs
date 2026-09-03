@@ -1164,11 +1164,7 @@ pub fn generate(
             // before any device allocation; this arm stays as the fail-closed
             // net. Message is shared with the admission refusal by construction.
             if m.gemma4_lowered_mut().is_some() {
-                emit_error_with_id(
-                    stdout,
-                    id,
-                    hipfire_arch_gemma4::LOWERED_GENERATE_REFUSAL,
-                );
+                emit_error_with_id(stdout, id, hipfire_arch_gemma4::LOWERED_GENERATE_REFUSAL);
                 return;
             }
             let _ = (
