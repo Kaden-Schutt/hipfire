@@ -905,6 +905,24 @@ pub struct MoePrefillParams<'a> {
     /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
     /// byte-identical to pre-EP behavior.
     pub routed_out: Option<&'a GpuTensor>,
+    /// Escha-W2 transform tables for this layer. `Some` iff the layer's routed
+    /// experts are escha-coded AND the indexed route is enabled — the same
+    /// marker `MoePrefillDtypes::escha` gates admission on, so a layer cannot
+    /// be admitted to batched prefill and then arrive here without the tables
+    /// the executor needs. `None` for every other model: the escha branch in
+    /// [`crate::pipeline::run_moe_prefill`] is skipped entirely and Path 1 /
+    /// Path 2 run exactly as they do today.
+    ///
+    /// Only the FOUR `[E, ·]` transform tables are read — the `[k]`-sized
+    /// decode scratch fields of `EschaRoutedRefs` are ignored here, because
+    /// batched prefill uses the model-global `[n_tokens × k]` scratch from
+    /// `Gpu::ensure_escha_prefill_scratch` instead.
+    pub escha: Option<crate::pipeline::escha::EschaRoutedRefs<'a>>,
+    /// Model hidden size. Decode's `MoeParams` already carries this; prefill
+    /// did not need it until the escha branch, whose H128 transforms are sized
+    /// by it (`down_m` happens to equal it, but relying on that coincidence is
+    /// how a shape bug gets written).
+    pub hidden: usize,
 }
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.

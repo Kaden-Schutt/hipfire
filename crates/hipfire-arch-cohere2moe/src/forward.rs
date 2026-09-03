@@ -34,10 +34,11 @@ use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, moe_family, rotate_x_mq_batched_for, rotate_x_mq_for,
-    weight_gemv, weight_gemv_residual};
-use hipfire_runtime::llama::KvCacheExt;
+    weight_gemv, weight_gemv_residual,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Grouped-MoE prefill tiling constant — must match `run_moe_prefill`'s
@@ -890,6 +891,11 @@ pub fn forward_batch(
                     paro_down: None,
                     down_awq_scale: None,
                     routed_out: None,
+                    // Not an escha model: the escha branch in
+                    // `run_moe_prefill` is skipped and Path 1 / Path 2 run
+                    // exactly as before.
+                    escha: None,
+                    hidden,
                 };
                 moe_family()
                     .run_prefill(&ctx, gpu, &params)

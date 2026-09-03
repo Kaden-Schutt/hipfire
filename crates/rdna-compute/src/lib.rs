@@ -40,6 +40,8 @@ pub use dispatch::{
     MQ6G256V2_GROUP_BYTES,
 };
 pub use feature_flags::FeatureFlags;
+/// Slot-to-activation mapping for `Gpu::escha_h128_batched`'s input side.
+pub use gemv::EschaXGroup;
 pub use hip_bridge::{HipError, HipResult};
 use std::sync::OnceLock;
 

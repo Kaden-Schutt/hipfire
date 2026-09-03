@@ -1809,8 +1809,17 @@ impl Gpu {
     /// (round-to-nearest-even). Escha-only precision-matching step: see
     /// `kernels/src/router_logits_round_f16_rne.hip` for why and
     /// `hipfire_dispatch::families::moe::MoeDtypes::has_escha_experts` for
-    /// the gate. Callers other than the escha decode path must not call
+    /// the gate. Callers other than the escha routed paths must not call
     /// this — every other model's router logits stay F32 end-to-end.
+    ///
+    /// Numel-driven and layout-agnostic: `x` may be one decode token's
+    /// `[n_exp]` logits or a batched prefill chunk's `[n x n_exp]` block. Both
+    /// call sites exist and MUST both round, or batched prefill would select
+    /// experts from unrounded logits while decode selects from rounded ones —
+    /// a systematic route divergence, not the ~0.42% f16-boundary straddle
+    /// that is inherent to the format. A batched caller should pass a view of
+    /// exactly the live rows; the whole scratch would also round stale tail
+    /// rows (harmless, but a larger launch for nothing).
     pub fn router_logits_round_f16_rne(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(

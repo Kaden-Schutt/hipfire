@@ -41,7 +41,8 @@
 use hipfire_arch_qwen35::qwen35::escha::{load_escha_moe_experts, EschaWeightStore};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::escha::{
-    escha_launches_per_token, escha_routed_decode, escha_routed_decode_indexed, EschaIndexedRouting,
+    escha_launches_per_token, escha_routed_decode, escha_routed_decode_indexed,
+    escha_routed_prefill_indexed, EschaIndexedRouting,
 };
 use hipfire_quantize::float16::f16_to_f32;
 use hipfire_runtime::hfq::{load_weight_tensor_pread, HfqFile};
@@ -132,6 +133,18 @@ struct ArmResult {
     /// arm: the number of ROUTED-ONLY output floats that did NOT match the
     /// CPU-top-K route bit-for-bit, across every token. Must be 0.
     indexed_mismatches: Option<usize>,
+    /// `Some(n)` when the BATCHED-PREFILL routed executor was cross-checked on
+    /// this arm: the number of routed-only output floats where running all
+    /// `n_tok` tokens in ONE call disagreed, bit-for-bit, with running them one
+    /// at a time through `escha_routed_decode_indexed`.
+    ///
+    /// Must be 0, and equality — not a tolerance — is the right standard here
+    /// for the same reason it is for indexed-vs-host: every kernel in the
+    /// escha routed pipeline is purely slot-parallel, so slot `s` performs the
+    /// identical FLOPs in the identical order regardless of how many slots the
+    /// launch carried. A difference means a wrong stride, a wrong `x_group`
+    /// row, or a scratch aliasing bug — never rounding.
+    batched_mismatches: Option<usize>,
 }
 
 /// Device pointer table over the loaded experts, in the `[n_exp]` packed-u64
@@ -224,6 +237,7 @@ fn run_arm(
         None
     };
     let mut indexed_mismatches = indexed.as_ref().map(|_| 0usize);
+    let mut per_token_indexed: Vec<f32> = Vec::new();
 
     for t in 0..n_tok {
         let x_gpu = upload_f32(gpu, &x[t * hidden..(t + 1) * hidden]);
@@ -292,6 +306,9 @@ fn run_arm(
                 .zip(idx_route[..hidden].iter())
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
+            // Keep the per-token indexed result as the oracle for the batched
+            // executor below.
+            per_token_indexed.extend_from_slice(&idx_route[..hidden]);
         }
 
         run_shared_expert(gpu, shared, &x_gpu, &out, smi, hidden);
@@ -301,6 +318,71 @@ fn run_arm(
         got[t * hidden..(t + 1) * hidden].copy_from_slice(&row[..hidden]);
         let _ = gpu.free_tensor(x_gpu);
     }
+
+    // ── Batched-prefill routed executor cross-check ──────────────────────
+    //
+    // The whole point of `escha_routed_prefill_indexed` is that `slots` grows
+    // from `k` to `n_tok * k` and NOTHING else changes. This runs all `n_tok`
+    // tokens in one call and requires the result to be bit-identical to the
+    // per-token indexed route captured above — the routed half of the §5.4
+    // batched-prefill gate, at the layer where a failure is diagnosable.
+    //
+    // The tokens deliberately have DIFFERENT expert sets and different
+    // activations (they come from EschaLabs' shipped fixture), so an executor
+    // that broadcast token 0's activation to every slot — the `x_group`
+    // mistake this is here to catch — fails on tokens 1.. rather than passing
+    // by luck.
+    let batched_mismatches = indexed.as_ref().map(|(gu_tbl, dn_tbl, _, _, _)| {
+        let slots = n_tok * top_k;
+        let x_all = upload_f32(gpu, x);
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|&i| (i as i32).to_le_bytes()).collect();
+        let ids_dev = gpu.upload_raw(&id_bytes, &[slots]).unwrap();
+        let w_bytes: Vec<u8> = scores.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let wts_dev = gpu.upload_raw(&w_bytes, &[slots]).unwrap();
+        let out_b = gpu.alloc_tensor(&[n_tok * hidden], DType::F32).unwrap();
+        let zb = vec![0.0f32; n_tok * hidden];
+        gpu.hip
+            .memcpy_htod(&out_b.buf, unsafe {
+                std::slice::from_raw_parts(zb.as_ptr() as *const u8, n_tok * hidden * 4)
+            })
+            .unwrap();
+        let scratch = gpu
+            .ensure_escha_prefill_scratch(slots, hidden, mi)
+            .expect("escha prefill scratch");
+        escha_routed_prefill_indexed(
+            gpu,
+            &refs,
+            &scratch,
+            &EschaIndexedRouting {
+                expert_gate_up_ptrs: gu_tbl,
+                expert_down_ptrs: dn_tbl,
+                topk_indices: &ids_dev,
+                topk_weights: &wts_dev,
+                gate_up_m: 2 * mi,
+                gate_up_k: hidden,
+                down_m: hidden,
+                down_k: mi,
+            },
+            &out_b,
+            &x_all,
+            hidden,
+            mi,
+            top_k,
+            n_tok,
+        )
+        .expect("escha routed prefill (batched)");
+        gpu.hip.device_synchronize().unwrap();
+        let batched = gpu.download_f32(&out_b).unwrap();
+        let bad = batched[..n_tok * hidden]
+            .iter()
+            .zip(per_token_indexed.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        for t in [x_all, ids_dev, wts_dev, out_b] {
+            let _ = gpu.free_tensor(t);
+        }
+        bad
+    });
 
     let diffs: Vec<f32> = got
         .iter()
@@ -331,6 +413,7 @@ fn run_arm(
         mean_abs,
         got,
         indexed_mismatches,
+        batched_mismatches,
     }
 }
 
@@ -487,6 +570,35 @@ fn main() {
         f32_arm.indexed_mismatches.is_none(),
         "the F32 control arm has no indexed counterpart (the indexed GEMV is Q8_0-only) — a \
          Some here means the cross-check silently ran against the wrong container"
+    );
+
+    // ── Batched-prefill route == per-token indexed route, bit-for-bit ────
+    // The routed half of the §5.4 batched-prefill gate. The dense half of a
+    // batched prefill is NOT bit-identical (a batched WMMA GEMM does not
+    // accumulate like a batch-1 GEMV) — but the ROUTED half must be, because
+    // every kernel in the escha pipeline is purely slot-parallel and slot `s`
+    // does the same FLOPs in the same order at 8 slots as at 2 048. Asserting
+    // equality here is what makes the whole-model logit delta attributable to
+    // the dense half alone.
+    let n_batched = q8_arm
+        .batched_mismatches
+        .expect("the Q8_0 arm must cross-check the batched-prefill route");
+    println!(
+        "batched prefill route vs per-token indexed route: {n_batched} differing floats (want 0)"
+    );
+    assert_eq!(
+        n_batched, 0,
+        "the batched-prefill escha route disagreed with the per-token indexed route on \
+         {n_batched} routed-output floats. These must be BIT-identical — only `slots` \
+         changes. Look at (1) `escha_h128_in_batched`'s `x_group`: the gate_up input side \
+         must be `Grouped(k)` (slot s reads token s/k), not `Broadcast` (every slot reads \
+         token 0) and not `PerSlot`; (2) the token-major slot layout, which must match what \
+         `moe_topk_renorm_k8_batched` writes and `moe_down_combine_k8_batched` reads; \
+         (3) the scratch views, which must be cut to exactly `n_tok * k` slots."
+    );
+    assert!(
+        f32_arm.batched_mismatches.is_none(),
+        "the F32 control arm has no batched counterpart (the indexed GEMV is Q8_0-only)"
     );
 
     let dq: Vec<f32> = q8_arm

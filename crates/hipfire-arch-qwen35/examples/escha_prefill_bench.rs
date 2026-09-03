@@ -149,6 +149,19 @@ fn main() -> Result<(), String> {
         if bad != 0 {
             return Err(format!("non-finite logits after an {n}-token prefill"));
         }
+        // Full final-token logits, for byte-level A/B between two runs of the
+        // SAME binary (e.g. `HIPFIRE_FP16_X_LEGACY_CACHE=1` vs not, to measure
+        // whether a given model was affected by the FP16 activation-cache fix).
+        // An argmax and a 4-decimal top logit cannot establish bit-identity;
+        // this can. Nothing else in the harness depends on it.
+        if let Ok(dump) = std::env::var("HIPFIRE_BENCH_LOGITS_OUT") {
+            let mut bytes = Vec::with_capacity(b.config.vocab_size * 4);
+            for v in logits.iter().take(b.config.vocab_size) {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(&dump, &bytes).map_err(|e| format!("write {dump}: {e}"))?;
+            eprintln!("wrote {} logits to {dump}", b.config.vocab_size);
+        }
 
         // Decode continuation, from the state this prefill just built. The
         // first token is discarded: it pays any first-shape JIT.

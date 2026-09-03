@@ -1235,6 +1235,7 @@ impl Gpu {
                 mq_x_scales: None,
                 mq_rmsnorm_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                escha_prefill: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -2925,6 +2926,25 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
+    }
+
+    /// Model-global Escha-W2 batched-prefill routed scratch, allocated on
+    /// first use and grown on demand. See
+    /// [`crate::scratch::EschaPrefillScratch`].
+    /// Returns VIEWS by value, not a borrow: the caller launches kernels
+    /// through `&mut Gpu` immediately afterwards, so a borrow of
+    /// `self.scratch` could not survive.
+    pub fn ensure_escha_prefill_scratch(
+        &mut self,
+        slots: usize,
+        hidden: usize,
+        mi: usize,
+    ) -> HipResult<crate::scratch::EschaPrefillViews> {
+        // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
+        Ok(self
+            .scratch
+            .ensure_escha_prefill(&self.hip, self.device_id, slots, hidden, mi)?
+            .views(slots))
     }
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {

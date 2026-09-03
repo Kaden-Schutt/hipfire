@@ -168,6 +168,40 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
     })
 }
 
+/// How the input activation of `escha_h128_in_batched` maps onto its slots.
+///
+/// Replaces a bare `x_batched: bool`. The bool covered the two decode cases
+/// (one shared `x`, or one `x` per slot); batched prefill needs a third — one
+/// `x` per TOKEN, shared by that token's `k` expert slots — and a bool cannot
+/// express it. Making it an enum rather than a raw `i32` means a caller cannot
+/// pass `2` when it meant "true": the grouped case has to name its group size,
+/// which is exactly the value that would otherwise be silently wrong.
+///
+/// The kernarg encoding (`<= 0` broadcast, else `slot / g`) keeps 0 and 1
+/// meaning what the bool's `false` and `true` meant, so the kernel change is
+/// backward compatible for every existing call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EschaXGroup {
+    /// One `[n]` activation shared by every slot.
+    Broadcast,
+    /// `[slots, n]` — one activation per slot.
+    PerSlot,
+    /// `[slots / g, n]` — slot `s` reads row `s / g`. `g` must divide `slots`.
+    Grouped(usize),
+}
+
+impl EschaXGroup {
+    /// The `x_group` kernarg. `PerSlot` is `Grouped(1)` by construction.
+    #[inline]
+    pub fn as_kernarg(self) -> i32 {
+        match self {
+            EschaXGroup::Broadcast => 0,
+            EschaXGroup::PerSlot => 1,
+            EschaXGroup::Grouped(g) => g as i32,
+        }
+    }
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -13859,9 +13893,18 @@ impl Gpu {
     /// the per-expert form costs 1280 launches/token = 3.07 ms = a 326 tok/s
     /// ceiling before any GEMV work. The batched form is 160 launches.
     ///
-    /// - `a`: `[n]` when `x_batched == false` (input side of gate_up — every
-    ///   top-k expert sees the same post-rmsnorm activation), else
-    ///   `[slots, n]`. The output side is always `[slots, n]`.
+    /// - `x_group` (INPUT side only; ignored by `escha_h128_out_batched`) says
+    ///   how many consecutive slots share one row of `a`:
+    ///   * `EschaXGroup::Broadcast` — `a` is `[n]`, every slot reads it. The
+    ///     decode gate_up input side: a token's top-k experts see the same
+    ///     post-rmsnorm activation and differ only in `rin`.
+    ///   * `EschaXGroup::PerSlot` — `a` is `[slots, n]`. The down input side.
+    ///   * `EschaXGroup::Grouped(g)` — `a` is `[slots / g, n]`; slot `s` reads
+    ///     row `s / g`. The batched-prefill gate_up input side with `g = k`:
+    ///     slots are token-major (`token * k + krank`), so all k of a token's
+    ///     experts read that token's activation. `slots % g != 0` is rejected
+    ///     rather than truncated — a ragged tail would silently read a wrong
+    ///     row for the last few slots.
     /// - `r_table`: the whole resident `[E, n]` `escha_rin_eff` /
     ///   `escha_rout_eff` tensor. Slot `s` reads row `ids[s]` — that indexing
     ///   IS the batching; no per-expert vector is gathered or copied.
@@ -13876,7 +13919,7 @@ impl Gpu {
         out: &GpuTensor,
         n: usize,
         slots: usize,
-        x_batched: bool,
+        x_group: EschaXGroup,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if n % 128 != 0 {
@@ -13885,7 +13928,22 @@ impl Gpu {
                 &format!("escha_h128_batched: n={n} is not a multiple of 128"),
             ));
         }
-        let want_a = if x_batched { slots * n } else { n };
+        let want_a = match x_group {
+            EschaXGroup::Broadcast => n,
+            EschaXGroup::PerSlot => slots * n,
+            EschaXGroup::Grouped(g) => {
+                if g == 0 || slots % g != 0 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "escha_h128_batched: x_group={g} does not divide slots={slots}; \
+                             a ragged group would make the last slots read the wrong row of a"
+                        ),
+                    ));
+                }
+                (slots / g) * n
+            }
+        };
         if a.numel() != want_a {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -13929,7 +13987,7 @@ impl Gpu {
         let mut i_ptr = ids.buf.as_ptr();
         let mut o_ptr = out.buf.as_ptr();
         let mut n_val = n as i32;
-        let mut xb = i32::from(x_batched);
+        let mut xb = x_group.as_kernarg();
         let mut params: Vec<*mut c_void> = if entry == "escha_h128_in_batched" {
             vec![
                 &mut a_ptr as *mut _ as *mut c_void,
@@ -16700,5 +16758,28 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod escha_x_group_tests {
+    use super::EschaXGroup;
+
+    /// The kernarg encoding must keep the two meanings the old `x_batched:
+    /// bool` had, or the two pre-existing decode call sites (and G3's two
+    /// pre-existing cases) change behaviour under a change that is supposed to
+    /// be purely additive.
+    #[test]
+    fn x_group_kernarg_is_backward_compatible() {
+        assert_eq!(EschaXGroup::Broadcast.as_kernarg(), 0, "was `false`");
+        assert_eq!(EschaXGroup::PerSlot.as_kernarg(), 1, "was `true`");
+        // Grouped(1) is PerSlot by construction — the kernel computes
+        // `slot / x_group`, and `slot / 1 == slot`.
+        assert_eq!(
+            EschaXGroup::Grouped(1).as_kernarg(),
+            EschaXGroup::PerSlot.as_kernarg()
+        );
+        // The batched-prefill case: k slots per token.
+        assert_eq!(EschaXGroup::Grouped(8).as_kernarg(), 8);
     }
 }

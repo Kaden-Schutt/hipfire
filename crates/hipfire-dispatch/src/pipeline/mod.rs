@@ -20,6 +20,7 @@ pub mod superop;
 /// Escha-W2 routed-expert decode executor (Task 10). Replaces step 4 of the
 /// CPU-top-K fallback for escha layers; everything else stays arch-6 code.
 pub mod escha;
+pub mod route_trace;
 
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
@@ -1240,6 +1241,12 @@ pub fn run_moe_decode(
     //
     // It returns rather than falling through: it has already accumulated the
     // routed contribution into `out_target`, so the generic body must not run.
+    // Selection capture (off unless HIPFIRE_ESCHA_ROUTE_TRACE is set). Placed
+    // after top-k and before any routed body, so it records what the expert
+    // GEMVs are about to index with on EITHER decode route.
+    if crate::pipeline::route_trace::enabled() {
+        crate::pipeline::route_trace::record(gpu, p.topk_indices, p.batch_size, p.k);
+    }
     if escha_indexed_supported {
         let escha = p
             .escha
@@ -3384,6 +3391,73 @@ pub fn run_moe_prefill(
     // read load-time zero-dummy weights → contribute 0, so the all-reduced sum of
     // partials equals the full single-GPU routed combine.
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_batch);
+
+    // ── Escha-W2 routed experts, batched + indexed ───────────────────────────
+    //
+    // Mirrors the escha branch in `run_moe_decode`, and for the same reason:
+    // escha weights live in a ROTATED domain, so Path 1 and Path 2 below —
+    // which feed the activation straight into the expert GEMVs and combine the
+    // raw result — would omit both Hadamard transforms and emit finite,
+    // fluent, ~1e-1-wrong output with nothing to catch it. This branch RETURNS;
+    // it has already accumulated the routed contribution into `out_target`.
+    //
+    // It runs BEFORE the Path 2 scatter so escha never pays for a scatter it
+    // does not use.
+    if let Some(escha) = p.escha.as_ref() {
+        // The same four refusals the two decode escha branches make, for the
+        // same reasons. Kept verbatim rather than factored out: each one is a
+        // claim about THIS executor, and a shared helper would let a future
+        // divergence between the routes go unnoticed.
+        //
+        // AWQ / graded tiers: the escha executor has no arm for either.
+        if p.expert_down_awq_ptrs.is_some() || p.expert_dtype_tags.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-with-awq-or-graded-tiers",
+                arch: "",
+                quant: "",
+            });
+        }
+        // Hessian capture keyed on the activation would record the H128
+        // outputs instead of the raw pre-rotation activations, silently
+        // poisoning the Hessians.
+        if gpu.hessian_capture.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-hessian-capture-unsupported",
+                arch: "",
+                quant: "",
+            });
+        }
+        // The escha executor always folds the weighted combine into the layer
+        // (phase 8); there is no expanded, uncombined `down_expanded` to hand
+        // back. (Prefill has no `defer_routed_combine` flag today — the decode
+        // branch refuses one — so this is recorded as a comment rather than a
+        // dead check. If prefill gains the flag, it must refuse here.)
+        let slots = total_slots;
+        let scratch = hip!(gpu.ensure_escha_prefill_scratch(slots, p.hidden, mi))?;
+        return crate::pipeline::escha::escha_routed_prefill_indexed(
+            gpu,
+            escha,
+            &scratch,
+            &crate::pipeline::escha::EschaIndexedRouting {
+                expert_gate_up_ptrs: p.expert_gate_up_ptrs,
+                expert_down_ptrs: p.expert_down_ptrs,
+                topk_indices: p.topk_indices,
+                topk_weights: p.topk_weights,
+                gate_up_m: 2 * mi,
+                gate_up_k,
+                down_m,
+                down_k,
+            },
+            out_target,
+            p.x_norm_batch,
+            p.hidden,
+            mi,
+            k_top,
+            n,
+        );
+    }
 
     // ── Path 2 scatter pipeline ───────────────────────────────────────
     let mut path2_m_total: usize = 0;

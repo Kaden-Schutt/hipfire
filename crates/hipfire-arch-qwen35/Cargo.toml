@@ -43,6 +43,10 @@ required-features = ["deltanet"]
 [[example]]
 name = "escha_router_contract"
 path = "examples/escha_router_contract.rs"
+
+[[example]]
+name = "escha_prefill_batch_gate"
+path = "examples/escha_prefill_batch_gate.rs"
 required-features = ["deltanet"]
 
 [[example]]

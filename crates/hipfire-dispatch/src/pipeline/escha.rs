@@ -80,7 +80,7 @@
 //! bit-exactly against `escha_ref` by
 //! `rdna-compute/examples/test_escha_h128_gpu_vs_cpu.rs`.
 
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{EschaXGroup, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GemvFamily, WeightRef};
@@ -236,7 +236,7 @@ pub fn escha_routed_decode(
         e.xh_gu,
         hidden,
         k,
-        false,
+        EschaXGroup::Broadcast,
     ))?;
 
     // ── 2. gate_up GEMV per selected expert ───────────────────────────────
@@ -257,7 +257,7 @@ pub fn escha_routed_decode(
         e.y_gu,
         2 * mi,
         k,
-        true,
+        EschaXGroup::PerSlot,
     ))?;
 
     // ── 4. SwiGLU on the f16-rounded merged output, gate = FIRST half ─────
@@ -272,7 +272,7 @@ pub fn escha_routed_decode(
         e.xh_dn,
         mi,
         k,
-        true,
+        EschaXGroup::PerSlot,
     ))?;
 
     // ── 6. down GEMV per selected expert ──────────────────────────────────
@@ -291,7 +291,7 @@ pub fn escha_routed_decode(
         e.y_dn,
         hidden,
         k,
-        true,
+        EschaXGroup::PerSlot,
     ))?;
 
     // ── 8. weighted combine into the residual, ONE launch ─────────────────
@@ -402,7 +402,7 @@ pub fn escha_routed_decode_indexed(
         e.xh_gu,
         hidden,
         k,
-        false,
+        EschaXGroup::Broadcast,
     ))?;
 
     // ── 2. gate_up GEMV for ALL k experts, ONE launch ─────────────────────
@@ -425,7 +425,7 @@ pub fn escha_routed_decode_indexed(
         e.y_gu,
         2 * mi,
         k,
-        true,
+        EschaXGroup::PerSlot,
     ))?;
 
     // ── 4. SwiGLU on the f16-rounded merged output, gate = FIRST half ─────
@@ -440,7 +440,7 @@ pub fn escha_routed_decode_indexed(
         e.xh_dn,
         mi,
         k,
-        true,
+        EschaXGroup::PerSlot,
     ))?;
 
     // ── 6. down GEMV for ALL k experts, ONE launch ────────────────────────
@@ -463,10 +463,232 @@ pub fn escha_routed_decode_indexed(
         e.y_dn,
         hidden,
         k,
-        true,
+        EschaXGroup::PerSlot,
     ))?;
 
     // ── 8. weighted combine into the residual, ONE launch ─────────────────
     hip!(gpu.moe_down_combine_k8_batched(e.y_dn, e.weights, out, hidden, k, 1))?;
+    Ok(())
+}
+
+/// Run the routed half of one Escha-W2 MoE layer for a BATCH of `n_tokens`,
+/// with the routing left on the device.
+///
+/// The batched-prefill twin of [`escha_routed_decode_indexed`]. Same eight
+/// phases, same H128 pair, same kernels — the ONLY change is that `slots` is
+/// `n_tokens * k` instead of `k`.
+///
+/// # Why that is enough, and why it is bit-identical per slot
+///
+/// Every kernel in the pipeline is already purely slot-parallel:
+///
+/// * `escha_gemv_q8_0_moe_k8_indexed_batched` (and its wide sibling) take
+///   `krank = blockIdx.y`, read `x_batch + krank*K`, write `y_batch + krank*M`
+///   and address the expert through `expert_ptrs[topk_indices[krank]]`. No
+///   loop bound, accumulator, unroll or reduction depends on how many slots
+///   there are, so slot `s` computes exactly the same sum in exactly the same
+///   order whether the launch carried 8 slots or 2 048.
+/// * `escha_h128_out_batched`, `escha_swiglu_batched` and
+///   `moe_down_combine_k8_batched` are already `[slots, ...]` /
+///   `[N, K_TOP, M]`-shaped and need nothing.
+/// * `escha_h128_in_batched` needed the one change: its input-side activation
+///   was either broadcast to every slot or one row per slot, and batched
+///   prefill needs one row per TOKEN shared by that token's `k` slots. Hence
+///   [`EschaXGroup::Grouped`].
+///
+/// That per-slot invariance is the reason the routed half of batched prefill
+/// is asserted EQUAL to the per-token route rather than close to it — see the
+/// gate in `hipfire-arch-qwen35/examples/escha_prefill_batch_gate.rs`. (The
+/// DENSE half is not bit-identical: a batched WMMA GEMM does not accumulate
+/// like a batch-1 GEMV.)
+///
+/// # Slot layout
+///
+/// Token-major: slot `s` is token `s / k`, rank `s % k`. This is the layout
+/// `moe_topk_renorm_k8_batched` already writes `topk_indices` / `topk_weights`
+/// in, and the layout `moe_down_combine_k8_batched` already reads
+/// `expert_outputs` in, so nothing is permuted anywhere in this function.
+///
+/// `out` (`[n_tokens, hidden]`) is accumulated into, never overwritten.
+#[allow(clippy::too_many_arguments)]
+pub fn escha_routed_prefill_indexed(
+    gpu: &mut Gpu,
+    tables: &EschaRoutedRefs<'_>,
+    scratch: &rdna_compute::scratch::EschaPrefillViews,
+    r: &EschaIndexedRouting<'_>,
+    out: &GpuTensor,
+    x_norm_batch: &GpuTensor,
+    hidden: usize,
+    mi: usize,
+    k: usize,
+    n_tokens: usize,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($ex:expr) => {
+            $ex.map_err(|err| DispatchError::Hip(err.to_string()))
+        };
+    }
+    // `moe_down_combine_k8_batched` unrolls to a hard 8 slots per token
+    // (`k < K_TOP` guard inside a `for k in 0..8`), so it silently DROPS ranks
+    // 8.. rather than failing. Same bound as both decode routes.
+    if k == 0 || k > 8 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-prefill-supports-k<=8",
+            arch: "",
+            quant: "",
+        });
+    }
+    if n_tokens == 0 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-prefill-empty-batch",
+            arch: "",
+            quant: "",
+        });
+    }
+    let slots = n_tokens
+        .checked_mul(k)
+        .ok_or(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-prefill-slot-overflow",
+            arch: "",
+            quant: "",
+        })?;
+    // The indexed GEMVs put `slots` on grid.y, which HIP caps at 65 535. Above
+    // that the launch would be truncated, not rejected — tokens past the cap
+    // would silently contribute nothing to the residual, which reads as a
+    // mildly worse model rather than as a failure.
+    if slots > 65_535 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-prefill-slots-exceed-grid-y",
+            arch: "",
+            quant: "",
+        });
+    }
+    // The scratch is model-global and grows on demand, and its views are cut
+    // to a specific slot count; a caller that cut them for a different chunk
+    // would have every kernel here read or write the wrong extent. The
+    // wrappers also length-check exactly, so this is belt and braces — but it
+    // names the mistake instead of reporting a numel mismatch six frames down.
+    if scratch.slots != slots {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-prefill-scratch-slot-mismatch",
+            arch: "",
+            quant: "",
+        });
+    }
+    // Same shape contract as the decode route: the GEMVs read
+    // `expert_ptrs[topk_indices[slot]]` on device, so a mis-sized weight table
+    // is an out-of-bounds READ, not a wrong answer, and a projection whose
+    // shape disagrees with the scratch would have the GEMV write past the end
+    // of `mid_gu` / `mid_dn`.
+    if r.gate_up_m != 2 * mi || r.gate_up_k != hidden || r.down_m != hidden || r.down_k != mi {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-indexed-routed-shape-mismatch",
+            arch: "",
+            quant: "",
+        });
+    }
+
+    let weights = &scratch.weights;
+    let xh_gu = &scratch.xh_gu;
+    let mid_gu = &scratch.mid_gu;
+    let y_gu = &scratch.y_gu;
+    let h = &scratch.h;
+    let xh_dn = &scratch.xh_dn;
+    let mid_dn = &scratch.mid_dn;
+    let y_dn = &scratch.y_dn;
+    // `topk_indices` / `topk_weights` are the [max_batch x k] prefill scratch;
+    // only the first `slots` entries are this chunk's.
+    let ids = r.topk_indices.sub_offset(0, slots);
+    let raw_weights = r.topk_weights.sub_offset(0, slots);
+
+    // ── 0. f16-round the combine weights, ONE launch, out-of-place ────────
+    hip!(gpu.escha_round_weights_f16_rne(&raw_weights, weights, slots))?;
+
+    // ── 1. gate_up input transform, all slots, ONE launch ─────────────────
+    // Grouped(k): slot s reads token s/k's row of `x_norm_batch`. This is the
+    // one place batched prefill differs from decode, which broadcasts a single
+    // row to all k slots.
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        x_norm_batch,
+        tables.gate_up_rin,
+        &ids,
+        xh_gu,
+        hidden,
+        slots,
+        EschaXGroup::Grouped(k),
+    ))?;
+
+    // ── 2. gate_up GEMV for ALL slots, ONE launch ─────────────────────────
+    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+        r.expert_gate_up_ptrs,
+        &ids,
+        xh_gu,
+        mid_gu,
+        r.gate_up_m,
+        r.gate_up_k,
+        slots,
+    ))?;
+
+    // ── 3. gate_up output transform, ONE launch ───────────────────────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_out_batched",
+        mid_gu,
+        tables.gate_up_rout,
+        &ids,
+        y_gu,
+        2 * mi,
+        slots,
+        EschaXGroup::PerSlot,
+    ))?;
+
+    // ── 4. SwiGLU on the f16-rounded merged output, gate = FIRST half ─────
+    hip!(gpu.escha_swiglu_batched(y_gu, h, mi, slots))?;
+
+    // ── 5. down input transform, ONE launch (per-slot activation) ─────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        h,
+        tables.down_rin,
+        &ids,
+        xh_dn,
+        mi,
+        slots,
+        EschaXGroup::PerSlot,
+    ))?;
+
+    // ── 6. down GEMV for ALL slots, ONE launch ────────────────────────────
+    hip!(gpu.escha_gemv_q8_0_moe_k8_indexed_batched(
+        r.expert_down_ptrs,
+        &ids,
+        xh_dn,
+        mid_dn,
+        r.down_m,
+        r.down_k,
+        slots,
+    ))?;
+
+    // ── 7. down output transform, ONE launch ──────────────────────────────
+    hip!(gpu.escha_h128_batched(
+        "escha_h128_out_batched",
+        mid_dn,
+        tables.down_rout,
+        &ids,
+        y_dn,
+        hidden,
+        slots,
+        EschaXGroup::PerSlot,
+    ))?;
+
+    // ── 8. weighted combine into the residual, ONE launch ─────────────────
+    // `[n_tokens, k, hidden]` folded into `[n_tokens, hidden]`; blockIdx.y is
+    // already the token, so this is the same kernel decode uses at n = 1.
+    hip!(gpu.moe_down_combine_k8_batched(y_dn, weights, out, hidden, k, n_tokens))?;
     Ok(())
 }

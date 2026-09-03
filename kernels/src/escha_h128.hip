@@ -164,15 +164,32 @@ extern "C" __global__ void escha_h128_out(
 // rounding happens at exactly the same point — but the consumer is
 // hipfire's f32 GEMV, so widening here saves a separate convert launch.
 //
-// `x_batched == 0` broadcasts a single `[n]` activation across all slots
-// (the gate_up input side: every top_k expert of a token sees the same
-// post-rmsnorm x, only `rin` differs). `x_batched != 0` reads `[slots, n]`
-// (the down input side, whose per-slot activation is that slot's SwiGLU
-// output).
+// `x_group` says how many CONSECUTIVE slots share one row of `x`:
+//
+//   x_group <= 0  broadcast — every slot reads the single `[n]` row `x`.
+//                 (Decode gate_up input side: a token's top_k experts all see
+//                 the same post-rmsnorm x, only `rin` differs.)
+//   x_group == 1  one row per slot, `x` is `[slots, n]`.
+//                 (Down input side: each slot's activation is its own SwiGLU
+//                 output.)
+//   x_group == g  row `slot / g`, `x` is `[slots/g, n]`.
+//                 (Batched-prefill gate_up input side, g = k: slots are laid
+//                 out token-major as `token * k + krank`, so `slot / k` is the
+//                 token and every one of its k experts reads that token's x.)
+//
+// 0 and 1 keep the exact meanings the old binary `x_batched` flag had, so the
+// two pre-existing call sites and the two pre-existing G3 cases are unchanged
+// by construction; the grouped case is the only new behaviour and G3 gates it
+// bit-exactly against escha_ref like the other two.
+//
+// Deliberately `slot / x_group` rather than a second `tokens` kernarg: the
+// division is once per block (128 threads share it) against a value already
+// in a register, and expressing it as "how many slots share a row" keeps ALL
+// THREE cases one expression instead of a three-way branch per element.
 extern "C" __global__ void escha_h128_in_batched(
     const float* __restrict__ x, const float* __restrict__ r,
     const int* __restrict__ ids, float* __restrict__ out,
-    int n, int x_batched) {
+    int n, int x_group) {
     __shared__ float bufA[128];
     __shared__ float bufB[128];
     int groups = n >> 7;
@@ -181,7 +198,8 @@ extern "C" __global__ void escha_h128_in_batched(
     int t = threadIdx.x;
     int lane = grp * 128 + t;
     int e = ids[slot];
-    float xv = x_batched ? x[(size_t)slot * n + lane] : x[lane];
+    float xv = (x_group <= 0) ? x[lane]
+                              : x[(size_t)(slot / x_group) * n + lane];
     bufA[t] = xv * r[(size_t)e * n + lane];
     __syncthreads();
     float* h = h128_parallel(bufA, bufB, t);

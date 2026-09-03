@@ -4,6 +4,7 @@
 //! butterfly order is also self-inverse and would pass it while being wrong.
 use hipfire_quantize::escha_ref;
 use hipfire_quantize::float16::f16_to_f32;
+use rdna_compute::EschaXGroup;
 
 fn main() {
     let n = 2048usize;
@@ -101,7 +102,7 @@ fn batched_vs_ref(gpu: &mut rdna_compute::Gpu, n: usize) {
         &d_out,
         n,
         slots,
-        false,
+        EschaXGroup::Broadcast,
     )
     .expect("in batched (broadcast)");
     let got = gpu.download_f32(&d_out).expect("dl");
@@ -129,7 +130,7 @@ fn batched_vs_ref(gpu: &mut rdna_compute::Gpu, n: usize) {
         &d_out,
         n,
         slots,
-        true,
+        EschaXGroup::PerSlot,
     )
     .expect("in batched (per-slot)");
     let got = gpu.download_f32(&d_out).expect("dl");
@@ -151,6 +152,117 @@ fn batched_vs_ref(gpu: &mut rdna_compute::Gpu, n: usize) {
     );
     assert_eq!(bad, 0);
 
+    // ── in, GROUPED x (Task perf-3: batched prefill) ─────────────────────
+    //
+    // The third `x_group` case, gated exactly like the other two: bit-exact
+    // against `escha_ref`, never against the other kernel arms.
+    //
+    // This is the case batched prefill needs and neither existing case covers:
+    // `slots = n_tokens * k` laid out token-major, with all `k` slots of a
+    // token reading THAT TOKEN's activation row. `slots = 4`, `g = 2` means
+    // two tokens of two experts each: slots 0,1 read x row 0 and slots 2,3
+    // read x row 1.
+    //
+    // Getting the group arithmetic wrong is silent, not loud. `slot * n`
+    // (the PerSlot formula) against a `[slots/g, n]` buffer reads off the end
+    // for the later slots; `slot / g` with the wrong `g` reads a real,
+    // full-magnitude activation belonging to a DIFFERENT token — plausible
+    // output, wrong answer. Only an oracle comparison distinguishes them,
+    // which is why this is here rather than a round-trip or a self-check.
+    //
+    // The ids list still repeats an expert and is still unsorted, and the two
+    // tokens' rows differ, so an implementation that broadcast row 0 to
+    // everything (the `x_group <= 0` arm firing by accident) fails on slots
+    // 2 and 3 rather than passing by luck.
+    let group = 2usize;
+    assert_eq!(slots % group, 0, "grouped case needs g | slots");
+    let n_tokens = slots / group;
+    let xg: Vec<f32> = (0..n_tokens * n)
+        .map(|i| ((i * 23) as f32 * 0.0091).sin() * 0.75)
+        .collect();
+    let d_xg = up(gpu, &xg);
+    gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        &d_xg,
+        &d_rin,
+        &d_ids,
+        &d_out,
+        n,
+        slots,
+        EschaXGroup::Grouped(group),
+    )
+    .expect("in batched (grouped)");
+    let got = gpu.download_f32(&d_out).expect("dl");
+    let mut bad = 0usize;
+    for (s, &e) in ids.iter().enumerate() {
+        let tok = s / group;
+        let want = escha_ref::input_transform(
+            &xg[tok * n..(tok + 1) * n],
+            &r_in[e as usize * n..(e as usize + 1) * n],
+        );
+        for i in 0..n {
+            if got[s * n + i] != f16_to_f32(want[i]) {
+                bad += 1;
+            }
+        }
+    }
+    println!(
+        "h128_in_batched (grouped x, g={group}): {bad} mismatched of {}",
+        slots * n
+    );
+    assert_eq!(bad, 0);
+
+    // Grouped(1) must be byte-identical to PerSlot — the backward-compatibility
+    // claim the kernel change rests on, checked rather than asserted in a
+    // comment. (Grouped(0) is rejected by the wrapper, not silently treated as
+    // broadcast, so there is nothing to check for it here.)
+    gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        &d_xk,
+        &d_rin,
+        &d_ids,
+        &d_out,
+        n,
+        slots,
+        EschaXGroup::Grouped(1),
+    )
+    .expect("in batched (grouped g=1)");
+    let got_g1 = gpu.download_f32(&d_out).expect("dl");
+    gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        &d_xk,
+        &d_rin,
+        &d_ids,
+        &d_out,
+        n,
+        slots,
+        EschaXGroup::PerSlot,
+    )
+    .expect("in batched (per-slot recheck)");
+    let got_ps = gpu.download_f32(&d_out).expect("dl");
+    assert_eq!(
+        got_g1, got_ps,
+        "Grouped(1) must be byte-identical to PerSlot"
+    );
+    println!("h128_in_batched: Grouped(1) == PerSlot, byte-identical");
+
+    // A group that does not divide `slots` must be REFUSED, not truncated:
+    // a ragged tail would read a wrong row for the last slots, silently.
+    assert!(
+        gpu.escha_h128_batched(
+            "escha_h128_in_batched",
+            &d_xg,
+            &d_rin,
+            &d_ids,
+            &d_out,
+            n,
+            slots,
+            EschaXGroup::Grouped(3),
+        )
+        .is_err(),
+        "a group size that does not divide slots must be rejected"
+    );
+
     // ── out ──────────────────────────────────────────────────────────────
     gpu.escha_h128_batched(
         "escha_h128_out_batched",
@@ -160,7 +272,7 @@ fn batched_vs_ref(gpu: &mut rdna_compute::Gpu, n: usize) {
         &d_out,
         n,
         slots,
-        true,
+        EschaXGroup::PerSlot,
     )
     .expect("out batched");
     let got = gpu.download_f32(&d_out).expect("dl");

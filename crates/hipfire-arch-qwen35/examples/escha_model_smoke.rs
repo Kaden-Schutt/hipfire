@@ -14,22 +14,28 @@
 //!
 //! # The prefill phase, and why the launch counter is the load-bearing assert
 //!
-//! Escha layers are expected to route to the escha executor in prefill too,
-//! but by a completely different mechanism from decode. In prefill,
-//! `moe_ffn_batched_admissible_for_dtypes` admits no `Q8_0` routed arm, so
-//! `prefill_batch_pbs_eligible` comes out false for the WHOLE model and
-//! `forward_prefill_batch` falls to its per-token `forward_scratch` loop —
-//! which is byte-identical to decode and therefore reaches
-//! `run_moe_decode` → `run_moe_decode_cpu_fallback` → the escha executor.
+//! Escha layers route to an escha executor in prefill too, but through
+//! `escha_routed_prefill_indexed` rather than the decode one. The H128 launch
+//! budget is what identifies which of THREE things happened, and the three are
+//! indistinguishable by looking at the logits:
 //!
-//! That chain was INFERRED from source, not observed, and the failure mode if
-//! the inference is wrong is silent wrong output: a batched MoE prefill body
-//! would run the Q8_0 experts with no H128 pair and produce finite, fluent,
-//! ~1e-1-wrong hidden state. Finiteness alone would not catch it. The
-//! `escha_h128_launches()` delta would: on the batched body it is ZERO, on the
-//! correct per-token path it is exactly `n_prompt * 4 * n_layers`. So the
-//! prefill phase below asserts BOTH, and the counter is what actually proves
-//! the escha executor ran for every layer of every prompt token.
+//! | launches (8-token prompt, 40 layers) | what ran |
+//! |---|---|
+//! | **160** = `4 * n_layers` per CHUNK | batched escha prefill — correct |
+//! | 1 280 = `n * 4 * n_layers` | silently fell back to the per-token loop |
+//! | 0 | a batched MoE body with NO escha awareness |
+//!
+//! Zero is the dangerous one: the generic batched routed body would run the
+//! Q8_0 experts without the H128 pair and emit finite, fluent, ~1e-1-wrong
+//! hidden state, which finiteness alone would never catch. 1 280 is not wrong,
+//! just 3.6x slower — but a silent fallback is exactly how a performance fix
+//! rots, so it fails here too rather than being tolerated.
+//!
+//! The count is per CHUNK because that is the whole point of the batched body:
+//! one launch of `escha_h128_in_batched` covers `n_tokens * k` slots. A prompt
+//! longer than the prefill chunk ceiling would legitimately show one budget
+//! per chunk; this gate keeps the prompt inside one chunk so the expected
+//! number is exact.
 //!
 //! Token ids are arbitrary here on purpose: this gate is about the launch
 //! budget and the structural invariants (finite logits, a non-degenerate
@@ -147,10 +153,11 @@ fn main() -> Result<(), String> {
         .filter(|v| !v.is_finite())
         .count();
     eprintln!(
-        "prefill n={}: H128 launches={prefill_launches} ({} per token, want {want_launches}), \
-         non-finite logits={prefill_bad}/{}, {:?}",
+        "prefill n={}: H128 launches={prefill_launches} (want {want_launches} for one \
+         batched chunk; {} would be the per-token fallback), non-finite logits={prefill_bad}/{}, \
+         {:?}",
         PROMPT.len(),
-        prefill_launches / PROMPT.len() as u64,
+        PROMPT.len() * want_launches,
         b.config.vocab_size,
         t.elapsed()
     );
@@ -160,18 +167,42 @@ fn main() -> Result<(), String> {
         "non-finite logits after an {}-token prefill",
         PROMPT.len()
     );
-    assert_eq!(
-        prefill_launches as usize,
-        PROMPT.len() * want_launches,
-        "PREFILL took a path that did not run the escha executor for every (layer, token). \
-         Expected {} H128 launches ({} tokens x 4 x {} layers), saw {prefill_launches}. Zero \
-         means the model was admitted to a BATCHED MoE prefill body, which has no escha \
-         awareness and would emit finite-but-~1e-1-wrong hidden state — check \
-         `moe_ffn_batched_admissible_for_dtypes` for a newly-added Q8_0 routed arm.",
-        PROMPT.len() * want_launches,
-        PROMPT.len(),
+    // BOTH correct routes are accepted, and everything else fails.
+    //
+    // `HIPFIRE_PREFILL_BATCHED=0` is a supported escape hatch, so a gate that
+    // demanded the batched count would fail the model under a configuration it
+    // is meant to survive — and a gate that has to be run with one specific
+    // env is a gate people stop running. What must never be accepted is ZERO:
+    // that is the generic batched MoE body running escha weights without the
+    // H128 pair, the finite-fluent-wrong case no logit check would catch.
+    let per_token_total = PROMPT.len() * want_launches;
+    let route = match prefill_launches as usize {
+        n if n == want_launches => "batched escha prefill body",
+        n if n == per_token_total => "per-token fallback (HIPFIRE_PREFILL_BATCHED=0?)",
+        _ => "UNKNOWN",
+    };
+    eprintln!("prefill route: {route}");
+    assert!(
+        prefill_launches as usize == want_launches || prefill_launches as usize == per_token_total,
+        "PREFILL issued {prefill_launches} H128 launches, which is neither the batched \
+         budget ({want_launches} = 4 x {} layers, once for the whole chunk) nor the \
+         per-token one ({per_token_total}). ZERO in particular means the model reached a \
+         BATCHED MoE body with NO escha awareness: it omits both Hadamard transforms and \
+         emits finite, fluent, ~1e-1-wrong hidden state that no finiteness or argmax check \
+         would catch. Check that the escha branch at the top of `run_moe_prefill` still \
+         fires before Path 1 / Path 2.",
         b.config.n_layers
     );
+    // Under the DEFAULT configuration the batched body is the expected route;
+    // a silent fall back to per-token is correct but 3.6x slower, and a
+    // performance fix that quietly stops applying is how this regresses.
+    if hipfire_runtime::config::get().prefill_batched {
+        assert_eq!(
+            prefill_launches as usize, want_launches,
+            "default config, but prefill took the per-token route ({prefill_launches} \
+             launches). Run with HIPFIRE_DEBUG_BATCH=1 to see which layer refused."
+        );
+    }
 
     // ── Phase 2: DECODE, continuing from the prefilled context ───────────
     let mut prev = rdna_compute::escha_h128_launches();
