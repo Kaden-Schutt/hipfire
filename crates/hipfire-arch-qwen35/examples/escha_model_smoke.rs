@@ -44,15 +44,17 @@
 //! the daemon DOES drive this checkpoint (`scripts/_coherence_runner.py`, and
 //! §10.4 of the design doc).
 //!
-//! COST: **37.5 GB resident**, measured as an amdgpu GTT delta on gfx1151
-//! (`scripts/escha-gtt-probe.sh`). 34.2 GB of that is the Q8_0 routed experts
-//! and ~3.3 GB is everything else. It was 67.9 GB until the experts were
-//! packed one device buffer per (layer, projection): while each of the 20,480
+//! COST: **37.6 GB resident** (37 587 996 672 B), measured as an amdgpu GTT
+//! delta on gfx1151 (`scripts/escha-gtt-probe.sh`: 40.94 GB peak over a
+//! 3.36 GB idle baseline). 34.2 GB of that is the Q8_0 routed experts and
+//! ~3.3 GB is everything else. It was 67.9 GB until the experts were packed
+//! one device buffer per (layer, projection): while each of the 20,480
 //! per-expert buffers was its own allocation, the HIP allocator's 2 MiB
 //! granule rounded the 2.125 MiB gate_up up to 4 MiB and the 1.0625 MiB down
 //! up to 2 MiB, spending 30 GB on rounding. Still not free on a 128 GB
 //! workstation with other applications running — check headroom first.
-//! See design doc §10.3.
+//! See design doc §10.3, which now records this figure rather than the 67.9 GB
+//! it predated.
 //!
 //! Run:
 //!   cargo run --release -p hipfire-arch-qwen35 \

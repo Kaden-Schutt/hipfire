@@ -3555,7 +3555,8 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // rounding unconditionally, so omitting it here would make batched prefill
     // select from UNROUNDED logits while decode selects from rounded ones —
     // a systematic prefill-vs-decode route divergence on every token, on top
-    // of the ~0.42% of decisions that genuinely straddle an f16 boundary.
+    // of the residual divergence that genuinely straddles an f16 boundary
+    // (measured 2.96-3.13% per expert slot; design doc §10.5(b)).
     // Applied to the shared `router_logits` buffer BEFORE the softmax, exactly
     // where decode applies it, so both routes see identical inputs to top-k.
     //

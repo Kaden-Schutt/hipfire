@@ -77,7 +77,7 @@ fn sink() -> &'static Mutex<Option<File>> {
 ///
 /// Exists because the comparison this module serves needs TWO traces from ONE
 /// process (a batched arm and a per-token arm over the same prompt, with the
-/// model loaded once — it is 37.5 GB). Re-reading the env var would not work:
+/// model loaded once — it is 37.6 GB). Re-reading the env var would not work:
 /// the sink is initialised on first use, which is inside the first MoE layer,
 /// long before the second arm starts.
 pub fn reopen(path: &str) {

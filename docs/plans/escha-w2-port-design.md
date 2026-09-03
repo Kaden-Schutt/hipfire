@@ -1,6 +1,6 @@
 # Escha-W2 port — design
 
-**Status:** design approved, plan pending
+**Status:** Phase 1 implemented and gated; see §10 for measured results and §10.5 for the limitations that remain open.
 **Date:** 2026-09-02
 **Branch:** `nw_escha_w2` (worktree `~/repos/hipfire-escha`, off `origin/master` @ `8cd15a62b`)
 **Targets:** `EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (first), `EschaLabs/Qwen3.8-27B-Escha-W2` (second)
@@ -617,7 +617,7 @@ Reproduce with `scripts/escha-kld.sh`.
 | p99 KLD | 0.054 nats |
 | reference PPL / NLL | 7.6651 / 2.036678 |
 | candidate PPL / NLL | 7.6585 / 2.035821 |
-| negative control (exact vs itself) | **0.000000** nats, NLL identical to 8 dp |
+| negative control (exact vs itself) | **0.000000** nats as printed (actual 2.1341e-10, p99 6.03e-09) |
 | KLD vs the bf16 parent | **not run** — see §10.2 |
 
 Near-zero, as §7 predicted, and it is the `Q8_0` intermediate rather than the
@@ -640,8 +640,17 @@ before being fixed:
   default in place gives **0.018357** nats on the identical reference — 6.5x
   the real figure, and almost all of it is KV quantisation, not the codec.
 - **The negative control is the thing that makes the number attributable.**
-  Scoring the exact arm against its own reference returns exactly 0.000000, so
-  the harness is not reporting a run-to-run noise floor.
+  Scoring the exact arm against its own reference prints 0.000000. The
+  underlying float is not bit-zero — it is 2.1341004702939135e-10 (p99
+  6.029504362788427e-09) — and re-running it against the same reference
+  reproduces both figures BIT-FOR-BIT. That reproducibility is the point: a
+  nondeterminism floor would not repeat. The residue is the fixed difference
+  between two programs computing the same forward (`build_kld_ref_native`
+  writes the reference, `eval_hipfire` scores it), and it is ~1.3e7 times
+  below the 0.0027576 the production arm reports. `scripts/escha-kld.sh` now
+  asserts both halves of that — the control rounds to 0.000000 at the printed
+  precision, and it is at least 1e4x below the headline number — rather than
+  leaving "must print exactly 0.000000" to a human reading stdout.
 
 The reference could not be `escha_ref` driving a CPU forward: `escha_ref` is a
 block-level oracle (codec, H128, `expert_linear`, `swiglu`) and this repo has
@@ -666,30 +675,47 @@ prices the port, not the codec.
 
 ### 10.3 Speed and memory
 
+All figures re-measured on the branch head (gfx1151, ROCm 7.2.2) with
+`escha_prefill_bench` and `scripts/escha-gtt-probe.sh`. An earlier revision of
+this section reported the state before `6547c78b6` (contiguous expert buffers)
+and `06ab4db8e` (reachable batched prefill) and understated prefill by 4x; the
+numbers below supersede it.
+
 | | escha (Phase 1) | `qwen3.6:35b-a3b-mq4r` |
 |---|---|---|
-| decode | **40.0 tok/s** | 71.8 tok/s (MTP engaged, tau 1.52) |
-| prefill, 1240-token prompt | **40.0 tok/s** | — |
-| prefill, short prompt | 37.5–40.7 tok/s | 289.6 tok/s |
+| decode | **40.0–40.2 tok/s** | 71.8 tok/s (MTP engaged, tau 1.52) |
+| prefill, n=512 | **161.9 tok/s** | — |
+| prefill, n=2048 | **165.0 tok/s** | — |
+| prefill, short prompt | — | 289.6 tok/s |
 | file on disk | 12.34 GB | 18.7 GB |
-| resident (GTT) | **67.9 GB** | — |
+| resident (GTT) | **37.58 GB** | — |
 
-Phase 1 **loses to `qwen3.6:35b-a3b-mq2` on speed**, as §9 predicted, and that
-is Phase 2's job. mq2 itself is not on this box, so the table uses `mq4r` from
-the same family; the conclusion is a-fortiori rather than assumed — mq2 is
-11.6 GB against mq4r's 18.7 GB, reads strictly fewer expert bytes per token,
-and takes the same indexed GPU-top-K path, so it is at least as fast as the
-column shown. The decode row is not like-for-like (mq4r has its MTP sidecar
-attached and escha has no speculator wired); the prefill row is, and it is the
-starker gap: escha has no admissible batched prefill body, so
-`forward_prefill_batch` falls to a per-token loop and prefill runs at decode
-speed, 7.2x behind.
+Batched prefill IS admissible and IS taken: `escha_routed_prefill_indexed`
+runs the routed half over `n_tokens * k` slots in one launch per (layer,
+projection, side), which the bench confirms as 160 H128 launches for a
+512-token prompt (a per-token fallback would be 81 920). Prefill is therefore
+~4.1x decode, not equal to it.
 
-**Resident memory is 67.9 GB, not the ~36.7 GB §9 predicted.** The prediction
-was not wrong about the format; it was wrong about the allocator. Measured on
-gfx1151 as GTT delta over baseline (`mem_info_gtt_used`, 71.2 GB peak against a
-3.4 GB idle baseline), steady through decode. The cause is allocation
-granularity across 20,480 separate per-expert buffers:
+The remaining prefill gap to `mq4r` is ~1.8x, and §10.5 says what closing it
+would cost. The decode row is still not like-for-like — `mq4r` has its MTP
+sidecar attached and escha has no speculator wired (and, per the MTP refusal
+added on this branch, cannot have one until the H128 pair is taught to that
+forward).
+
+`qwen3.6:35b-a3b-mq2` remains the honest speed comparison and is still not on
+this box, so the table uses `mq4r` from the same family; mq2 is 11.6 GB
+against mq4r's 18.7 GB, reads strictly fewer expert bytes per token and takes
+the same indexed GPU-top-K path, so it is at least as fast as the column
+shown.
+
+**Resident memory is 37.58 GB**, measured as an amdgpu GTT delta over a
+3.36 GB idle baseline (40.94 GB peak). 34.2 GB of that is the Q8_0 routed
+experts and ~3.3 GB is everything else.
+
+It was **67.9 GB** until `6547c78b6`, and the cause was allocation
+granularity, not the codec or the carrier. While each of the 20 480 per-expert
+projections was its own device allocation, the HIP allocator's 2 MiB granule
+rounded up every one of them:
 
 | | logical | rounded to 2 MiB granules |
 |---|---|---|
@@ -697,19 +723,18 @@ granularity across 20,480 separate per-expert buffers:
 | down `[2048, 512]` Q8_0 | 1.0625 MiB | 2 MiB |
 | x 10240 experts | 31.9 GiB (34.2 GB) | 60 GiB (64.4 GB) |
 
-64.4 GB of granules plus ~3.4 GB of everything else is 67.8 GB, against 67.9 GB
-observed — the arithmetic closes to 0.1%, which is why this is attributed to
-granularity rather than to a leak. Two consequences worth carrying into Phase 2:
+64.4 GB of granules plus ~3.4 GB of everything else is 67.8 GB against 67.9 GB
+observed — the arithmetic closed to 0.1%, which is why it was attributed to
+granularity rather than to a leak, and why packing the experts into one buffer
+per (layer, projection) recovered the predicted ~30 GB exactly. The logical
+34.2 GB now IS the resident cost.
 
-- The fix is one contiguous per-layer expert buffer with per-expert offsets,
-  not a change of codec or carrier. It would recover ~30 GB, nearly half the
-  footprint, and is independent of the fused-GEMV work.
-- Until then, the weight-exact **F16** store is free: F16's 4 MiB / 2 MiB
-  projections are exactly what Q8_0 already occupies. That is what makes the
-  §10.1 reference arm runnable at all — F32 would be 129 GB and would not fit.
-
-`escha_model_smoke`'s own note that it "OOMs with ~60 GB already in use"
-corroborates ~65-70 GB rather than the 36 GB it states next to it.
+One consequence survives the fix: the weight-exact **F16** expert store is no
+longer free. It was free at 67.9 GB, because F16's 4 MiB / 2 MiB projections
+were exactly what the rounded Q8_0 already occupied. Packed, F16 is a genuine
+2x on the expert half (~68 GB resident). That still fits on this box and is
+what the §10.1 reference arm uses, but it is now a real cost rather than an
+accounting artifact, and F32 (129 GB) still does not fit.
 
 ### 10.4 Coherence
 
@@ -736,6 +761,103 @@ switch and reasons anyway, so a short `max_tokens` truncates mid-think and the
 daemon reports `open think span at end of generation (validation)`. That is a
 budget artifact, not a decode fault — the same prompt with headroom closes the
 span and emits a normal answer.
+
+### 10.5 Limitations that remain open
+
+Two, both measured, both required reading before this is treated as finished.
+
+**(a) The routed half does not amortise in prefill.** Batched prefill amortises
+the *launch* cost of the H128 transforms and the *activation* traffic, and that
+is what took prefill from decode speed to ~163 tok/s. It does not amortise the
+expert **weight** traffic: each token's top-8 experts are read for that token,
+so a batch of `n` tokens still moves ~`n` x 34.2 GB / (n_layers x tokens)
+worth of expert bytes — 34.2 GB of expert traffic per full pass over the batch,
+the same total as the per-token route. That is why escha stays ~1.8x behind
+`mq4r`'s 289.6 tok/s at prefill despite the batched body.
+
+Closing it needs a Q8_0 grouped GEMM over **sorted expert groups**: sort the
+`n * k` slots by expert, then run one GEMM per expert over all the tokens that
+chose it, so each expert's weights are read once per batch instead of once per
+token. That is the same Path-2 scatter/grouped structure the MQ dtypes already
+use, and it is a real change rather than a port: grouping changes the order in
+which a token's `k` expert contributions accumulate, so the result would no
+longer be bit-identical to the per-token route. G4's
+`batched prefill route vs per-token indexed route: 0 differing floats` — an
+equality claim, not a tolerance — would have to be restated as a bound, and
+the argument for the new bound would have to be made from scratch. Do not land
+that work while leaving G4 asserting equality; the gate would go red and the
+temptation would be to loosen it.
+
+That grouped arm is also what would spring the prefill hole this branch closed
+with `check_moe_prefill_supported`: it is the first generic Q8_0 routed prefill
+arm, and without the guard an escha layer with `HIPFIRE_ESCHA_INDEXED=0` would
+silently take it and drop both Hadamard transforms.
+
+**(b) Prefill and decode select different experts, at 2.96% per expert slot.**
+The design-time estimate in §5 was ~0.42% of routing decisions straddling an
+f16 boundary. The measured figure is **8x that**, and — more importantly — the
+dominant term is not the one the estimate was about.
+
+`escha_prefill_batch_gate` records the `topk_indices` both routes actually
+indexed with. Measured at n=64:
+
+| | rate |
+|---|---|
+| expert-SLOT divergence, whole stack | **2.96–3.13%** |
+| (token, layer) SET divergence, whole stack | 24.1% |
+| (token, layer) SET divergence, layer 0 | 0.00% |
+
+Layer 0 is 0% because both routes feed it the same embedding, and it is the
+only layer that cannot have compounded. The whole-stack rate is higher because
+a flip at layer L changes that token's hidden state for every later layer; the
+per-layer series rises from 0% to a ~25-35% plateau, which is compounding, not
+a defect.
+
+The dominant contribution is an **f16 activation downcast**, not accumulation
+reordering. The batched dense half converts its F32 activations to F16 for the
+WMMA GEMMs where the per-token route runs F32 GEMVs; that downcast is a much
+coarser perturbation of the router input than the last-bit differences of a
+reordered f32 sum, and it is what pushes decisions across the f16 rounding
+boundary that `router_logits_round_f16_rne` then quantises them to. Attributing
+this to "accumulation reordering" — as the 0.42% estimate did — is why the
+estimate was 8x low.
+
+Consequences: escha's prefill and decode are NOT interchangeable for anything
+that assumes identical routing (KV-cache reuse across a prefill/decode boundary
+is fine; a cache of routed-expert outputs would not be). And the final-token
+logit delta between the routes is `max 4.393e-1 / mean 7.160e-2` — two orders
+of magnitude above what reordering alone gives, dominated by this divergence.
+The argmax is stable, which is what G6 asserts, but the logits are not close.
+
+Neither limitation is a blocker for Phase 1, whose claim is correctness plus a
+servable artifact. Both are stated here because §10.3 reads like a success and
+a reader who stops there would carry away two wrong beliefs.
+
+### 10.6 Correctness gates (measured)
+
+The six gates, their commands, and the results on the branch head. All are
+re-runnable; G1-G4b need no model beyond the checkpoint and the committed
+fixtures. Registered in `docs/VALIDATION.md` and `scripts/gates.sh`.
+
+| Gate | What it asserts | Result |
+|---|---|---|
+| **G1** | every `escha_code` tensor in the `.hfq` is byte-identical to the source safetensors | **80/80 byte-identical** (40 layers x 2 projections; count asserted against `model.safetensors.index.json`, not hardcoded) |
+| **G2** | GPU tile decode == `escha_ref::reconstruct` exactly, in fp16 | **bit-exact**, 0 mismatched, at both golden shapes and at production shapes of 89 128 960 elements (K=2 and K=3) |
+| **G3** | the H128 pair == `escha_ref`, all launch forms | **bit-exact**, 0 mismatched: `h128_in`, `h128_out`, batched broadcast / per-slot / grouped input mappings, `out_batched`, and swiglu |
+| **G4b** | arch-6 router selects the same experts as escha's reference routing | **0/8 tokens with a differing top-8 set** |
+| **G4** | the whole MoE block against escha's `moeblk_out.f16` golden | F32 (weight-exact) arm **max 1.828e-4 / mean 9.673e-6**; Q8_0 (production) arm **max 2.633e-4 / mean 3.027e-5**, against a golden mean magnitude of 1.85e-2. Indexed route vs host route: **0 differing floats**. Batched prefill route vs per-token indexed route: **0 differing floats**. Q8_0 re-quantisation cost, arm2 - arm1: max 1.687e-4 / mean 2.864e-5 |
+| **G5** | KLD against the weight-exact escha arm on a fixed teacher-forced corpus | **0.0027576 nats** (95% CI 0.0019491-0.0038610), p99 0.054, **PPL 7.6585**; negative control **2.13e-10 (prints 0.000000)** and bit-reproducible across runs — see §10.1 |
+| **G6** | batched prefill vs the per-token route, whole model | **argmax stable** (135744 on both arms); max\|delta\| 4.393e-1, mean\|delta\| 7.160e-2, 0 non-finite logits. Both deltas are now asserted, not printed — see §10.5(b) for why they are this large |
+
+The two `0 differing floats` rows in G4 are EQUALITY claims, not tolerances,
+and are only true because every kernel in the escha routed pipeline is purely
+slot-parallel: slot `s` performs the same FLOPs in the same order whether the
+launch carried 8 slots or 2048. §10.5(a) explains what would break them.
+
+G4's F32 arm is the codec+transform accuracy; its Q8_0 arm is that plus the
+8-bit expert store. The gap between them (max 1.687e-4) is the price of the
+Q8_0 carrier at block level, and G5's 0.0027576 nats is the same price
+end-to-end over 40 layers.
 
 ## 11. Out of scope
 

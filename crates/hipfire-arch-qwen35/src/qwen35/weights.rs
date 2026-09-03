@@ -105,7 +105,8 @@ pub struct ExpertWeights {
 /// occupy 4 MiB and 2 MiB each — 64.4 GB of granules for 34.2 GB of weights.
 /// Packing each (layer, projection) into ONE buffer pays the rounding once per
 /// buffer instead of once per expert and recovers ~30 GB. Measured: 67.9 GB ->
-/// 37.7 GB of GTT for the whole escha-35b model on gfx1151.
+/// 37.6 GB of GTT for the whole escha-35b model on gfx1151 (37 587 996 672 B
+/// delta, `scripts/escha-gtt-probe.sh`).
 pub struct PackedExpertOwners {
     pub gate_up: GpuTensor,
     pub down: GpuTensor,

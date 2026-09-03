@@ -71,7 +71,7 @@ pub enum EschaWeightStore {
     /// logical expert size) and F16 was free. Since the projections are packed
     /// one buffer per (layer, projection) — see [`PackedExpertOwners`] — the
     /// granule is charged 80 times instead of 20,480 and Q8_0 is measured at
-    /// 37.5 GB. F16 would be ~32 GB more. It remains the G5 KLD reference arm
+    /// 37.6 GB. F16 would be ~32 GB more. It remains the G5 KLD reference arm
     /// and still fits; it is no longer a free upgrade.
     ///
     /// Like F32 this loses the indexed GPU-top-K fast path (admission is

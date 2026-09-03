@@ -49,14 +49,19 @@
 //!
 //! Escha's router logits pass through `router_logits_round_f16_rne` on BOTH
 //! routes (that is what makes the comparison meaningful at all), but the
-//! logits fed to it differ by the same accumulation reordering. ~0.42% of
-//! escha routing decisions were measured in Task 9 to straddle an f16
-//! boundary, so a few tokens per prompt legitimately select a different expert
-//! set on the two routes. That is a property of the format, not a defect — but
-//! it has to be BOUNDED, so this gate measures it rather than repeating the
-//! estimate: with `HIPFIRE_ESCHA_ROUTE_TRACE` set, both arms record the
-//! `topk_indices` every MoE layer actually indexed with, and the gate reports
-//! the fraction of (token, layer) decisions whose top-k SET differs.
+//! logits fed to it differ, so some decisions land on the other side of an f16
+//! rounding boundary and the two routes legitimately select different experts.
+//! That is a property of the format, not a defect — but it has to be MEASURED,
+//! which is what this gate does: with `HIPFIRE_ESCHA_ROUTE_TRACE` set, both
+//! arms record the `topk_indices` every MoE layer actually indexed with.
+//!
+//! The measured rate is **2.96-3.13% per expert slot** (24.1% of (token,
+//! layer) SETS over the whole stack, 0.00% at layer 0). Task 9's design-time
+//! estimate was ~0.42%, i.e. 8x low, and it was low because it modelled the
+//! wrong term: the dominant perturbation is not f32 accumulation reordering
+//! but the **f16 downcast** the batched dense half applies to its activations
+//! for the WMMA GEMMs, which the per-token F32 GEMV route does not. See the
+//! design doc §10.5(b). Do not re-quote 0.42% anywhere.
 //!
 //! # State reset between the arms
 //!
@@ -68,7 +73,7 @@
 //! reset — arm B prefills from position 0 and rewrites the same slots, and
 //! attention only reads positions below its own `start_pos + n`.
 //!
-//! COST: loads the whole model, ~37.5 GB resident.
+//! COST: loads the whole model, ~37.6 GB resident.
 //!
 //! Run:
 //!   cargo run --release -p hipfire-arch-qwen35 \
@@ -412,10 +417,12 @@ fn main() -> Result<(), String> {
 
     // Layer 0 is the assertion. Both routes feed it the SAME embedding, so a
     // flip there can only come from this layer's own accumulation reordering
-    // landing on an f16 boundary. Task 9 measured ~0.42% of escha routing
-    // decisions sitting on such a boundary; 5% leaves room for sampling noise
-    // at small `n` while still failing loudly if the dense half is wrong (when
-    // the stale-FP16-activation bug was live this was well above it).
+    // landing on an f16 boundary. Measured on this model at n=64: 0.00% —
+    // layer 0 does not flip at all. The 10% bound leaves room for sampling
+    // noise at small `n` while still failing loudly if the dense half is wrong
+    // (when the stale-FP16-activation bug was live this was well above it).
+    // The whole-stack rate is a different quantity and is much higher (24.1%
+    // of sets, 2.96-3.13% of slots) because it compounds; see §10.5(b).
     assert!(
         l0_pct < 10.0,
         "layer-0 expert-selection divergence {l0_pct:.4}% is far above the few percent \

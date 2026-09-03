@@ -21,7 +21,7 @@
 //! activations, so a fixed prompt also keeps the expert-selection work
 //! comparable between runs.
 //!
-//! COST: loads the whole model, ~37.5 GB resident. See `escha_model_smoke`.
+//! COST: loads the whole model, ~37.6 GB resident. See `escha_model_smoke`.
 //!
 //! Run:
 //!   cargo run --release -p hipfire-arch-qwen35 \

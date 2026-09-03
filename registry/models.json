@@ -457,9 +457,7 @@
       "file": "qwen3.6-35b-a3b.escha",
       "size_gb": 12.3,
       "min_vram_gb": 40,
-      "desc": "EschaLabs Escha-W2 2-bit trellis codec, decoded to Q8_0 experts at load (Phase 1: correctness + a servable artifact, not speed). 12.3 GB on disk, 37.5 GB resident (measured GTT delta on gfx1151) \u2014 the experts decode to Q8_0 at load, packed one buffer per (layer, projection). Local-only until published.",
-      "sha256": "bd186b37037ee6c1cb58ce6a5c053b785e9ba30b7f1de04fda7ef4f4f06e3010",
-      "size_bytes": 12344899840
+      "desc": "EschaLabs Escha-W2 2-bit trellis codec, decoded to Q8_0 experts at load. Phase 1: correctness plus a servable artifact \u2014 40 tok/s decode, 163 tok/s prefill. 12.3 GB on disk, 37.6 GB resident (measured GTT delta on gfx1151), the experts packed one buffer per (layer, projection). Local-only: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent \u2014 a locally-computed digest of a file nobody else can fetch verifies nothing and reads like a published one. They go in when the artifact does."
     },
     "qwen3.6:35b-a3b-mq3p": {
       "recommended_settings": {
