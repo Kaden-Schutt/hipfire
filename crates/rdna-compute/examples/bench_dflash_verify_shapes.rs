@@ -71,7 +71,10 @@ use rdna_compute::{DType, Gpu};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-const ROOFLINE_GBS: f64 = 960.0;
+/// Bandwidth roofline in GB/s. Default is the RX 7900 XTX (gfx1100) GDDR6
+/// figure; override with `ROOFLINE_GBS` for other cards (e.g. 256 for the
+/// gfx1151 8060S LPDDR5X-8000).
+const DEFAULT_ROOFLINE_GBS: f64 = 960.0;
 const WARMUP: usize = 32;
 const LAUNCHES: usize = 200;
 const SAMPLES: usize = 3;
@@ -512,8 +515,17 @@ fn main() {
         },
     ];
 
-    let mut gpu = Gpu::init_with_device(0).expect("Gpu init");
-    emit(&format!("\narch: {}", gpu.arch));
+    // `BENCH_DEVICE` selects the HIP device index (default 0 = 7900 XTX on hipx).
+    let device: i32 = std::env::var("BENCH_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let roofline_gbs: f64 = std::env::var("ROOFLINE_GBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROOFLINE_GBS);
+    let mut gpu = Gpu::init_with_device(device).expect("Gpu init");
+    emit(&format!("\narch: {} (device {device}, roofline {roofline_gbs:.0} GB/s)", gpu.arch));
 
     // Upload real weights once; X per (arm, N) once.
     struct Live {
@@ -638,7 +650,7 @@ fn main() {
             for (ni, &n) in NS.iter().enumerate() {
                 let m_out: usize = arm.ms.iter().sum();
                 let bytes = arm.w_bytes + n * arm.k * 2 + n * m_out * 4 * 2;
-                let floor_us = bytes as f64 / (ROOFLINE_GBS * 1e9) * 1e6;
+                let floor_us = bytes as f64 / (roofline_gbs * 1e9) * 1e6;
                 let yg: Vec<rdna_compute::GpuTensor> = arm
                     .ms
                     .iter()
@@ -708,7 +720,7 @@ fn main() {
                 med,
                 bytes,
                 gbps(bytes, med),
-                gbps(bytes, med) / ROOFLINE_GBS * 100.0,
+                gbps(bytes, med) / roofline_gbs * 100.0,
                 floor_us
             ));
         }
