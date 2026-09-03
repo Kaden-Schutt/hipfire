@@ -83,15 +83,32 @@ pub struct ExpertWeights {
     pub down: WeightTensor,    // [hidden, moe_intermediate]
 }
 
-/// Owning storage for a layer's packed uniform-MQ4 routed experts.
+/// Owning storage for a layer's packed routed experts — one device buffer per
+/// (layer, projection) covering ALL experts.
 ///
 /// `experts` still carries one [`WeightTensor`] view per routed expert so the
 /// CPU fallback and every existing indexed dispatch keep their exact metadata
 /// and pointer-table ABI. Those views are non-owning subranges of these two
 /// buffers; only this owner pair may be returned to the GPU pool.
-pub(crate) struct PackedExpertOwners {
-    pub(crate) gate_up: GpuTensor,
-    pub(crate) down: GpuTensor,
+///
+/// Two producers build this: `try_load_packed_mq4_experts` (uniform MQ4) and
+/// `escha::load_escha_moe_experts` (Escha-W2). It is `pub` because the latter
+/// hands the owners back across the crate boundary to
+/// `examples/escha_moe_block_gate`, which loads a layer's experts directly and
+/// must free them exactly once.
+///
+/// ## Why this is not merely tidier
+///
+/// The HIP allocator rounds every allocation up to a 2 MiB granule. At A3B
+/// shapes a Q8_0 gate_up is 2.125 MiB and a Q8_0 down is 1.0625 MiB, so 20,480
+/// independent per-expert buffers (40 layers x 256 experts x 2 projections)
+/// occupy 4 MiB and 2 MiB each — 64.4 GB of granules for 34.2 GB of weights.
+/// Packing each (layer, projection) into ONE buffer pays the rounding once per
+/// buffer instead of once per expert and recovers ~30 GB. Measured: 67.9 GB ->
+/// 37.7 GB of GTT for the whole escha-35b model on gfx1151.
+pub struct PackedExpertOwners {
+    pub gate_up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 /// SP2: build the per-expert (gate_up, down) quant-tier tables that

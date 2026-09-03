@@ -4792,7 +4792,7 @@ pub(crate) fn load_moe_ffn(
     }
     let escha_tables = if escha_layer {
         let store = escha_weight_store();
-        let (experts, tables) = escha::load_escha_moe_experts(
+        let (experts, tables, owners) = escha::load_escha_moe_experts(
             hfq,
             gpu,
             p,
@@ -4806,11 +4806,13 @@ pub(crate) fn load_moe_ffn(
         )?;
         if layer_idx == 0 {
             eprintln!(
-                "  Escha-W2 routed experts: {} experts decoded from the trellis, stored {store:?}",
-                experts.len()
+                "  Escha-W2 routed experts: {} experts decoded from the trellis, stored {store:?}, \
+                 {} per-expert weight buffers -> 2 layer blobs",
+                experts.len(),
+                2 * experts.len()
             );
         }
-        Some((experts, tables))
+        Some((experts, tables, owners))
     } else {
         None
     };
@@ -4820,39 +4822,45 @@ pub(crate) fn load_moe_ffn(
     } else {
         None
     };
-    let (mut experts, packed_expert_owners, escha_tables) = if let Some((e, t)) = escha_tables {
-        (e, None, Some(t))
-    } else if let Some((experts, owners)) = packed {
-        if layer_idx == 0 {
-            eprintln!(
-                "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
-                2 * experts.len()
-            );
-        }
-        (experts, Some(owners), None)
-    } else {
-        let mut experts = Vec::with_capacity(expert_ids.len());
-        for x in expert_ids {
-            let gate_up = load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
-                2 * mi,
-                config.dim,
-                qwen35_tensor_name_candidates,
-            )?;
-            let down = load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.experts.{x}.down_proj.weight"),
-                config.dim,
-                mi,
-                qwen35_tensor_name_candidates,
-            )?;
-            experts.push(ExpertWeights { gate_up, down });
-        }
-        (experts, None, None)
-    };
+    let (mut experts, packed_expert_owners, escha_tables) =
+        if let Some((e, t, owners)) = escha_tables {
+            // Escha expert slots are views into `owners`, exactly like the packed
+            // MQ4 path's — so they ride the SAME `packed_expert_owners` free path
+            // (`free_moe_ffn` frees per-expert metadata only, then the two blobs).
+            // Publishing them here rather than in a bespoke field is what keeps
+            // teardown from double-freeing or leaking 32 GB.
+            (e, Some(owners), Some(t))
+        } else if let Some((experts, owners)) = packed {
+            if layer_idx == 0 {
+                eprintln!(
+                    "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
+                    2 * experts.len()
+                );
+            }
+            (experts, Some(owners), None)
+        } else {
+            let mut experts = Vec::with_capacity(expert_ids.len());
+            for x in expert_ids {
+                let gate_up = load_weight_tensor(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+                    2 * mi,
+                    config.dim,
+                    qwen35_tensor_name_candidates,
+                )?;
+                let down = load_weight_tensor(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.experts.{x}.down_proj.weight"),
+                    config.dim,
+                    mi,
+                    qwen35_tensor_name_candidates,
+                )?;
+                experts.push(ExpertWeights { gate_up, down });
+            }
+            (experts, None, None)
+        };
     if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() && ep_shard.is_none() {
         let mut converted = 0usize;
         for ew in experts.iter_mut() {

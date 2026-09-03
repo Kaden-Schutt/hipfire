@@ -164,7 +164,7 @@ fn run_arm(
     smi: usize,
 ) -> ArmResult {
     let all: Vec<usize> = (0..n_exp).collect();
-    let (experts, tables) = load_escha_moe_experts(
+    let (experts, tables, owners) = load_escha_moe_experts(
         hfq,
         gpu,
         layer_prefix,
@@ -316,10 +316,14 @@ fn run_arm(
             let _ = gpu.free_tensor(t);
         }
     }
-    for e in experts {
-        e.gate_up.free_all(gpu);
-        e.down.free_all(gpu);
-    }
+    // Expert slots are non-owning views into `owners` (one blob per
+    // projection), so return the two blobs and NOT the 512 views. `free_all`
+    // on a view is refused by `free_tensor` and would leak the blob — this
+    // gate runs the F32 arm at 256 experts, i.e. 2 GiB per projection, and
+    // both arms run in one process.
+    drop(experts);
+    let _ = gpu.free_tensor(owners.gate_up);
+    let _ = gpu.free_tensor(owners.down);
     tables.free_gpu(gpu);
 
     ArmResult {

@@ -46,6 +46,7 @@ use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
 use super::weights::ExpertWeights;
+use super::weights::PackedExpertOwners;
 
 /// How the decoded fp16 expert weight is stored in the expert slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -61,14 +62,17 @@ pub enum EschaWeightStore {
     /// bit-identically the same values as [`EschaWeightStore::F32`] in half
     /// the bytes. It is the G5 KLD reference arm.
     ///
-    /// It is not merely cheaper than F32, it is free relative to production.
-    /// Every per-expert buffer is a separate allocation that the HIP
-    /// allocator rounds up to a 2 MiB granule, and at A3B shapes Q8_0's
-    /// 2.125 MiB gate_up / 1.0625 MiB down round to exactly the 4 MiB / 2 MiB
-    /// that F16 needs outright. Both arms therefore sit at 60 GiB of experts
-    /// — measured 67.9 GB of GTT for the whole Q8_0 model on gfx1151 against
-    /// a 34.2 GB "logical" expert size. The only difference between the arms
-    /// is the 8-bit re-quantisation, which is exactly what G5 prices.
+    /// It costs **2x production's expert bytes**, and that is now the whole
+    /// difference. It did not used to be: while every per-expert buffer was
+    /// its own allocation, the HIP allocator's 2 MiB granule rounded Q8_0's
+    /// 2.125 MiB gate_up / 1.0625 MiB down up to exactly the 4 MiB / 2 MiB
+    /// F16 needed outright, so both arms sat at 60 GiB of experts (measured
+    /// 67.9 GB of GTT for the whole Q8_0 model on gfx1151, against a 34.2 GB
+    /// logical expert size) and F16 was free. Since the projections are packed
+    /// one buffer per (layer, projection) — see [`PackedExpertOwners`] — the
+    /// granule is charged 80 times instead of 20,480 and Q8_0 is measured at
+    /// 37.5 GB. F16 would be ~32 GB more. It remains the G5 KLD reference arm
+    /// and still fits; it is no longer a free upgrade.
     ///
     /// Like F32 this loses the indexed GPU-top-K fast path (admission is
     /// `routed_gate_up == Q8_0 && routed_down == Q8_0`, see
@@ -264,6 +268,19 @@ fn k_from_quant_type(qt: u8, name: &str) -> HipResult<u32> {
 /// `expert_ids` selects which experts to materialise, in slot order — the
 /// caller's REAP/EP mapping, or simply `0..n_exp`. Passing a short list is how
 /// the G4 gate keeps a single-layer probe cheap.
+///
+/// ## Ownership
+///
+/// The returned [`ExpertWeights`] are **non-owning views** into the returned
+/// [`PackedExpertOwners`] pair — one device buffer per projection covering
+/// every requested expert. The caller must keep the owners alive for as long
+/// as the views are used and free the owners (not the views) exactly once. In
+/// the model loader that is `MoeFfnWeights::packed_expert_owners`, whose
+/// existing free path (`free_moe_ffn`) already frees per-expert metadata only
+/// and returns the two blobs; a direct caller such as the G4 gate must do the
+/// same. `Gpu::free_tensor` refuses a borrowed view, so a caller that gets
+/// this wrong gets an error rather than a double free — but it also leaks the
+/// blob, so it is not a substitute for freeing the owners.
 #[allow(clippy::too_many_arguments)]
 pub fn load_escha_moe_experts(
     hfq: &HfqFile,
@@ -276,7 +293,7 @@ pub fn load_escha_moe_experts(
     k: usize,
     store: EschaWeightStore,
     resolve: NameResolver,
-) -> HipResult<(Vec<ExpertWeights>, EschaMoeTables)> {
+) -> HipResult<(Vec<ExpertWeights>, EschaMoeTables, PackedExpertOwners)> {
     // gate_up: [ic = hidden, oc = 2*mi]; down: [ic = mi, oc = hidden].
     let gu = (hidden, 2 * mi);
     let dn = (mi, hidden);
@@ -338,26 +355,67 @@ pub fn load_escha_moe_experts(
         k,
     };
 
-    let mut gate_ups = decode_projection(
+    let (mut gate_ups, gate_up_owner) = decode_projection(
         hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store, resolve,
     )?;
-    let mut downs = decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve)?;
+    let (mut downs, down_owner) =
+        match decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve) {
+            Ok(ok) => ok,
+            Err(error) => {
+                // The gate_up blob is already on the device and its per-expert
+                // views are about to be dropped without ever reaching a
+                // caller, so nothing else can free it. Return it here or the
+                // whole projection (544 MiB at A3B shapes) leaks on every
+                // failed layer load.
+                let _ = gpu.free_tensor(gate_up_owner);
+                return Err(error);
+            }
+        };
 
     let experts = gate_ups
         .drain(..)
         .zip(downs.drain(..))
         .map(|(gate_up, down)| ExpertWeights { gate_up, down })
         .collect();
-    Ok((experts, tables))
+    Ok((
+        experts,
+        tables,
+        PackedExpertOwners {
+            gate_up: gate_up_owner,
+            down: down_owner,
+        },
+    ))
 }
 
-/// Decode every requested expert of ONE projection.
+/// Bytes and elements one expert slot of this projection occupies, for a given
+/// store. `(elems_per_slot, dtype)` — `sub_offset` counts in `dtype.size()`
+/// units, and `DType::Q8_0::size()` is 1, so the Q8_0 arm's "elements" are
+/// bytes. Pure, so the packing arithmetic is checkable without a GPU.
+fn slot_extent(store: EschaWeightStore, ic: usize, oc: usize) -> (usize, DType) {
+    match store {
+        // Q8_0 rows are `ic/32` blocks of 34 B (32 int8 + one f16 scale).
+        EschaWeightStore::Q8_0 => (oc * (ic / 32) * 34, DType::Q8_0),
+        EschaWeightStore::F32 => (ic * oc, DType::F32),
+        EschaWeightStore::F16 => (ic * oc, DType::F16),
+    }
+}
+
+/// Decode every requested expert of ONE projection into ONE device buffer.
 ///
 /// Staging is reused across experts: one device code buffer, one device bare
 /// buffer. At A3B gate_up shapes that is 512 KB + 4 MB held for the whole
 /// layer instead of 256 allocations, and the decode never round-trips through
 /// the host (`escha_decode_tiles` is the device-resident entry; the `_host`
 /// wrapper exists only for the G2 parity gate).
+///
+/// The returned `WeightTensor`s are non-owning `sub_offset` views into the
+/// returned owner buffer — see [`load_escha_moe_experts`] for why, and
+/// [`PackedExpertOwners`] for how much it is worth. Each slot's byte offset is
+/// `slot * slot_extent(...)`; at A3B shapes that stride is a multiple of 1024,
+/// so every view is at least as aligned as an independent allocation would be
+/// and no kernel's vector loads are disturbed. The values written are
+/// byte-identical to the per-allocation version: `escha_bare_to_*` takes a
+/// base pointer and a size, and both are unchanged.
 #[allow(clippy::too_many_arguments)]
 fn decode_projection(
     hfq: &HfqFile,
@@ -369,7 +427,7 @@ fn decode_projection(
     shape: (usize, usize),
     store: EschaWeightStore,
     resolve: NameResolver,
-) -> HipResult<Vec<WeightTensor>> {
+) -> HipResult<(Vec<WeightTensor>, GpuTensor)> {
     let (ic, oc) = shape;
     let name = escha_leaf(p, proj, "code");
     let (info, data) = find(hfq, &name, resolve)
@@ -389,73 +447,138 @@ fn decode_projection(
         ));
     }
 
+    // Reject out-of-range ids BEFORE allocating anything, so the error path
+    // has nothing to unwind. (Previously this check sat inside the decode loop
+    // and had to free the staging buffers by hand.)
+    if let Some(&bad) = expert_ids.iter().find(|&&x| x >= n_exp) {
+        return Err(HipError::new(
+            0,
+            &format!("escha: expert id {bad} out of range for {n_exp} experts ({name})"),
+        ));
+    }
+
+    // ONE buffer for the whole projection. See `PackedExpertOwners`: the 2 MiB
+    // allocation granule is charged once here instead of once per expert.
+    let (slot_elems, slot_dtype) = slot_extent(store, ic, oc);
+    let total_elems = slot_elems
+        .checked_mul(expert_ids.len())
+        .ok_or_else(|| HipError::new(0, &format!("escha: {name} packed size overflow")))?;
+    let owner = gpu.alloc_tensor(&[total_elems], slot_dtype)?;
+
     // `escha_decode_tiles` validates `code.numel()` in SHORTS, so the staging
     // tensor's logical length must be the i16 count (F16 gives the right
     // 2-bytes-per-element sizing; the payload is trellis code, not floats).
-    let code_stage = gpu.alloc_tensor(&[words_per_expert], DType::F16)?;
-    let bare = gpu.alloc_tensor(&[ic * oc], DType::F16)?;
+    let code_stage = match gpu.alloc_tensor(&[words_per_expert], DType::F16) {
+        Ok(t) => t,
+        Err(error) => {
+            let _ = gpu.free_tensor(owner);
+            return Err(error);
+        }
+    };
+    let bare = match gpu.alloc_tensor(&[ic * oc], DType::F16) {
+        Ok(t) => t,
+        Err(error) => {
+            let _ = gpu.free_tensor(code_stage);
+            let _ = gpu.free_tensor(owner);
+            return Err(error);
+        }
+    };
 
     let mut out = Vec::with_capacity(expert_ids.len());
-    for &x in expert_ids {
-        if x >= n_exp {
-            let _ = gpu.free_tensor(code_stage);
-            let _ = gpu.free_tensor(bare);
-            return Err(HipError::new(
-                0,
-                &format!("escha: expert id {x} out of range for {n_exp} experts ({name})"),
-            ));
-        }
-        let src = &data[x * bytes_per_expert..(x + 1) * bytes_per_expert];
-        gpu.hip.memcpy_htod(&code_stage.buf, src)?;
-        gpu.escha_decode_tiles(&code_stage, &bare, ic as u32, oc as u32, k)?;
+    let mut decode = |gpu: &mut Gpu| -> HipResult<()> {
+        for (slot, &x) in expert_ids.iter().enumerate() {
+            let src = &data[x * bytes_per_expert..(x + 1) * bytes_per_expert];
+            gpu.hip.memcpy_htod(&code_stage.buf, src)?;
+            gpu.escha_decode_tiles(&code_stage, &bare, ic as u32, oc as u32, k)?;
 
-        // The transpose to hipfire's OUT-major slot lives here, folded into
-        // the store. See the module docs.
-        let wt = match store {
-            EschaWeightStore::Q8_0 => {
-                let nbytes = oc * (ic / 32) * 34;
-                let buf = gpu.alloc_tensor(&[nbytes], DType::Q8_0)?;
-                gpu.escha_bare_to_q8_0(&bare, &buf, ic, oc)?;
-                WeightTensor {
-                    buf,
-                    gpu_dtype: DType::Q8_0,
-                    m: oc,
-                    k: ic,
-                    row_stride: 0,
-                    paro: None,
-                    awq_scale: None,
-                }
+            // Non-owning window onto this expert's slice of the layer blob.
+            // The device pointer this yields is what lands in
+            // `expert_{gate_up,down}_ptrs`, so the indexed GEMV addresses the
+            // expert exactly as it did when each slot was its own allocation.
+            let buf = owner.sub_offset(slot * slot_elems, slot_elems);
+
+            // The transpose to hipfire's OUT-major slot lives here, folded
+            // into the store. See the module docs.
+            match store {
+                EschaWeightStore::Q8_0 => gpu.escha_bare_to_q8_0(&bare, &buf, ic, oc)?,
+                EschaWeightStore::F32 => gpu.escha_bare_to_f32(&bare, &buf, ic, oc)?,
+                EschaWeightStore::F16 => gpu.escha_bare_to_f16(&bare, &buf, ic, oc)?,
             }
-            EschaWeightStore::F32 => {
-                let buf = gpu.alloc_tensor(&[oc, ic], DType::F32)?;
-                gpu.escha_bare_to_f32(&bare, &buf, ic, oc)?;
-                WeightTensor {
-                    buf,
-                    gpu_dtype: DType::F32,
-                    m: oc,
-                    k: ic,
-                    row_stride: 0,
-                    paro: None,
-                    awq_scale: None,
-                }
-            }
-            EschaWeightStore::F16 => {
-                let buf = gpu.alloc_tensor(&[oc, ic], DType::F16)?;
-                gpu.escha_bare_to_f16(&bare, &buf, ic, oc)?;
-                WeightTensor {
-                    buf,
-                    gpu_dtype: DType::F16,
-                    m: oc,
-                    k: ic,
-                    row_stride: 0,
-                    paro: None,
-                    awq_scale: None,
-                }
-            }
-        };
-        out.push(wt);
-    }
+            out.push(WeightTensor {
+                buf,
+                gpu_dtype: slot_dtype,
+                m: oc,
+                k: ic,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        Ok(())
+    };
+    let result = decode(gpu);
     let _ = gpu.free_tensor(code_stage);
     let _ = gpu.free_tensor(bare);
-    Ok(out)
+    if let Err(error) = result {
+        let _ = gpu.free_tensor(owner);
+        return Err(error);
+    }
+    Ok((out, owner))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slot_extent;
+    use super::EschaWeightStore;
+    use rdna_compute::DType;
+
+    /// The packing arithmetic, at the real A3B shapes, against the sizes the
+    /// allocator-granularity diagnosis is built on. A slot stride that is not
+    /// a multiple of the Q8_0 block (34 B) or that disagrees with
+    /// `escha_bare_to_q8_0`'s own `oc * (ic/32) * 34` would put every expert
+    /// after slot 0 at a wrong offset — plausible, finite, wrong weights.
+    #[test]
+    fn q8_0_slot_extent_matches_the_a3b_projection_sizes() {
+        // gate_up: ic = hidden = 2048, oc = 2*mi = 1024.
+        let (gu, gu_dtype) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024);
+        assert_eq!(gu_dtype, DType::Q8_0);
+        assert_eq!(gu, 2_228_224, "gate_up slot is 2.125 MiB");
+        // down: ic = mi = 512, oc = hidden = 2048.
+        let (dn, _) = slot_extent(EschaWeightStore::Q8_0, 512, 2048);
+        assert_eq!(dn, 1_114_112, "down slot is 1.0625 MiB");
+        // 256 experts x 40 layers x both projections = the 34.2 GB of real
+        // weight bytes the 67.9 GB of granules was hiding.
+        assert_eq!((gu + dn) * 256 * 40, 34_225_520_640);
+    }
+
+    /// `sub_offset` counts in `dtype.size()` units. Q8_0 is a byte dtype, so
+    /// the Q8_0 stride is a byte stride while F16/F32 strides are element
+    /// counts. Getting that wrong scales every offset by 2 or 4.
+    #[test]
+    fn slot_extent_is_in_dtype_units_not_bytes() {
+        let (f32_elems, f32_dtype) = slot_extent(EschaWeightStore::F32, 2048, 1024);
+        assert_eq!(f32_dtype, DType::F32);
+        assert_eq!(f32_elems, 2048 * 1024);
+        assert_eq!(f32_elems * DType::F32.size(), 8 * 1024 * 1024);
+
+        let (f16_elems, f16_dtype) = slot_extent(EschaWeightStore::F16, 2048, 1024);
+        assert_eq!(f16_dtype, DType::F16);
+        assert_eq!(f16_elems, 2048 * 1024);
+        assert_eq!(f16_elems * DType::F16.size(), 4 * 1024 * 1024);
+
+        let (q8_elems, q8_dtype) = slot_extent(EschaWeightStore::Q8_0, 2048, 1024);
+        assert_eq!(q8_dtype.size(), 1, "Q8_0 offsets are byte offsets");
+        assert_eq!(q8_elems * q8_dtype.size(), 2_228_224);
+    }
+
+    /// Every A3B slot stride is a multiple of 1024 B, so no expert view is
+    /// less aligned than the 2 MiB-granule allocation it replaces and the
+    /// kernels' vector loads are undisturbed.
+    #[test]
+    fn a3b_slot_strides_are_widely_aligned() {
+        for (ic, oc) in [(2048usize, 1024usize), (512, 2048)] {
+            let (elems, dtype) = slot_extent(EschaWeightStore::Q8_0, ic, oc);
+            assert_eq!(elems * dtype.size() % 1024, 0, "{ic}x{oc} stride alignment");
+        }
+    }
 }
