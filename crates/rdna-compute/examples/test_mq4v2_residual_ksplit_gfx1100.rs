@@ -649,16 +649,20 @@ fn main() {
                 }
                 htod_f32(&gpu, &d_y_lds, &y_init);
                 for _ in 0..WARMUP {
-                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(&d_a, &d_x, &d_y_lds, m, k, n)
-                        .unwrap();
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+                        &d_a, &d_x, &d_y_lds, m, k, n,
+                    )
+                    .unwrap();
                 }
                 sync(&gpu);
                 let mut us_lds: Vec<f64> = Vec::with_capacity(SAMPLES);
                 for _ in 0..SAMPLES {
                     htod_f32(&gpu, &d_y_lds, &y_init);
                     us_lds.push(time_batch(&mut gpu, &mut |gm: &mut Gpu| {
-                        gm.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(&d_a, &d_x, &d_y_lds, m, k, n)
-                            .unwrap()
+                        gm.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+                            &d_a, &d_x, &d_y_lds, m, k, n,
+                        )
+                        .unwrap()
                     }));
                 }
                 us_lds.sort_by(|a, b| a.partial_cmp(b).unwrap());
