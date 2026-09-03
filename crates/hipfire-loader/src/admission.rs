@@ -26,7 +26,8 @@ pub enum EffectiveTopology {
 
 /// A source admitted before any destructive side effect.
 pub struct SourceAdmission {
-    /// The already-open source the load route must consume (no second open).
+    /// The already-open source. The single/pp route consumes it (no second
+    /// open); the EP route re-opens `path` per rank and drops this handle.
     pub source: ModelSource,
     pub arch_id: u32,
     pub is_dir: bool,
@@ -148,6 +149,15 @@ fn df_lash_lm_head_admission(
     Ok(())
 }
 
+/// Expert-parallel VMM refusal, mirroring `load_model_ep_with_kv_mode`'s
+/// per-arch dispatch: VMM is single-device, so the EP arches whose loaders
+/// have no VMM path (Qwen3.5 5|6, MiniMax 10) refuse it. DeepSeek V4 (9) is
+/// the one EP arch that serves vmm by design and stays vmm-capable here.
+fn ep_vmm_refusal(arch_id: u32, kv_backend: KvBackend) -> Option<String> {
+    (kv_backend == KvBackend::Vmm && matches!(arch_id, 5 | 6 | 10))
+        .then(|| format!("KV backend '{}' requires tp=1", kv_backend.as_str()))
+}
+
 /// Read-only source admission: open the source, classify `arch_id` + vision,
 /// decide the effective topology, and refuse every unsupported/contradictory
 /// combination — without touching GPU state, VMM, or any prior model.
@@ -174,7 +184,9 @@ pub fn admit_source(
 
     let (topology, carrier) = if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
-        // `load_model_ep_with_kv_mode`'s arch_id dispatch + VMM refusal.
+        // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
+        // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5 (5|6) and
+        // MiniMax (10) refuse it (single-device backend, no EP VMM path).
         if is_dir {
             return Err(
                 "EP not supported for safetensors directory sources (load as a single HFQ file)"
@@ -186,11 +198,8 @@ pub fn admit_source(
                 "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
             ));
         }
-        if kv_backend == KvBackend::Vmm {
-            return Err(format!(
-                "KV backend '{}' requires tp=1",
-                kv_backend.as_str()
-            ));
+        if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
+            return Err(refusal);
         }
         (EffectiveTopology::Expert(tp), None)
     } else {
@@ -270,5 +279,20 @@ mod tests {
         for arch in [0u32, 1, 7, 9, 10, 22] {
             assert_eq!(classify_vision(arch, true, true).unwrap(), false);
         }
+    }
+
+    /// The EP VMM refusal is per-arch, mirroring `load_model_ep_with_kv_mode`:
+    /// Qwen3.5 (5|6) and MiniMax (10) refuse `vmm`; DeepSeek V4 (9) serves it.
+    /// A blanket gate here would refuse the DS4 EP + vmm load master serves.
+    #[test]
+    fn ep_vmm_refusal_is_per_arch() {
+        assert!(ep_vmm_refusal(5, KvBackend::Vmm).is_some());
+        assert!(ep_vmm_refusal(6, KvBackend::Vmm).is_some());
+        assert!(ep_vmm_refusal(10, KvBackend::Vmm).is_some());
+        // DeepSeek V4 is vmm-capable.
+        assert!(ep_vmm_refusal(9, KvBackend::Vmm).is_none());
+        // Non-vmm backends are never refused.
+        assert!(ep_vmm_refusal(5, KvBackend::Contiguous).is_none());
+        assert!(ep_vmm_refusal(9, KvBackend::Contiguous).is_none());
     }
 }

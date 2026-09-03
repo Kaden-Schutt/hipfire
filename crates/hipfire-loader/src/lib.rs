@@ -2945,9 +2945,11 @@ pub fn load_model_ep_with_kv_mode(
     )
 }
 
-/// Dispatch an already-admitted expert-parallel source on its `arch_id`, no
-/// re-open or re-classify. Destructive (per-rank allocation + collectives)
-/// begins inside the per-arch loaders.
+/// Dispatch an already-admitted expert-parallel source on its `arch_id` —
+/// admission's classification is not repeated. Unlike the single/pp route,
+/// the per-arch EP loaders still re-open `path` per rank, so the retained
+/// `SourceAdmission.source` is dropped here rather than consumed. Destructive
+/// (per-rank allocation + collectives) begins inside the per-arch loaders.
 pub fn load_model_ep_admitted(
     admission: crate::admission::SourceAdmission,
     path: &str,
