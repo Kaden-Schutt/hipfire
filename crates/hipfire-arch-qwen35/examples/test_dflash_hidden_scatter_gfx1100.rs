@@ -341,6 +341,12 @@ fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags
     rb_l.commit_staging_to_ring(gpu, N)
         .map_err(|e| format!("direct: loop commit: {e}"))?;
     gpu.flags = saved;
+    // The raw launcher does not advance head/written (that stays with the
+    // caller, mirroring commit_staging_to_ring's advance-after-enqueue);
+    // advance manually so the scatter below uses the post-commit head,
+    // exactly as the loop arm does.
+    rb_k.head = (HEAD + N) % MP;
+    rb_k.written += N;
     for ext in 0..N_EXTRACT {
         let a = gpu
             .download_f32(&rb_k.layer_bufs[ext])
