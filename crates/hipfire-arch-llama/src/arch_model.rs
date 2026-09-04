@@ -40,19 +40,24 @@ impl ArchModel for LlamaBundle {
             weights,
             scratch,
             kv,
+            manifest_plan: _,
+            weight_store,
+            weight_origin: _,
+            mesh: _,
             dflash_extract_layers: _,
             dspark_weights: _,
             dspark_assets: _,
         } = *self;
-        // Mirror unload_model ModelState::Llama arm exactly (lib.rs:3041):
-        //   b.scratch.free_gpu(gpu);
-        //   b.weights.free_gpu(gpu);
-        //   note(b.kv.free_gpu(gpu)…)
-        // Ordering matters: scratch → weights → kv. dspark sidecars (when
-        // present) are reclaimed via the speculator/spec scratch paths, not
-        // here — matching the current unload_model which also does not handle
-        // them in this arm.
+        // Mirror the existing unload ordering: scratch → store/weights → kv.
         scratch.free_gpu(gpu);
+        if let Some(store) = weight_store {
+            // Attachment already checked the complete origin and created this
+            // owner capability. There is no mismatch branch to leak the model:
+            // an attached store can only be drained by this consuming owner.
+            if let Err(error) = store.drain(gpu) {
+                eprintln!("llama: failed to release attached weight store: {error}");
+            }
+        }
         weights.free_gpu(gpu);
         let _ = kv.free_gpu(gpu);
     }

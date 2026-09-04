@@ -17,9 +17,12 @@
 use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::llama::KvCacheExt;
-use rdna_compute::Gpu;
+use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::weight_manifest::{
+    DTypeConstraint, FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+};
+use rdna_compute::{DType, Gpu};
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -36,6 +39,58 @@ use hipfire_runtime::llama::{attention_family, AttnParams, KvTierInputs, KvTierP
 /// see [`hipfire_arch_qwen35::Qwen35`] for those.
 pub struct Llama;
 
+fn linear_source_constraint() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![
+        DType::F32,
+        DType::Q4F16G64,
+        DType::Q8_0,
+        DType::Q4K,
+        DType::Q8HFQ,
+        DType::HFQ4G256,
+        DType::HFQ4G128,
+        DType::HFQ6G256,
+        DType::HFQ2G256,
+        DType::HFQ2G128,
+        DType::HFQ3G256,
+        DType::HFQ3G128,
+        DType::MQ4G256,
+        DType::MQ8G256,
+        DType::MQ6G256,
+        DType::MQ3G256,
+        DType::MQ2G256,
+        DType::MQ2G256Lloyd,
+        DType::MQ2G256LloydU,
+        DType::MQ3G256Lloyd,
+        DType::HFP4G32,
+        DType::MFP4G32,
+        DType::MQ4G256Lloyd,
+        DType::MQ2G256GL,
+        DType::MQ3G256GL,
+        DType::TQ2G128,
+        DType::BQ1G128,
+        DType::MQ4G256V2,
+        DType::MQ4CG256,
+        DType::MQ6G256V2,
+        DType::MQ5G256V2,
+        DType::MQ3G256V2,
+        DType::MQ2G256V2,
+    ])
+}
+
+fn embedding_source_constraint() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![
+        DType::F32,
+        DType::Q8_0,
+        DType::Q4K,
+        DType::HFQ4G256,
+        DType::HFQ4G128,
+    ])
+}
+
+fn norm_source_constraint() -> DTypeConstraint {
+    DTypeConstraint::source_exact(DType::F32)
+}
+
 impl Architecture for Llama {
     type Weights = LlamaWeights;
     type State = ForwardScratch;
@@ -43,12 +98,8 @@ impl Architecture for Llama {
 
     fn arch_id() -> u32 {
         // `arch_id = 0` is the canonical LLaMA-family marker. The
-        // actual arch_id loaded at runtime is on `HfqFile::arch_id`
-        // and is either 0 (LLaMA / Mistral) or 1 (plain Qwen3 /
-        // Qwen2); both share this trait impl. The qwen3-norm flag
-        // is read off the HFQ metadata inside `config_from_hfq`,
-        // so the bring-up triple does not need a separate marker
-        // type per arch_id.
+        // actual id loaded at runtime is on `HfqFile::arch_id` and may
+        // differ for plain Qwen3/Qwen2; config parsing resolves that.
         0
     }
 
@@ -57,13 +108,6 @@ impl Architecture for Llama {
     }
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
-        // `hfq::config_from_hfq` is the LLaMA-family HFQ metadata
-        // parser — emits a `LlamaConfig` with the appropriate
-        // `ModelArch` (Llama vs Qwen3) tag. It lives in the runtime
-        // crate because the qwen35 hybrid path's pflash drafter also
-        // calls it via `hfq::config_from_hfq` for its "Plain"
-        // variant. See arch-llama/src/lib.rs for the colocation
-        // rationale.
         hfq::config_from_hfq(hfq)
     }
 
@@ -72,27 +116,193 @@ impl Architecture for Llama {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        // `hfq::load_weights_hfq` is the LLaMA-family HFQ tensor
-        // loader. Same colocation reasoning as `config_from_hfq`.
         hfq::load_weights_hfq(hfq, cfg, gpu)
             .map_err(|e| format!("llama: load_weights_hfq failed: {e:?}"))
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
-        // The LLaMA-arch "state" is the `ForwardScratch` — persistent
-        // GPU scratch buffers reused across decode steps. There is no
-        // separate recurrent state (LLaMA is full-attention only).
         ForwardScratch::new(gpu, cfg)
             .map_err(|e| format!("llama: ForwardScratch::new failed: {e:?}"))
     }
 
     // Optional overrides: defaults from `hipfire_runtime::arch` already
     // assume Qwen3.5 family conventions. LLaMA / Mistral / Qwen3 don't
-    // emit `<think>` blocks, but PR 11 keeps the override surface
-    // empty here on purpose — the daemon's existing per-`arch_id`
-    // policy choices stay unchanged. Future PRs that consolidate
-    // policy through the trait can populate these (LLaMA: no
-    // strip_think, no Qwen-specific blocked tokens).
+    // emit `<think>` blocks, but the existing policy choices stay unchanged.
+}
+
+impl Llama {
+    /// Pure dense LLaMA-family weight declaration. Source names remain
+    /// logical; carriers translate them to HFQ/safetensors namespaces.
+    pub fn weight_manifest(cfg: &LlamaConfig) -> Vec<WeightEntry> {
+        use ShardPolicy::*;
+        let (dim, hidden, head_dim) = (cfg.dim, cfg.hidden_dim, cfg.head_dim);
+        let (heads, kv_heads) = (cfg.n_heads, cfg.n_kv_heads);
+        let linear = linear_source_constraint();
+        let embedding = embedding_source_constraint();
+        let norm = norm_source_constraint();
+        let mut manifest = Vec::with_capacity(cfg.n_layers * 11 + 3);
+        manifest.push(WeightEntry::model_with_dtype_constraint(
+            "token_embd",
+            vec![cfg.vocab_size, dim],
+            DType::F16,
+            embedding,
+            Pin(PinTarget::Embed),
+        ));
+        for layer in 0..cfg.n_layers {
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "wq",
+                layer,
+                vec![heads * head_dim, dim],
+                DType::F16,
+                linear.clone(),
+                FusedQkv {
+                    q_heads: heads,
+                    kv_heads,
+                    head_dim,
+                    layout: FusedQkvLayout::Qkv,
+                },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "wk",
+                layer,
+                vec![kv_heads * head_dim, dim],
+                DType::F16,
+                linear.clone(),
+                ColumnShard { axis: 0 },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "wv",
+                layer,
+                vec![kv_heads * head_dim, dim],
+                DType::F16,
+                linear.clone(),
+                ColumnShard { axis: 0 },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "wo",
+                layer,
+                vec![dim, heads * head_dim],
+                DType::F16,
+                linear.clone(),
+                RowShard { axis: 1 },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "ffn_gate",
+                layer,
+                vec![hidden, dim],
+                DType::F16,
+                linear.clone(),
+                ColumnShard { axis: 0 },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "ffn_up",
+                layer,
+                vec![hidden, dim],
+                DType::F16,
+                linear.clone(),
+                ColumnShard { axis: 0 },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "ffn_down",
+                layer,
+                vec![dim, hidden],
+                DType::F16,
+                linear.clone(),
+                RowShard { axis: 1 },
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "attn_norm",
+                layer,
+                vec![dim],
+                DType::F32,
+                norm.clone(),
+                Replicate,
+            ));
+            manifest.push(WeightEntry::layer_with_dtype_constraint(
+                "ffn_norm",
+                layer,
+                vec![dim],
+                DType::F32,
+                norm.clone(),
+                Replicate,
+            ));
+            if cfg.has_qk_norm {
+                manifest.push(WeightEntry::layer_with_dtype_constraint(
+                    "q_norm",
+                    layer,
+                    vec![head_dim],
+                    DType::F32,
+                    norm.clone(),
+                    Replicate,
+                ));
+                manifest.push(WeightEntry::layer_with_dtype_constraint(
+                    "k_norm",
+                    layer,
+                    vec![head_dim],
+                    DType::F32,
+                    norm.clone(),
+                    Replicate,
+                ));
+            }
+        }
+        manifest.push(WeightEntry::model_with_dtype_constraint(
+            "output_norm",
+            vec![dim],
+            DType::F32,
+            norm,
+            Replicate,
+        ));
+        manifest.push(WeightEntry::model_with_dtype_constraint(
+            "lm_head",
+            vec![cfg.vocab_size, dim],
+            DType::F16,
+            linear,
+            Pin(PinTarget::Output),
+        ));
+        manifest
+    }
+
+    /// Build the manifest for an HFQ source after source classification.
+    ///
+    /// A separate `lm_head.weight` is a resident output projection. When the
+    /// source omits it, the declaration is a true tie to `token_embd`; the
+    /// output placement remains pinned to the final stage while the source
+    /// representation contract is copied from the embedding entry.
+    pub fn weight_manifest_for_hfq(
+        cfg: &LlamaConfig,
+        has_separate_lm_head: bool,
+    ) -> Vec<WeightEntry> {
+        let mut manifest = Self::weight_manifest(cfg);
+        if !has_separate_lm_head {
+            let embedding_constraint = manifest
+                .first()
+                .expect("LLaMA manifest always contains token_embd")
+                .dtype_constraint
+                .clone();
+            let output = manifest
+                .last_mut()
+                .expect("LLaMA manifest always contains lm_head");
+            output.dtype_constraint = embedding_constraint;
+            output.policy = ShardPolicy::Tied {
+                source: "token_embd".into(),
+            };
+        }
+        manifest
+    }
+
+    /// Pure state declaration for the full-attention LLaMA family.
+    pub fn state_manifest(cfg: &LlamaConfig) -> Vec<StateEntry> {
+        (0..cfg.n_layers)
+            .map(|layer| {
+                StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    layer,
+                )
+            })
+            .collect()
+    }
 }
 
 // ── Dispatch integration ─────────────────────────────────────────

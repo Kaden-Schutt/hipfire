@@ -432,6 +432,19 @@ impl HfqFile {
         self.overlay.is_some()
     }
 
+    /// Whether this source carries any AWQ scale sidecar. The carrier uses
+    /// this classification before allocation so supported sidecars stay on the
+    /// legacy loader until the manifest resolver can represent them.
+    pub fn has_awq_sidecars(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|tensor| tensor.name.ends_with(".awq_scale.weight"))
+            || self
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.has_awq_sidecars())
+    }
+
     /// Open an HFQM container that lives inside a larger file, starting at
     /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
     /// MTP section embedded after the trunk's tensor data.
@@ -1638,6 +1651,7 @@ fn load_embedding_llama(
         .expect("embed_tokens not found");
     // Q4K embeddings are llama-family-only (GGUF-derived). qwen2/qwen35 have no
     // Q4K embedding-lookup kernel — that is why the shared `load_embedding` /
+
     // `embed_classify` deliberately rejects qt 4 (rejecting at load gives a clean
     // error instead of an "unsupported embedding format" panic deep in the qwen
     // forward pass). So Q4K stays an explicit llama-only branch here; everything
@@ -1651,28 +1665,13 @@ fn load_embedding_llama(
     load_embedding(gpu, info.quant_type, data, config.vocab_size, config.dim)
 }
 
-/// Load LLaMA weights from an HFQ file onto GPU.
-pub fn load_weights_hfq(
-    hfq: &HfqFile,
-    config: &LlamaConfig,
-    gpu: &mut Gpu,
-) -> HipResult<LlamaWeights> {
-    // R2 guard: the LLaMA-family loader does NOT read Q/K/V proj bias —
-    // `LayerWeights` has no `wq_bias` / `wk_bias` / `wv_bias` fields and
-    // the per-layer load below only names `*.q_proj.weight`. Qwen2
-    // requires those biases (`attention_bias=true` is the modeling
-    // default). The quantiser used to auto-tag every Qwen2 model as
-    // `arch_id=1`, which the daemon dispatches to this loader; the
-    // result was silently-wrong outputs with no warning. As of the
-    // `--arch-id` flag (see `hipfire-quantize`), Qwen2 models should be
-    // tagged `arch_id=7` and dispatched to `hipfire-arch-qwen2`.
-    //
-    // If we see `q_proj.bias` while loading as the LLaMA family, the
-    // input is a mis-tagged Qwen2 HFQ. Refuse hard with a pointer at
-    // the correct path. (Detection by manifest is robust to either the
-    // model_type tag or the model family — both LLaMA and Qwen3 lack
-    // these bias tensors, so any HFQ with `model.layers.0.self_attn.q_proj.bias`
-    // is by definition a Qwen2-family input.)
+/// Reject a mis-tagged Qwen2 HFQ before any model allocation.
+///
+/// The LLaMA-family `LayerWeights` type has no attention-bias tensors. A
+/// Qwen2 file carrying `q_proj.bias` would therefore load and produce
+/// silently-wrong output unless this admission check runs before every loader
+/// route, including the manifest pilot.
+pub fn validate_llama_hfq_admission(hfq: &HfqFile) -> HipResult<()> {
     if hfq
         .find_tensor_info("model.layers.0.self_attn.q_proj.bias")
         .is_some()
@@ -1696,6 +1695,16 @@ pub fn load_weights_hfq(
             ),
         ));
     }
+    Ok(())
+}
+
+/// Load LLaMA weights from an HFQ file onto GPU.
+pub fn load_weights_hfq(
+    hfq: &HfqFile,
+    config: &LlamaConfig,
+    gpu: &mut Gpu,
+) -> HipResult<LlamaWeights> {
+    validate_llama_hfq_admission(hfq)?;
 
     let mut source = LlamaHfqSource { hfq, cfg: config };
     let layout = crate::model_load::Layout::single(config.n_layers);
