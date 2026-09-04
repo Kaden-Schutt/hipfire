@@ -42,6 +42,14 @@ use crate::dispatch::{Gpu, GpuTensor};
 /// the launcher's grid clamp depend on these; keep in sync.
 pub const TDK_MAX_K: usize = 8;
 pub const TDK_N_MAX: usize = 16;
+/// ctl words: [0] launch counter, [1] release, [2..44) arrival slots.
+pub const TDK_CTL_WORDS: usize = 44;
+
+/// Bytes required for the `ctl` scratch tensor (zeroed once at allocation;
+/// all words are monotonic — the kernel never resets them).
+pub fn ddtree_topk_ctl_bytes() -> usize {
+    TDK_CTL_WORDS * 4
+}
 /// 96 CU x 14 resident one-wave blocks (static `__launch_bounds__(32, 14)`,
 /// occupancy proven by the amdgpu-waves-per-eu compile check; 78 VGPRs).
 pub const TDK_WG_MAX: usize = 1344;
@@ -62,10 +70,11 @@ impl Gpu {
     ///
     /// - `a_raw`: `[m, k]` MQ4G256V2 (qt=44) packed lm_head weights.
     /// - `x_f32`: `[n, k]` F32 FWHT-rotated hidden rows; converted to fp16
-    ///   here (cache-stomped first, mirroring `gemm_mq4g256v2_batched_lmhead`).
+    ///   inline by the kernel (RNE — bit-identical to `convert_f32_to_f16`),
+    ///   so no convert launch and no fp16 scratch are needed here.
     /// - `partials`: Raw scratch of at least [`ddtree_topk_partials_bytes`].
-    /// - `ctl`: Raw scratch of at least 8 bytes (arrival counter, generation),
-    ///   zeroed once before first use.
+    /// - `ctl`: Raw scratch of at least [`ddtree_topk_ctl_bytes`], zeroed
+    ///   once before first use (monotonic barrier words).
     /// - `top_idx`: `[n * k_top]` f32-storage tensor; kernel writes i32 ids.
     /// - `top_logp`: `[n * k_top]` f32 log-probs (`logit - log_z`).
     ///
@@ -149,20 +158,22 @@ impl Gpu {
                 ),
             ));
         }
-        if ctl.buf.size() < 8 {
+        if ctl.buf.size() < ddtree_topk_ctl_bytes() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "mq4v2_lmhead_topk_direct_gfx1100: ctl scratch must be >= 8 bytes",
+                &format!(
+                    "mq4v2_lmhead_topk_direct_gfx1100: ctl scratch {} < {} bytes",
+                    ctl.buf.size(),
+                    ddtree_topk_ctl_bytes()
+                ),
             ));
         }
 
         self.bind_thread()?;
         self.ensure_kernel(MODULE, SRC, FUNC)?;
 
-        // Mirror `gemm_mq4g256v2_batched_lmhead`: force the fp16 conversion
-        // (the rotated scratch is rewritten every call) and convert here.
-        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-        let x_f16_ptr = self.ensure_fp16_x(x_f32, n * k)?;
+        // X stays F32: the kernel RNE-converts inline (no convert launch).
+        let x_ptr_in = x_f32.buf.as_ptr();
 
         let m_tiles = m.div_ceil(16);
         // HIPFIRE_TDK_WGS=<n> debug/acceptance knob: caps the grid below
@@ -179,7 +190,7 @@ impl Gpu {
         let wgs = m_tiles.min(cap) as u32;
 
         let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
+        let mut x_ptr = x_ptr_in;
         let mut p_ptr = partials.buf.as_ptr();
         let mut c_ptr = ctl.buf.as_ptr();
         let mut ti_ptr = top_idx.buf.as_ptr();
@@ -202,7 +213,7 @@ impl Gpu {
             &mut kt_val as *mut _ as *mut c_void,
             &mut kw_val as *mut _ as *mut c_void,
         ];
-        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + n * k * 2;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + n * k * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
