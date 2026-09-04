@@ -1288,6 +1288,10 @@ def _run_decide(args) -> int:
     decision = None
     fable_unavailable = False
     fable_error_reason: str | None = None
+    # What the seat actually said/emitted when it did not produce a decision.
+    # Run 33866758629 (#702) ended "no JSON object in assistant text" after 10 s
+    # and the artifact carried nothing to diagnose it with.
+    fable_raw: dict | None = None
     investigation: list = []
     unproven: list = []
     if investigate:
@@ -1346,6 +1350,8 @@ def _run_decide(args) -> int:
                         fable_unavailable = True
                         fable_error_reason = "omp decide: no JSON object in assistant text"
                         sys.stderr.write(f"fable omp failed: {fable_error_reason}\n")
+                        sys.stderr.write(f"fable assistant text (tail): {(last_text or '')[-2000:]!r}\n")
+                        fable_raw = {"assistant_text_tail": (last_text or "")[-4000:], "stderr_tail": stderr_text[-4000:]}
                         investigation = []
                         unproven = []
                         decision = None
@@ -1625,6 +1631,8 @@ def _run_decide(args) -> int:
         "investigation": investigation,
         "unproven": unproven,
         "evidence_dir": evidence_dir_val,
+        "fable_error": fable_error_reason,
+        "fable_raw": fable_raw,
     }
     try:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)

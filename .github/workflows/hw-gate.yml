@@ -402,6 +402,11 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
         run: |
           set -euo pipefail
+          # The runner reuses its workspace: without the rm, Fable inherits the
+          # previous PR's evidence files and home (run 33866758629 on #702
+          # carried #700's fable-summary.md and #686's route outputs) and can
+          # cite them as its own. Every session starts empty.
+          rm -rf fable-evidence fable-home
           mkdir -p fable-evidence fable-home
           exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
           flock --exclusive --timeout 3600 9
@@ -496,7 +501,11 @@ jobs:
         if: env.skip != 'true'
         run: |
           set -euo pipefail
-          decision=$(jq -r '.decision // "hold"' decision/decision.json)
+          # review.py writes the seat's full object under `.decision` and the
+          # floor-applied verdict under `.decision_final`; `.decision` is a JSON
+          # object, so the old jq yielded "[object]" and every run — including
+          # a successful merge-staging (#689, run 33889229683) — went red.
+          decision=$(jq -r '.decision_final // .decision.decision // "hold"' decision/decision.json)
           hard=$(jq -r '(.floor.hard // []) | join(", ")' decision/decision.json)
           echo "decision=$decision hard_floor=[$hard] human_reviewed=${{ needs.select.outputs.human_reviewed }}"
           case "$decision" in
