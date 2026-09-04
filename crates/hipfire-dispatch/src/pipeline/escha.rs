@@ -172,12 +172,28 @@ fn escha_routed_gemv(
 ) -> Result<(), DispatchError> {
     use rdna_compute::DType;
     let r = match dtype {
-        DType::Escha2T16 => {
-            gpu.escha_gemv_native_moe_k8_indexed_batched(expert_ptrs, ids, x, y, m, k, slots, 2)
-        }
-        DType::Escha3T16 => {
-            gpu.escha_gemv_native_moe_k8_indexed_batched(expert_ptrs, ids, x, y, m, k, slots, 3)
-        }
+        DType::Escha2T16 => gpu.escha_gemv_native_moe_k8_indexed_batched(
+            expert_ptrs,
+            ids,
+            x,
+            y,
+            m,
+            k,
+            slots,
+            2,
+            false,
+        ),
+        DType::Escha3T16 => gpu.escha_gemv_native_moe_k8_indexed_batched(
+            expert_ptrs,
+            ids,
+            x,
+            y,
+            m,
+            k,
+            slots,
+            3,
+            false,
+        ),
         DType::Q8_0 => {
             gpu.escha_gemv_q8_0_moe_k8_indexed_batched(expert_ptrs, ids, x, y, m, k, slots)
         }
@@ -300,7 +316,17 @@ fn escha_routed_gemm_grouped(
     // 16-float run, so there is nothing to share — is what unlocked it.
     if std::env::var("HIPFIRE_ESCHA_GROUPED_SCALAR").is_ok() {
         return hip!(gpu.escha_gemm_native_moe_grouped(
-            expert_ptrs, &offsets, &sorted, x, y, m, k, slots, n_exp, trellis_k,
+            expert_ptrs,
+            &offsets,
+            &sorted,
+            x,
+            y,
+            m,
+            k,
+            slots,
+            n_exp,
+            trellis_k,
+            false
         ));
     }
     hip!(gpu.escha_gemm_native_moe_grouped_wmma(
@@ -314,6 +340,7 @@ fn escha_routed_gemm_grouped(
         slots,
         n_exp,
         trellis_k,
+        false
     ))
 }
 

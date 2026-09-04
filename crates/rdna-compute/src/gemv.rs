@@ -14310,6 +14310,7 @@ impl Gpu {
         k: usize,
         slots: usize,
         trellis_k: u32,
+        nt_major: bool,
     ) -> HipResult<()> {
         let wide = self.escha_indexed_gemv_preflight(
             "escha_gemv_native_moe_k8_indexed_batched",
@@ -14344,6 +14345,7 @@ impl Gpu {
             m,
             k,
             slots,
+            Some(nt_major),
         )
     }
 
@@ -14393,6 +14395,7 @@ impl Gpu {
             m,
             k,
             slots,
+            None,
         )
     }
 
@@ -14486,6 +14489,7 @@ impl Gpu {
         m: usize,
         k: usize,
         slots: usize,
+        nt_major: Option<bool>,
     ) -> HipResult<()> {
         self.ensure_kernel(
             "escha_moe_gemv_native",
@@ -14506,6 +14510,13 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
+        // The escha NATIVE kernels take a trailing `int nt_major` selecting the
+        // tile-grid order; the F16 reference arm does not, so it passes `None`
+        // and its kernarg list is unchanged.
+        let nt_major_val = nt_major.map(|v| i32::from(v));
+        if let Some(v) = nt_major_val.as_ref() {
+            params.push(v as *const i32 as *mut c_void);
+        }
         // Grid (m/16, slots), block 256: a block owns a 16-wide tile column,
         // and each of its EIGHT warps owns two of that column's output rows
         // (`w` and `w + 8`) because those two share a decode window. See the
@@ -14524,6 +14535,13 @@ impl Gpu {
                 b.push_ptr(yp);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                // MUST mirror `params` above — this closure is the SECOND,
+                // independent kernarg description used on the capture/blob
+                // path. Updating only `params` silently sends the old arg list
+                // whenever a graph is being recorded.
+                if let Some(v) = nt_major_val {
+                    b.push_i32(v);
+                }
                 b
             },
         )
@@ -14589,6 +14607,7 @@ impl Gpu {
         slots: usize,
         n_exp: usize,
         trellis_k: u32,
+        nt_major: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let what = "escha_gemm_native_moe_grouped_wmma";
@@ -14644,6 +14663,8 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
+        let mut ntm = i32::from(nt_major);
+        params.push(&mut ntm as *mut _ as *mut c_void);
         let func = &self.functions[entry];
         unsafe {
             self.hip.launch_kernel(
@@ -14669,6 +14690,7 @@ impl Gpu {
         slots: usize,
         n_exp: usize,
         trellis_k: u32,
+        nt_major: bool,
     ) -> HipResult<()> {
         let (rows, ctiles) = escha_grouped_tile(m);
         self.escha_gemm_native_moe_grouped_tiled(
@@ -14682,6 +14704,7 @@ impl Gpu {
             slots,
             n_exp,
             trellis_k,
+            nt_major,
             rows,
             ctiles,
         )
@@ -14708,6 +14731,7 @@ impl Gpu {
         slots: usize,
         n_exp: usize,
         trellis_k: u32,
+        nt_major: bool,
         rows: usize,
         ctiles: usize,
     ) -> HipResult<()> {

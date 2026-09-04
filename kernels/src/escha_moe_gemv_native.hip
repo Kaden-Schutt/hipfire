@@ -199,7 +199,7 @@ __device__ __forceinline__ void escha_gemv_native_narrow_body(
     const int* __restrict__ topk_indices,
     const float* __restrict__ x_batch,
     float* __restrict__ y_batch,
-    int M, int K
+    int M, int K, int nt_major
 ) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -238,11 +238,24 @@ __device__ __forceinline__ void escha_gemv_native_narrow_body(
         return;
     }
 
-    // Tile `kt` of column `nt` starts at `(kt*tn + nt) * 8*TRELLIS_K` DWORDS.
-    // This lane's tile in iteration `bi` is `kt = bi*2 + tile_hi`, so the base
-    // is a loop-invariant origin plus `bi` times two strips.
-    const size_t strip = (size_t)tn * (8 * TRELLIS_K);
-    EschaCodePtr strip0 = code + (size_t)nt * (8 * TRELLIS_K) + (size_t)tile_hi * strip;
+    // The tile grid comes in one of two orders and `nt_major` says which. Both
+    // reduce to a pair of loop-invariant strides, so there is no hot-loop cost
+    // and no second kernel:
+    //
+    //   kt-major `[ic/16][oc/16]`  (MoE, and any un-permuted code): a `kt` step
+    //     crosses a whole tile ROW, `tn * 8*TRELLIS_K`.
+    //   nt-major `[oc/16][ic/16]`  (dense, permuted at load by
+    //     `escha_tiles_to_nt_major`): a `kt` step is ONE TILE, so the four
+    //     tiles a quad reads sit 32 dwords apart at K=2 instead of two 139 KB
+    //     strides. Worth a measured 24% on this kernel.
+    //
+    // This lane's tile in iteration `bi` is `kt = bi*2 + tile_hi`.
+    const size_t ktiles = (size_t)K >> 4;
+    const size_t strip = nt_major ? (size_t)(8 * TRELLIS_K)
+                                  : (size_t)tn * (8 * TRELLIS_K);
+    const size_t colstride = nt_major ? ktiles * (size_t)(8 * TRELLIS_K)
+                                      : (size_t)(8 * TRELLIS_K);
+    EschaCodePtr strip0 = code + (size_t)nt * colstride + (size_t)tile_hi * strip;
 
     const int blocks_per_row = K / 32;
     float sum_lo = 0.0f, sum_hi = 0.0f;
@@ -290,7 +303,7 @@ __device__ __forceinline__ void escha_gemv_native_wide_body(
     const int* __restrict__ topk_indices,
     const float* __restrict__ x_batch,
     float* __restrict__ y_batch,
-    int M, int K
+    int M, int K, int nt_major
 ) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -317,8 +330,24 @@ __device__ __forceinline__ void escha_gemv_native_wide_body(
         return;
     }
 
-    const size_t strip = (size_t)tn * (8 * TRELLIS_K);
-    EschaCodePtr strip0 = code + (size_t)nt * (8 * TRELLIS_K) + (size_t)tile_hi * strip;
+    // The tile grid comes in one of two orders and `nt_major` says which. Both
+    // reduce to a pair of loop-invariant strides, so there is no hot-loop cost
+    // and no second kernel:
+    //
+    //   kt-major `[ic/16][oc/16]`  (MoE, and any un-permuted code): a `kt` step
+    //     crosses a whole tile ROW, `tn * 8*TRELLIS_K`.
+    //   nt-major `[oc/16][ic/16]`  (dense, permuted at load by
+    //     `escha_tiles_to_nt_major`): a `kt` step is ONE TILE, so the four
+    //     tiles a quad reads sit 32 dwords apart at K=2 instead of two 139 KB
+    //     strides. Worth a measured 24% on this kernel.
+    //
+    // This lane's tile in iteration `bi` is `kt = bi*2 + tile_hi`.
+    const size_t ktiles = (size_t)K >> 4;
+    const size_t strip = nt_major ? (size_t)(8 * TRELLIS_K)
+                                  : (size_t)tn * (8 * TRELLIS_K);
+    const size_t colstride = nt_major ? ktiles * (size_t)(8 * TRELLIS_K)
+                                      : (size_t)(8 * TRELLIS_K);
+    EschaCodePtr strip0 = code + (size_t)nt * colstride + (size_t)tile_hi * strip;
 
     const int blocks_per_row = K / 32;
     float lo0 = 0.0f, lo1 = 0.0f, lo2 = 0.0f, lo3 = 0.0f;
@@ -402,9 +431,9 @@ __device__ __forceinline__ void escha_gemv_native_wide_body(
         const int* __restrict__ topk_indices,                                  \
         const float* __restrict__ x_batch,                                     \
         float* __restrict__ y_batch,                                           \
-        int M, int K                                                           \
+        int M, int K, int nt_major                                             \
     ) {                                                                        \
-        FORM<TK>(expert_ptrs, topk_indices, x_batch, y_batch, M, K);           \
+        FORM<TK>(expert_ptrs, topk_indices, x_batch, y_batch, M, K, nt_major); \
     }
 
 ESCHA_NATIVE_GEMV(escha_gemv_native_k2_moe_k8_indexed_batched,
@@ -499,7 +528,7 @@ extern "C" __global__ void escha_gemv_f16_moe_k8_indexed_batched(
     const int* __restrict__ topk_indices,
     const float* __restrict__ x_batch,
     float* __restrict__ y_batch,
-    int M, int K
+    int M, int K, int nt_major
 ) {
     escha_gemv_f16_body<false>(expert_ptrs, topk_indices, x_batch, y_batch, M, K);
 }
@@ -510,7 +539,7 @@ extern "C" __global__ void escha_gemv_f16_wide_moe_k8_indexed_batched(
     const int* __restrict__ topk_indices,
     const float* __restrict__ x_batch,
     float* __restrict__ y_batch,
-    int M, int K
+    int M, int K, int nt_major
 ) {
     escha_gemv_f16_body<true>(expert_ptrs, topk_indices, x_batch, y_batch, M, K);
 }

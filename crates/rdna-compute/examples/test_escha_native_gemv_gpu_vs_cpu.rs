@@ -304,6 +304,7 @@ fn main() {
             case.ic,
             slots,
             case.trellis_k as u32,
+            false,
         )
         .expect("native gemv");
         gpu.escha_gemv_f16_moe_k8_indexed_batched(

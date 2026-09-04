@@ -123,6 +123,7 @@ fn main() {
                 case.ic,
                 slots,
                 case.trellis_k,
+                false,
             )
             .expect("gemv warmup");
         }
@@ -141,6 +142,7 @@ fn main() {
                 case.ic,
                 slots,
                 case.trellis_k,
+                false,
             )
             .expect("gemv");
             gpu.hip.device_synchronize().expect("sync");

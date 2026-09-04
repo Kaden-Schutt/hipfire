@@ -197,7 +197,7 @@ __device__ __forceinline__ void escha_gemm_grouped_body(
     const int* __restrict__ sorted_slot_index, // [slots] sorted pos -> flat slot
     const float* __restrict__ x_batch,         // [slots, K]
     float* __restrict__ y_batch,               // [slots, M]
-    int M, int K
+    int M, int K, int nt_major
 ) {
     const int e = blockIdx.y;
     const int g_start = expert_offsets[e];
@@ -241,9 +241,13 @@ __device__ __forceinline__ void escha_gemm_grouped_body(
     EschaCodePtr code = (EschaCodePtr)(expert_ptrs[e]);
     // Tile `kt` of tile column `nt` starts at `(kt*tn + nt) * 8*TRELLIS_K`
     // DWORDS. This lane's tile in iteration `bi` is `kt = bi*2 + tile_hi`.
-    const size_t strip = (size_t)tn * (8 * TRELLIS_K);
+    const size_t ktiles = (size_t)K >> 4;
+    const size_t strip = nt_major ? (size_t)(8 * TRELLIS_K)
+                                  : (size_t)tn * (8 * TRELLIS_K);
+    const size_t colstride = nt_major ? ktiles * (size_t)(8 * TRELLIS_K)
+                                      : (size_t)(8 * TRELLIS_K);
     const int nt0 = blockIdx.x * CTILES;
-    EschaCodePtr strip0 = code + (size_t)nt0 * (8 * TRELLIS_K) + (size_t)tile_hi * strip;
+    EschaCodePtr strip0 = code + (size_t)nt0 * colstride + (size_t)tile_hi * strip;
 
     const int blocks_per_row = K / 32;
 
@@ -274,7 +278,7 @@ __device__ __forceinline__ void escha_gemm_grouped_body(
             #pragma unroll
             for (int c = 0; c < CTILES; c++) {
                 EschaCodePtr tile =
-                    strip0 + (size_t)c * (8 * TRELLIS_K) + (size_t)bi * 2 * strip;
+                    strip0 + (size_t)c * colstride + (size_t)bi * 2 * strip;
                 const unsigned long long merged =
                     ((unsigned long long)escha_native_word(tile, word_a) << 32) |
                     escha_native_word(tile, word_b);
@@ -332,11 +336,11 @@ __device__ __forceinline__ void escha_gemm_grouped_body(
         const int* __restrict__ sorted_slot_index,                             \
         const float* __restrict__ x_batch,                                     \
         float* __restrict__ y_batch,                                           \
-        int M, int K                                                           \
+        int M, int K, int nt_major                                             \
     ) {                                                                        \
         escha_gemm_grouped_body<TK, ROWS, CTILES>(                             \
             expert_ptrs, expert_offsets, sorted_slot_index, x_batch, y_batch,  \
-            M, K);                                                             \
+            M, K, nt_major);                                                   \
     }
 
 ESCHA_GROUPED_GEMM(escha_gemm_grouped_k2_r4_c2, 2, 4, 2)

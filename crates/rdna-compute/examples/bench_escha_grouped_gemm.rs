@@ -200,6 +200,7 @@ fn main() {
                     case.ic,
                     slots,
                     case.trellis_k,
+                    false,
                 )
                 .expect("slot-parallel gemv");
                 gpu.hip.device_synchronize().expect("sync");
@@ -266,6 +267,7 @@ fn main() {
                     slots,
                     n_exp,
                     case.trellis_k,
+                    false,
                     rows,
                     ctiles,
                 );
@@ -315,6 +317,7 @@ fn main() {
                         slots,
                         n_exp,
                         case.trellis_k,
+                        false,
                     );
                     if let Err(e) = r {
                         println!("  wmma  : launch refused: {e}");

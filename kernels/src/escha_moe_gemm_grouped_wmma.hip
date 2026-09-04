@@ -140,7 +140,7 @@ __device__ __forceinline__ void escha_decode_tile_lds(
         const int* __restrict__ sorted_slot_index,                             \
         const float* __restrict__ x_batch,                                     \
         float* __restrict__ y_batch,                                           \
-        int M, int K) {                                                        \
+        int M, int K, int nt_major) {                                          \
         const int nt = blockIdx.x;                                             \
         const int e = blockIdx.y;                                              \
         const int lane = threadIdx.x;                                          \
@@ -161,7 +161,11 @@ __device__ __forceinline__ void escha_decode_tile_lds(
                                                                                \
             for (int kt = 0; kt < ktiles; ++kt) {                              \
                 /* A: decode escha tile (kt, nt); lane takes column `lane`. */ \
-                const short* tile = code + (size_t)(kt * ntiles + nt) * 16 * TK;\
+                /* kt-major `[ic/16][oc/16]` or nt-major `[oc/16][ic/16]`;   \
+                   see escha_moe_gemv_native.hip. Two loop-invariant strides. */\
+                const size_t tile_off = nt_major                                \
+                    ? (size_t)(nt * ktiles + kt) : (size_t)(kt * ntiles + nt);  \
+                const short* tile = code + tile_off * 16 * TK;                  \
                 escha_decode_tile_lds<TK>(tile, w_lds, 17, lane);              \
                                                                                \
                 /* Stage the weight tile AND all NT activation tiles, then a  \

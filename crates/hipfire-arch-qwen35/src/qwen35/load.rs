@@ -349,7 +349,25 @@ fn load_weight_tensor_raw(
             //
             // `m`/`k` are the logical output/input dims; the buffer length is
             // the tile-packed code, not m*k of anything.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            //
+            // TILE GRID TRANSPOSED HERE, kt-major -> nt-major. Every escha
+            // kernel holds one output tile column `nt` fixed and walks `kt`;
+            // in the checkpoint's order consecutive `kt` are a full tile-row
+            // apart (139 KB on the 27B's gate_proj), so each step is a fresh
+            // 64-bit address against a cold line. Adjacent instead: measured
+            // 243.9 -> 186.3 us on the decode GEMV, 24%.
+            //
+            // ONLY THIS (DENSE) LOADER PERMUTES. MoE experts come through
+            // `escha::load_escha_moe_experts` and stay kt-major, which is why
+            // the kernels take an `nt_major` flag rather than assuming a
+            // layout — the dense call sites pass `true`, MoE passes `false`.
+            //
+            // At LOAD, not in the converter, so the payload stays verbatim
+            // from upstream: no re-convert, no re-upload, no format version.
+            // Whole tiles move and their contents are untouched, so every
+            // decoded weight is identical. Gated on mean KLD = 0.000000.
+            let permuted = escha_tiles_to_nt_major(data, m, k, quant_type)?;
+            let buf = gpu.upload_raw(&permuted, &[permuted.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: if quant_type == 42 {
@@ -5102,4 +5120,42 @@ pub(crate) fn load_moe_ffn(
         ep_dummy_buffers,
         escha: escha_tables,
     })
+}
+
+/// Transpose an escha code blob's TILE GRID from the checkpoint's
+/// `[ic/16][oc/16]` (kt-major) to `[oc/16][ic/16]` (nt-major). See the call
+/// site. Moves whole tiles only, so it is bit-exact by construction.
+fn escha_tiles_to_nt_major(data: &[u8], m: usize, k: usize, quant_type: u8) -> HipResult<Vec<u8>> {
+    let tk = if quant_type == 42 { 2usize } else { 3usize };
+    if m % 16 != 0 || k % 16 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("escha code: m={m} k={k}; both must be multiples of 16"),
+        ));
+    }
+    let (ktiles, ntiles) = (k / 16, m / 16);
+    let tile_bytes = 16 * tk * 2;
+    let grid = ktiles * ntiles * tile_bytes;
+    if grid == 0 || data.len() % grid != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "escha code: {} bytes is not a whole number of {grid}-byte grids \
+                 (ktiles={ktiles} ntiles={ntiles})",
+                data.len()
+            ),
+        ));
+    }
+    let mut out = vec![0u8; data.len()];
+    for e in 0..(data.len() / grid) {
+        let base = e * grid;
+        for kt in 0..ktiles {
+            for nt in 0..ntiles {
+                let src = base + (kt * ntiles + nt) * tile_bytes;
+                let dst = base + (nt * ktiles + kt) * tile_bytes;
+                out[dst..dst + tile_bytes].copy_from_slice(&data[src..src + tile_bytes]);
+            }
+        }
+    }
+    Ok(out)
 }

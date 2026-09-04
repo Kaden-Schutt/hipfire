@@ -426,20 +426,22 @@ pub fn load_escha_moe_experts(
     };
 
     let (mut gate_ups, gate_up_owner) = decode_projection(
-        hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store, resolve, escha_leaf)?;
-    let (mut downs, down_owner) =
-        match decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve, escha_leaf) {
-            Ok(ok) => ok,
-            Err(error) => {
-                // The gate_up blob is already on the device and its per-expert
-                // views are about to be dropped without ever reaching a
-                // caller, so nothing else can free it. Return it here or the
-                // whole projection (544 MiB at A3B shapes) leaks on every
-                // failed layer load.
-                let _ = gpu.free_tensor(gate_up_owner);
-                return Err(error);
-            }
-        };
+        hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store, resolve, escha_leaf,
+    )?;
+    let (mut downs, down_owner) = match decode_projection(
+        hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve, escha_leaf,
+    ) {
+        Ok(ok) => ok,
+        Err(error) => {
+            // The gate_up blob is already on the device and its per-expert
+            // views are about to be dropped without ever reaching a
+            // caller, so nothing else can free it. Return it here or the
+            // whole projection (544 MiB at A3B shapes) leaks on every
+            // failed layer load.
+            let _ = gpu.free_tensor(gate_up_owner);
+            return Err(error);
+        }
+    };
 
     let experts = gate_ups
         .drain(..)
@@ -607,7 +609,16 @@ impl EschaProj {
         } else {
             rdna_compute::EschaXGroup::PerSlot
         };
-        gpu.escha_h128_batched("escha_h128_in_batched", x, &self.rin, ids, xh, ic, slots, xg)?;
+        gpu.escha_h128_batched(
+            "escha_h128_in_batched",
+            x,
+            &self.rin,
+            ids,
+            xh,
+            ic,
+            slots,
+            xg,
+        )?;
         match grouped {
             // BATCHED: one group holding every slot. The indexed GEMV re-reads
             // the weight ONCE PER SLOT — correct for MoE, where each slot is a
@@ -616,13 +627,15 @@ impl EschaProj {
             // it once per (layer, batch) instead, which is the same fix that
             // took the 35B's expert path from 4.525 to 2.657 ms/token.
             Some((offsets, iota)) if slots > 1 => {
+                // nt_major = true: dense escha codes are transposed at load
+                // by `escha_tiles_to_nt_major`. MoE experts stay kt-major.
                 gpu.escha_gemm_native_moe_grouped_wmma(
-                    &self.ptr0, offsets, iota, xh, mid, oc, ic, slots, 1, tk,
+                    &self.ptr0, offsets, iota, xh, mid, oc, ic, slots, 1, tk, true,
                 )?;
             }
             _ => {
                 gpu.escha_gemv_native_moe_k8_indexed_batched(
-                    &self.ptr0, ids, xh, mid, oc, ic, slots, tk,
+                    &self.ptr0, ids, xh, mid, oc, ic, slots, tk, true,
                 )?;
             }
         }
@@ -656,7 +669,13 @@ pub fn load_escha_proj(
     }
     let (ic, oc) = (w.k, w.m);
     let rin = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rin_eff"), ic, resolve)?;
-    let rout = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rout_eff"), oc, resolve)?;
+    let rout = read_f32_tensor(
+        hfq,
+        gpu,
+        &escha_dense_leaf(p, proj, "rout_eff"),
+        oc,
+        resolve,
+    )?;
     let addr = w.buf.buf.as_ptr() as u64;
     let ptr0 = gpu.upload_raw(&addr.to_le_bytes(), &[1])?;
     Ok(Some(EschaProj { rin, rout, ptr0 }))
@@ -700,7 +719,13 @@ pub fn load_escha_dense_linear(
     }
     let w = ws.remove(0);
     let rin = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rin_eff"), ic, resolve)?;
-    let rout = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rout_eff"), oc, resolve)?;
+    let rout = read_f32_tensor(
+        hfq,
+        gpu,
+        &escha_dense_leaf(p, proj, "rout_eff"),
+        oc,
+        resolve,
+    )?;
 
     // Bias is OPTIONAL by the leaf contract (§1.4): an export without the
     // end-to-end stage ships none and must still load. So absence is not an
@@ -817,7 +842,7 @@ pub fn escha_dense_linear_forward(
                 }
             };
             gpu.escha_gemv_native_moe_k8_indexed_batched(
-                ptr0, &lin.ids0, xh, mid, oc, ic, 1, tk,
+                ptr0, &lin.ids0, xh, mid, oc, ic, 1, tk, true,
             )?;
         }
         // Plain `weight_gemv`, NOT `weight_gemv_prerotated`. The decoded
@@ -848,7 +873,9 @@ fn read_bias_f32(gpu: &mut Gpu, qt: u8, data: &[u8], oc: usize) -> HipResult<Gpu
     match qt {
         1 => {
             for c in data.chunks_exact(2) {
-                v.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])));
+                v.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    c[0], c[1],
+                ])));
             }
         }
         _ => {
@@ -860,7 +887,6 @@ fn read_bias_f32(gpu: &mut Gpu, qt: u8, data: &[u8], oc: usize) -> HipResult<Gpu
     v.truncate(oc);
     gpu.upload_f32(&v, &[oc])
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn decode_projection(
