@@ -166,10 +166,14 @@ impl Default for ArchCaps {
 
 /// Request-derived flags for [`is_batch_eligible`] style checks.
 ///
-/// The daemon builds this from the incoming JSON, `LoadedModel` topology
-/// (`pp`, `ep`), and feature flags (`speculator`, `kv_adaptive`,
-/// `eviction`, `pflash`). `ArchCaps` is passed separately — the function
-/// never inspects an identifier.
+/// Consumed by `hipfire_engine::scheduler::is_batch_eligible` together with
+/// [`ArchCaps`]: each field snapshots one request/topology input (`pp`,
+/// `ep`, image/tools/stop payloads, `speculator`/`kv_adaptive`/`pflash`
+/// activity, single-user history, think mode, continuous-batch opt-in and
+/// size). Nothing in production constructs this struct today — it is built
+/// in unit tests; the daemon's live request path decides through
+/// `hipfire_generate::batch::is_batch_request_eligible`, which reads the
+/// JSON message and `LoadedModel` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchEligibilityRequest {
     /// Pipeline-parallel degree from `LoadedModel::pp`.

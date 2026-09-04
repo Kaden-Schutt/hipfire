@@ -32,7 +32,7 @@
 //! tokenization-compatible).
 //!
 //! Usage:
-//!   cargo run --release -p hipfire-runtime --example imatrix_collect -- \
+//!   cargo run --release -p saddle-lab --example imatrix_collect -- \
 //!       --bf16-gguf <path-to-bf16.gguf> \
 //!       --corpus    <path-to-calibration-corpus.txt> \
 //!       --output    <path-to-output.imatrix.gguf> \

@@ -170,6 +170,12 @@ comments first.
 
 No-GPU CI green never substitutes for hw-gate or for a required manual route. hw-gate green does not create an admission or skip claim-specific oracles named below.
 
+Branch protection requires the no-GPU workflow's checks by exact CI job
+name: `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, and
+`gates (ratchets, layering, registers)` (all in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). `hw-gate` is
+the hardware rung — currently advisory, planned required.
+
 ### Automatic entrypoints
 
 | Route | Path | Role |

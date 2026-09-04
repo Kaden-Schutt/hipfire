@@ -5,7 +5,7 @@
 
 ## Purpose
 
-Model-agnostic REAP: selective expert pruning + (SP2) selective re-quant overlay for MoE models. Owns `gather` (per-expert importance), `plan` (`ExpertPlan`), `hook` (`ReapArchHook`), `load`/`source` overlay applied at load. Spec is `docs/superpowers/specs/2026-06-11-generic-moe-reap-design.md`. The `//!` docs in [`src/lib.rs`](src/lib.rs) are the crate entry point.
+Model-agnostic REAP: selective expert pruning + (SP2) selective re-quant overlay for MoE models. Owns `gather` (first-axis byte row-gather of kept rows for keep maps), `plan` (`ExpertPlan`), `hook` (`ReapArchHook`), `load`/`source` overlay applied at load. Spec is `docs/superpowers/specs/2026-06-11-generic-moe-reap-design.md`. The `//!` docs in [`src/lib.rs`](src/lib.rs) are the crate entry point.
 
 ## Gotchas
 
