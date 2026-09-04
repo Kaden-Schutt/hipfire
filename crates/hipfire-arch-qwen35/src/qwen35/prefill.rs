@@ -4653,6 +4653,7 @@ fn batch_chunk_delta_net_output_projection(
     // instead of gated_norm_f32 + mq_rotate_x + convert.
     if s4_residual_fast(gpu, fusion, layer.wo.gpu_dtype, &epilogue, n)
         && config.linear_value_head_dim == 128
+        && n_v_heads * config.linear_value_head_dim == layer.wo.k
     {
         let k = layer.wo.k;
         let m = layer.wo.m;
