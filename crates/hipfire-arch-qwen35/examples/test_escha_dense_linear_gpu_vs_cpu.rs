@@ -119,6 +119,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("bias: absent (optional leaf)");
     }
 
+    // ── FOLD CHECK ───────────────────────────────────────────────────────
+    // Can the two H128s and both diagonals be folded into the weight, so an
+    // escha dense linear becomes an ORDINARY weight that every existing fused
+    // path can consume untouched? The algebra says yes:
+    //
+    //   mid = W^T xh,  xh = RS*H*diag(rin)*x,  y = RS*diag(rout)*H*mid
+    //   =>  W_eff[i][o] = RS^2 * rin_i * (H W H)[i][o] * rout_o
+    //
+    // The only deviation from the reference is that folding SKIPS the fp16
+    // rounding of xh, so it should land at or slightly better than the
+    // runtime path — not worse. If this holds, the 27B needs no forward-path
+    // changes at all.
+    {
+        const RS: f32 = 0.088_388_347_648;
+        let mut wf: Vec<f32> = w_bits
+            .iter()
+            .map(|&b| hipfire_runtime::llama::f16_to_f32(b))
+            .collect();
+        // H along the contiguous o-axis (each of the ic rows, length oc).
+        for row in wf.chunks_exact_mut(oc) {
+            hipfire_quantize::escha_ref::h128_inplace(row);
+        }
+        // H along the strided i-axis (each of the oc columns, stride oc).
+        let mut col = vec![0.0f32; ic];
+        for o in 0..oc {
+            for i in 0..ic {
+                col[i] = wf[i * oc + o];
+            }
+            hipfire_quantize::escha_ref::h128_inplace(&mut col);
+            for i in 0..ic {
+                wf[i * oc + o] = col[i];
+            }
+        }
+        // Both diagonals and RS^2.
+        for i in 0..ic {
+            let s = RS * RS * rin[i];
+            for o in 0..oc {
+                wf[i * oc + o] *= s * rout[o];
+            }
+        }
+        // Plain matmul, no transforms at all.
+        let mut y_fold = vec![0.0f32; oc];
+        for i in 0..ic {
+            let a = x[i];
+            let row = &wf[i * oc..(i + 1) * oc];
+            for (m, w) in y_fold.iter_mut().zip(row) {
+                *m += a * w;
+            }
+        }
+        if let Some((info, d)) = find(&hfq, &bias_name) {
+            let b: Vec<f32> = match info.quant_type {
+                1 => d
+                    .chunks_exact(2)
+                    .map(|c| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+                _ => d
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            };
+            for (yi, bi) in y_fold.iter_mut().zip(b.iter()) {
+                *yi += bi;
+            }
+        }
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in y_fold.iter().zip(y_ref.iter()) {
+            let d = (*a - *b) as f64;
+            num += d * d;
+            den += (*b as f64) * (*b as f64);
+        }
+        println!(
+            "  FOLDED (rotations baked into the weight, no runtime transform): rel_rms {:.3e}",
+            (num / den.max(1e-30)).sqrt()
+        );
+    }
+
     // ── GPU ──────────────────────────────────────────────────────────────
     // F16 store: the decode to fp16 is exact, so any difference is the
     // forward path rather than a re-quantisation. Q8_0 is reported after.
