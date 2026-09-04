@@ -1208,6 +1208,28 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
     }
 }
 
+/// S4-f16-residual-inputs: batched AWQ-aware `fused_silu_mul_rotate_mq`
+/// writing the frozen F16 sidecar directly (no F32 `x_rot`, no convert).
+/// The `down_proj_weight` selects the plain vs AWQ kernel exactly like
+/// [`fused_silu_mul_rotate_mq_batched_for`]; `x_rot_f16` must be DType::F16.
+///
+/// Byte-identical to the F32 producer followed by `convert_f32_to_f16`.
+pub fn fused_silu_mul_rotate_mq_f16_batched_for(
+    gpu: &mut Gpu,
+    down_proj_weight: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot_f16: &GpuTensor,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
+        gpu.fused_silu_mul_rotate_mq_awq_f16_batched(gate, up, awq, x_rot_f16, k, batch_size)
+    } else {
+        gpu.fused_silu_mul_rotate_mq_f16_batched(gate, up, x_rot_f16, k, batch_size)
+    }
+}
+
 /// GEMV with optional pre-rotated x for MagnumQuant weights.
 ///
 /// - MQ4 + `x_rot = Some(..)`: calls the arch-tuned HFQ4 GEMV on the pre-rotated buffer,

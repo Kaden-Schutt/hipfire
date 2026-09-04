@@ -25,6 +25,7 @@ mod kernels;
 pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;
+pub mod mq_f16_residual_producers;
 pub mod norm;
 pub mod pool;
 pub mod profile;
