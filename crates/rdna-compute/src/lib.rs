@@ -9,6 +9,7 @@ pub mod attention;
 pub mod cdna;
 mod compiler;
 mod dispatch;
+pub mod dflash_hidden_scatter;
 pub mod embedding;
 pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
