@@ -28036,33 +28036,35 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
-        // Exact gfx1100 DFlash verify tier: slab-synchronized X-in-LDS for
-        // N<=16, where the base kernel (one wave32 per 16x16 tile) launches
-        // too few waves to cover 96 CUs. Capture-SAFE (unlike the mw_lds tier
-        // below): the kernel is deterministic (fixed wave-order LDS reduction,
-        // no atomics), launches via launch_maybe_blob (blob ABI recorded under
-        // capture), and its symbol carries the replay.rs kernarg contract, so
-        // verify-graph capture bakes xlds and every replayed cycle keeps the
-        // win. Only Redline tape recording keeps the base contract.
-        // Kill switches: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables the whole tier
-        // (flags.residual_ksplit_off) and restores the base oracle;
-        // HIPFIRE_RESIDUAL_XLDS_OFF=1 drops back to the ks table
-        // (flags.residual_xlds_off, ks4 for the verify shapes). The ldsstage
-        // kernel (gfx1100 port of the gfx12 ldsstage design, opt-in via
-        // HIPFIRE_RESIDUAL_LDSSTAGE=1 wherever K % 512 == 0) stays as a
-        // measurement reference behind xlds. xlds is the default wherever
-        // K % 512 == 0 (both verify shapes qualify): it stages each 512-K
-        // slab's 16x512 fp16 X tile cooperatively in LDS so the WMMA loop's B
-        // operands come from ds_load with no vmcnt drain between WMMAs (ISA
-        // gate), removing the ~1,600 per-launch X drains that cap every ks
-        // variant at ~50% of roofline.
+        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
+        // base kernel (one wave32 per 16x16 tile) launches too few waves to
+        // cover 96 CUs. Capture-SAFE (unlike the mw_lds tier below): the
+        // kernel is deterministic (fixed wave-order LDS reduction, no
+        // atomics), launches via launch_maybe_blob (blob ABI recorded under
+        // capture), and its symbols carry the replay.rs kernarg contract, so
+        // verify-graph capture bakes ks4_lds and every replayed cycle keeps
+        // the win. Only Redline tape recording keeps the base contract.
+        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables the whole tier
+        // (flags.residual_ksplit_off) and restores the base oracle. The
+        // ldsstage kernel (gfx1100 port of the gfx12 ldsstage design, opt-in
+        // via HIPFIRE_RESIDUAL_LDSSTAGE=1 wherever K % 512 == 0) stays as a
+        // measurement reference, as does the xlds kernel (slab-synchronized
+        // X-in-LDS, opt-in via HIPFIRE_RESIDUAL_XLDS=1 wherever K % 512 == 0;
+        // HIPFIRE_RESIDUAL_XLDS_OFF=1 forces ks even when opted in). xlds
+        // passes the ISA gate (zero vmcnt between slab WMMAs, B from ds_load)
+        // but benches ~2-2.5x slower than ks4 on hipx, so ks stays the
+        // default until the per-slab barrier/occupancy cost is addressed.
         if !self.replay.is_recording()
             && !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && batch_size <= 16
         {
-            if !self.flags.residual_xlds_off && k % 512 == 0 && k > 0 {
+            if self.flags.residual_xlds
+                && !self.flags.residual_xlds_off
+                && k % 512 == 0
+                && k > 0
+            {
                 return self.gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
                     a_raw, x, y, m, k, batch_size,
                 );
@@ -28567,8 +28569,11 @@ impl Gpu {
         }
         result
     }
+
     /// MQ4V2 gfx1100 slab-synchronized X-in-LDS residual — DFlash verify tier
-    /// (N<=16) default wherever K % 512 == 0.
+    /// (N<=16) opt-in via HIPFIRE_RESIDUAL_XLDS=1 wherever K % 512 == 0.
+    /// (Was briefly the tier default; reverted — see tier comment: ~2-2.5x
+    /// slower than ks4 on hipx. Kept as a measurement reference.)
     ///
     /// One 16x16 output tile per 8-wave block; each 512-K slab's 16x512 fp16 X
     /// tile is staged cooperatively in LDS (16 KiB) and each wave consumes its
