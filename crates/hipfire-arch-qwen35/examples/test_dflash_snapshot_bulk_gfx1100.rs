@@ -57,13 +57,7 @@ fn pattern(fam: u8, layer: usize, len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-fn alloc_fam(
-    gpu: &mut Gpu,
-    bytes: usize,
-    dtype: DType,
-    fam: u8,
-    seed: u64,
-) -> Vec<GpuTensor> {
+fn alloc_fam(gpu: &mut Gpu, bytes: usize, dtype: DType, fam: u8, seed: u64) -> Vec<GpuTensor> {
     let mut out = Vec::with_capacity(N_LAYERS);
     for layer in 0..N_LAYERS {
         let buf = gpu.hip.malloc(bytes).expect("malloc family tensor");
@@ -170,8 +164,14 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
         .expect("canary fill");
     let check_canary = |gpu: &Gpu, where_: &str| {
         let mut host = vec![0u8; 4096];
-        gpu.hip.memcpy_dtoh(&mut host, &canary).expect("canary read");
-        assert_eq!(host, vec![0xA5u8; 4096], "{tag}: canary clobbered ({where_})");
+        gpu.hip
+            .memcpy_dtoh(&mut host, &canary)
+            .expect("canary read");
+        assert_eq!(
+            host,
+            vec![0xA5u8; 4096],
+            "{tag}: canary clobbered ({where_})"
+        );
     };
 
     // 1. save(P) -> poison(Q) -> restore -> live==P: backup held P, and the
@@ -196,7 +196,8 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
         .expect("save_from_async_on");
     gpu.hip.stream_synchronize(&stream).expect("stream sync");
     poison_state(gpu, &state, 0x55);
-    snap.restore_to(&mut state, gpu).expect("restore after async");
+    snap.restore_to(&mut state, gpu)
+        .expect("restore after async");
     expect_live(gpu, tag, "live-after-async-restore", &state, 0x44);
     check_canary(gpu, "async-save");
 
@@ -205,7 +206,8 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
     // original live state to it (fallback/fast interop).
     let state2 = make_state(gpu, ef_on, 0x99);
     snap.save_from(&state2, gpu).expect("alien save_from");
-    snap.restore_to(&mut state, gpu).expect("restore after alien");
+    snap.restore_to(&mut state, gpu)
+        .expect("restore after alien");
     expect_live(gpu, tag, "live-after-alien-restore", &state, 0x99);
     check_canary(gpu, "alien");
     state2.free_gpu(gpu);

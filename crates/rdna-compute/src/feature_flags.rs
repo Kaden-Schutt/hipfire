@@ -627,8 +627,7 @@ impl FeatureFlags {
                 == Some("1"),
             mq_f16_projection_off: value("HIPFIRE_MQ_F16_PROJECTION_OFF").ok().as_deref()
                 == Some("1"),
-            mq_f16_residual_off: value("HIPFIRE_MQ_F16_RESIDUAL_OFF").ok().as_deref()
-                == Some("1"),
+            mq_f16_residual_off: value("HIPFIRE_MQ_F16_RESIDUAL_OFF").ok().as_deref() == Some("1"),
             gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
             fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
             draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),

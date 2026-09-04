@@ -8,10 +8,10 @@
 use super::batch::valid_lane_mask;
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::MaskEmbedOverride;
 use super::config::Qwen35Config;
-use super::config::DflashFusionCtx;
 use super::config::TreeVerifyCtx;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
@@ -4386,7 +4386,6 @@ fn batch_chunk_delta_net_input_projection(
         )?;
     }
     Ok(())
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4606,7 +4605,6 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
     Ok(tree_parents)
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4694,14 +4692,7 @@ fn batch_chunk_delta_net_output_projection(
                     n,
                 )?;
                 let x_f16 = pbs.dn_normed_rot_f16_batch.sub_offset(0, n * k);
-                gpu.gemm_mq4g256v2_residual_wmma_f16(
-                    &layer.wo.buf,
-                    &x_f16,
-                    &pbs.x_batch,
-                    m,
-                    k,
-                    n,
-                )?;
+                gpu.gemm_mq4g256v2_residual_wmma_f16(&layer.wo.buf, &x_f16, &pbs.x_batch, m, k, n)?;
                 return Ok(());
             }
         }
@@ -4764,7 +4755,6 @@ fn batch_chunk_delta_net_output_projection(
         arch_has_wmma,
     )?;
     Ok(())
-
 }
 
 pub(crate) fn batch_chunk_delta_net_attn(
@@ -4804,7 +4794,24 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // is wired in a separate PR (issue #182).
     batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
-    let tree_parents = batch_chunk_delta_net_pre_gdn(gpu, layer, config, pbs, dn_state, n, k_dim, v_dim, n_v_heads, hd, batch_semantics, tree_verify, gdn_tape, tape_offset, delta_layer_idx, fusion)?;
+    let tree_parents = batch_chunk_delta_net_pre_gdn(
+        gpu,
+        layer,
+        config,
+        pbs,
+        dn_state,
+        n,
+        k_dim,
+        v_dim,
+        n_v_heads,
+        hd,
+        batch_semantics,
+        tree_verify,
+        gdn_tape,
+        tape_offset,
+        delta_layer_idx,
+        fusion,
+    )?;
 
     // Gated Delta Net — tree variant reads per-token S from
     // s_tape[parent] (or pre-block s_q8_init at root); linear
@@ -4971,7 +4978,18 @@ pub(crate) fn batch_chunk_delta_net_attn(
         }
     }
 
-    batch_chunk_delta_net_output_projection(gpu, layer, config, pbs, n, n_v_heads, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
+    batch_chunk_delta_net_output_projection(
+        gpu,
+        layer,
+        config,
+        pbs,
+        n,
+        n_v_heads,
+        q8_wmma_arch,
+        arch_has_wmma,
+        epilogue,
+        fusion,
+    )?;
 
     Ok(())
 }
@@ -5190,7 +5208,6 @@ fn batch_chunk_delta_net_ffn_gate_up(
         )?;
     }
     Ok(())
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5283,7 +5300,6 @@ fn batch_chunk_delta_net_ffn_down(
         arch_has_wmma,
     )?;
     Ok(())
-
 }
 
 pub(crate) fn batch_chunk_delta_net_ffn(
@@ -5301,7 +5317,17 @@ pub(crate) fn batch_chunk_delta_net_ffn(
 ) -> HipResult<()> {
     batch_chunk_delta_net_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
-    batch_chunk_delta_net_ffn_down(gpu, layer, pbs, hidden_dim, n, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
+    batch_chunk_delta_net_ffn_down(
+        gpu,
+        layer,
+        pbs,
+        hidden_dim,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+        epilogue,
+        fusion,
+    )?;
 
     Ok(())
 }
@@ -5576,7 +5602,6 @@ fn batch_chunk_full_attn_input_projection(
         batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
     }
     Ok(())
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5618,10 +5643,8 @@ fn batch_chunk_full_attn_prepare(
     } else {
         &pbs.positions
     };
-    let fa_prep_shape_ok = matches!(
-        (config.n_heads, config.n_kv_heads),
-        (16, 2) | (24, 4)
-    ) && config.head_dim == 256
+    let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
+        && config.head_dim == 256
         && fa_prep_n_rot == 64;
     let fa_prep_fused_ok = fusion == DflashFusionCtx::ChainVerify
         && gpu.arch_caps.is_gfx1100()
@@ -5647,98 +5670,98 @@ fn batch_chunk_full_attn_prepare(
             n,
         )?;
     } else {
-    // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
-    gpu.deinterleave_f32_batched(
-        &pbs.fa_q_full_batch,
-        &pbs.fa_q_batch,
-        &pbs.fa_gate_batch,
-        config.n_heads,
-        config.head_dim,
-        n,
-    )?;
-
-    // 4. Per-head Q/K rmsnorm. rmsnorm_batched uses batch =
-    // number of "rows" of head_dim. For [N × n_heads × head_dim]
-    // that's batch = N * n_heads.
-    gpu.rmsnorm_batched(
-        &pbs.fa_q_batch,
-        &layer.q_norm,
-        &pbs.fa_q_batch,
-        n * config.n_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-    gpu.rmsnorm_batched(
-        &pbs.fa_k_batch,
-        &layer.k_norm,
-        &pbs.fa_k_batch,
-        n * config.n_kv_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-
-    if hipfire_runtime::triattn::tap_enabled() {
-        // Try GPU path first: dispatches a reduce kernel on the
-        // device-resident Q tensor, zero PCIe transfer. Only
-        // succeeds when install_tap_gpu() was used. Falls through
-        // to CPU path otherwise.
-        let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
-            gpu,
-            layer_idx,
-            &pbs.fa_q_batch.buf,
-            n,
+        // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
+        gpu.deinterleave_f32_batched(
+            &pbs.fa_q_full_batch,
+            &pbs.fa_q_batch,
+            &pbs.fa_gate_batch,
             config.n_heads,
             config.head_dim,
+            n,
         )?;
-        if !gpu_handled {
-            let n_q = config.n_heads * config.head_dim;
-            let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-            if hipfire_runtime::triattn::tap_needs_k() {
-                let n_k = config.n_kv_heads * config.head_dim;
-                let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                for b in 0..n {
-                    hipfire_runtime::triattn::record_prerope_qk(
-                        layer_idx,
-                        &q_cpu[b * n_q..(b + 1) * n_q],
-                        Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                    );
-                }
-            } else {
-                for b in 0..n {
-                    hipfire_runtime::triattn::record_prerope_q(
-                        layer_idx,
-                        &q_cpu[b * n_q..(b + 1) * n_q],
-                    );
+
+        // 4. Per-head Q/K rmsnorm. rmsnorm_batched uses batch =
+        // number of "rows" of head_dim. For [N × n_heads × head_dim]
+        // that's batch = N * n_heads.
+        gpu.rmsnorm_batched(
+            &pbs.fa_q_batch,
+            &layer.q_norm,
+            &pbs.fa_q_batch,
+            n * config.n_heads,
+            config.head_dim,
+            config.norm_eps,
+        )?;
+        gpu.rmsnorm_batched(
+            &pbs.fa_k_batch,
+            &layer.k_norm,
+            &pbs.fa_k_batch,
+            n * config.n_kv_heads,
+            config.head_dim,
+            config.norm_eps,
+        )?;
+
+        if hipfire_runtime::triattn::tap_enabled() {
+            // Try GPU path first: dispatches a reduce kernel on the
+            // device-resident Q tensor, zero PCIe transfer. Only
+            // succeeds when install_tap_gpu() was used. Falls through
+            // to CPU path otherwise.
+            let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
+                gpu,
+                layer_idx,
+                &pbs.fa_q_batch.buf,
+                n,
+                config.n_heads,
+                config.head_dim,
+            )?;
+            if !gpu_handled {
+                let n_q = config.n_heads * config.head_dim;
+                let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                if hipfire_runtime::triattn::tap_needs_k() {
+                    let n_k = config.n_kv_heads * config.head_dim;
+                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                    for b in 0..n {
+                        hipfire_runtime::triattn::record_prerope_qk(
+                            layer_idx,
+                            &q_cpu[b * n_q..(b + 1) * n_q],
+                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                        );
+                    }
+                } else {
+                    for b in 0..n {
+                        hipfire_runtime::triattn::record_prerope_q(
+                            layer_idx,
+                            &q_cpu[b * n_q..(b + 1) * n_q],
+                        );
+                    }
                 }
             }
         }
-    }
 
-    // 5. Batched partial-interleaved RoPE (per-row positions).
-    // pos_offset = compact_offset so new Q/K rotate at ABSOLUTE phase
-    // after eviction (cached keys are absolute-phased); pbs.positions
-    // stays physical for the KV-write below. 0 when no compaction.
-    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    // 39aa358: in DDTree verify, rotate at DEPTH positions (correct
-    // sibling phases); KV writes below still use flat physical
-    // slots. Linear path unchanged.
-    let rope_pos_buf = if tree_verify.is_some() {
-        &pbs.rope_positions
-    } else {
-        &pbs.positions
-    };
-    gpu.rope_partial_interleaved_f32_batched(
-        &pbs.fa_q_batch,
-        &pbs.fa_k_batch,
-        rope_pos_buf,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-        n,
-        kv_cache.compact_offset as i32,
-    )?;
+        // 5. Batched partial-interleaved RoPE (per-row positions).
+        // pos_offset = compact_offset so new Q/K rotate at ABSOLUTE phase
+        // after eviction (cached keys are absolute-phased); pbs.positions
+        // stays physical for the KV-write below. 0 when no compaction.
+        let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        // 39aa358: in DDTree verify, rotate at DEPTH positions (correct
+        // sibling phases); KV writes below still use flat physical
+        // slots. Linear path unchanged.
+        let rope_pos_buf = if tree_verify.is_some() {
+            &pbs.rope_positions
+        } else {
+            &pbs.positions
+        };
+        gpu.rope_partial_interleaved_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            rope_pos_buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            kv_cache.compact_offset as i32,
+        )?;
     }
 
     // 6–7. Batched KV write + flash attention (via dispatch).
@@ -5807,7 +5830,6 @@ fn batch_chunk_full_attn_prepare(
             .map_err(|e| HipError::new(0, &e.to_string()))?;
     }
     Ok(())
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5863,14 +5885,7 @@ fn batch_chunk_full_attn_output_projection(
                     n,
                 )?;
                 let x_f16 = pbs.fa_attn_out_rot_f16_batch.sub_offset(0, n * k);
-                gpu.gemm_mq4g256v2_residual_wmma_f16(
-                    &layer.wo.buf,
-                    &x_f16,
-                    &pbs.x_batch,
-                    m,
-                    k,
-                    n,
-                )?;
+                gpu.gemm_mq4g256v2_residual_wmma_f16(&layer.wo.buf, &x_f16, &pbs.x_batch, m, k, n)?;
                 return Ok(());
             }
         }
@@ -5919,7 +5934,6 @@ fn batch_chunk_full_attn_output_projection(
         arch_has_wmma,
     )?;
     Ok(())
-
 }
 
 pub(crate) fn batch_chunk_full_attn_attn(
@@ -5950,9 +5964,34 @@ pub(crate) fn batch_chunk_full_attn_attn(
     let q_dim = config.n_heads * config.head_dim;
     batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
-    batch_chunk_full_attn_prepare(gpu, layer, config, pbs, s, kv_cache, n, start_pos, max_ctx_len, ctx, batch_semantics, tree_verify, kv_layer_idx, layer_idx, fusion)?;
+    batch_chunk_full_attn_prepare(
+        gpu,
+        layer,
+        config,
+        pbs,
+        s,
+        kv_cache,
+        n,
+        start_pos,
+        max_ctx_len,
+        ctx,
+        batch_semantics,
+        tree_verify,
+        kv_layer_idx,
+        layer_idx,
+        fusion,
+    )?;
 
-    batch_chunk_full_attn_output_projection(gpu, layer, pbs, n, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
+    batch_chunk_full_attn_output_projection(
+        gpu,
+        layer,
+        pbs,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+        epilogue,
+        fusion,
+    )?;
 
     Ok(())
 }
@@ -6167,7 +6206,6 @@ fn batch_chunk_full_attn_ffn_gate_up(
         )?;
     }
     Ok(())
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6252,7 +6290,6 @@ fn batch_chunk_full_attn_ffn_down(
         arch_has_wmma,
     )?;
     Ok(())
-
 }
 
 pub(crate) fn batch_chunk_full_attn_ffn(
@@ -6269,7 +6306,17 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     batch_chunk_full_attn_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
-    batch_chunk_full_attn_ffn_down(gpu, layer, pbs, hidden_dim, n, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
+    batch_chunk_full_attn_ffn_down(
+        gpu,
+        layer,
+        pbs,
+        hidden_dim,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+        epilogue,
+        fusion,
+    )?;
 
     Ok(())
 }

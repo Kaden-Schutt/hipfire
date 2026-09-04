@@ -47,3 +47,33 @@ required-features = ["deltanet"]
 name = "test_dflash_gdn_pre_gfx1100"
 path = "examples/test_dflash_gdn_pre_gfx1100.rs"
 required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_draft_collapse_gfx1100"
+path = "examples/test_dflash_draft_collapse_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_hidden_scatter_gfx1100"
+path = "examples/test_dflash_hidden_scatter_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_snapshot_bulk_gfx1100"
+path = "examples/test_dflash_snapshot_bulk_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_mq_f16_projection_producers_gfx1100"
+path = "examples/test_mq_f16_projection_producers_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_mq_f16_residual_producers_gfx1100"
+path = "examples/test_mq_f16_residual_producers_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_qwen35_fa_batch_fusion_gfx1100"
+path = "examples/test_qwen35_fa_batch_fusion_gfx1100.rs"
+required-features = ["deltanet"]

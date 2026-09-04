@@ -1160,7 +1160,13 @@ pub fn fused_rmsnorm_rotate_mq_f16_batched_for(
 ) -> HipResult<()> {
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.fused_rmsnorm_rotate_mq_awq_f16_batched(
-            x, norm_weight, awq, x_rot_f16, k, eps, batch_size,
+            x,
+            norm_weight,
+            awq,
+            x_rot_f16,
+            k,
+            eps,
+            batch_size,
         )
     } else {
         gpu.fused_rmsnorm_rotate_mq_f16_batched(x, norm_weight, x_rot_f16, k, eps, batch_size)

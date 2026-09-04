@@ -139,29 +139,25 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 fn htod_f32(gpu: &Gpu, dst: &GpuTensor, host: &[f32]) {
     assert_eq!(dst.numel(), host.len());
     gpu.hip
-        .memcpy_htod(
-            &dst.buf,
-            unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) },
-        )
+        .memcpy_htod(&dst.buf, unsafe {
+            std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
+        })
         .expect("htod f32");
 }
 
 fn dtoh_bytes(gpu: &Gpu, src: &GpuTensor) -> Vec<u8> {
     let n_bytes = src.numel() * src.dtype.size();
     let mut out = vec![0u8; n_bytes];
-    gpu.hip
-        .memcpy_dtoh(&mut out, &src.buf)
-        .expect("dtoh bytes");
+    gpu.hip.memcpy_dtoh(&mut out, &src.buf).expect("dtoh bytes");
     out
 }
 
 fn fill_f32_quiet_nan(gpu: &mut Gpu, tensor: &GpuTensor, payload_bits: u32) {
     let host: Vec<u32> = vec![payload_bits; tensor.numel()];
     gpu.hip
-        .memcpy_htod(
-            &tensor.buf,
-            unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) },
-        )
+        .memcpy_htod(&tensor.buf, unsafe {
+            std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
+        })
         .expect("htod fill quiet NaN");
     gpu.hip.device_synchronize().expect("sync fill");
 }
@@ -233,21 +229,25 @@ fn main() {
                 let x_host: Vec<f32> = (0..n * k)
                     .map(|i| {
                         let v = prng(i, 0xF16_0000 + n as u32) * 8.0 - 4.0;
-                        if i < k { v * 16.0 } else { v }
+                        if i < k {
+                            v * 16.0
+                        } else {
+                            v
+                        }
                     })
                     .collect();
-                let w_host: Vec<f32> = (0..k)
-                    .map(|i| 0.8 + 0.4 * prng(i, 0x9E37_0001))
-                    .collect();
-                let a_host: Vec<f32> = (0..k)
-                    .map(|i| 0.5 + 1.5 * prng(i, 0xA9A9_0002))
-                    .collect();
+                let w_host: Vec<f32> = (0..k).map(|i| 0.8 + 0.4 * prng(i, 0x9E37_0001)).collect();
+                let a_host: Vec<f32> = (0..k).map(|i| 0.5 + 1.5 * prng(i, 0xA9A9_0002)).collect();
 
                 let d_x = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc x");
                 let d_w = gpu.alloc_tensor(&[k], DType::F32).expect("alloc w");
                 let d_awq = gpu.alloc_tensor(&[k], DType::F32).expect("alloc awq");
-                let d_rot_f32 = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc rot f32");
-                let d_oracle_f16 = gpu.alloc_tensor(&[n * k], DType::F16).expect("alloc oracle");
+                let d_rot_f32 = gpu
+                    .alloc_tensor(&[n * k], DType::F32)
+                    .expect("alloc rot f32");
+                let d_oracle_f16 = gpu
+                    .alloc_tensor(&[n * k], DType::F16)
+                    .expect("alloc oracle");
                 let d_cand_f16 = gpu.alloc_tensor(&[n * k], DType::F16).expect("alloc cand");
                 let d_wrap_f16 = gpu.alloc_tensor(&[n * k], DType::F16).expect("alloc wrap");
                 htod_f32(&gpu, &d_x, &x_host);
@@ -263,7 +263,13 @@ fn main() {
                     )
                     .expect("old awq producer");
                     gpu.fused_rmsnorm_rotate_mq_awq_f16_batched(
-                        &d_x, &d_w, &d_awq, &d_cand_f16, k, EPS, n,
+                        &d_x,
+                        &d_w,
+                        &d_awq,
+                        &d_cand_f16,
+                        k,
+                        EPS,
+                        n,
                     )
                     .expect("new awq producer");
                 } else {
@@ -278,9 +284,7 @@ fn main() {
 
                 // Wrapper routing must match the direct producer call.
                 let anchor = WeightTensor {
-                    buf: gpu
-                        .upload_raw(&[0u8; 8], &[8])
-                        .expect("anchor buf"),
+                    buf: gpu.upload_raw(&[0u8; 8], &[8]).expect("anchor buf"),
                     gpu_dtype: DType::MQ4G256V2,
                     m: 8,
                     k,
@@ -292,16 +296,33 @@ fn main() {
                 // direct-producer oracle above already ran, so reuse the
                 // wrapper output only for the routing check.
                 fused_rmsnorm_rotate_mq_f16_batched_for(
-                    &mut gpu, &d_x, &d_w, &anchor, &d_wrap_f16, k, EPS, n,
+                    &mut gpu,
+                    &d_x,
+                    &d_w,
+                    &anchor,
+                    &d_wrap_f16,
+                    k,
+                    EPS,
+                    n,
                 )
                 .expect("wrapper producer");
                 gpu.hip.device_synchronize().expect("sync wrapper");
 
                 let oracle = dtoh_bytes(&gpu, &d_oracle_f16);
                 let cand = dtoh_bytes(&gpu, &d_cand_f16);
-                check(&format!("{tag} producer-f16-memcmp"), &cand, &oracle, &mut all_ok);
+                check(
+                    &format!("{tag} producer-f16-memcmp"),
+                    &cand,
+                    &oracle,
+                    &mut all_ok,
+                );
                 let wrap = dtoh_bytes(&gpu, &d_wrap_f16);
-                check(&format!("{tag} wrapper-routing-memcmp"), &wrap, &oracle, &mut all_ok);
+                check(
+                    &format!("{tag} wrapper-routing-memcmp"),
+                    &wrap,
+                    &oracle,
+                    &mut all_ok,
+                );
 
                 // Projection-output memcmp per family. Synthetic MQ4V2
                 // weights (distinct seeds so swapped routing cannot match).
@@ -318,22 +339,54 @@ fn main() {
                         .iter()
                         .map(|&m| gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc out"))
                         .collect();
-                    for (o, s) in outs_old.iter().zip([0x7fc0_0001, 0x7fc0_0002, 0x7fc0_0003, 0x7fc0_0004]) {
+                    for (o, s) in
+                        outs_old
+                            .iter()
+                            .zip([0x7fc0_0001, 0x7fc0_0002, 0x7fc0_0003, 0x7fc0_0004])
+                    {
                         fill_f32_quiet_nan(&mut gpu, o, s);
                     }
-                    for (o, s) in outs_new.iter().zip([0x7fc0_0011, 0x7fc0_0012, 0x7fc0_0013, 0x7fc0_0014]) {
+                    for (o, s) in
+                        outs_new
+                            .iter()
+                            .zip([0x7fc0_0011, 0x7fc0_0012, 0x7fc0_0013, 0x7fc0_0014])
+                    {
                         fill_f32_quiet_nan(&mut gpu, o, s);
                     }
                     gpu.gemm_qkvza_mq4g256v2_wmma(
-                        &w_qkv, &w_z, &w_b, &w_a, &d_rot_f32,
-                        &outs_old[0], &outs_old[1], &outs_old[2], &outs_old[3],
-                        qkv_m, z_m, beta_m, alpha_m, k, n,
+                        &w_qkv,
+                        &w_z,
+                        &w_b,
+                        &w_a,
+                        &d_rot_f32,
+                        &outs_old[0],
+                        &outs_old[1],
+                        &outs_old[2],
+                        &outs_old[3],
+                        qkv_m,
+                        z_m,
+                        beta_m,
+                        alpha_m,
+                        k,
+                        n,
                     )
                     .expect("old qkvza gemm");
                     gpu.gemm_qkvza_mq4g256v2_wmma_f16(
-                        &w_qkv, &w_z, &w_b, &w_a, &d_cand_f16,
-                        &outs_new[0], &outs_new[1], &outs_new[2], &outs_new[3],
-                        qkv_m, z_m, beta_m, alpha_m, k, n,
+                        &w_qkv,
+                        &w_z,
+                        &w_b,
+                        &w_a,
+                        &d_cand_f16,
+                        &outs_new[0],
+                        &outs_new[1],
+                        &outs_new[2],
+                        &outs_new[3],
+                        qkv_m,
+                        z_m,
+                        beta_m,
+                        alpha_m,
+                        k,
+                        n,
                     )
                     .expect("new qkvza gemm");
                     gpu.hip.device_synchronize().expect("sync qkvza");
@@ -346,9 +399,20 @@ fn main() {
                         let bb: &[u8] = unsafe {
                             std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4)
                         };
-                        assert!(a.iter().all(|v| v.is_finite()), "{tag} qkvza/{nm} old not finite");
-                        assert!(b.iter().all(|v| v.is_finite()), "{tag} qkvza/{nm} new not finite");
-                        check(&format!("{tag} qkvza/{nm}-output-memcmp"), bb, ab, &mut all_ok);
+                        assert!(
+                            a.iter().all(|v| v.is_finite()),
+                            "{tag} qkvza/{nm} old not finite"
+                        );
+                        assert!(
+                            b.iter().all(|v| v.is_finite()),
+                            "{tag} qkvza/{nm} new not finite"
+                        );
+                        check(
+                            &format!("{tag} qkvza/{nm}-output-memcmp"),
+                            bb,
+                            ab,
+                            &mut all_ok,
+                        );
                     }
                 }
                 // qkv
@@ -368,15 +432,33 @@ fn main() {
                         fill_f32_quiet_nan(&mut gpu, o, 0x7fc0_0021);
                     }
                     gpu.gemm_qkv_mq4g256v2_wmma(
-                        &w_q, &w_k, &w_v, &d_rot_f32,
-                        &outs_old[0], &outs_old[1], &outs_old[2],
-                        q_m, k_m, v_m, k, n,
+                        &w_q,
+                        &w_k,
+                        &w_v,
+                        &d_rot_f32,
+                        &outs_old[0],
+                        &outs_old[1],
+                        &outs_old[2],
+                        q_m,
+                        k_m,
+                        v_m,
+                        k,
+                        n,
                     )
                     .expect("old qkv gemm");
                     gpu.gemm_qkv_mq4g256v2_wmma_f16(
-                        &w_q, &w_k, &w_v, &d_cand_f16,
-                        &outs_new[0], &outs_new[1], &outs_new[2],
-                        q_m, k_m, v_m, k, n,
+                        &w_q,
+                        &w_k,
+                        &w_v,
+                        &d_cand_f16,
+                        &outs_new[0],
+                        &outs_new[1],
+                        &outs_new[2],
+                        q_m,
+                        k_m,
+                        v_m,
+                        k,
+                        n,
                     )
                     .expect("new qkv gemm");
                     gpu.hip.device_synchronize().expect("sync qkv");
@@ -389,9 +471,20 @@ fn main() {
                         let bb: &[u8] = unsafe {
                             std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4)
                         };
-                        assert!(a.iter().all(|v| v.is_finite()), "{tag} qkv/{nm} old not finite");
-                        assert!(b.iter().all(|v| v.is_finite()), "{tag} qkv/{nm} new not finite");
-                        check(&format!("{tag} qkv/{nm}-output-memcmp"), bb, ab, &mut all_ok);
+                        assert!(
+                            a.iter().all(|v| v.is_finite()),
+                            "{tag} qkv/{nm} old not finite"
+                        );
+                        assert!(
+                            b.iter().all(|v| v.is_finite()),
+                            "{tag} qkv/{nm} new not finite"
+                        );
+                        check(
+                            &format!("{tag} qkv/{nm}-output-memcmp"),
+                            bb,
+                            ab,
+                            &mut all_ok,
+                        );
                     }
                 }
                 // gate_up
@@ -410,15 +503,27 @@ fn main() {
                         fill_f32_quiet_nan(&mut gpu, o, 0x7fc0_0031);
                     }
                     gpu.gemm_gate_up_mq4g256v2_wmma(
-                        &w_g, &w_u, &d_rot_f32,
-                        &outs_old[0], &outs_old[1],
-                        gate_m, up_m, k, n,
+                        &w_g,
+                        &w_u,
+                        &d_rot_f32,
+                        &outs_old[0],
+                        &outs_old[1],
+                        gate_m,
+                        up_m,
+                        k,
+                        n,
                     )
                     .expect("old gate_up gemm");
                     gpu.gemm_gate_up_mq4g256v2_wmma_f16(
-                        &w_g, &w_u, &d_cand_f16,
-                        &outs_new[0], &outs_new[1],
-                        gate_m, up_m, k, n,
+                        &w_g,
+                        &w_u,
+                        &d_cand_f16,
+                        &outs_new[0],
+                        &outs_new[1],
+                        gate_m,
+                        up_m,
+                        k,
+                        n,
                     )
                     .expect("new gate_up gemm");
                     gpu.hip.device_synchronize().expect("sync gate_up");
@@ -431,9 +536,20 @@ fn main() {
                         let bb: &[u8] = unsafe {
                             std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4)
                         };
-                        assert!(a.iter().all(|v| v.is_finite()), "{tag} gate_up/{nm} old not finite");
-                        assert!(b.iter().all(|v| v.is_finite()), "{tag} gate_up/{nm} new not finite");
-                        check(&format!("{tag} gate_up/{nm}-output-memcmp"), bb, ab, &mut all_ok);
+                        assert!(
+                            a.iter().all(|v| v.is_finite()),
+                            "{tag} gate_up/{nm} old not finite"
+                        );
+                        assert!(
+                            b.iter().all(|v| v.is_finite()),
+                            "{tag} gate_up/{nm} new not finite"
+                        );
+                        check(
+                            &format!("{tag} gate_up/{nm}-output-memcmp"),
+                            bb,
+                            ab,
+                            &mut all_ok,
+                        );
                     }
                 }
             }

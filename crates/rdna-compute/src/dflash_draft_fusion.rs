@@ -184,7 +184,8 @@ impl Gpu {
         let batch_tiles = ((batch_size + 15) / 16) as u32;
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "mq4v2_overwrite_ksplit_dflash", bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "mq4v2_overwrite_ksplit_dflash", bytes);
         let result = self.launch_maybe_blob(
             sym,
             [row_tiles, batch_tiles, 1],
@@ -407,21 +408,14 @@ impl Gpu {
             &mut m_val2 as *mut _ as *mut c_void,
         ];
         let fin_grid = ((n_cells + 255) / 256) as u32;
-        let r = self.launch_maybe_blob(
-            FIN,
-            [fin_grid, 1, 1],
-            [256, 1, 1],
-            0,
-            &mut params2,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(y_ptr);
-                b.push_ptr(p_ptr2);
-                b.push_i32(bs_val2);
-                b.push_i32(m_val2);
-                b
-            },
-        );
+        let r = self.launch_maybe_blob(FIN, [fin_grid, 1, 1], [256, 1, 1], 0, &mut params2, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(y_ptr);
+            b.push_ptr(p_ptr2);
+            b.push_i32(bs_val2);
+            b.push_i32(m_val2);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

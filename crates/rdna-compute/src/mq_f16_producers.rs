@@ -310,12 +310,8 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            "gemm_qkvza_mq4g256v2_wmma_f16",
-            bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_mq4g256v2_wmma_f16", bytes);
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],

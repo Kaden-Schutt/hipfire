@@ -28,10 +28,8 @@ use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
+use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::{DType, Gpu, GpuTensor};
-use rdna_compute::dflash_state_copy::{
-    DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS,
-};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3215,8 +3213,7 @@ fn verify_dflash_block_inner(
                             .stream_synchronize(gpu.active_stream.as_ref().unwrap())
                     });
                 if let Err(err) = first_launch {
-                    gpu.graphs
-                        .verify_graph_destroy_all(&gpu.hip, gpu.device_id);
+                    gpu.graphs.verify_graph_destroy_all(&gpu.hip, gpu.device_id);
                     return Err(err);
                 }
                 if capture_lmhead_argmax {
@@ -4060,9 +4057,8 @@ pub fn build_dflash_noise_embeddings(
     }
     let ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
     let id_view = draft_scratch.noise_tokens.sub_offset(0, b);
-    let id_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4)
-    };
+    let id_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4) };
     gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
     let out_view = draft_scratch.x.sub_offset(0, b * h);
     gpu.embedding_lookup_q8_batched(&target.weights.token_embd, &out_view, &id_view, b, h)?;
@@ -7978,9 +7974,7 @@ mod tests {
             DType::MQ5G256V2,
             DType::MQ6G256V2,
         ] {
-            assert!(!dflash_verify_graph_env_eligible(
-                "gfx1100", dtype, None
-            ));
+            assert!(!dflash_verify_graph_env_eligible("gfx1100", dtype, None));
             assert!(!dflash_verify_graph_env_eligible(
                 "gfx1100",
                 dtype,

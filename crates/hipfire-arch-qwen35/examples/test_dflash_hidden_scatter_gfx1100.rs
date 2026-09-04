@@ -197,14 +197,12 @@ fn parity(mut gpu: Gpu) -> Result<(), String> {
             if modulus == usize::MAX { "MAX".to_string() } else { modulus.to_string() });
 
         // Identical starting state for both arms.
-        let mut rb_loop = HiddenStateRingBuffer::new_for_layers(
-            &mut gpu, &LAYERS, hidden, MAX_POS, MAX_BATCH,
-        )
-        .map_err(|e| format!("{tag}: loop ring alloc: {e}"))?;
-        let mut rb_fused = HiddenStateRingBuffer::new_for_layers(
-            &mut gpu, &LAYERS, hidden, MAX_POS, MAX_BATCH,
-        )
-        .map_err(|e| format!("{tag}: fused ring alloc: {e}"))?;
+        let mut rb_loop =
+            HiddenStateRingBuffer::new_for_layers(&mut gpu, &LAYERS, hidden, MAX_POS, MAX_BATCH)
+                .map_err(|e| format!("{tag}: loop ring alloc: {e}"))?;
+        let mut rb_fused =
+            HiddenStateRingBuffer::new_for_layers(&mut gpu, &LAYERS, hidden, MAX_POS, MAX_BATCH)
+                .map_err(|e| format!("{tag}: fused ring alloc: {e}"))?;
         for rb in [&rb_loop, &rb_fused] {
             fill_ring(&mut gpu, rb, hidden, ci * 1000)?;
             fill_staging(&mut gpu, rb, n, hidden)?;
@@ -215,10 +213,16 @@ fn parity(mut gpu: Gpu) -> Result<(), String> {
             rb.written = MAX_POS + 8;
         }
         let dst_loop = gpu
-            .upload_f32(&vec![-0.5f32; dst_rows * N_EXTRACT * hidden], &[dst_rows * N_EXTRACT * hidden])
+            .upload_f32(
+                &vec![-0.5f32; dst_rows * N_EXTRACT * hidden],
+                &[dst_rows * N_EXTRACT * hidden],
+            )
             .map_err(|e| format!("{tag}: dst_loop alloc: {e}"))?;
         let dst_fused = gpu
-            .upload_f32(&vec![-0.5f32; dst_rows * N_EXTRACT * hidden], &[dst_rows * N_EXTRACT * hidden])
+            .upload_f32(
+                &vec![-0.5f32; dst_rows * N_EXTRACT * hidden],
+                &[dst_rows * N_EXTRACT * hidden],
+            )
             .map_err(|e| format!("{tag}: dst_fused alloc: {e}"))?;
 
         // Oracle arm: kill switch forced — today's row-copy loops.
@@ -227,7 +231,13 @@ fn parity(mut gpu: Gpu) -> Result<(), String> {
             .commit_staging_to_ring(&mut gpu, n)
             .map_err(|e| format!("{tag}: loop commit: {e}"))?;
         speculative::scatter_hidden_block_to_interleaved(
-            &gpu, &rb_loop, &dst_loop, dst_row_offset, block_size, n, modulus,
+            &gpu,
+            &rb_loop,
+            &dst_loop,
+            dst_row_offset,
+            block_size,
+            n,
+            modulus,
         )
         .map_err(|e| format!("{tag}: loop scatter: {e}"))?;
         let loop_head = (rb_loop.head, rb_loop.written);
@@ -238,7 +248,13 @@ fn parity(mut gpu: Gpu) -> Result<(), String> {
             .commit_staging_to_ring(&mut gpu, n)
             .map_err(|e| format!("{tag}: fused commit: {e}"))?;
         speculative::scatter_hidden_block_to_interleaved(
-            &gpu, &rb_fused, &dst_fused, dst_row_offset, block_size, n, modulus,
+            &gpu,
+            &rb_fused,
+            &dst_fused,
+            dst_row_offset,
+            block_size,
+            n,
+            modulus,
         )
         .map_err(|e| format!("{tag}: fused scatter: {e}"))?;
         let fused_head = (rb_fused.head, rb_fused.written);
@@ -247,7 +263,11 @@ fn parity(mut gpu: Gpu) -> Result<(), String> {
         let ring_loop = download_ring(&gpu, &rb_loop)?;
         let ring_fused = download_ring(&gpu, &rb_fused)?;
         for ext in 0..N_EXTRACT {
-            assert_bits_eq(&ring_fused[ext], &ring_loop[ext], &format!("{tag}: ring ext{ext}"));
+            assert_bits_eq(
+                &ring_fused[ext],
+                &ring_loop[ext],
+                &format!("{tag}: ring ext{ext}"),
+            );
         }
         let d_loop = gpu
             .download_f32(&dst_loop)
@@ -290,7 +310,10 @@ fn parity(mut gpu: Gpu) -> Result<(), String> {
 
 /// Run the two raw launchers on scratch buffers and compare against the
 /// loop functions on identical inputs.
-fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags>) -> Result<(), String> {
+fn direct_launcher_arm(
+    gpu: &mut Gpu,
+    flags_off: &Arc<rdna_compute::FeatureFlags>,
+) -> Result<(), String> {
     const H: usize = 96;
     const MP: usize = 40;
     const N: usize = 16;
@@ -311,7 +334,8 @@ fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags
                 .map_err(|e| format!("direct: upload: {e}"))?;
             rb.write_rows_at_head(gpu, ext, &src, MP)
                 .map_err(|e| format!("direct: write: {e}"))?;
-            gpu.free_tensor(src).map_err(|e| format!("direct: free: {e}"))?;
+            gpu.free_tensor(src)
+                .map_err(|e| format!("direct: free: {e}"))?;
         }
         Ok(rb)
     };
@@ -329,7 +353,8 @@ fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags
                 .map_err(|e| format!("direct: staging upload: {e}"))?;
             rb.write_rows_to_staging(gpu, ext, &src, N)
                 .map_err(|e| format!("direct: staging write: {e}"))?;
-            gpu.free_tensor(src).map_err(|e| format!("direct: free: {e}"))?;
+            gpu.free_tensor(src)
+                .map_err(|e| format!("direct: free: {e}"))?;
         }
         rb.head = HEAD;
         rb.written = MP + 8;
@@ -369,7 +394,16 @@ fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags
     let start_slot = (rb_k.head + MP - (BLK - r_skip)) % MP;
     let launched = gpu
         .dflash_hidden_scatter5_try(
-            &rb_k.layer_bufs, &dst_k, start_slot, N, r_skip, H, MP, OFF, MOD, N_EXTRACT,
+            &rb_k.layer_bufs,
+            &dst_k,
+            start_slot,
+            N,
+            r_skip,
+            H,
+            MP,
+            OFF,
+            MOD,
+            N_EXTRACT,
         )
         .map_err(|e| format!("direct: scatter5 try: {e}"))?;
     assert!(launched, "direct: scatter5_try reported false after ensure");
@@ -385,8 +419,10 @@ fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags
 
     rb_k.free_gpu(gpu);
     rb_l.free_gpu(gpu);
-    gpu.free_tensor(dst_k).map_err(|e| format!("direct: free: {e}"))?;
-    gpu.free_tensor(dst_l).map_err(|e| format!("direct: free: {e}"))?;
+    gpu.free_tensor(dst_k)
+        .map_err(|e| format!("direct: free: {e}"))?;
+    gpu.free_tensor(dst_l)
+        .map_err(|e| format!("direct: free: {e}"))?;
     eprintln!("pass direct-launcher arm (commit5 + scatter5 vs loops)");
     Ok(())
 }
