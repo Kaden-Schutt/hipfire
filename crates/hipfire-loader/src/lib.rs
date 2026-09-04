@@ -4,6 +4,7 @@
 //! Top-of-DAG model loader. Owns `LoadedModel`, the carrier registry,
 //! and `load_model` — the single arch-dispatch point for the daemon.
 
+pub mod admission;
 pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
@@ -53,6 +54,28 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+    /// Read-only admission refusal for a topology/shape combination this
+    /// carrier cannot serve. Runs before any allocation or collective so a
+    /// refusal leaves no side effect (device-mesh G2 admission). Default:
+    /// pipeline-parallel (pp>1) is unsupported; HFQ and Dir get distinct
+    /// messages matching each carrier's load-time refusal. Qwen3.5 overrides —
+    /// it is the only carrier with a pp>1 path (`load_qwen35_pp`).
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err(if is_dir {
+                format!("{}: safetensors + pp>1 unsupported", self.name())
+            } else {
+                format!("{}: pipeline-parallel (pp>1) unsupported", self.name())
+            });
+        }
+        Ok(())
+    }
 
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
@@ -2395,37 +2418,69 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
+    // Classify once and admit before any side effect (source-aware admission).
+    let admission = crate::admission::admit_source(
+        path,
+        1, // this entry serves tp<=1
+        pp,
+        kv_backend_override,
+        draft_path,
+        gpu.arch.as_str(),
+    )?;
+    load_admitted_with_gemma4_drafter(
+        admission,
+        path,
+        max_seq,
+        deepseek4_experts_per_token,
+        deepseek4_compute_placement,
+        draft_path,
+        gemma4_drafter_path,
+        gemma4_draft_len,
+        kv_mode_override,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        spec,
+        gpu,
+    )
+}
+
+/// Consume an already-admitted source: the retained [`SourceAdmission`] handle
+/// plus its resolved carrier. Destructive work — VMM readiness, carrier load
+/// with its allocations and collectives — begins here, only after admission has
+/// succeeded.
+#[allow(clippy::too_many_arguments)]
+pub fn load_admitted_with_gemma4_drafter(
+    admission: crate::admission::SourceAdmission,
+    path: &str,
+    max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    draft_path: Option<&str>,
+    gemma4_drafter_path: Option<&str>,
+    gemma4_draft_len: usize,
+    kv_mode_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
+    let crate::admission::SourceAdmission {
+        source,
+        kv_backend,
+        carrier,
+        ..
+    } = admission;
+    let carrier =
+        carrier.ok_or_else(|| "single/pp admission must resolve a carrier".to_string())?;
     ensure_vmm_ready_for_load(gpu)?;
-    let src = ModelSource::from_path(path)?;
-    let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
-    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
-    let rec_sampling = match &src {
+    let rec_sampling = match &source {
         ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
         _ => None,
     };
-    // Reuse DFlash quant checks for draft_path (unchanged)
-    if draft_path.is_some() {
-        if let ModelSource::Hfq(ref hfq) = src {
-            let lm_qt = hfq
-                .tensor_data("lm_head.weight")
-                .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
-                .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
-                .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
-                .map(|(info, _)| info.quant_type);
-            let supported = dflash_lm_head_quant_supported(lm_qt, gpu.arch.as_str());
-            if !supported {
-                let qt_desc = match lm_qt {
-                    Some(qt) => format!("quant_type={qt}"),
-                    None => "no lm_head/embed_tokens tensor found".to_string(),
-                };
-                return Err(format!(
-                    "DFlash draft requested but target lm_head {} is not supported \
-                     on gfx11+gfx12 WMMA ({}).",
-                    qt_desc, gpu.arch
-                ));
-            }
-        }
-    }
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -2443,40 +2498,7 @@ pub fn load_model_with_gemma4_drafter(
         gemma4_drafter_path,
         gemma4_draft_len,
     };
-    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
-    let carrier = matches
-        .next()
-        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
-    if let Some(other) = matches.next() {
-        return Err(format!(
-            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
-            src.describe(),
-            carrier.name(),
-            other.name()
-        ));
-    }
-    if kv_backend == KvBackend::Vmm
-        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
-    {
-        return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
-            carrier.name()
-        ));
-    }
-    // The allowlist above gates on CARRIER, which let `vmm` + `pp>1` through:
-    // qwen35 is allowlisted, so a pipeline-parallel Qwen3.5 load passed it. But
-    // VMM is strictly per-device — `ensure_vmm_ready_for_load` takes a single
-    // `&mut Gpu`, `multi_gpu.rs` has no VMM path at all, and the pp>1 load tail
-    // never mentions it. Refusing here, BEFORE any allocation, beats letting a
-    // single-device KV backend be half-applied to a model spread across devices.
-    if kv_backend == KvBackend::Vmm && ctx.pp > 1 {
-        return Err(
-            "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
-             use a different kv_cache backend or load with pp=1"
-                .to_string(),
-        );
-    }
-    let mut result = carrier.load(src, &mut ctx)?;
+    let mut result = carrier.load(source, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
@@ -2968,29 +2990,48 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    // Admission: refuse archs with no `EpArch` before any per-arch device init.
-    ep_admission(hfq.arch_id)?;
-    let kv_backend_raw = kv_backend.unwrap_or("contiguous");
-    let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
-    match hfq.arch_id {
+    // Classify once and admit before any side effect. EP is HFQ-only and
+    // dispatches on arch_id, so the admission retains the arch_id decision and
+    // the per-rank file re-open happens inside the EP load (unchanged).
+    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "")?;
+    load_model_ep_admitted(
+        admission,
+        path,
+        max_seq,
+        tp,
+        kv_mode,
+        kv_backend,
+        state_quant,
+    )
+}
+
+/// Dispatch an already-admitted expert-parallel source on its `arch_id` —
+/// admission's classification is not repeated. Unlike the single/pp route,
+/// the per-arch EP loaders still re-open `path` per rank, so the retained
+/// `SourceAdmission.source` is dropped here rather than consumed. Destructive
+/// (per-rank allocation + collectives) begins inside the per-arch loaders.
+pub fn load_model_ep_admitted(
+    admission: crate::admission::SourceAdmission,
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
+    match admission.arch_id {
         9 => load_model_ep_ds4(
             path,
             max_seq,
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
-        10 if kv_backend_kind == KvBackend::Vmm => {
-            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
-        }
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 if kv_backend_kind == KvBackend::Vmm => {
-            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
-        }
         5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
-        // Backstop: `ep_admission` above already refused these; route through the
-        // shared constructor (not `unreachable!`) so the refusal survives a
-        // future edit that drops the early call.
+        // Backstop: `admit_source` above already refused every other arch_id.
+        // Route through the shared constructor (not `unreachable!`) so the
+        // refusal survives a future edit that drops the early classification,
+        // and so this message never drifts from `ep_admission`'s.
         id => Err(ep_unsupported_arch_message(id)),
     }
 }

@@ -1091,68 +1091,6 @@ fn main() {
                         }
                     }
                 }
-                // Unload previous if any. PFlash drafter goes first so
-                // its tensors join the pool before unload_model drains
-                // it -- otherwise free_tensor would queue them into the
-                // pool just-emptied by drain_pool with no follow-up
-                // drain, leaving drafter VRAM resident across the next
-                // load (the explicit "unload" handler has the same
-                // ordering for the same reason).
-                //
-                // FIX (transactional pflash teardown): pflash_state is part of
-                // the PRIOR model (it holds that model's PFlash drafter). For
-                // the deferred tp>1 EP path it must NOT be torn down here —
-                // otherwise a partial EP load failure (whose FIX #1 deferral
-                // keeps `model` alive) would leave the surviving prior model
-                // stripped of its drafter. Defer it to the success branch
-                // alongside the deferred model unload. For load_tp <= 1 the
-                // prior model is unloaded eagerly, so tear pflash down here in
-                // the original order. (EP archs are ds4/minimax and refuse
-                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
-                // the outgoing model's drafter at the deferred site.)
-                if load_tp <= 1 {
-                    if let Some(mut pf) = pflash_state.take() {
-                        if let Some(mut dg) = pflash_drafter_gpu.take() {
-                            dg.bind_thread_or_warn();
-                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                            gpu.bind_thread_or_warn();
-                        } else {
-                            pf.unload_drafter(&mut gpu);
-                        }
-                    }
-                    pflash_cfg = None;
-                    if let Some(m) = model.take() {
-                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
-                            emit_uncorrelated_error(
-                                &mut stdout,
-                                None,
-                                &format!("prior unload failed: {err}"),
-                                "internal",
-                                false,
-                                false,
-                            );
-                            let _ = stdout.flush();
-                            continue;
-                        }
-                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
-                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                }
-                // EP path: when no live prior model remains (fresh daemon, or
-                // after deferred prior unload failed and left model=None with
-                // pending VMM), refuse to construct a new EP model until
-                // orphan teardown clears. Skip when a live deferred prior
-                // still sits in `model` — unload stays deferred until after
-                // successful new-model construction.
-                if ep_deferred_needs_vmm_preflight(load_tp, model.is_some()) {
-                    if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
-                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 // hunt3 H-D: clamp request-driven max_seq to the config ceiling
@@ -1631,20 +1569,110 @@ fn main() {
                         continue;
                     }
                 };
-                let loaded = if tp > 1 {
-                    if deepseek4_experts_per_token.is_some() {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            "DeepSeek V4 experts-per-token override requires tp=1",
-                            "unsupported",
-                            false,
-                            false,
-                        );
+                // DeepSeek V4 experts-per-token override requires tp=1 (moved
+                // before admission so the refusal leaves the prior model intact).
+                if tp > 1 && deepseek4_experts_per_token.is_some() {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "DeepSeek V4 experts-per-token override requires tp=1",
+                        "unsupported",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                // ── G2 source-aware admission (read-only; before teardown) ──
+                // Classify the incoming source and decide the effective topology
+                // BEFORE any destructive side effect so a refusal leaves the
+                // prior model usable. The retained SourceAdmission is consumed
+                // by the load route below — no re-open, no re-classify.
+                let admission = match hipfire_loader::admission::admit_source(
+                    path,
+                    tp,
+                    pp,
+                    kv_backend_override.as_deref(),
+                    draft_path.as_deref(),
+                    gpu.arch.as_str(),
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        // Refusal ledger: admission is read-only — zero teardown,
+                        // allocation, VMM init, remap, carrier entry, collective,
+                        // or cache mutation; the prior model remains loaded.
+                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
                         let _ = stdout.flush();
                         continue;
                     }
-                    hipfire_loader::load_model_ep_with_kv_mode(
+                };
+
+                // Unload previous if any. PFlash drafter goes first so
+                // its tensors join the pool before unload_model drains
+                // it -- otherwise free_tensor would queue them into the
+                // pool just-emptied by drain_pool with no follow-up
+                // drain, leaving drafter VRAM resident across the next
+                // load (the explicit "unload" handler has the same
+                // ordering for the same reason).
+                //
+                // FIX (transactional pflash teardown): pflash_state is part of
+                // the PRIOR model (it holds that model's PFlash drafter). For
+                // the deferred tp>1 EP path it must NOT be torn down here —
+                // otherwise a partial EP load failure (whose FIX #1 deferral
+                // keeps `model` alive) would leave the surviving prior model
+                // stripped of its drafter. Defer it to the success branch
+                // alongside the deferred model unload. For load_tp <= 1 the
+                // prior model is unloaded eagerly, so tear pflash down here in
+                // the original order. (EP archs are ds4/minimax and refuse
+                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
+                // the outgoing model's drafter at the deferred site.)
+                if load_tp <= 1 {
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
+                    }
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("prior unload failed: {err}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
+                // EP path: when no live prior model remains (fresh daemon, or
+                // after deferred prior unload failed and left model=None with
+                // pending VMM), refuse to construct a new EP model until
+                // orphan teardown clears. Skip when a live deferred prior
+                // still sits in `model` — unload stays deferred until after
+                // successful new-model construction.
+                if ep_deferred_needs_vmm_preflight(load_tp, model.is_some()) {
+                    if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
+                let loaded = if tp > 1 {
+                    hipfire_loader::load_model_ep_admitted(
+                        admission,
                         path,
                         max_seq,
                         tp,
@@ -1653,7 +1681,8 @@ fn main() {
                         state_quant_override.as_deref(),
                     )
                 } else {
-                    hipfire_loader::load_model_with_gemma4_drafter(
+                    hipfire_loader::load_admitted_with_gemma4_drafter(
+                        admission,
                         path,
                         max_seq,
                         deepseek4_experts_per_token,
@@ -1662,7 +1691,6 @@ fn main() {
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
                         kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
