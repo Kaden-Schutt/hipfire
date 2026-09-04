@@ -37,6 +37,25 @@ pub struct DeltaNetLayerWeights {
     pub w_gate: WeightTensor,   // mlp.gate_proj
     pub w_up: WeightTensor,     // mlp.up_proj
     pub w_down: WeightTensor,   // mlp.down_proj
+    /// Additive output biases, present only on escha dense exports
+    /// (Qwen3.8-27B). Base Qwen3.8-27B has `attention_bias: false` and no MLP
+    /// bias — these are Escha's end-to-end output correction, and they cannot
+    /// be folded into a weight because they are additive. `None` for every
+    /// other model, which is why they are Option rather than a zero vector:
+    /// a zero add per projection per layer is real work for no effect.
+    pub biases: Option<DeltaNetBiases>,
+}
+
+/// See `DeltaNetLayerWeights::biases`. Each is `[oc]` f32, applied to the
+/// projection's output. `in_proj_a`/`in_proj_b` have none — they are on
+/// escha's `ignore` list and ship as plain weights.
+pub struct DeltaNetBiases {
+    pub qkv: GpuTensor,
+    pub z: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 /// Weights for a full attention (gated) layer — similar to Qwen3 but with q+gate split.
@@ -52,6 +71,19 @@ pub struct FullAttnLayerWeights {
     pub w_gate: WeightTensor,
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
+    /// See `DeltaNetLayerWeights::biases`.
+    pub biases: Option<FullAttnBiases>,
+}
+
+/// See `DeltaNetLayerWeights::biases`.
+pub struct FullAttnBiases {
+    pub q: GpuTensor,
+    pub k: GpuTensor,
+    pub v: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 // ─── MoE FFN weights (Qwen3.5-MoE / A3B) ────────────────────────────────

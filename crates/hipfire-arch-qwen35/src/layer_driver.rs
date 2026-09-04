@@ -6,6 +6,7 @@
 //! `WeightBackend`. `load_weights` (HFQ), `load_weights_paroquant` (PaRo), and
 //! `load_layer_into` (multi-GPU HFQ) all funnel through `load_layer`.
 
+use crate::qwen35::weights::{DeltaNetBiases, FullAttnBiases};
 use crate::qwen35::{
     DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
     LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
@@ -16,6 +17,28 @@ use hipfire_runtime::weight_backend::WeightBackend;
 /// Load one layer's weights. `load_moe` builds the MoE FFN block for MoE layers
 /// (format-specific: HFQ `load_moe_ffn` vs PaRo `paro_load_moe_ffn`), supplied by
 /// the caller so MoE layout stays arch-owned.
+/// A bias that MUST be there.
+///
+/// Escha ships all of a layer's biases together or none, so once the first
+/// probe finds one the rest are mandatory. A half-biased layer is a corrupt
+/// checkpoint, and silently substituting zeros would degrade output without
+/// failing — the same trap as the dropped MTP head.
+fn need_bias<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    n: usize,
+) -> hip_bridge::HipResult<rdna_compute::GpuTensor> {
+    b.bias_opt(rel, n)?.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{rel}: layer has some escha biases but not this one — a partially biased \
+                 layer is a corrupt checkpoint, not a model to run with zeros"
+            ),
+        )
+    })
+}
+
 pub(crate) fn load_layer<B: WeightBackend>(
     b: &mut B,
     config: &Qwen35Config,
@@ -58,6 +81,21 @@ pub(crate) fn load_layer<B: WeightBackend>(
             w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
             w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
             w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
+            // Escha dense exports (Qwen3.8-27B) carry an additive output bias
+            // on every coded projection. All six are present together or not
+            // at all, so one probe decides. `in_proj_a`/`in_proj_b` have none
+            // — escha's `ignore` list keeps them as plain weights.
+            biases: match b.bias_opt("linear_attn.in_proj_qkv.bias", qkv_dim)? {
+                None => None,
+                Some(qkv) => Some(DeltaNetBiases {
+                    qkv,
+                    z: need_bias(b, "linear_attn.in_proj_z.bias", d_inner)?,
+                    o: need_bias(b, "linear_attn.out_proj.bias", config.dim)?,
+                    gate: need_bias(b, "mlp.gate_proj.bias", config.hidden_dim)?,
+                    up: need_bias(b, "mlp.up_proj.bias", config.hidden_dim)?,
+                    down: need_bias(b, "mlp.down_proj.bias", config.dim)?,
+                }),
+            },
         }),
         (LayerType::FullAttention, false) => LayerWeights::FullAttn(FullAttnLayerWeights {
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
@@ -71,6 +109,18 @@ pub(crate) fn load_layer<B: WeightBackend>(
             w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
             w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
             w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
+            biases: match b.bias_opt("self_attn.q_proj.bias", q_out_dim)? {
+                None => None,
+                Some(q) => Some(FullAttnBiases {
+                    q,
+                    k: need_bias(b, "self_attn.k_proj.bias", kv_dim)?,
+                    v: need_bias(b, "self_attn.v_proj.bias", kv_dim)?,
+                    o: need_bias(b, "self_attn.o_proj.bias", config.dim)?,
+                    gate: need_bias(b, "mlp.gate_proj.bias", config.hidden_dim)?,
+                    up: need_bias(b, "mlp.up_proj.bias", config.hidden_dim)?,
+                    down: need_bias(b, "mlp.down_proj.bias", config.dim)?,
+                }),
+            },
         }),
         (LayerType::LinearAttention, true) => LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,

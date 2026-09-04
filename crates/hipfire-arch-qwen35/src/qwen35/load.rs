@@ -3659,6 +3659,7 @@ pub fn load_weights_dense_tp_rank(
                             w_gate: w_gate_opt.take().unwrap(),
                             w_up: w_up_opt.take().unwrap(),
                             w_down: w_down_opt.take().unwrap(),
+                            biases: None,
                         }))
                     })();
                     match layer_res {
@@ -3855,6 +3856,7 @@ pub fn load_weights_dense_tp_rank(
                             w_gate: w_gate_opt.take().unwrap(),
                             w_up: w_up_opt.take().unwrap(),
                             w_down: w_down_opt.take().unwrap(),
+                            biases: None,
                         }))
                     })();
                     match layer_res {

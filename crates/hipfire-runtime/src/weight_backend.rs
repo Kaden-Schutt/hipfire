@@ -1265,6 +1265,14 @@ pub trait WeightBackend {
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
     /// Load a bias vector (f32). Only qwen2 attention biases use this today.
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
+    /// Load a bias vector if the checkpoint has one, else `None`.
+    ///
+    /// `bias` PANICS on a missing tensor, which is right for qwen2 where the
+    /// bias is mandatory. Escha's dense export makes it optional per the leaf
+    /// contract (§1.4) — an export without the end-to-end stage ships none and
+    /// must still load — so that path needs absence to be a value, not a
+    /// crash.
+    fn bias_opt(&mut self, rel: &str, n: usize) -> HipResult<Option<GpuTensor>>;
 }
 
 /// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
@@ -1307,6 +1315,21 @@ impl<'a> WeightBackend for HfqBackend<'a> {
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         dequant_f32(self.gpu, info.quant_type, &data, n)
     }
+    fn bias_opt(&mut self, rel: &str, n: usize) -> HipResult<Option<GpuTensor>> {
+        let name = hfq_plain_name(self.layer, rel);
+        let Some((info, data)) = read_first(self.hfq, &name, self.candidates) else {
+            return Ok(None);
+        };
+        let t = dequant_f32(self.gpu, info.quant_type, &data, n)?;
+        if t.numel() != n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("bias {name} has {} elements, expected {n}", t.numel()),
+            ));
+        }
+        Ok(Some(t))
+    }
+
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
@@ -1378,6 +1401,12 @@ impl<'a> WeightBackend for ParoBackend<'a> {
             0,
             "ParoBackend: attention biases unsupported",
         ))
+    }
+
+    /// `None`, not an error: ParoQuant checkpoints simply have no biases, and
+    /// the optional loader's contract is that absence is a value.
+    fn bias_opt(&mut self, _rel: &str, _n: usize) -> HipResult<Option<GpuTensor>> {
+        Ok(None)
     }
 }
 
