@@ -156,9 +156,16 @@ impl AttentionFamily {
             is_tree: io.tree_bias.is_some(),
         };
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
-        dispatch_kv_write(gpu, plan.write_key, plan, io)?;
+        dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
+            DispatchError::Hip(format!(
+                "KV write {:?} for {:?} at pos={} cap={}: {error}",
+                plan.write_key, plan.attend_key, io.pos, io.physical_cap
+            ))
+        })?;
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
-        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io)
+        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io).map_err(|error| {
+            DispatchError::Hip(format!("attention {:?}: {error}", plan.attend_key))
+        })
     }
 
     /// Full-attention entry point (no KV cache — vision / DFlash cross-attention).
@@ -368,6 +375,36 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteQ8_0 => {
             debug_assert_eq!(plan.batch_size, 1);
+            if plan.attend_key == KernelKey::AttnFlashQ8_0Windowed {
+                hip!(gpu.kv_cache_write_q8_0_ring(
+                    io.k_cache,
+                    io.k,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+                .map_err(|error| {
+                    DispatchError::Hip(format!(
+                        "Q8 ring K write at pos={} cap={}: {error}",
+                        io.pos, io.physical_cap
+                    ))
+                })?;
+                return hip!(gpu.kv_cache_write_q8_0_ring(
+                    io.v_cache,
+                    io.v,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+                .map_err(|error| {
+                    DispatchError::Hip(format!(
+                        "Q8 ring V write at pos={} cap={}: {error}",
+                        io.pos, io.physical_cap
+                    ))
+                });
+            }
             if io.output_gate.is_some() {
                 hip!(gpu.kv_cache_write_q8_0_pair(
                     io.k_cache,
@@ -432,6 +469,19 @@ fn dispatch_kv_write(
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
+            if io.head_dim == 512 {
+                return hip!(gpu.kv_cache_write_asym3_hd512(
+                    io.k_cache,
+                    io.v_cache,
+                    io.k,
+                    io.v,
+                    io.pos_buf,
+                    ct,
+                    st,
+                    io.n_kv_heads,
+                    io.head_dim,
+                ));
+            }
             hip!(gpu.kv_cache_write_asym3_fused(
                 io.k_cache,
                 io.v_cache,
@@ -1048,6 +1098,23 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                if io.head_dim == 512 {
+                    return hip!(gpu.attention_flash_asym3_hd512(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                    ));
+                }
                 hip!(gpu.attention_flash_asym3(
                     io.q,
                     io.k_cache,

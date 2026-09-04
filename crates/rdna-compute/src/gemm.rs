@@ -26180,7 +26180,7 @@ impl Gpu {
         result
     }
 
-    #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -26192,10 +26192,43 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        Err(hip_bridge::HipError::new(
-            0,
-            "MoE kernel not yet ported (Phase 4)",
-        ))
+        const KERNEL: &str = "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed";
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed",
+            kernels::GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
+            KERNEL,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let sp = per_expert_scale.buf.as_ptr();
+        let hp = hidden_batch.buf.as_ptr();
+        let rp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(sp);
+            b.push_ptr(hp);
+            b.push_ptr(rp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
     }
     #[allow(unused_variables)]
     pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(

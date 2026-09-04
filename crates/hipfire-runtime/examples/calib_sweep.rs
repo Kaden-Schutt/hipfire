@@ -1661,7 +1661,7 @@ fn main() {
         }
         drop(hfq);
         let kv_max = seq_len + 16;
-        let scratch = hipfire_arch_gemma4::lowered::Gemma4Scratch::new(&mut gpu, &cfg, 1)
+        let scratch = hipfire_arch_gemma4::lowered::Gemma4Scratch::new(&mut gpu, &cfg, kv_max)
             .unwrap_or_else(|e| panic!("gemma4 scratch: {e:?}"));
         hipfire_arch_gemma4::lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
             .unwrap_or_else(|e| panic!("gemma4 init_scratch_constants: {e:?}"));

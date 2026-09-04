@@ -96,9 +96,12 @@ __global__ void attention_flash_q8_0_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int window                           // sliding-window span; <= 0 = full causal
+    int window,                          // sliding-window span; <= 0 = full causal
+    int effective_seq_len                // retained ABI; dynamic length comes from pos_buf
 ) {
-    const int seq_len = pos_buf[0] + 1;
+    (void)effective_seq_len;
+    const int logical_seq_len = pos_buf[0] + 1;
+    const int seq_len = (window > 0) ? min(logical_seq_len, max_seq) : logical_seq_len;
     // Sliding-window lower bound: keys at t < win_lo are outside the window
     // [seq_len-window, seq_len) and masked. window <= 0 = full causal.
     const int win_lo = (window > 0) ? (seq_len - window) : 0;
@@ -160,6 +163,10 @@ __global__ void attention_flash_q8_0_tile(
         const int t1 = tile_start + t_local + 1;
         const int t2 = tile_start + t_local + 2;
         const int t3 = tile_start + t_local + 3;
+        const int s0 = (window > 0) ? (t0 % max_seq) : t0;
+        const int s1 = (window > 0) ? (t1 % max_seq) : t1;
+        const int s2 = (window > 0) ? (t2 % max_seq) : t2;
+        const int s3 = (window > 0) ? (t3 % max_seq) : t3;
         float partial0 = 0.0f;
         float partial1 = 0.0f;
         float partial2 = 0.0f;
@@ -167,10 +174,10 @@ __global__ void attention_flash_q8_0_tile(
         for (int half = 0; half < n_halves; half++) {
             const int k_bi = half * 4 + tid / 8;
             const int k_blk_off = (kv_head_block_start + k_bi) * 34;
-            const unsigned char* kb0 = k_cache + (size_t)t0 * row_stride + k_blk_off;
-            const unsigned char* kb1 = k_cache + (size_t)t1 * row_stride + k_blk_off;
-            const unsigned char* kb2 = k_cache + (size_t)t2 * row_stride + k_blk_off;
-            const unsigned char* kb3 = k_cache + (size_t)t3 * row_stride + k_blk_off;
+            const unsigned char* kb0 = k_cache + (size_t)s0 * row_stride + k_blk_off;
+            const unsigned char* kb1 = k_cache + (size_t)s1 * row_stride + k_blk_off;
+            const unsigned char* kb2 = k_cache + (size_t)s2 * row_stride + k_blk_off;
+            const unsigned char* kb3 = k_cache + (size_t)s3 * row_stride + k_blk_off;
             float ks0 = (float)*((const _Float16*)kb0);
             float ks1 = (float)*((const _Float16*)kb1);
             float ks2 = (float)*((const _Float16*)kb2);
@@ -231,11 +238,12 @@ __global__ void attention_flash_q8_0_tile(
     }
     for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        const int slot = (window > 0) ? (t % max_seq) : t;
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
             const int k_bi = half * 4 + tid / 8;
             const int k_blk_off = (kv_head_block_start + k_bi) * 34;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
+            const unsigned char* kb = k_cache + (size_t)slot * row_stride + k_blk_off;
             float ks = (float)*((const _Float16*)kb);
             const float* qb_thread = q_lds + k_bi * 32 + k_off;
             partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
@@ -320,10 +328,14 @@ __global__ void attention_flash_q8_0_tile(
             int t1 = tile_start + (tl) + 1; \
             int t2 = tile_start + (tl) + 2; \
             int t3 = tile_start + (tl) + 3; \
-            const unsigned char* vb0 = v_cache + (size_t)t0 * row_stride + v_blk_off; \
-            const unsigned char* vb1 = v_cache + (size_t)t1 * row_stride + v_blk_off; \
-            const unsigned char* vb2 = v_cache + (size_t)t2 * row_stride + v_blk_off; \
-            const unsigned char* vb3 = v_cache + (size_t)t3 * row_stride + v_blk_off; \
+            int s0 = (window > 0) ? (t0 % max_seq) : t0; \
+            int s1 = (window > 0) ? (t1 % max_seq) : t1; \
+            int s2 = (window > 0) ? (t2 % max_seq) : t2; \
+            int s3 = (window > 0) ? (t3 % max_seq) : t3; \
+            const unsigned char* vb0 = v_cache + (size_t)s0 * row_stride + v_blk_off; \
+            const unsigned char* vb1 = v_cache + (size_t)s1 * row_stride + v_blk_off; \
+            const unsigned char* vb2 = v_cache + (size_t)s2 * row_stride + v_blk_off; \
+            const unsigned char* vb3 = v_cache + (size_t)s3 * row_stride + v_blk_off; \
             float vs0 = (float)*((const _Float16*)vb0); \
             float vs1 = (float)*((const _Float16*)vb1); \
             float vs2 = (float)*((const _Float16*)vb2); \
@@ -364,7 +376,8 @@ __global__ void attention_flash_q8_0_tile(
         #define ACCUM_V(tl) do { \
             float w = scores[(tl)]; \
             int t = tile_start + (tl); \
-            const unsigned char* vb = v_cache + (size_t)t * row_stride + v_blk_off; \
+            int slot = (window > 0) ? (t % max_seq) : t; \
+            const unsigned char* vb = v_cache + (size_t)slot * row_stride + v_blk_off; \
             float vs = (float)*((const _Float16*)vb); \
             out0 += w * (vs * (float)((signed char)vb[2 + bj_base + 0])); \
             out1 += w * (vs * (float)((signed char)vb[2 + bj_base + 1])); \

@@ -2151,6 +2151,58 @@ pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
 
     output
 }
+
+/// Quantize a row-major matrix to HFQ4-G128 without allowing a quantization
+/// group to cross a row boundary. Rows whose K dimension is not divisible by
+/// 128 receive one zero-padded tail group; kernels use the same ceil-divided
+/// row stride and predicate the padded lanes.
+pub(crate) fn quantize_hfq4g128_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k, "HFQ4-G128 matrix shape mismatch");
+    let row_bytes = k.div_ceil(128) * 72;
+    let mut output = Vec::with_capacity(m * row_bytes);
+    for row in f32_data.chunks_exact(k) {
+        output.extend_from_slice(&quantize_hfq4g128(row));
+    }
+    debug_assert_eq!(output.len(), m * row_bytes);
+    output
+}
+
+#[cfg(test)]
+mod hfq4g128_row_tests {
+    use super::{quantize_hfq4g128, quantize_hfq4g128_2d};
+
+    #[test]
+    fn non_aligned_k_pads_each_row_independently() {
+        const M: usize = 3;
+        const K: usize = 704;
+        let values: Vec<f32> = (0..M * K)
+            .map(|i| ((i / K) as f32 * 10.0) + ((i % K) as f32 - 352.0) / 97.0)
+            .collect();
+
+        let packed = quantize_hfq4g128_2d(&values, M, K);
+        let row_bytes = K.div_ceil(128) * 72;
+        assert_eq!(row_bytes, 432);
+        assert_eq!(packed.len(), M * row_bytes);
+
+        // Independent row packing is the format contract. A flat packer would
+        // combine each row's 64-value tail with the next row's first 64 values.
+        for row in 0..M {
+            let expected = quantize_hfq4g128(&values[row * K..(row + 1) * K]);
+            assert_eq!(&packed[row * row_bytes..(row + 1) * row_bytes], expected);
+        }
+    }
+
+    #[test]
+    fn aligned_k_retains_the_existing_layout() {
+        const M: usize = 2;
+        const K: usize = 256;
+        let values: Vec<f32> = (0..M * K).map(|i| (i as f32).sin()).collect();
+        assert_eq!(
+            quantize_hfq4g128_2d(&values, M, K),
+            quantize_hfq4g128(&values)
+        );
+    }
+}
 // ---- TQ2G128 / BQ1G128 low-bit packers (ported from pr-597 main.rs) ----
 
 pub(crate) fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {

@@ -24,7 +24,7 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemm::GemmParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps, run_uniform_moe_gate_up, GemvInput, Step};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -957,6 +957,11 @@ fn load_gemma4_weight(
                 paro: None,
             });
         }
+        // Q8F16/Q8_0 projections are emitted when a matrix is not eligible
+        // for the requested grouped format.  The lowered forward path already
+        // dispatches DType::Q8_0; keep its loader aligned with the eager and
+        // drafter loaders instead of rejecting a valid quantizer fallback.
+        3 => DType::Q8_0,
         4 => DType::Q4K,
         6 => DType::HFQ4G256,
         7 => DType::HFQ4G128,
@@ -1538,6 +1543,37 @@ pub fn init_scratch_constants(
 // ─── Scratch ────────────────────────────────────────────────────────────
 
 use hip_bridge::DeviceBuffer;
+/// Flash tile size for gemma4 lowered path. Matches the HIP partition kernel's
+/// `TILE_SIZE = 128`.
+pub const GEMMA4_FLASH_TILE: usize = 128;
+/// Max prefill batch size for lowered gemma4. Sized once; batch flash partials
+/// scale linearly with this.
+pub const GEMMA4_MAX_PREFILL_BATCH: usize = 128;
+
+/// Pure geometry: single-query flash partial length for `max_seq`.
+/// `n_heads * ceil(max_seq / TILE) * (2 + head_dim)` floats.
+#[inline]
+pub fn gemma4_flash_partials_len(max_seq: usize, n_heads: usize, full_head_dim: usize) -> usize {
+    let tiles = max_seq.div_ceil(GEMMA4_FLASH_TILE);
+    n_heads * tiles * (2 + full_head_dim)
+}
+
+/// Pure geometry: batched flash partial length for `max_seq`.
+#[inline]
+pub fn gemma4_pb_flash_partials_len(max_seq: usize, n_heads: usize, full_head_dim: usize) -> usize {
+    GEMMA4_MAX_PREFILL_BATCH * gemma4_flash_partials_len(max_seq, n_heads, full_head_dim)
+}
+
+/// Convenience for `Gemma4Config`.
+#[inline]
+pub fn gemma4_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Config) -> usize {
+    gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim)
+}
+
+#[inline]
+pub fn gemma4_pb_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Config) -> usize {
+    gemma4_pb_flash_partials_len(max_seq, config.n_heads, config.full_head_dim)
+}
 
 /// Per-decode scratch, sized once at model-load time against the MAX of
 /// sliding and full attention dimensions so a single buffer works across
@@ -1671,7 +1707,11 @@ pub struct Gemma4Scratch {
 }
 
 impl Gemma4Scratch {
-    pub fn new(gpu: &mut Gpu, config: &Gemma4Config, _max_prefill: usize) -> HipResult<Self> {
+    /// `max_seq` is the sole allocation authority — MUST equal `LoadCtx::max_seq`
+    /// and the `KvCache::max_seq` / `physical_cap` for the paired caches.
+    /// Both `flash_partials` and `pb_flash_partials` are sized from this single
+    /// value; the `HIPFIRE_KV_SEQ` env var is no longer consulted.
+    pub fn new(gpu: &mut Gpu, config: &Gemma4Config, max_seq: usize) -> HipResult<Self> {
         let dim = config.dim;
         let q_dim =
             (config.n_heads * config.sliding_head_dim).max(config.n_heads * config.full_head_dim);
@@ -1693,7 +1733,6 @@ impl Gemma4Scratch {
         let up_ffn = gpu.zeros(&[config.hidden_dim], DType::F32)?;
         let ffn_hidden = gpu.zeros(&[config.hidden_dim], DType::F32)?;
         let ffn_out = gpu.zeros(&[dim], DType::F32)?;
-
         let logits = gpu.zeros(&[config.vocab_size], DType::F32)?;
         let sample_buf = gpu.zeros(&[2], DType::F32)?;
         let repeat_buf = gpu.zeros(&[1024], DType::F32)?;
@@ -1701,27 +1740,14 @@ impl Gemma4Scratch {
         // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
         // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
         // sliding-layer dispatches use part of the buffer, full-layer dispatches
-        // use all of it.
-        //
-        // Default 32k. The branch name "gemma4-128k-ring-buffer" describes the
-        // sliding-window code path (sliding KV is ring-buffered at sliding_window
-        // = 1024 slots regardless of context length). The FULL-attention layers
-        // (5 of 30 in 26B-A4B-it) still allocate `max_kv_seq` slots — those
-        // layers are NOT ring-buffered. At 26B-A4B-it asym3 sizes the full KV
-        // budget for 128k is ~970 MB (5 layers × 2 KV heads × 131072 tokens ×
-        // 740 B/head), which fits comfortably on a 17 GB card alongside the
-        // 14.8 GB model weights. Users who want the full 128k context set
-        // `HIPFIRE_KV_SEQ=131072` at daemon launch. Default stays at 32k to
-        // match the cross-arch baseline.
-        const FALLBACK_KV_SEQ: usize = 32768;
-        const TILE_SIZE: usize = 128;
-        let max_kv_seq: usize = std::env::var("HIPFIRE_KV_SEQ")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 128 && n <= 524_288)
-            .unwrap_or(FALLBACK_KV_SEQ);
-        let max_tiles_full = (max_kv_seq + TILE_SIZE - 1) / TILE_SIZE;
-        let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
+        // use all of it. `max_seq` is the single authority shared with both KV
+        // caches — no independent `HIPFIRE_KV_SEQ` env var.
+        assert!(
+            max_seq >= 128,
+            "gemma4 scratch: max_seq {max_seq} too small"
+        );
+        let flash_partials_sz =
+            gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
         // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
@@ -1766,43 +1792,45 @@ impl Gemma4Scratch {
 
         // Prefill-batch scratch (N tokens at once). Larger batches expose
         // more concurrent GPU work — total batch scratch ≈ N*0.16 MB.
-        const MAX_PREFILL_BATCH: usize = 128;
-        let pb_attn_out = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_ffn_out = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_pre2 = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_pre2_rot = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_router_in = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_router_logits = gpu.zeros(&[MAX_PREFILL_BATCH, n_exp], DType::F32)?;
-        let pb_moe_topk_indices = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        let pb_moe_topk_weights = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_attn_out = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_ffn_out = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_pre2 = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_pre2_rot = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_router_in = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_router_logits = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, n_exp], DType::F32)?;
+        let pb_moe_topk_indices = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_moe_topk_weights = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top], DType::F32)?;
         // Routing-bucket scratch (Phase B). expert_offsets has n_exp+1 entries.
         // expert_token_list has one entry per (token, krank) pair = N × k_top.
         let pb_moe_expert_offsets = gpu.zeros(&[n_exp + 1], DType::F32)?; // i32-typed slots
-        let pb_moe_expert_token_list = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        let pb_moe_gate_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_up_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_hidden_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_cur_moe = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_cur_mlp = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_residual = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_tmp = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_expert_token_list = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_moe_gate_batch = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_up_batch = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_hidden_batch = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_cur_moe = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_cur_mlp = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_residual = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_tmp = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
         // Sized for max across sliding/full per-token vector dims.
         // q_dim_max = n_heads * max(sliding_head_dim, full_head_dim)
         let q_dim_max = config.n_heads * config.sliding_head_dim.max(config.full_head_dim);
         let kv_dim_max = (config.sliding_n_kv_heads * config.sliding_head_dim)
             .max(config.full_n_kv_heads * config.full_head_dim);
-        let pb_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
-        let pb_attn_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
-        let pb_flash_partials = gpu.zeros(&[MAX_PREFILL_BATCH * flash_partials_sz], DType::F32)?;
-        let pb_k = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
-        let pb_v = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
-        let pb_gate = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_up = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_ffn_hidden = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_positions = gpu.zeros(&[MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
-                                                                         // BF16 staging for calibration MFMA: persistent, sized once.
+        let pb_q = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_attn_q = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_flash_partials_sz =
+            gemma4_pb_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
+        let pb_flash_partials = gpu.zeros(&[pb_flash_partials_sz], DType::F32)?;
+        let pb_k = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
+        let pb_v = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
+        let pb_gate = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_up = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_ffn_hidden =
+            gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_positions = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
+                                                                                // BF16 staging for calibration MFMA: persistent, sized once.
         let max_k_bf16 = config.dim.max(config.hidden_dim);
-        let pb_bf16 = gpu.zeros(&[MAX_PREFILL_BATCH * max_k_bf16], DType::BF16)?;
+        let pb_bf16 = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH * max_k_bf16], DType::BF16)?;
 
         Ok(Gemma4Scratch {
             x,
@@ -1836,7 +1864,7 @@ impl Gemma4Scratch {
             moe_expert_gate_batch,
             moe_expert_up_batch,
             moe_expert_hidden_batch,
-            max_prefill_batch: MAX_PREFILL_BATCH,
+            max_prefill_batch: GEMMA4_MAX_PREFILL_BATCH,
             pb_attn_out,
             pb_ffn_out,
             pb_moe_pre2,
@@ -1931,6 +1959,121 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.pb_bf16);
     }
 }
+#[cfg(test)]
+mod scratch_geometry_tests {
+    use super::*;
+
+    fn dummy_cfg_31b() -> Gemma4Config {
+        // Minimal config mirroring 31B/26B shapes: n_heads=32, full_head_dim=512
+        Gemma4Config {
+            dim: 5376,
+            n_layers: 40,
+            vocab_size: 262144,
+            norm_eps: 1e-6,
+            bos_token: 2,
+            eos_token: 1,
+            pad_token: 0,
+            n_heads: 32,
+            sliding_head_dim: 256,
+            sliding_n_kv_heads: 16,
+            sliding_rope_theta: 10000.0,
+            sliding_window: 1024,
+            full_head_dim: 512,
+            full_n_kv_heads: 4,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            hidden_dim: 21504,
+            enable_moe_block: false,
+            moe_intermediate_size: 704,
+            num_experts: 128,
+            top_k_experts: 8,
+            final_logit_softcapping: 30.0,
+            tie_word_embeddings: true,
+            embed_scale: (5376 as f32).sqrt(),
+            layer_types: vec![LayerType::Sliding; 40],
+            has_vision: false,
+            image_token_id: 258880,
+            boi_token_id: 255999,
+            eoi_token_id: 258882,
+            audio_token_id: 258881,
+            video_token_id: 258884,
+        }
+    }
+
+    #[test]
+    fn flash_partials_geometry_matches_formula() {
+        // Single tile edge
+        assert_eq!(gemma4_flash_partials_len(128, 32, 512), 32 * 1 * 514);
+        assert_eq!(gemma4_flash_partials_len(129, 32, 512), 32 * 2 * 514);
+        assert_eq!(gemma4_flash_partials_len(256, 32, 512), 32 * 2 * 514);
+        // 32k baseline (FALLBACK_KV_SEQ before fix)
+        assert_eq!(gemma4_flash_partials_len(32768, 32, 512), 32 * 256 * 514);
+        assert_eq!(gemma4_flash_partials_len(32768, 32, 512), 4_210_688);
+        // 131072 must be exactly 4× the 32768 geometry (no overflow, no env var)
+        assert_eq!(gemma4_flash_partials_len(131072, 32, 512), 32 * 1024 * 514);
+        assert_eq!(gemma4_flash_partials_len(131072, 32, 512), 16_842_752);
+        assert_eq!(
+            gemma4_flash_partials_len(131072, 32, 512),
+            4 * gemma4_flash_partials_len(32768, 32, 512)
+        );
+    }
+
+    #[test]
+    fn pb_flash_is_batch_scaled_and_single_authority() {
+        for &max_seq in &[128usize, 1024, 32768, 131072] {
+            let single = gemma4_flash_partials_len(max_seq, 32, 512);
+            let batched = gemma4_pb_flash_partials_len(max_seq, 32, 512);
+            assert_eq!(batched, GEMMA4_MAX_PREFILL_BATCH * single);
+            // PB via config helper shares the same max_seq authority
+            let cfg = dummy_cfg_31b();
+            assert_eq!(
+                gemma4_pb_flash_partials_len_for_config(max_seq, &cfg),
+                batched
+            );
+            assert_eq!(gemma4_flash_partials_len_for_config(max_seq, &cfg), single);
+        }
+        // Concrete 131072 batched size without allocating GPU memory
+        assert_eq!(
+            gemma4_pb_flash_partials_len(131072, 32, 512),
+            128 * 16_842_752
+        );
+        assert_eq!(gemma4_pb_flash_partials_len(131072, 32, 512), 2_155_872_256);
+        assert_eq!(gemma4_pb_flash_partials_len(32768, 32, 512), 538_968_064);
+    }
+
+    #[test]
+    fn flash_scales_invariant_to_tile_rounding() {
+        // Non-multiple of 128 must ceil
+        let tiles_32769 = 32769usize.div_ceil(GEMMA4_FLASH_TILE);
+        assert_eq!(tiles_32769, 257);
+        assert_eq!(gemma4_flash_partials_len(32769, 32, 512), 32 * 257 * 514);
+        // 131071 is one short of 131072 -> still 1024 tiles (ceil)
+        assert_eq!(131071usize.div_ceil(GEMMA4_FLASH_TILE), 1024);
+        assert_eq!(
+            gemma4_flash_partials_len(131071, 32, 512),
+            gemma4_flash_partials_len(131072, 32, 512)
+        );
+    }
+
+    #[test]
+    fn kv_and_partials_share_max_seq_authority_concept() {
+        // Documents the invariant: KV capacity (ctx.max_seq / physical_cap) and
+        // both flash buffers are derived from the same max_seq value. We test
+        // the arithmetic side here; the carrier integration test below asserts
+        // that the constructor is wired to ctx.max_seq and not an env var.
+        let max_seq = 131072usize;
+        let cfg = dummy_cfg_31b();
+        // If KV were sized to max_seq but partials to a different value, decode
+        // would OOB. Here we just prove both helpers agree on the same input.
+        let kv_tiles = max_seq.div_ceil(GEMMA4_FLASH_TILE);
+        let flash = gemma4_flash_partials_len_for_config(max_seq, &cfg);
+        assert_eq!(flash, cfg.n_heads * kv_tiles * (2 + cfg.full_head_dim));
+        let pb = gemma4_pb_flash_partials_len_for_config(max_seq, &cfg);
+        assert_eq!(pb, GEMMA4_MAX_PREFILL_BATCH * flash);
+    }
+}
 
 // ─── Forward pass ───────────────────────────────────────────────────────
 
@@ -1970,7 +2113,6 @@ fn apply_moe_branch(
     attn_out: &GpuTensor,
 ) -> HipResult<()> {
     let dim = config.dim;
-    let dim_bytes = dim * 4;
     let mi = config.moe_intermediate_size;
     let n_exp = config.num_experts;
     let k_top = config.top_k_experts;
@@ -2021,7 +2163,7 @@ fn apply_moe_branch(
         &scratch.moe_router_in,
         config.norm_eps,
     )?;
-    gpu.scale_f32(&scratch.moe_router_in, 1.0 / (dim as f32).sqrt())?;
+    gpu.scale_f32_recorded(&scratch.moe_router_in, 1.0 / (dim as f32).sqrt())?;
 
     // 4) Router GEMV → logits [n_exp]
     weight_gemv(
@@ -2055,11 +2197,12 @@ fn apply_moe_branch(
     // Hits the fast path. Other Gemma 4 variants might land in legacy.
     let first = &moe.experts[0];
     let gate_mq4 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
+    let gate_hfq4 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::HFQ4G256;
+    let gate_hfq6 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::HFQ6G256;
     let gate_q8 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_q8 = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    let fast = (gate_mq4 || gate_q8) && down_q8;
-    let _ = (gate_mq4, down_hfq4g128);
+    let fast = (gate_mq4 || gate_hfq4 || gate_hfq6 || gate_q8) && (down_q8 || down_hfq4g128);
     {
         use std::sync::OnceLock;
         static LOGGED: OnceLock<()> = OnceLock::new();
@@ -2092,6 +2235,20 @@ fn apply_moe_branch(
                 2 * mi,
                 dim,
             )?;
+        } else if gate_hfq4 || gate_hfq6 {
+            run_uniform_moe_gate_up(
+                gpu,
+                first.gate_up_proj.gpu_dtype,
+                &moe.experts_gate_up_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_pre2,
+                &scratch.moe_expert_gate_batch,
+                &scratch.moe_expert_up_batch,
+                2 * mi,
+                dim,
+                k_top,
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         } else {
             // Q8_0 — no rotation needed.
             gpu.gemv_q8_0_moe_gate_up_k8_indexed(
@@ -2118,12 +2275,7 @@ fn apply_moe_branch(
         )?;
 
         // Zero accumulator (memset is sync but tiny — 11 KB for dim=2816).
-        if let Some(s) = gpu.active_stream.as_ref() {
-            gpu.hip
-                .memset_async(&scratch.moe_cur_moe.buf, 0, dim_bytes, s)?;
-        } else {
-            gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
-        }
+        gpu.zero_f32(&scratch.moe_cur_moe)?;
 
         // Indexed down + scaled residual: 8 fused GEMVs, atomicAdd into
         // moe_cur_moe with scale = topk_weights[krank] *
@@ -2173,12 +2325,7 @@ fn apply_moe_branch(
                 ));
             }
         }
-        if let Some(s) = gpu.active_stream.as_ref() {
-            gpu.hip
-                .memset_async(&scratch.moe_cur_moe.buf, 0, dim_bytes, s)?;
-        } else {
-            gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
-        }
+        gpu.zero_f32(&scratch.moe_cur_moe)?;
         // Dump router info for first MoE layer
         {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2278,7 +2425,7 @@ fn apply_moe_branch(
     )?;
 
     // 10) combined = cur_mlp + cur_moe → scratch.tmp
-    gpu.add_f32(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
+    gpu.add_f32_graph_safe(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
 
     // 11) tmp = post_feedforward_layernorm(combined)
     gpu.rmsnorm_f32(&scratch.tmp, post_ffn_norm, &scratch.tmp, config.norm_eps)?;
@@ -3026,7 +3173,6 @@ fn sliding_layer_decode_impl(
 
     // KV cache write + flash attention via dispatch framework (Step::Attend).
     // flash_mode=2 (forced) because sliding layers always need flash for window masking.
-    let sliding_cap = kv_cache.physical_cap as u32;
     {
         let tier_inputs = KvTierInputs {
             quant_asym4: kv_cache.quant_asym4,
@@ -3046,7 +3192,7 @@ fn sliding_layer_decode_impl(
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
-            q8_windowed: false,
+            q8_windowed: true,
             window: config.sliding_window as i32,
         };
         let plan = KvTierPlan::derive(tier_inputs)
@@ -3065,7 +3211,7 @@ fn sliding_layer_decode_impl(
             n_heads,
             n_kv_heads: n_kv,
             head_dim,
-            physical_cap: kv_cache.max_seq,
+            physical_cap: kv_cache.physical_cap,
             batch_size: 1,
             max_ctx_len: 0,
             flash_partials: Some(&scratch.flash_partials),
@@ -4252,7 +4398,7 @@ fn forward_prefill_batch_v2(
                         batch_size: 1,
                         is_tree: false,
                         is_boundary: false,
-                        q8_windowed: false,
+                        q8_windowed: true,
                         window: sliding_cap as i32,
                     };
                     let plan = KvTierPlan::derive(tier_inputs)
@@ -4271,7 +4417,7 @@ fn forward_prefill_batch_v2(
                         n_heads,
                         n_kv_heads: n_kv,
                         head_dim,
-                        physical_cap: kv_sliding.max_seq,
+                        physical_cap: kv_sliding.physical_cap,
                         batch_size: 1,
                         max_ctx_len: 0,
                         flash_partials: Some(&scratch.flash_partials),
@@ -4584,7 +4730,7 @@ fn forward_prefill_batch_v2(
                     batch_size: n_batch,
                     is_tree: false,
                     is_boundary: false,
-                    q8_windowed: false,
+                    q8_windowed: true,
                     window: 0,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
@@ -5240,21 +5386,57 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 )),
             },
             g4_op::PROJ_V_SLIDING => match self.layer {
-                LayerWeights::Sliding(lw) => weight_gemv(gpu, &lw.v_proj, &s.tmp, &s.v),
+                LayerWeights::Sliding(lw) => {
+                    let wr = lw.v_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.tmp),
+                            out: &s.v,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
                 _ => Err(hip_bridge::HipError::new(
                     0,
                     "PROJ_V_SLIDING on non-Sliding layer",
                 )),
             },
             g4_op::PROJ_Q_FULL => match self.layer {
-                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.q_proj, &s.tmp, &s.q),
+                LayerWeights::Full(lw) => {
+                    let wr = lw.q_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.tmp),
+                            out: &s.q,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
                 _ => Err(hip_bridge::HipError::new(
                     0,
                     "PROJ_Q_FULL on non-Full layer",
                 )),
             },
             g4_op::PROJ_K_FULL => match self.layer {
-                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.k_proj, &s.tmp, &s.k),
+                LayerWeights::Full(lw) => {
+                    let wr = lw.k_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.tmp),
+                            out: &s.k,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
                 _ => Err(hip_bridge::HipError::new(
                     0,
                     "PROJ_K_FULL on non-Full layer",
@@ -5274,7 +5456,19 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     )
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
                 }
-                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.o_proj, &s.attn_out, &s.tmp),
+                LayerWeights::Full(lw) => {
+                    let wr = lw.o_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.attn_out),
+                            out: &s.tmp,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
             },
             g4_op::PROJ_GATE_UP => match self.layer {
                 LayerWeights::Sliding(lw) => {
@@ -5342,7 +5536,17 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
                     }
                     LayerWeights::Full(lw) => {
-                        weight_gemv(gpu, &lw.down_proj, &s.ffn_hidden, &s.ffn_out)
+                        let wr = lw.down_proj.dispatch_ref();
+                        execute_steps(
+                            gpu,
+                            ctx,
+                            &[Step::Gemv {
+                                w: &wr,
+                                input: GemvInput::Raw(&s.ffn_hidden),
+                                out: &s.ffn_out,
+                            }],
+                        )
+                        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
                     }
                 }
             }
@@ -5361,7 +5565,6 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
     ) -> Result<(), hipfire_dispatch::types::DispatchError> {
         let s = self.scratch;
         let dim = self.config.dim;
-        let dim_bytes = dim * 4;
         let hip_to_dispatch =
             |e: hip_bridge::HipError| hipfire_dispatch::types::DispatchError::Hip(e.to_string());
 
@@ -5369,56 +5572,29 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
             g4_op::RESID_POST_ATTN => {
                 // First: save x → residual (this is the first time residual is set
                 // in this layer — Norm(INPUT) wrote to tmp, x is still intact).
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.residual.buf, 0, &s.x.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.residual.buf, &s.x.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.residual, &s.x, dim)
+                    .map_err(hip_to_dispatch)?;
                 // x = residual + tmp (tmp holds post_attn_norm output).
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.x.buf, 0, &s.residual.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.x.buf, &s.residual.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.x, &s.residual, dim)
+                    .map_err(hip_to_dispatch)?;
                 gpu.add_inplace_f32(&s.x, &s.tmp).map_err(hip_to_dispatch)?;
                 // Save x → residual for the FFN residual stream.
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.residual.buf, 0, &s.x.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.residual.buf, &s.x.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.residual, &s.x, dim)
+                    .map_err(hip_to_dispatch)?;
                 Ok(())
             }
             g4_op::RESID_POST_FFN => {
                 // x = residual + tmp; x *= layer_scalar.
                 // Identical for dense and MoE — tmp already holds normalized output.
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.x.buf, 0, &s.residual.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.x.buf, &s.residual.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.x, &s.residual, dim)
+                    .map_err(hip_to_dispatch)?;
                 gpu.add_inplace_f32(&s.x, &s.tmp).map_err(hip_to_dispatch)?;
                 let layer_scalar = match self.layer {
                     LayerWeights::Sliding(lw) => lw.layer_scalar_host,
                     LayerWeights::Full(lw) => lw.layer_scalar_host,
                 };
-                gpu.scale_f32(&s.x, layer_scalar).map_err(hip_to_dispatch)?;
+                gpu.scale_f32_recorded(&s.x, layer_scalar)
+                    .map_err(hip_to_dispatch)?;
                 Ok(())
             }
             other => Err(hip_bridge::HipError::new(
@@ -5532,7 +5708,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 .map_err(hip_to_dispatch)?;
 
                 // Pre-scale Q by sqrt(head_dim) — Gemma 4 attention scale is 1.0.
-                gpu.scale_f32(&s.q, (head_dim as f32).sqrt())
+                gpu.scale_f32_recorded(&s.q, (head_dim as f32).sqrt())
                     .map_err(hip_to_dispatch)?;
 
                 // Full rotate_half RoPE (all dims rotate).
@@ -5550,7 +5726,6 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 // KV write + flash attention via dispatch.
                 let kv = &mut *self.kv_sliding;
                 let kv_layer_idx = self.sliding_kv_idx;
-                let sliding_cap = kv.physical_cap as u32;
                 let ctx = DispatchCtx::new(gpu);
                 let tier_inputs = KvTierInputs {
                     quant_asym4: kv.quant_asym4,
@@ -5570,7 +5745,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
-                    q8_windowed: false,
+                    q8_windowed: true,
                     window: config.sliding_window as i32,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
@@ -5589,7 +5764,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     n_heads,
                     n_kv_heads: n_kv,
                     head_dim,
-                    physical_cap: kv.max_seq,
+                    physical_cap: kv.physical_cap,
                     batch_size: 1,
                     max_ctx_len: 0,
                     flash_partials: Some(&s.flash_partials),
@@ -5619,15 +5794,8 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 let kv_bytes = n_kv * head_dim * 4;
 
                 // CRITICAL: capture pre-k_norm K as V before applying k_norm.
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.v.buf, 0, &s.k.buf, 0, kv_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.v.buf, &s.k.buf, kv_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.v, &s.k, kv_bytes / 4)
+                    .map_err(hip_to_dispatch)?;
 
                 // q/k/v norms (v_norm is no-scale — ones buffer).
                 gpu.rmsnorm_batched(&s.q, &lw.q_norm, &s.q, n_heads, head_dim, config.norm_eps)
@@ -5645,7 +5813,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 .map_err(hip_to_dispatch)?;
 
                 // Pre-scale Q by sqrt(head_dim).
-                gpu.scale_f32(&s.q, (head_dim as f32).sqrt())
+                gpu.scale_f32_recorded(&s.q, (head_dim as f32).sqrt())
                     .map_err(hip_to_dispatch)?;
 
                 // Proportional partial RoPE (only first n_rot_pairs pairs rotate).

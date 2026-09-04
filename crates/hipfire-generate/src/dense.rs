@@ -2002,6 +2002,284 @@ mod gemma4_prefill_batch_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn generate_gemma4_lowered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    logprobs_top_k: Option<usize>,
+    request_seed: u32,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    }
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
+
+    let Some(bundle_ref) = m.gemma4_lowered_mut() else {
+        emit_error_with_id(stdout, id, "gemma4 lowered bundle missing");
+        return;
+    };
+    let bos_tok = bundle_ref.config.bos_token;
+    let cfg_eos_tok = bundle_ref.config.eos_token;
+    let bundle = bundle_ref as *mut hipfire_loader::Gemma4LoweredBundle;
+
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+            && m.chat_template.is_some();
+        let mut ids = if try_jinja {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template: m.chat_template.as_ref().unwrap(),
+                system: system_prompt,
+                user: prompt,
+                enable_thinking,
+                bos_token: Some("<bos>"),
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized;
+                let history = match messages_history {
+                    Some(history) => history,
+                    None => {
+                        let mut messages = Vec::new();
+                        if let Some(system) = system_prompt {
+                            messages.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: system.to_owned(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                        }
+                        messages.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_owned(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                        synthesized = messages;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(history, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(error) => {
+                    eprintln!("[daemon] jinja render failed in Gemma4 lowered path ({error}); using raw prompt");
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+    if prompt_ids.len() + max_tokens > m.max_seq {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4 lowered request needs {} KV positions but max_seq is {}",
+                prompt_ids.len() + max_tokens,
+                m.max_seq
+            ),
+        );
+        return;
+    }
+
+    // The lowered route does not yet publish a prompt-cache contract. Rebuild
+    // the full Jinja frame from position zero so stale KV can never leak across
+    // requests; absolute-position writes overwrite every row that is observed.
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let t0 = Instant::now();
+    for (pos, &token) in prompt_ids.iter().enumerate() {
+        let result = unsafe {
+            gemma4::lowered::forward_scratch(
+                gpu,
+                &(*bundle).weights,
+                &(*bundle).config,
+                token,
+                pos,
+                &mut (*bundle).kv_sliding,
+                &mut (*bundle).kv_full,
+                &(*bundle).scratch,
+            )
+        };
+        if let Err(error) = result {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("gemma4 lowered prefill failed: {error:?}"),
+            );
+            return;
+        }
+    }
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.seq_pos = prompt_ids.len();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    let stop_set = unsafe { [cfg_eos_tok, (*bundle).eos_tok, 106] };
+    let sampler_cfg = hipfire_runtime::sampler::SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let mut rng_state = request_seed;
+    let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    let mut generated = 0usize;
+    let mut ttft_ms = None;
+    let decode_t0 = Instant::now();
+
+    while generated < max_tokens {
+        let next = unsafe {
+            hipfire_runtime::sampler::sample(
+                gpu,
+                &(*bundle).scratch.logits,
+                &(*bundle).scratch.sample_buf,
+                &(*bundle).scratch.repeat_buf,
+                (*bundle).config.vocab_size,
+                &m.conversation_tokens,
+                &sampler_cfg,
+                &mut rng_state,
+            )
+        };
+        if stop_set.contains(&next) {
+            break;
+        }
+        if ttft_ms.is_none() {
+            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let frag = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let host_logits = if logprobs_top_k.is_some() {
+            unsafe { gpu.download_f32(&(*bundle).scratch.logits).ok() }
+        } else {
+            None
+        };
+        for event in router.push(&frag).0 {
+            match event {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                GemmaEmit::Token(text) => {
+                    let mut envelope = serde_json::json!({
+                        "type": "token", "id": id, "text": text,
+                        "attempt_id": active_attempt_id(),
+                    });
+                    if let Some(logits) = host_logits.as_ref() {
+                        if let Some((logprob, top)) = crate::common::token_logprob_fields(
+                            logits,
+                            next,
+                            logprobs_top_k,
+                            m.tokenizer.as_ref().unwrap(),
+                        ) {
+                            envelope["logprob"] = serde_json::json!(logprob);
+                            envelope["top_logprobs"] = top;
+                        }
+                    }
+                    let _ = writeln!(stdout, "{envelope}");
+                    let _ = stdout.flush();
+                }
+            }
+        }
+        m.conversation_tokens.push(next);
+        generated += 1;
+        let pos = m.seq_pos;
+        let result = unsafe {
+            gemma4::lowered::forward_scratch(
+                gpu,
+                &(*bundle).weights,
+                &(*bundle).config,
+                next,
+                pos,
+                &mut (*bundle).kv_sliding,
+                &mut (*bundle).kv_full,
+                &(*bundle).scratch,
+            )
+        };
+        if let Err(error) = result {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("gemma4 lowered decode failed: {error:?}"),
+            );
+            return;
+        }
+        m.seq_pos += 1;
+    }
+    for event in router.flush() {
+        match event {
+            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
+        }
+    }
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let decode_tok_s = generated as f64 * 1000.0 / decode_ms as f64;
+    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
+        id,
+        generated,
+        decode_tok_s,
+        prompt_ids.len(),
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms.unwrap_or(total_ms as f64),
+        total_ms,
+        active_attempt_id(),
+    );
+    let _ = stdout.flush();
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -2896,38 +3174,38 @@ impl GemmaThoughtRouter {
         loop {
             match self.state {
                 GemmaChannel::AwaitingThought => {
-                    if let Some(pos) = self.pending.find("<|channel>thought") {
-                        let mut header_end = pos + "<|channel>thought".len();
+                    const CHANNEL_OPEN: &str = "<|channel>";
+                    const THOUGHT_OPEN: &str = "<|channel>thought";
+
+                    // A thought channel is optional and may be split across
+                    // decoded fragments. Hold only while the bytes seen so far
+                    // can still become the canonical opening header.
+                    if THOUGHT_OPEN.starts_with(&self.pending) {
+                        break;
+                    }
+                    if self.pending.starts_with(THOUGHT_OPEN) {
+                        let mut header_end = THOUGHT_OPEN.len();
                         if self.pending[header_end..].starts_with('\n') {
                             header_end += 1;
-                        }
-                        if pos > 0 {
-                            let pre = self.pending[..pos].to_string();
-                            self.pending.drain(..pos);
-                            header_end -= pos;
-                            if !pre.is_empty() && !gemma_is_marker_prefix(&pre) {
-                                out.push(GemmaEmit::Token(pre));
-                            }
-                            continue;
                         }
                         self.pending.drain(..header_end);
                         self.state = GemmaChannel::Reasoning;
                         continue;
-                    } else {
-                        let hold = gemma_longest_marker_suffix(&self.pending);
-                        if hold == 0 || hold >= self.pending.len() {
-                            break;
-                        }
-                        let emit_len = self.pending.len() - hold;
-                        if emit_len > 0 {
-                            let text = self.pending[..emit_len].to_string();
-                            self.pending.drain(..emit_len);
-                            if !text.is_empty() && !gemma_is_marker_prefix(&text) {
-                                out.push(GemmaEmit::Token(text));
-                            }
-                        }
-                        break;
                     }
+
+                    // The response schema makes the thought header optional.
+                    // Once the buffered bytes cannot form that header, route
+                    // them as answer content. Some Gemma4 checkpoints emit an
+                    // orphan `<|channel>` before an otherwise valid answer;
+                    // consume that control token without dropping its payload.
+                    if self.pending.starts_with(CHANNEL_OPEN) {
+                        self.pending.drain(..CHANNEL_OPEN.len());
+                        if self.pending.starts_with('\n') {
+                            self.pending.drain(..1);
+                        }
+                    }
+                    self.state = GemmaChannel::Answer;
+                    continue;
                 }
                 GemmaChannel::Reasoning => {
                     if let Some(pos) = self.pending.find("<channel|>") {
@@ -2960,30 +3238,63 @@ impl GemmaThoughtRouter {
                     }
                 }
                 GemmaChannel::Answer => {
-                    if let Some(pos) = self.pending.find("<turn|>") {
-                        if pos > 0 {
-                            let text = self.pending[..pos].to_string();
-                            self.pending.drain(..pos);
-                            if !text.is_empty() {
-                                out.push(GemmaEmit::Token(text));
+                    // Answer must chunk-safely strip any Gemma channel
+                    // control markers, including canonical <|channel|>
+                    // forms, orphan <|channel> variants, and markers
+                    // arriving after a forced max-think transition.
+                    // Preserve payload before/after each marker and hold
+                    // a suffix that could still become a marker.
+                    const ANSWER_MARKERS: &[&str] = &[
+                        "<|channel>thought",
+                        "<|channel>",
+                        "<|channel|>",
+                        "<channel|>",
+                        "<|turn>",
+                        "<turn|>",
+                    ];
+                    loop {
+                        let hold = gemma_longest_marker_suffix(&self.pending);
+                        let search_len = self.pending.len().saturating_sub(hold);
+                        let searchable = &self.pending[..search_len];
+                        let mut best_pos: Option<usize> = None;
+                        let mut best_len = 0usize;
+                        for &m in ANSWER_MARKERS {
+                            if let Some(pos) = searchable.find(m) {
+                                if best_pos.is_none()
+                                    || pos < best_pos.unwrap()
+                                    || (pos == best_pos.unwrap() && m.len() > best_len)
+                                {
+                                    best_pos = Some(pos);
+                                    best_len = m.len();
+                                }
+                            }
+                        }
+                        if let Some(pos) = best_pos {
+                            if pos > 0 {
+                                let text = self.pending[..pos].to_string();
+                                self.pending.drain(..pos);
+                                if !text.is_empty() {
+                                    out.push(GemmaEmit::Token(text));
+                                }
+                                continue;
+                            }
+                            self.pending.drain(..best_len);
+                            if self.pending.starts_with('\n') {
+                                self.pending.drain(..1);
+                            }
+                            if self.pending.is_empty() {
+                                break;
                             }
                             continue;
                         }
-                        self.pending.drain(.."<turn|>".len());
-                        if !self.pending.is_empty() && !gemma_is_marker_prefix(&self.pending) {
-                            let tail = std::mem::take(&mut self.pending);
-                            out.push(GemmaEmit::Token(tail));
+                        if search_len > 0 {
+                            let text = self.pending[..search_len].to_string();
+                            self.pending.drain(..search_len);
+                            if !text.is_empty() {
+                                out.push(GemmaEmit::Token(text));
+                            }
                         }
                         break;
-                    }
-                    let hold = gemma_longest_marker_suffix(&self.pending);
-                    let emit_len = self.pending.len().saturating_sub(hold);
-                    if emit_len > 0 {
-                        let text = self.pending[..emit_len].to_string();
-                        self.pending.drain(..emit_len);
-                        if !text.is_empty() {
-                            out.push(GemmaEmit::Token(text));
-                        }
                     }
                     break;
                 }
@@ -3016,7 +3327,7 @@ impl GemmaThoughtRouter {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        if self.state == GemmaChannel::AwaitingThought {
+        if self.state == GemmaChannel::AwaitingThought && gemma_is_marker_prefix(&self.pending) {
             self.pending.clear();
             return Vec::new();
         }
@@ -3036,17 +3347,312 @@ pub fn gemma_is_marker_prefix(s: &str) -> bool {
     const MARKERS: &[&str] = &[
         "<|channel>thought",
         "<|channel>",
+        "<|channel|>",
         "<channel|>",
         "<|turn>",
         "<turn|>",
     ];
-    MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
+    MARKERS.iter().any(|m| m.starts_with(s))
+}
+
+#[cfg(test)]
+mod gemma_thought_router_tests {
+    use super::{gemma_is_marker_prefix, GemmaChannel, GemmaEmit, GemmaThoughtRouter};
+
+    fn route(enable_thinking: bool, chunks: &[&str]) -> (String, String, GemmaChannel) {
+        let mut router = GemmaThoughtRouter::new(enable_thinking, 0);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for chunk in chunks {
+            for event in router.push(chunk).0 {
+                match event {
+                    GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                    GemmaEmit::Token(text) => visible.push_str(&text),
+                }
+            }
+        }
+        for event in router.flush() {
+            match event {
+                GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                GemmaEmit::Token(text) => visible.push_str(&text),
+            }
+        }
+        (visible, reasoning, router.state)
+    }
+
+    #[test]
+    fn gemma_router_routes_canonical_thought_then_answer() {
+        let (visible, reasoning, state) = route(
+            true,
+            &["<|channel>", "thought", "\nplan<channel|>\nanswer<turn|>"],
+        );
+        assert_eq!(reasoning, "plan");
+        assert_eq!(visible, "answer");
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_recovers_orphan_channel_before_answer() {
+        let (visible, reasoning, state) =
+            route(true, &["<|channel>", "\n", "```python\nprint('ok')\n```"]);
+        assert_eq!(visible, "```python\nprint('ok')\n```");
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_orphan_channel_is_chunk_boundary_invariant() {
+        let full = "<|channel>\nanswer";
+        let expected = route(true, &[full]);
+        for split in 1..full.len() {
+            if full.is_char_boundary(split) {
+                assert_eq!(route(true, &[&full[..split], &full[split..]]), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn gemma_router_thinking_request_can_emit_direct_answer() {
+        let (visible, reasoning, state) = route(true, &["direct answer"]);
+        assert_eq!(visible, "direct answer");
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_drops_only_an_unfinished_control_marker_at_eos() {
+        let (visible, reasoning, state) = route(true, &["<|chan"]);
+        assert!(visible.is_empty());
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::AwaitingThought);
+    }
+
+    #[test]
+    fn gemma_marker_prefix_does_not_classify_marker_plus_payload() {
+        assert!(gemma_is_marker_prefix("<|chan"));
+        assert!(gemma_is_marker_prefix("<|channel>"));
+        assert!(!gemma_is_marker_prefix("<|channel>\nanswer"));
+    }
+
+    fn route_with_cap(
+        enable_thinking: bool,
+        max_think_tokens: usize,
+        chunks: &[&str],
+    ) -> (String, String, GemmaChannel) {
+        let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for chunk in chunks {
+            for event in router.push(chunk).0 {
+                match event {
+                    GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                    GemmaEmit::Token(text) => visible.push_str(&text),
+                }
+            }
+        }
+        for event in router.flush() {
+            match event {
+                GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                GemmaEmit::Token(text) => visible.push_str(&text),
+            }
+        }
+        (visible, reasoning, router.state)
+    }
+
+    fn assert_no_markers(s: &str) {
+        for m in &[
+            "<|channel>thought",
+            "<|channel>",
+            "<|channel|>",
+            "<channel|>",
+            "<|turn>",
+            "<turn|>",
+        ] {
+            assert!(!s.contains(m), "visible leaked marker {:?} in {:?}", m, s);
+        }
+    }
+
+    #[test]
+    fn gemma_router_thinking_off_strips_all_channel_markers_every_split() {
+        // Thinking-off starts in Answer; every channel/turn marker must be
+        // stripped chunk-safely regardless of split.
+        let full = "pre<|channel>mid<channel|>post<|channel|>inner<|channel>thought\nX<channel|>tail<|turn>end<turn|>after";
+        let expected = route_with_cap(false, 0, &[full]);
+        assert_no_markers(&expected.0);
+        // Adjacent payload must survive: markers stripped, text joined.
+        assert_eq!(expected.0, "premidpostinnerXtailendafter");
+        for split in 1..full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = route_with_cap(false, 0, &[&full[..split], &full[split..]]);
+            assert_eq!(got, expected, "mismatch at split {}", split);
+            assert_no_markers(&got.0);
+        }
+        // Also verify orphan <|channel> with newline framing is stripped.
+        let full2 = "<|channel>\nanswer";
+        let exp2 = route_with_cap(false, 0, &[full2]);
+        assert_eq!(exp2.0, "answer");
+        for split in 1..full2.len() {
+            if !full2.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                route_with_cap(false, 0, &[&full2[..split], &full2[split..]]),
+                exp2
+            );
+        }
+        // Canonical <|channel|> in thinking-off must also be stripped.
+        let full3 = "A<|channel|>B";
+        let exp3 = route_with_cap(false, 0, &[full3]);
+        assert_eq!(exp3.0, "AB");
+        assert_no_markers(&exp3.0);
+        for split in 1..full3.len() {
+            if !full3.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                route_with_cap(false, 0, &[&full3[..split], &full3[split..]]),
+                exp3
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_router_forced_close_strips_markers_after_transition_every_split() {
+        // Force max-think after one reasoning push, then ensure every
+        // subsequent channel/turn marker in Answer is stripped at every
+        // split, preserving adjacent payload.
+        let pre = "<|channel>thought\nAAA<channel|>";
+        let post = "BBB<|channel>CCC<channel|>DDD<|channel|>EEE<|turn>FFF<turn|>GGG";
+        let full = format!("{}{}", pre, post);
+        // full = "<|channel>thought\nAAA<channel|>BBB<|channel>CCC<channel|>DDD<|channel|>EEE<|turn>FFF<turn|>GGG"
+        // With max_think=1 the router forces to Answer after the first
+        // reasoning push; the trailing <channel|> that closes thought and
+        // all markers inside post must be stripped, not leaked.
+        let expected = route_with_cap(true, 1, &[&full]);
+        assert!(expected.1.contains("AAA") || expected.0.contains("AAA"));
+        assert_no_markers(&expected.0);
+        // Answer payload should be the post text with markers removed.
+        // Post without markers: "BBBCCCDDDEEEFFFGGG"
+        assert_eq!(expected.0, "BBBCCCDDDEEEFFFGGG");
+        // For split invariance after forced close, keep the reasoning header
+        // as one chunk and only split the post payload. Splitting the header
+        // itself changes per-push reasoning counting and is not required to
+        // be invariant for this test.
+        for split in 0..=post.len() {
+            if split != 0 && !post.is_char_boundary(split) {
+                continue;
+            }
+            let got = if split == 0 || split == post.len() {
+                route_with_cap(true, 1, &[&full])
+            } else {
+                let c1 = &post[..split];
+                let c2 = &post[split..];
+                route_with_cap(true, 1, &[pre, c1, c2])
+            };
+            assert_eq!(got.0, expected.0, "forced mismatch at post split {}", split);
+            assert_no_markers(&got.0);
+        }
+        // Also test forced transition where pending marker is split across
+        // the forced boundary: reasoning chunk ends with partial marker prefix.
+        let full2 = "<|channel>thought\nRR<channel|>XX<|channel>YY";
+        let exp2 = route_with_cap(true, 1, &[full2]);
+        assert_no_markers(&exp2.0);
+        // Split only the post part after the forced close to keep reasoning counting stable
+        let pre2 = "<|channel>thought\nRR<channel|>";
+        let post2 = "XX<|channel>YY";
+        let exp2_post = route_with_cap(true, 1, &[full2]);
+        for split in 0..=post2.len() {
+            if split != 0 && !post2.is_char_boundary(split) {
+                continue;
+            }
+            let got = if split == 0 || split == post2.len() {
+                route_with_cap(true, 1, &[full2])
+            } else {
+                route_with_cap(true, 1, &[pre2, &post2[..split], &post2[split..]])
+            };
+            assert_eq!(
+                got.0, exp2.0,
+                "forced split2 mismatch at post split {}",
+                split
+            );
+            assert_no_markers(&got.0);
+        }
+        // Verify that a marker arriving strictly after forced transition
+        // as a separate push is still stripped at every internal split.
+        for payload in &[
+            "hello<channel|>world",
+            "hello<|channel>world",
+            "hello<|channel|>world",
+            "hello<turn|>world",
+            "hello<|turn>world",
+        ] {
+            let expected_payload = (*payload)
+                .replace("<|channel>thought", "")
+                .replace("<|channel>", "")
+                .replace("<|channel|>", "")
+                .replace("<channel|>", "")
+                .replace("<|turn>", "")
+                .replace("<turn|>", "");
+            for split in 0..=payload.len() {
+                if split != 0 && !payload.is_char_boundary(split) {
+                    continue;
+                }
+                // Build payload split after forced transition.
+                let full = if split == 0 || split == payload.len() {
+                    format!("<|channel>thought\nZ<channel|>{}", payload)
+                } else {
+                    // Simulate payload split across two pushes after forced.
+                    // Create a single concatenated string and test split invariance
+                    // via the full-string split test already done; here just
+                    // verify the payload alone after forced.
+                    let c1 = &payload[..split];
+                    let c2 = &payload[split..];
+                    let mut rr = GemmaThoughtRouter::new(true, 1);
+                    let _ = rr.push("<|channel>thought\nZ");
+                    let mut vis = String::new();
+                    for ev in rr.push("<channel|>").0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.push(c1).0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.push(c2).0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.flush() {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    assert_eq!(
+                        vis, expected_payload,
+                        "payload {:?} split {}",
+                        payload, split
+                    );
+                    assert_no_markers(&vis);
+                    continue;
+                };
+                let got = route_with_cap(true, 1, &[&full]);
+                assert!(got.0.contains(&expected_payload) || got.0 == expected_payload);
+                assert_no_markers(&got.0);
+            }
+        }
+    }
 }
 
 pub fn gemma_longest_marker_suffix(s: &str) -> usize {
     const MARKERS: &[&str] = &[
         "<|channel>thought",
         "<|channel>",
+        "<|channel|>",
         "<channel|>",
         "<|turn>",
         "<turn|>",

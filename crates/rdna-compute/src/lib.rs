@@ -14,6 +14,7 @@ pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod gemm;
+mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 pub mod graph;

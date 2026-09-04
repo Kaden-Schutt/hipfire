@@ -453,7 +453,7 @@ pub fn run_uniform_moe_gate_up(
         result.map_err(|error| DispatchError::Hip(error.to_string()))
     };
     match dtype {
-        DType::MQ4G256 => hip(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+        DType::MQ4G256 | DType::HFQ4G256 => hip(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             expert_ptrs,
             topk_indices,
             x_rot,
@@ -463,7 +463,7 @@ pub fn run_uniform_moe_gate_up(
             k,
             k_top,
         )),
-        DType::MQ6G256 => hip(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+        DType::MQ6G256 | DType::HFQ6G256 => hip(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             expert_ptrs,
             topk_indices,
             x_rot,

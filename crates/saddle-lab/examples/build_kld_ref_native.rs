@@ -574,7 +574,7 @@ fn main() {
         }
 
         let kv_max = n_ctx + 16;
-        let scratch = Gemma4Scratch::new(&mut gpu, &cfg, 1).expect("gemma4 scratch");
+        let scratch = Gemma4Scratch::new(&mut gpu, &cfg, kv_max).expect("gemma4 scratch");
         lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
             .expect("gemma4 init_scratch_constants");
         let mut kv_sliding = KvCache::new_gpu_q8(

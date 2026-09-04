@@ -1846,6 +1846,57 @@ impl Gpu {
         result
     }
 
+    /// Write one logical KV row into a bounded Q8 sliding-window ring.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_q8_0_ring(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_ring",
+            kernels::KV_CACHE_WRITE_Q8_0_SRC,
+            "kv_cache_write_q8_0_ring",
+        )?;
+        let d = dst.buf.as_ptr();
+        let s = src.buf.as_ptr();
+        let p = pos_buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let cap = cache_capacity as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &d as *const _ as *mut c_void,
+            &s as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &cap as *const _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_q8_0_ring",
+            [total_blocks, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(cap);
+                b
+            },
+        )
+    }
+
     /// Exact paired K/V Q8_0 cache write for single-token decode. Uses the
     /// same 32-lane block quantizer as `kv_cache_write_q8_0` and concatenates
     /// the independent K and V block grids into one dispatch.
@@ -3732,11 +3783,25 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
+        // Once a sliding cache rolls over, its physical rows contain exactly
+        // the last `max_seq` logical tokens. Attention is permutation-invariant
+        // over those rows (RoPE is already baked into K), so scan the compact
+        // physical ring rather than launching over the unbounded logical span.
+        let effective_seq_len = if window > 0 {
+            seq_len_hint.min(max_seq)
+        } else {
+            seq_len_hint
+        };
+        let effective_seq_arg = if window > 0 {
+            effective_seq_len as i32
+        } else {
+            0
+        };
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
         // For profiling / non-graph code paths, the actual tile count:
-        let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
+        let actual_tiles = (effective_seq_len + tile_size - 1) / tile_size;
         // Redline records an immutable launch sequence independently of
         // hipGraph's capture_mode. Its replay updates pos_buf but cannot grow a
         // recorded grid when seq_len crosses a tile boundary, so the
@@ -3778,6 +3843,7 @@ impl Gpu {
             let sc = scale;
             let ts = tile_size as i32;
             let wn = window;
+            let es = effective_seq_arg;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((tile_size + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
@@ -3793,6 +3859,7 @@ impl Gpu {
                 &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
                 &wn as *const _ as *mut c_void,
+                &es as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob_position_grid(
                 "attention_flash_q8_0_tile",
@@ -3817,6 +3884,7 @@ impl Gpu {
                     b.push_f32(sc);
                     b.push_i32(ts);
                     b.push_i32(wn);
+                    b.push_i32(es);
                     b
                 },
             )?;
@@ -3871,7 +3939,7 @@ impl Gpu {
     }
 
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
-    fn ensure_givens4_kernel(
+    pub(crate) fn ensure_givens4_kernel(
         &mut self,
         name: &str,
         body_src: &str,
@@ -5850,6 +5918,24 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if head_dim == 512 {
+            self.launch_asym_k_batched(
+                "kv_cache_write_asym_k_givens3_hd512_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC,
+                "kv_cache_write_asym_k_givens3_hd512_batched",
+                k_dst,
+                k_src,
+                positions,
+                cos_theta,
+                sin_theta,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+            )?;
+            return self.kv_cache_write_q8_0_batched(
+                v_dst, v_src, positions, n_kv_heads, head_dim, batch_size,
+            );
+        }
         // K: batched 3-bit rotated write.
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens3_batched",
@@ -6058,6 +6144,52 @@ impl Gpu {
         row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if head_dim == 512 {
+            // Fail-closed: HD512's descriptor translation requires that the
+            // KvSlotDesc fields can actually represent the layout. The only
+            // field that can overflow is `cap: i32` (and `seq_len: i32`) —
+            // `k_base`/`v_base` are u64 and wide enough for any arena this
+            // GPU can allocate. If max_seq does not fit in i32, the device-side
+            // `KvSlotDesc.cap` would truncate and silently corrupt slab
+            // bounds; we must not silently fall back to the legacy path.
+            if slot_descs.is_some() && max_seq > i32::MAX as usize {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "hd512 batched: max_seq {max_seq} exceeds KvSlotDesc.cap i32 range; \
+                         cannot represent HD512 layout via descriptors — fail closed rather than \
+                         silently ignoring descriptors"
+                    ),
+                ));
+            }
+            return self.launch_asym_flash_batched(
+                "attention_flash_asym3_tile_hd512_batched",
+                kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC,
+                "attention_flash_asym3_tile_hd512_batched",
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                cos_theta,
+                sin_theta,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_start,
+                block_cols,
+                V_MODE_Q8,
+                0,
+                false,
+                slot_descs,
+                row_slot,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
             kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,

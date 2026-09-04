@@ -15,7 +15,7 @@ extern "C" __global__ void gemv_hfq4g128(
     if (row >= M) return;
     const int tid = threadIdx.x;
 
-    const int groups_per_row = K / 128;
+    const int groups_per_row = (K + 127) / 128;
     const int row_bytes = groups_per_row * 72;
     const char* row_ptr = A + (long long)row * row_bytes;
 
@@ -39,8 +39,14 @@ extern "C" __global__ void gemv_hfq4g128(
         float v2 = scale * (float)(b1 & 0xF) + zero;
         float v3 = scale * (float)(b1 >> 4)  + zero;
 
-        acc += v0 * x[base_idx]     + v1 * x[base_idx + 1]
-             + v2 * x[base_idx + 2] + v3 * x[base_idx + 3];
+        if (base_idx + 3 < K) {
+            acc += v0 * x[base_idx]     + v1 * x[base_idx + 1]
+                 + v2 * x[base_idx + 2] + v3 * x[base_idx + 3];
+        } else {
+            if (base_idx     < K) acc += v0 * x[base_idx];
+            if (base_idx + 1 < K) acc += v1 * x[base_idx + 1];
+            if (base_idx + 2 < K) acc += v2 * x[base_idx + 2];
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

@@ -6,15 +6,16 @@
 //! Ported from `feat/gemma4-128k-ring-buffer`. Includes hd512 attention,
 //! proportional partial RoPE, logit softcap, and MoE stubs (Phase 4).
 
-use crate::{GpuTensor, Gpu};
 use crate::kernels;
-use hip_bridge::{DeviceBuffer, HipError, HipResult};
+use crate::{Gpu, GpuTensor};
+use hip_bridge::{DeviceBuffer, HipResult};
 
 // rope_partial_halved_f32 / logit_softcap_f32 live in norm.rs (master copies
 // with profiling timers) — the ported duplicates were removed in the union merge.
 
 // ─── hd512 attention + KV write (full-attention layers) ─────────────────
 
+#[rustfmt::skip]
 impl Gpu {
     /// Single-token hd512 flash attention for asym3 KV cache (Gemma4 full-attn layers).
     pub fn attention_flash_asym3_hd512(
@@ -35,34 +36,42 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode || self.replay.is_recording() {
+            max_tiles
+        } else {
+            actual_tiles
+        };
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         // Phase 1: tile kernel → unnormalized per-tile partials.
         {
-            let func = &self.functions["attention_flash_asym3_tile_hd512"];
-            let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
-            let mut vp = v_cache.buf.as_ptr(); let mut pp = partials.buf.as_ptr();
-            let mut posp = pos_buf.as_ptr(); let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
-            let mut sc = scale; let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32;
-            let mut ws: i32 = 0; // window_size=0 → full causal (no sliding on full layers)
+            let qp = q.buf.as_ptr(); let kp = k_cache.buf.as_ptr();
+            let vp = v_cache.buf.as_ptr(); let pp = partials.buf.as_ptr();
+            let posp = pos_buf.as_ptr(); let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32; let ms = max_seq as i32;
+            let sc = scale; let ts = TILE_SIZE as i32; let mt = max_tiles as i32;
+            let ws: i32 = 0; // window_size=0 → full causal (no sliding on full layers)
             let mut params: Vec<*mut std::ffi::c_void> = vec![
-                &mut qp as *mut _ as *mut std::ffi::c_void, &mut kp as *mut _ as *mut std::ffi::c_void,
-                &mut vp as *mut _ as *mut std::ffi::c_void, &mut pp as *mut _ as *mut std::ffi::c_void,
-                &mut posp as *mut _ as *mut std::ffi::c_void, &mut ctp as *mut _ as *mut std::ffi::c_void,
-                &mut stp as *mut _ as *mut std::ffi::c_void, &mut nh as *mut _ as *mut std::ffi::c_void,
-                &mut nkv as *mut _ as *mut std::ffi::c_void, &mut hd as *mut _ as *mut std::ffi::c_void,
-                &mut ms as *mut _ as *mut std::ffi::c_void, &mut sc as *mut _ as *mut std::ffi::c_void,
-                &mut ts as *mut _ as *mut std::ffi::c_void, &mut mt as *mut _ as *mut std::ffi::c_void,
-                &mut ws as *mut _ as *mut std::ffi::c_void,
+                &qp as *const _ as *mut _, &kp as *const _ as *mut _, &vp as *const _ as *mut _,
+                &pp as *const _ as *mut _, &posp as *const _ as *mut _, &ctp as *const _ as *mut _,
+                &stp as *const _ as *mut _, &nh as *const _ as *mut _, &nkv as *const _ as *mut _,
+                &hd as *const _ as *mut _, &ms as *const _ as *mut _, &sc as *const _ as *mut _,
+                &ts as *const _ as *mut _, &mt as *const _ as *mut _, &ws as *const _ as *mut _,
             ];
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(func, grid, [32, 1, 1], shared, self.stream_ref(), &mut params)?;
-            }
+            self.launch_maybe_blob_position_grid(
+                "attention_flash_asym3_tile_hd512", grid, [32, 1, 1], shared,
+                &mut params, 1, 1, TILE_SIZE as u32,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp); b.push_ptr(pp);
+                    b.push_ptr(posp); b.push_ptr(ctp); b.push_ptr(stp);
+                    b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
+                    b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(ws); b
+                },
+            )?;
         }
         // Phase 2: reduce partials → out. WITHOUT THIS, attn_out is never written
         // and full-attention layers read stale data from the prior sliding layer.
@@ -75,33 +84,25 @@ impl Gpu {
             "attention_flash_q8_0_reduce",
         )?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut o_ptr = out.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
+            let p_ptr = partials.buf.as_ptr(); let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32; let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr(); let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
             let mut params: Vec<*mut std::ffi::c_void> = vec![
-                &mut p_ptr as *mut _ as *mut std::ffi::c_void,
-                &mut o_ptr as *mut _ as *mut std::ffi::c_void,
-                &mut nh as *mut _ as *mut std::ffi::c_void,
-                &mut hd as *mut _ as *mut std::ffi::c_void,
-                &mut pos_ptr as *mut _ as *mut std::ffi::c_void,
-                &mut ts as *mut _ as *mut std::ffi::c_void,
-                &mut mt as *mut _ as *mut std::ffi::c_void,
+                &p_ptr as *const _ as *mut _, &o_ptr as *const _ as *mut _,
+                &nh as *const _ as *mut _, &hd as *const _ as *mut _,
+                &pos_ptr as *const _ as *mut _, &ts as *const _ as *mut _,
+                &mt as *const _ as *mut _,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_q8_0_reduce", [n_heads as u32, 1, 1], [256, 1, 1],
+                (max_tiles * std::mem::size_of::<f32>()) as u32, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr); b.push_ptr(o_ptr); b.push_i32(nh); b.push_i32(hd);
+                    b.push_ptr(pos_ptr); b.push_i32(ts); b.push_i32(mt); b
+                },
+            )?;
         }
         Ok(())
     }
@@ -124,22 +125,25 @@ impl Gpu {
             "kv_cache_write_asym_k_givens3_hd512",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens3_hd512"];
-            let mut kdp = k_dst.buf.as_ptr(); let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr(); let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+            let kdp = k_dst.buf.as_ptr(); let ksp = k_src.buf.as_ptr();
+            let pp = pos_buf.as_ptr(); let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32; let hd = head_dim as i32;
             let mut params: Vec<*mut std::ffi::c_void> = vec![
-                &mut kdp as *mut _ as *mut std::ffi::c_void, &mut ksp as *mut _ as *mut std::ffi::c_void,
-                &mut pp as *mut _ as *mut std::ffi::c_void, &mut ctp as *mut _ as *mut std::ffi::c_void,
-                &mut stp as *mut _ as *mut std::ffi::c_void, &mut nkv as *mut _ as *mut std::ffi::c_void,
-                &mut hd as *mut _ as *mut std::ffi::c_void,
+                &kdp as *const _ as *mut _, &ksp as *const _ as *mut _, &pp as *const _ as *mut _,
+                &ctp as *const _ as *mut _, &stp as *const _ as *mut _, &nkv as *const _ as *mut _,
+                &hd as *const _ as *mut _,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
-                    self.stream_ref(), &mut params)?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens3_hd512", [n_kv_heads as u32, 1, 1],
+                [32, 1, 1], shared_mem, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp); b.push_ptr(ctp);
+                    b.push_ptr(stp); b.push_i32(nkv); b.push_i32(hd); b
+                },
+            )?;
         }
         // V: standard Q8_0
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
@@ -231,8 +235,8 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
+                    [256, 1, 1],
+                    (max_tiles * std::mem::size_of::<f32>()) as u32,
                     self.stream_ref(),
                     &mut params,
                 )?;
@@ -285,6 +289,9 @@ impl Gpu {
 
 // ─── MoE GPU method stubs (Phase 4) ────────────────────────────────────
 
+// These pre-modular stubs duplicate production implementations in gemm.rs.
+#[cfg(any())]
+#[rustfmt::skip]
 impl Gpu {
     /// Indexed MoE gate_up GEMV for MQ4G256 expert weights.
     /// MQ4G256 has the same 136-byte/group layout as HFQ4G256, so this
@@ -497,6 +504,9 @@ impl Gpu {
 
 // ─── Sliding-window attention wrappers (route hd512 → hd512 kernels) ───
 
+// These wrappers target retired *_cap APIs; routing now lives in dispatch.
+#[cfg(any())]
+#[rustfmt::skip]
 impl Gpu {
     pub fn attention_flash_asym3_window(
         &mut self,

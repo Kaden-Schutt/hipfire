@@ -433,9 +433,19 @@ impl PacketImage {
         const IB_TEMPORAL_LU: u32 = 3 << 28;
         let address = address as usize as u64;
         let pm4_header = (3_u32 << 30) | (2 << 16) | (PACKET3_INDIRECT_BUFFER << 8);
-        // Vendor-specific is packet type zero. Barrier keeps the nonzero 0x100
-        // publication header required by MES on gfx12.
-        let aql_header = 1_u16 << abi::PACKET_HEADER_BARRIER;
+        // Vendor-specific is packet type zero.  The retained IB crosses from
+        // HIP-owned allocations into a distinct ROCr queue and back again, so
+        // its completion must carry the same system-scope ownership contract
+        // as an ordinary terminal AQL dispatch.  Barrier alone orders packets
+        // but does not make shader writes available to host/HIP consumers.
+        let aql_header = packet_header(
+            0,
+            HeaderPolicy {
+                barrier: true,
+                acquire: FenceScope::System,
+                release: FenceScope::System,
+            },
+        );
         let mut bytes = [0_u8; AQL_PACKET_BYTES];
         bytes[0..2].copy_from_slice(&aql_header.to_le_bytes());
         bytes[2..4].copy_from_slice(&1_u16.to_le_bytes());
@@ -663,8 +673,8 @@ mod tests {
             abi::Signal(0x5566_7788_99aa_bbcc),
         )
         .unwrap();
-        assert_eq!(packet.header_word, 0x0001_0100);
-        assert_eq!(&packet.bytes[0..4], &0x0001_0100_u32.to_le_bytes());
+        assert_eq!(packet.header_word, 0x0001_1500);
+        assert_eq!(&packet.bytes[0..4], &0x0001_1500_u32.to_le_bytes());
         assert_eq!(&packet.bytes[4..8], &0xc002_3f00_u32.to_le_bytes());
         assert_eq!(&packet.bytes[8..12], &0x5678_9000_u32.to_le_bytes());
         assert_eq!(&packet.bytes[12..16], &0x0000_1234_u32.to_le_bytes());

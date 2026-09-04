@@ -892,7 +892,7 @@ fn main() {
         let mut weights =
             gemma4::load_weights(&mut hfq, &cfg, &mut gpu).expect("gemma4 load weights");
         let kv_max = n_ctx + 16;
-        let scratch = gemma4::Gemma4Scratch::new(&mut gpu, &cfg, 1).expect("gemma scratch");
+        let scratch = gemma4::Gemma4Scratch::new(&mut gpu, &cfg, kv_max).expect("gemma scratch");
         gemma4::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
             .expect("gemma init scratch");
         // Q8 KV — mirrors calib_sweep: gemma sliding+full both q8 (lines 853-854)

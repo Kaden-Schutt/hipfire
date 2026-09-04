@@ -424,9 +424,14 @@ def main() -> int:
     )
     parser.add_argument("--runtime-home", type=Path)
     parser.add_argument(
+        "--no-think",
         "--closed-think",
+        dest="no_think",
         action="store_true",
-        help="start generation after a closed thinking span (Qwen no-think validation)",
+        help=(
+            "disable Gemma thinking through its native Jinja contract; "
+            "--closed-think is retained as a compatibility alias"
+        ),
     )
     args = parser.parse_args()
     if args.suite == "longbench" and (not args.dataset or not args.manifest):
@@ -484,7 +489,7 @@ def main() -> int:
         "force_native_prefill": args.force_native_prefill,
         "q8_batched_legacy": False,
         "prefill_batch": args.prefill_batch,
-        "closed_think": args.closed_think,
+        "no_think": args.no_think,
         "q8_fused_prefill": args.q8_fused_prefill,
         "batched_embedding_prefill": args.batched_embedding_prefill,
         "ple_batched_prefill": args.ple_batched_prefill,
@@ -553,8 +558,8 @@ def main() -> int:
                 "type": "generate", "id": "warmup", "attempt_id": 1,
                 "prompt": "Reply with exactly: ready", "temperature": 0.0, "max_tokens": 8,
             }
-        if args.closed_think:
-            warm_request.update(assistant_prefix="closed_think", max_think_tokens=1)
+        if args.no_think:
+            warm_request.update(thinking_enabled=False, assistant_prefix="plain")
         warm, _ = daemon.request(
             warm_request,
             {"done", "error", "aborted"}, args.timeout,
@@ -579,8 +584,8 @@ def main() -> int:
                 "repeat_penalty": 1.0,
                 "max_tokens": max_tokens,
             }
-            if args.closed_think:
-                request.update(assistant_prefix="closed_think", max_think_tokens=1)
+            if args.no_think:
+                request.update(thinking_enabled=False, assistant_prefix="plain")
             started = time.monotonic()
             try:
                 done, events = daemon.request(request, {"done", "error", "aborted"}, args.timeout)
@@ -603,6 +608,7 @@ def main() -> int:
                     "prediction_sha256": text_hash(visible),
                     "prediction_chars": len(visible),
                     "reasoning": reasoning,
+                    "no_think_violation": bool(args.no_think and reasoning),
                     "gold": task.get("gold"),
                     "pred": pred,
                     "pred_source": pred_source,

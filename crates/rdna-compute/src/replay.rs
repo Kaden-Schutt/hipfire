@@ -24,8 +24,8 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
-    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
+    FenceScope, Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice,
+    GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
     PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
     SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
@@ -338,7 +338,7 @@ impl Pm4Commands {
     }
 
     fn requires_dependency_acquire(&self) -> bool {
-        matches!(self, Self::Legacy { .. })
+        true
     }
 
     fn wait_compute_idle(&mut self) -> Result<(), String> {
@@ -4407,6 +4407,28 @@ impl ReplayController {
             }
         }
         apply_qwen_q8_full_attention_visibility(&self.recorded[..prefix], &mut headers);
+        // A queue barrier orders execution but does not publish vector-cache
+        // writes to the next dispatch on gfx11/gfx12. Keep ordinary intra-tape
+        // ownership at agent scope, with system scope only at the external
+        // HIP/AQL entry and host-visible completion boundaries.
+        if Pm4Architecture::from_name(device.name())? != Pm4Architecture::Gfx10 {
+            headers.fill(HeaderPolicy::SAME_AGENT_DISPATCH);
+            if headers.len() == 1 {
+                headers[0] = HeaderPolicy::RECORDED_DISPATCH;
+            } else {
+                headers[0] = HeaderPolicy {
+                    barrier: true,
+                    acquire: FenceScope::System,
+                    release: FenceScope::Agent,
+                };
+                let last = headers.len() - 1;
+                headers[last] = HeaderPolicy {
+                    barrier: true,
+                    acquire: FenceScope::Agent,
+                    release: FenceScope::System,
+                };
+            }
+        }
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,

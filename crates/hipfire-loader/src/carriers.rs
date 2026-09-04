@@ -1899,22 +1899,112 @@ impl Carrier for Gemma4Carrier {
         gpu: &mut rdna_compute::Gpu,
         synthetic: &[u32],
         _n: usize,
-        _prefill_err: &mut Option<String>,
+        prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let bundle = m.gemma4_mut().unwrap();
-        let config = &bundle.config;
-        let weights = &bundle.weights;
-        let state = &mut bundle.state;
-        let mut ok = true;
-        for (i, &tok) in synthetic.iter().enumerate() {
-            if hipfire_arch_gemma4::forward::decode_step(config, weights, state, gpu, tok, i as u32)
-                .is_err()
-            {
-                ok = false;
-                break;
+        if let Some(bundle) = m.gemma4_mut() {
+            for (i, &tok) in synthetic.iter().enumerate() {
+                if let Err(error) = hipfire_arch_gemma4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    tok,
+                    i as u32,
+                ) {
+                    *prefill_err = Some(format!("gemma4 eager bench prefill failed: {error:?}"));
+                    return Some(false);
+                }
             }
+            return Some(true);
         }
-        Some(ok)
+
+        if let Some(bundle) = m.gemma4_lowered_mut() {
+            for (i, &tok) in synthetic.iter().enumerate() {
+                if let Err(error) = hipfire_arch_gemma4::lowered::forward_scratch(
+                    gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    tok,
+                    i,
+                    &mut bundle.kv_sliding,
+                    &mut bundle.kv_full,
+                    &bundle.scratch,
+                ) {
+                    *prefill_err = Some(format!("gemma4 lowered bench prefill failed: {error:?}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+
+        *prefill_err = Some("gemma4 bench prefill missing eager/lowered state".into());
+        Some(false)
+    }
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let mut error = None;
+        match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
+            Some(true) => Some(None),
+            Some(false) => {
+                Some(Some(error.unwrap_or_else(|| {
+                    "gemma4 bench decode prime failed".into()
+                })))
+            }
+            None => None,
+        }
+    }
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        if let Some(bundle) = m.gemma4_mut() {
+            for i in 0..iterations {
+                let token = 101 + (i as u32 % 1000);
+                if let Err(error) = hipfire_arch_gemma4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    token,
+                    (context + i) as u32,
+                ) {
+                    *decode_err = Some(format!("gemma4 eager bench decode failed: {error:?}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+
+        if let Some(bundle) = m.gemma4_lowered_mut() {
+            for i in 0..iterations {
+                let token = 101 + (i as u32 % 1000);
+                if let Err(error) = hipfire_arch_gemma4::lowered::forward_scratch(
+                    gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    token,
+                    context + i,
+                    &mut bundle.kv_sliding,
+                    &mut bundle.kv_full,
+                    &bundle.scratch,
+                ) {
+                    *decode_err = Some(format!("gemma4 lowered bench decode failed: {error:?}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+
+        *decode_err = Some("gemma4 bench decode missing eager/lowered state".into());
+        Some(false)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {

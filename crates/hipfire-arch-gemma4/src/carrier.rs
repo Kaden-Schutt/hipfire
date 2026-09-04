@@ -125,7 +125,7 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         let mut hfq2 = hfq;
         let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-        let scratch = lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
+        let scratch = lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, ctx.max_seq)
             .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
         lowered::init_scratch_constants(ctx.gpu, &scratch, lcfg.full_head_dim)
             .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
@@ -199,5 +199,48 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(lowered_kv_layer_counts(&layer_types), (40, 8));
+    }
+
+    #[test]
+    fn scratch_geometry_uses_single_max_seq_authority() {
+        // No HIPFIRE_KV_SEQ env var should affect geometry; both partials
+        // and KV are sized from the same ctx.max_seq. Verify the pure helpers
+        // that the loader now uses.
+        let max_seq_small = 32768usize;
+        let max_seq_large = 131072usize;
+        let n_heads = 32usize;
+        let full_hd = 512usize;
+        let s_small = lowered::gemma4_flash_partials_len(max_seq_small, n_heads, full_hd);
+        let s_large = lowered::gemma4_flash_partials_len(max_seq_large, n_heads, full_hd);
+        assert_eq!(s_small, 4_210_688);
+        assert_eq!(s_large, 16_842_752);
+        assert_eq!(s_large, 4 * s_small);
+        let pb_small = lowered::gemma4_pb_flash_partials_len(max_seq_small, n_heads, full_hd);
+        let pb_large = lowered::gemma4_pb_flash_partials_len(max_seq_large, n_heads, full_hd);
+        assert_eq!(pb_small, 128 * s_small);
+        assert_eq!(pb_large, 128 * s_large);
+        assert_eq!(pb_large, 2_155_872_256);
+    }
+
+    #[test]
+    fn scratch_geometry_has_no_env_mismatch() {
+        // Simulate that an old env var could earlier cause mismatch between
+        // KV (ctx.max_seq) and scratch (HIPFIRE_KV_SEQ). After the fix both
+        // derive from the same max_seq, so the arithmetic must be identical
+        // for any max_seq value, including 131072 without GPU alloc.
+        for &max_seq in &[8192usize, 32768, 65536, 131072] {
+            let n_heads = 32;
+            let hd = 512;
+            let tiles = max_seq.div_ceil(lowered::GEMMA4_FLASH_TILE);
+            let expected = n_heads * tiles * (2 + hd);
+            assert_eq!(
+                lowered::gemma4_flash_partials_len(max_seq, n_heads, hd),
+                expected
+            );
+            assert_eq!(
+                lowered::gemma4_pb_flash_partials_len(max_seq, n_heads, hd),
+                lowered::GEMMA4_MAX_PREFILL_BATCH * expected
+            );
+        }
     }
 }

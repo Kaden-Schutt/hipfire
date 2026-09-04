@@ -4787,7 +4787,13 @@ fn handle_moe_expert_3d(
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ4G256, 256u32)
             } else {
-                let q = quantize_hfq4g128(&f32_slice);
+                // Keep every HFQ4-G128 group within one matrix row. Gemma4's
+                // routed-expert down_proj has K=704: flat packing joins the
+                // last 64 values of one row to the first 64 of the next while
+                // GPU kernels address rows independently, corrupting every
+                // row after the first. The 2-D packer emits a padded tail
+                // group and the kernels predicate those padding lanes.
+                let q = quantize_hfq4g128_2d(&f32_slice, inner_m, inner_k_e);
                 (q, QuantType::HFQ4G128, 128u32)
             };
             let weight = HfqTensor {
@@ -5450,7 +5456,13 @@ fn handle_main_quant(
                             let q = quantize_hfq4g256(&f32_data);
                             (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                         } else {
-                            let q = quantize_hfq4g128(&f32_data);
+                            let q = if meta.shape.len() == 2 {
+                                let m = meta.shape[0];
+                                let k = meta.shape[1];
+                                quantize_hfq4g128_2d(&f32_data, m, k)
+                            } else {
+                                quantize_hfq4g128(&f32_data)
+                            };
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
                     }
@@ -5480,7 +5492,13 @@ fn handle_main_quant(
                         (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
                     } else {
                         // Fallback to HFQ4 for non-256-aligned
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq8g256 && is_embed {
@@ -5663,7 +5681,13 @@ fn handle_main_quant(
                         (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                     } else {
                         // Fallback to standard HFQ4-G128 for non-256-aligned
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq4v2 {
@@ -5697,7 +5721,13 @@ fn handle_main_quant(
                         };
                         (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq4c {
@@ -5731,7 +5761,13 @@ fn handle_main_quant(
                         };
                         (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_hfp4 && is_embed {
@@ -5750,7 +5786,13 @@ fn handle_main_quant(
                         (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                     } else {
                         // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mfp4 && is_embed {
@@ -5772,7 +5814,13 @@ fn handle_main_quant(
                     } else {
                         // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
                         // requires 256-element segments). Matches MQ4's ragged fallback.
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mfp4l && is_embed {
@@ -5791,7 +5839,13 @@ fn handle_main_quant(
                         let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
                         (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mfp4p && is_embed {
@@ -5812,7 +5866,13 @@ fn handle_main_quant(
                         (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
                     } else {
                         // Ragged dim fallback — matches mfp4 / mfp4L (HFQ4-G128, no rotation).
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if (flags.use_mfp4e8
@@ -5860,7 +5920,13 @@ fn handle_main_quant(
                         (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                     } else {
                         // Ragged dim fallback — matches mfp4+P (HFQ4-G128, no rotation).
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mfp3e8_gptq_fmt {
@@ -5895,7 +5961,13 @@ fn handle_main_quant(
                         };
                         (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mfp2e8_gptq_fmt {
@@ -5930,7 +6002,13 @@ fn handle_main_quant(
                         };
                         (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mfp4e8soa {
@@ -5947,7 +6025,13 @@ fn handle_main_quant(
                         let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
                         (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq5g256 && is_embed {
@@ -5988,7 +6072,13 @@ fn handle_main_quant(
                         (q, QuantType::MQ5G256, 256u32, "MQ5G256")
                     } else {
                         // Fallback to HFQ4-G128 for non-256-aligned (no MQ5G128).
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq6g256 && is_embed {
@@ -6073,7 +6163,13 @@ fn handle_main_quant(
                         };
                         (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq3g256v2 && is_embed {
@@ -6165,7 +6261,13 @@ fn handle_main_quant(
                         (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                     } else {
                         // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_mq3g256_lloyd {
@@ -6393,7 +6495,17 @@ fn handle_main_quant(
                         let q = quantize_hfq4g256(&f32_data);
                         (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                     } else {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            if k % 128 != 0 {
+                                eprintln!("error: ragged HFQ4-G128 embedding {name} has K={k} not divisible by 128 (no tail-safe kernel)");
+                                std::process::exit(2);
+                            }
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if flags.use_hfq4g256 {
@@ -6409,11 +6521,23 @@ fn handle_main_quant(
                         let q = quantize_hfq4g256(&f32_data);
                         (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                     } else if k_dim % 128 == 0 {
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     } else {
                         // Pad to 128-element boundary
-                        let q = quantize_hfq4g128(&f32_data);
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
                 } else if this_q8 {
@@ -7435,5 +7559,84 @@ mod pipeline_tests {
         assert!(lfm2_dense_mq_name_matches(proj, false));
         let w1 = "model.language_model.layers.0.feed_forward.w1.weight";
         assert!(lfm2_dense_mq_name_matches(w1, false));
+    }
+}
+
+/// Public pipeline round-trip for HFQ4-G128 with M>1, K=704.
+/// Proves the row-stride contract: encoded byte length matches M*ceil(K/128)*72,
+/// each row payload equals independent per-row packing (no cross-row groups),
+/// and the final group's padded tail lanes are zero-filled and kernel-masked.
+pub fn hfq4g128_2d_pipeline_roundtrip_m704() -> Vec<u8> {
+    const M: usize = 4;
+    const K: usize = 704;
+    // Distinct per-row data: row 0..M each has unique bias so cross-row mixing would be detectable.
+    let f32_data: Vec<f32> = (0..M * K)
+        .map(|i| {
+            let row = i / K;
+            let col = i % K;
+            // Row-dependent offset ensures each row's distribution differs.
+            (row as f32 * 10.0) + ((col as f32 - 352.0) / 97.0)
+        })
+        .collect();
+    let packed = quantize_hfq4g128_2d(&f32_data, M, K);
+    let row_bytes = K.div_ceil(128) * 72;
+    assert_eq!(row_bytes, 432, "row stride for K=704 must be 6*72=432");
+    assert_eq!(
+        packed.len(),
+        M * row_bytes,
+        "encoded byte length must match M*ceil(K/128)*72"
+    );
+    // Row payload boundaries: each row's slice equals independent per-row packing.
+    for row in 0..M {
+        let row_slice = &f32_data[row * K..(row + 1) * K];
+        let expected = quantize_hfq4g128(row_slice);
+        let got = &packed[row * row_bytes..(row + 1) * row_bytes];
+        assert_eq!(
+            got, expected,
+            "row {row} payload must equal independent quantize_hfq4g128(row) - no cross-row groups"
+        );
+        // Final group tail lanes: last group has 64 valid + 64 padded values.
+        // Padded nibbles must be zero (q=0) so the kernel's tail predicate is safe.
+        let last_group_off = row * row_bytes + 5 * 72;
+        // Header: 4B scale, 4B min, then 64B nibbles.
+        let _scale = f32::from_le_bytes(
+            packed[last_group_off..last_group_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let _min = f32::from_le_bytes(
+            packed[last_group_off + 4..last_group_off + 8]
+                .try_into()
+                .unwrap(),
+        );
+        // Nibbles: 64 bytes, each byte packs 2 nibbles. First 32 bytes = 64 valid values, second 32 = 64 padded.
+        for byte_idx in 32..64 {
+            let byte = packed[last_group_off + 8 + byte_idx];
+            let lo = byte & 0x0F;
+            let hi = (byte >> 4) & 0x0F;
+            assert_eq!(
+                lo, 0,
+                "row {row} last group padded lo nibble must be 0 (byte {byte_idx})"
+            );
+            assert_eq!(
+                hi, 0,
+                "row {row} last group padded hi nibble must be 0 (byte {byte_idx})"
+            );
+        }
+    }
+    packed
+}
+
+#[cfg(test)]
+mod hfq4g128_pipeline_roundtrip_tests {
+    use super::hfq4g128_2d_pipeline_roundtrip_m704;
+
+    #[test]
+    fn pipeline_roundtrip_m704_proves_row_boundaries_and_tail_lanes() {
+        let packed = hfq4g128_2d_pipeline_roundtrip_m704();
+        // Also verify the public function's byte length contract directly.
+        const M: usize = 4;
+        const K: usize = 704;
+        assert_eq!(packed.len(), M * K.div_ceil(128) * 72);
     }
 }

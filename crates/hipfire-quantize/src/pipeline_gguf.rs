@@ -355,8 +355,8 @@ pub(crate) fn run_gguf_pipeline(
         let mut map = HashMap::new();
         let mut counts = [0u32; 4];
         for info in &gguf.tensors {
-            let out_name = gguf_to_safetensors_name(&info.name, arch_id)
-                .unwrap_or_else(|| info.name.clone());
+            let out_name =
+                gguf_to_safetensors_name(&info.name, arch_id).unwrap_or_else(|| info.name.clone());
             let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
@@ -916,7 +916,9 @@ pub(crate) fn run_gguf_pipeline(
             // This branch fires for the rare ragged dim; ignores --format
             // (no G128 variant of mq4/mq6 exists).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
-            let q = quantize_hfq4g128(&f32_data);
+            let m = info.shape[0] as usize;
+            let k = info.shape[1] as usize;
+            let q = quantize_hfq4g128_2d(&f32_data, m, k);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
         };

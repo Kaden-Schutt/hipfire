@@ -206,6 +206,7 @@ pub enum BenchDecodeRoute {
     Deepseek4,
     Lfm2Moe,
     Qwen35,
+    Gemma4,
     MuseGlimmer,
     Unsupported,
 }
@@ -214,6 +215,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         9 => BenchDecodeRoute::Deepseek4,
         11 => BenchDecodeRoute::Lfm2Moe,
         5 | 6 => BenchDecodeRoute::Qwen35,
+        13 => BenchDecodeRoute::Gemma4,
         14 => BenchDecodeRoute::MuseGlimmer,
         _ => BenchDecodeRoute::Unsupported,
     }
@@ -4214,12 +4216,13 @@ mod registry_tests {
             );
         }
 
-        // ── bench_decode_route: 9, 11, 5|6, 14; everything else Unsupported ──
+        // ── bench_decode_route: 9, 11, 5|6, 13, 14; everything else Unsupported ──
         for id in 0u32..=14 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
                 5 | 6 => BenchDecodeRoute::Qwen35,
+                13 => BenchDecodeRoute::Gemma4,
                 14 => BenchDecodeRoute::MuseGlimmer,
                 _ => BenchDecodeRoute::Unsupported,
             };

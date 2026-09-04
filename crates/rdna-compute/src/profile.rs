@@ -154,7 +154,7 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
 /// HFQ4-G128 weight footprint: 72 B per 128-element group (4 B scale +
 /// 4 B zero + 64 B packed 4-bit weights).
 pub fn hfq4g128_weight_bytes(m: usize, k: usize) -> usize {
-    let groups = k / 128;
+    let groups = k.div_ceil(128);
     m * groups * 72
 }
 

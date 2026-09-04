@@ -18,7 +18,7 @@ extern "C" __global__ void gemm_hfq4g128(
     const int batch_start = blockIdx.y * BATCH_TILE;
     const int tid = threadIdx.x;
 
-    const int groups_per_row = K / 128;
+    const int groups_per_row = (K + 127) / 128;
     const int row_bytes = groups_per_row * 72;
     const char* row_ptr = A + (long long)row * row_bytes;
 
@@ -48,8 +48,14 @@ extern "C" __global__ void gemm_hfq4g128(
 
         for (int b = 0; b < local_bs; b++) {
             const float* xb = x + (batch_start + b) * K;
-            acc[b] += w0 * xb[base_k]     + w1 * xb[base_k + 1]
-                    + w2 * xb[base_k + 2] + w3 * xb[base_k + 3];
+            if (base_k + 3 < K) {
+                acc[b] += w0 * xb[base_k]     + w1 * xb[base_k + 1]
+                        + w2 * xb[base_k + 2] + w3 * xb[base_k + 3];
+            } else {
+                if (base_k     < K) acc[b] += w0 * xb[base_k];
+                if (base_k + 1 < K) acc[b] += w1 * xb[base_k + 1];
+                if (base_k + 2 < K) acc[b] += w2 * xb[base_k + 2];
+            }
         }
     }
 

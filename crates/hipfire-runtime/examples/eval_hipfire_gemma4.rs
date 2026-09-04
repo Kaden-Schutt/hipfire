@@ -38,15 +38,30 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--ref" => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--max-chunks" => { max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int")); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--ref" => {
+                ref_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--max-chunks" => {
+                max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int"));
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: eval_hipfire_gemma4 --model <hfq> --ref <kldref.bin> --output <kldseq> [--max-chunks N]");
                 std::process::exit(0);
             }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");
@@ -63,9 +78,15 @@ fn main() {
 
     // -------- load model --------
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("eval_hipfire_gemma4: arch={} model={}", gpu.arch, model.display());
+    eprintln!(
+        "eval_hipfire_gemma4: arch={} model={}",
+        gpu.arch,
+        model.display()
+    );
     if gpu.arch.starts_with("gfx12") {
-        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
+        unsafe {
+            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
+        }
         eprintln!("eval_hipfire_gemma4: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
     }
     let mut hfq = HfqFile::open(&model).expect("open model");
@@ -79,7 +100,8 @@ fn main() {
     let mut magic = [0u8; 8];
     ref_in.read_exact(&mut magic).expect("read ref magic");
     if &magic != b"HFKLDR\0\0" {
-        eprintln!("bad ref magic: {magic:?}"); std::process::exit(2);
+        eprintln!("bad ref magic: {magic:?}");
+        std::process::exit(2);
     }
     let mut hdr = [0u8; 24];
     ref_in.read_exact(&mut hdr).expect("read ref header");
@@ -90,10 +112,14 @@ fn main() {
     let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
     let _flags = u16::from_le_bytes(hdr[18..20].try_into().unwrap());
     if version != 1 {
-        eprintln!("unsupported ref version {version}"); std::process::exit(2);
+        eprintln!("unsupported ref version {version}");
+        std::process::exit(2);
     }
     if ref_n_vocab != config.vocab_size {
-        eprintln!("vocab mismatch: ref says {ref_n_vocab}, model says {}", config.vocab_size);
+        eprintln!(
+            "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+            config.vocab_size
+        );
         std::process::exit(2);
     }
     let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
@@ -121,22 +147,30 @@ fn main() {
         .collect();
 
     // -------- scratch + dual KV (identical to ref builder) --------
-    let scratch = Gemma4Scratch::new(&mut gpu, &config, 1).expect("scratch");
+    let kv_max = n_ctx + 16;
+    let scratch = Gemma4Scratch::new(&mut gpu, &config, kv_max).expect("scratch");
     gemma4::init_scratch_constants(&mut gpu, &scratch, config.full_head_dim)
         .expect("init_scratch_constants");
-    let kv_max = n_ctx + 16;
     let mut kv_sliding = KvCache::new_gpu(
-        &mut gpu, config.n_layers, config.sliding_n_kv_heads,
-        config.sliding_head_dim, kv_max,
-    ).expect("kv sliding alloc");
+        &mut gpu,
+        config.n_layers,
+        config.sliding_n_kv_heads,
+        config.sliding_head_dim,
+        kv_max,
+    )
+    .expect("kv sliding alloc");
     // FULL KV = F32, NOT asym3: on gfx942/CDNA the asym3 full-KV path is
     // catastrophically wrong (grows with depth; PPL 3826 at 512 ctx) while
     // F32 full-KV is HF-EXACT (top-5 logits match HF to 1e-4 at 128 ids,
     // 2026-06-10). F32 both sides also removes the shared KV-noise floor.
     let mut kv_full = KvCache::new_gpu(
-        &mut gpu, config.n_layers, config.full_n_kv_heads,
-        config.full_head_dim, kv_max,
-    ).expect("kv full alloc");
+        &mut gpu,
+        config.n_layers,
+        config.full_n_kv_heads,
+        config.full_head_dim,
+        kv_max,
+    )
+    .expect("kv full alloc");
 
     // -------- per-chunk loop --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
@@ -158,9 +192,16 @@ fn main() {
 
         for pos in 0..(n_ctx - 1) {
             gemma4::forward_scratch(
-                &mut gpu, &weights, &config, chunk_tokens[pos], pos,
-                &mut kv_sliding, &mut kv_full, &scratch,
-            ).expect("forward_scratch");
+                &mut gpu,
+                &weights,
+                &config,
+                chunk_tokens[pos],
+                pos,
+                &mut kv_sliding,
+                &mut kv_full,
+                &scratch,
+            )
+            .expect("forward_scratch");
             if pos < scoring_start {
                 continue;
             }
@@ -170,12 +211,16 @@ fn main() {
             let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
             let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
             for j in 0..top_k {
-                top_indices.push(u32::from_le_bytes(block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
+                top_indices.push(u32::from_le_bytes(
+                    block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
+                ));
             }
             let lp_off = top_k * 4;
             for j in 0..top_k {
                 top_log_probs.push(f32::from_le_bytes(
-                    block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap(),
+                    block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
+                        .try_into()
+                        .unwrap(),
                 ));
             }
             let resid_off = top_k * 8;
@@ -189,7 +234,10 @@ fn main() {
             let mut max_logit = f32::NEG_INFINITY;
             let mut argmax = 0usize;
             for (idx, &v) in cand_logits.iter().enumerate() {
-                if v > max_logit { max_logit = v; argmax = idx; }
+                if v > max_logit {
+                    max_logit = v;
+                    argmax = idx;
+                }
             }
             let mut sum_exp = 0.0f64;
             for &v in cand_logits.iter() {
@@ -209,7 +257,9 @@ fn main() {
             let mut sum_p_cand_at_ref_top = 0.0f64;
             for j in 0..top_k {
                 let ref_idx = top_indices[j] as usize;
-                if ref_idx >= cand_logits.len() { continue; }
+                if ref_idx >= cand_logits.len() {
+                    continue;
+                }
                 let log_p_ref = top_log_probs[j] as f64;
                 let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
                 let p_ref = log_p_ref.exp();
@@ -220,8 +270,8 @@ fn main() {
             let sum_p_residual_ref = sum_p_residual as f64;
             let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
             if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-                kld_token += sum_p_residual_ref
-                    * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+                kld_token +=
+                    sum_p_residual_ref * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
             }
             debug_assert!(
                 kld_token >= -1e-9,
@@ -243,7 +293,12 @@ fn main() {
                 let rate = total_scored_done as f64 / elapsed.max(1e-9);
                 eprint!(
                     "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                    c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
+                    c + 1,
+                    effective_n_chunk,
+                    total_scored_done,
+                    total_scored,
+                    pct,
+                    rate
                 );
             }
         }
@@ -262,7 +317,9 @@ fn main() {
         let p99 = sorted[p99_idx];
         let mean_nll = if chunk_nll_count > 0 {
             chunk_nll_sum / chunk_nll_count as f64
-        } else { f64::NAN };
+        } else {
+            f64::NAN
+        };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
         mean_nll_per_seq.push(mean_nll);
@@ -284,9 +341,11 @@ fn main() {
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
     out.write_all(&2u32.to_le_bytes()).unwrap();
-    out.write_all(&(effective_n_chunk as u32).to_le_bytes()).unwrap();
+    out.write_all(&(effective_n_chunk as u32).to_le_bytes())
+        .unwrap();
     out.write_all(&0u32.to_le_bytes()).unwrap();
-    for ((m, p), n) in mean_kld_per_seq.iter()
+    for ((m, p), n) in mean_kld_per_seq
+        .iter()
         .zip(p99_kld_per_seq.iter())
         .zip(mean_nll_per_seq.iter())
     {
@@ -296,8 +355,13 @@ fn main() {
     }
     out.flush().unwrap();
 
-    let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
-    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied().filter(|x| x.is_finite()).collect();
+    let overall_mean: f64 =
+        mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
+    let nll_finite: Vec<f64> = mean_nll_per_seq
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
     let overall_nll: f64 = if nll_finite.is_empty() {
         f64::NAN
     } else {
@@ -306,7 +370,9 @@ fn main() {
     let overall_ppl = overall_nll.exp();
     let top1_pct = if top1_total > 0 {
         top1_agree as f64 * 100.0 / top1_total as f64
-    } else { f64::NAN };
+    } else {
+        f64::NAN
+    };
     eprintln!(
         "eval_hipfire_gemma4: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}  top1-agree = {:.2}% ({}/{})",
         overall_mean, overall_nll, overall_ppl, top1_pct, top1_agree, top1_total
