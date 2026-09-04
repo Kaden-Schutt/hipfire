@@ -67,6 +67,20 @@ __global__ void qwen35_fa_prep_batched_gfx1100(
         v = out[tid];
         weight = k_weight;
     }
+    // Match rmsnorm_f32's 256-thread shared-memory reduction exactly.
+    sdata[tid] = v * v;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float rms = rsqrtf(sdata[0] / (float)HD + eps);
+    const float normed = v * weight[tid] * rms;
+    out[tid] = normed;
+    // Lagging waves still read sdata[0] as the sum of squares; rsqrtf of the negative value written below returns NaN.
+    __syncthreads();
+    sdata[tid] = normed;
+    __syncthreads();
     // Match rope_partial_halfsplit_batched_f32's source expression and pair mapping.
     // The two outputs MUST use explicit fmaf in the exact formation the old
     // kernel's TU contracts to (probed on gfx1100: o[i] fuses the v0 term as
