@@ -4572,10 +4572,20 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // `in_proj_a`/`in_proj_b` stay on the ordinary batched GEMM: escha's
     // `ignore` list leaves them uncoded.
     if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
         e.qkv.forward(gpu, &layer.wqkv, &e.ids, &pbs.x_rot_batch,
-                      &pbs.escha_xh_batch, &pbs.dn_qkv_batch, &pbs.dn_qkv_batch, n)?;
+                      &pbs.escha_xh_batch, &pbs.dn_qkv_batch, &pbs.dn_qkv_batch, n, grouped)?;
         e.z.forward(gpu, &layer.wz, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.dn_z_batch, &pbs.dn_z_batch, n)?;
+                    &pbs.escha_xh_batch, &pbs.dn_z_batch, &pbs.dn_z_batch, n, grouped)?;
         batched_gemm_single_weight(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
         batched_gemm_single_weight(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
     } else if is_6bit
@@ -5171,13 +5181,23 @@ pub(crate) fn batch_chunk_delta_net_attn(
         &pbs.dn_normed_batch
     };
     if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
         // Trellis wo: project into the ffn scratch, then accumulate into the
         // residual. The fused epilogue folds those together but cannot read a
         // trellis code; the split add is exact, both terms being plain f32.
         // Input is the UNROTATED gated-norm output: escha applies its own
         // H128, so `dn_normed_batch` and not the MQ-rotated variant.
         e.o.forward(gpu, &layer.wo, &e.ids, &pbs.dn_normed_batch,
-                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
     } else {
     dispatch_batched_gemm_epilogue(
@@ -5221,21 +5241,31 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     // fused gate_up kernel cannot serve this — the two projections have
     // different rin and it could not read a trellis code regardless.
     if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
         gpu.rmsnorm_batched(
             &pbs.x_batch, &layer.ffn_norm, &pbs.x_norm_batch, n, layer.w_gate.k,
             config.norm_eps,
         )?;
         e.gate.forward(gpu, &layer.w_gate, &e.ids, &pbs.x_norm_batch,
-                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n)?;
+                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n, grouped)?;
         e.up.forward(gpu, &layer.w_up, &e.ids, &pbs.x_norm_batch,
-                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n)?;
+                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n, grouped)?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
             gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
         }
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         e.down.forward(gpu, &layer.w_down, &e.ids, &pbs.ffn_hidden_batch,
-                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
@@ -5557,12 +5587,22 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // normed (unrotated) activation in `x_rot_batch`, which is what escha
     // wants.
     if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
         e.q.forward(gpu, &layer.wq, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.fa_q_full_batch, &pbs.fa_q_full_batch, n)?;
+                    &pbs.escha_xh_batch, &pbs.fa_q_full_batch, &pbs.fa_q_full_batch, n, grouped)?;
         e.k.forward(gpu, &layer.wk, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.fa_k_batch, &pbs.fa_k_batch, n)?;
+                    &pbs.escha_xh_batch, &pbs.fa_k_batch, &pbs.fa_k_batch, n, grouped)?;
         e.v.forward(gpu, &layer.wv, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.fa_v_batch, &pbs.fa_v_batch, n)?;
+                    &pbs.escha_xh_batch, &pbs.fa_v_batch, &pbs.fa_v_batch, n, grouped)?;
     } else if qkv_is_6bit && qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
@@ -5926,11 +5966,21 @@ pub(crate) fn batch_chunk_full_attn_attn(
         &pbs.fa_attn_out_batch
     };
     if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
         // Trellis o_proj from the UNROTATED attention output, then accumulate.
         // The fused epilogue is SKIPPED, not supplemented: it writes into the
         // residual itself, so running both would count this projection twice.
         e.o.forward(gpu, &layer.wo, &e.ids, &pbs.fa_attn_out_batch,
-                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
     } else {
     dispatch_batched_gemm_epilogue(
@@ -5974,21 +6024,31 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     // fused gate_up kernel cannot serve this — the two projections have
     // different rin and it could not read a trellis code regardless.
     if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
         gpu.rmsnorm_batched(
             &pbs.x_batch, &layer.ffn_norm, &pbs.x_norm_batch, n, layer.w_gate.k,
             config.norm_eps,
         )?;
         e.gate.forward(gpu, &layer.w_gate, &e.ids, &pbs.x_norm_batch,
-                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n)?;
+                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n, grouped)?;
         e.up.forward(gpu, &layer.w_up, &e.ids, &pbs.x_norm_batch,
-                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n)?;
+                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n, grouped)?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
             gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
         }
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         e.down.forward(gpu, &layer.w_down, &e.ids, &pbs.ffn_hidden_batch,
-                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;

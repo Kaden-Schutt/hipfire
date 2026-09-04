@@ -63,6 +63,9 @@ pub struct DeltaNetEscha {
     /// `slots`-long run of zeros for the indexed GEMV; sized for the largest
     /// batch the model was built for so decode (slots=1) reads a prefix.
     pub ids: GpuTensor,
+    /// `0..MAX` — the grouped GEMM's slot permutation, which for a dense
+    /// linear is the identity.
+    pub iota: GpuTensor,
 }
 
 /// See `DeltaNetLayerWeights::biases`. Each is `[oc]` f32, applied to the
@@ -106,6 +109,8 @@ pub struct FullAttnEscha {
     pub up: crate::qwen35::escha::EschaProj,
     pub down: crate::qwen35::escha::EschaProj,
     pub ids: GpuTensor,
+    /// See `DeltaNetEscha::iota`.
+    pub iota: GpuTensor,
 }
 
 /// See `DeltaNetLayerWeights::biases`.

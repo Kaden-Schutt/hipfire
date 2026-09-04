@@ -5018,9 +5018,9 @@ fn escha_run_proj(
             // rotated twice.
             gpu.rmsnorm_f32(&s.x, &l.attn_norm, &s.tmp, config.norm_eps)
                 .map_err(hip)?;
-            e.qkv.forward(gpu, &l.wqkv, &e.ids, &s.tmp, &s.escha_xh, &s.dn_qkv, &s.dn_qkv, 1)
+            e.qkv.forward(gpu, &l.wqkv, &e.ids, &s.tmp, &s.escha_xh, &s.dn_qkv, &s.dn_qkv, 1, None)
                 .map_err(hip)?;
-            e.z.forward(gpu, &l.wz, &e.ids, &s.tmp, &s.escha_xh, &s.dn_z, &s.dn_z, 1)
+            e.z.forward(gpu, &l.wz, &e.ids, &s.tmp, &s.escha_xh, &s.dn_z, &s.dn_z, 1, None)
                 .map_err(hip)?;
             hipfire_runtime::llama::weight_gemv(gpu, &l.w_beta, &s.tmp, &s.dn_beta).map_err(hip)?;
             hipfire_runtime::llama::weight_gemv(gpu, &l.w_alpha, &s.tmp, &s.dn_alpha)
@@ -5031,11 +5031,11 @@ fn escha_run_proj(
             let Some(e) = l.escha.as_ref() else { return Ok(false) };
             gpu.rmsnorm_f32(&s.x, &l.attn_norm, &s.tmp, config.norm_eps)
                 .map_err(hip)?;
-            e.q.forward(gpu, &l.wq, &e.ids, &s.tmp, &s.escha_xh, &s.fa_q_full, &s.fa_q_full, 1)
+            e.q.forward(gpu, &l.wq, &e.ids, &s.tmp, &s.escha_xh, &s.fa_q_full, &s.fa_q_full, 1, None)
                 .map_err(hip)?;
-            e.k.forward(gpu, &l.wk, &e.ids, &s.tmp, &s.escha_xh, &s.fa_k, &s.fa_k, 1)
+            e.k.forward(gpu, &l.wk, &e.ids, &s.tmp, &s.escha_xh, &s.fa_k, &s.fa_k, 1, None)
                 .map_err(hip)?;
-            e.v.forward(gpu, &l.wv, &e.ids, &s.tmp, &s.escha_xh, &s.fa_v, &s.fa_v, 1)
+            e.v.forward(gpu, &l.wv, &e.ids, &s.tmp, &s.escha_xh, &s.fa_v, &s.fa_v, 1, None)
                 .map_err(hip)?;
             Ok(true)
         }
@@ -5043,9 +5043,9 @@ fn escha_run_proj(
             let Some(e) = l.escha.as_ref() else { return Ok(false) };
             gpu.rmsnorm_f32(&s.x, &l.ffn_norm, &s.tmp, config.norm_eps)
                 .map_err(hip)?;
-            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1)
+            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1, None)
                 .map_err(hip)?;
-            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1)
+            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1, None)
                 .map_err(hip)?;
             Ok(true)
         }
@@ -5053,9 +5053,9 @@ fn escha_run_proj(
             let Some(e) = l.escha.as_ref() else { return Ok(false) };
             gpu.rmsnorm_f32(&s.x, &l.ffn_norm, &s.tmp, config.norm_eps)
                 .map_err(hip)?;
-            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1)
+            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1, None)
                 .map_err(hip)?;
-            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1)
+            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1, None)
                 .map_err(hip)?;
             Ok(true)
         }
@@ -5096,7 +5096,7 @@ fn escha_run_resid(
     match op_code(op) {
         q35_op::RESID_WO => {
             esch.0
-                .forward(gpu, wo, escha_ids(layer), dn_in, &s.escha_xh, &s.o, &s.o, 1)
+                .forward(gpu, wo, escha_ids(layer), dn_in, &s.escha_xh, &s.o, &s.o, 1, None)
                 .map_err(hip)?;
             gpu.add_inplace_f32(&s.x, &s.o).map_err(hip)?;
             Ok(true)
@@ -5116,6 +5116,7 @@ fn escha_run_resid(
                     &s.ffn_out,
                     &s.ffn_out,
                     1,
+                    None,
                 )
                 .map_err(hip)?;
             gpu.add_inplace_f32(&s.x, &s.ffn_out).map_err(hip)?;

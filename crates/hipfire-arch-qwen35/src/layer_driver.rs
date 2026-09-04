@@ -108,6 +108,7 @@ pub(crate) fn load_layer<B: WeightBackend>(
                     up: need_eproj(b, "mlp.up_proj", &w_up)?,
                     down: need_eproj(b, "mlp.down_proj", &w_down)?,
                     ids: b.zeros_i32(ESCHA_MAX_SLOTS)?,
+                    iota: b.iota_i32(ESCHA_MAX_SLOTS)?,
                 }),
             };
             LayerWeights::DeltaNet(DeltaNetLayerWeights {
@@ -173,6 +174,7 @@ pub(crate) fn load_layer<B: WeightBackend>(
                     up: need_eproj(b, "mlp.up_proj", &w_up)?,
                     down: need_eproj(b, "mlp.down_proj", &w_down)?,
                     ids: b.zeros_i32(ESCHA_MAX_SLOTS)?,
+                    iota: b.iota_i32(ESCHA_MAX_SLOTS)?,
                 }),
             };
             LayerWeights::FullAttn(FullAttnLayerWeights {

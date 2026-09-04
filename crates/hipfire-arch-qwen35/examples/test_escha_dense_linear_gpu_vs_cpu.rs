@@ -295,7 +295,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let xh = gpu.alloc_tensor(&[slots * ic], DType::F32)?;
             let mid = gpu.alloc_tensor(&[slots * oc], DType::F32)?;
             let yg = gpu.alloc_tensor(&[slots * oc], DType::F32)?;
-            ep.forward(&mut gpu, &lin.w, &ids, &xg, &xh, &mid, &yg, slots)?;
+            // Exercise BOTH shapes: the per-slot GEMV and, above 1 slot, the
+            // grouped WMMA GEMM that batched prefill uses.
+            let off_bytes: Vec<u8> = [0i32, slots as i32]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+            let iota: Vec<f32> = (0..slots).map(|i| f32::from_bits(i as u32)).collect();
+            let iota = gpu.upload_f32(&iota, &[slots])?;
+            let grouped = if slots > 1 { Some((&offsets, &iota)) } else { None };
+            ep.forward(&mut gpu, &lin.w, &ids, &xg, &xh, &mid, &yg, slots, grouped)?;
             let y = gpu.download_f32(&yg)?;
             // Every slot fed the same x, so every slot must equal y_ref
             // (minus the bias, which EschaProj deliberately does not add).

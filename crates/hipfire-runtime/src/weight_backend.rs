@@ -1288,6 +1288,10 @@ pub trait WeightBackend {
     /// holds INTEGERS declared F32 because `DType` has no integer variant —
     /// the same deliberate reinterpretation `EschaMoeTables::ids` documents.
     fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor>;
+    /// `0..n` as 32-bit ints. The grouped escha GEMM's `sorted_slot_index`:
+    /// a dense linear is one group in slot order, so the permutation is the
+    /// identity.
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor>;
 }
 
 /// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
@@ -1333,6 +1337,12 @@ impl<'a> WeightBackend for HfqBackend<'a> {
     fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
         self.gpu.upload_f32(&vec![f32::from_bits(0); n], &[n])
     }
+
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        let v: Vec<f32> = (0..n).map(|i| f32::from_bits(i as u32)).collect();
+        self.gpu.upload_f32(&v, &[n])
+    }
+
 
     fn escha_sidecars(
         &mut self,
@@ -1460,6 +1470,12 @@ impl<'a> WeightBackend for ParoBackend<'a> {
     fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
         self.gpu.upload_f32(&vec![f32::from_bits(0); n], &[n])
     }
+
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        let v: Vec<f32> = (0..n).map(|i| f32::from_bits(i as u32)).collect();
+        self.gpu.upload_f32(&v, &[n])
+    }
+
 
     /// ParoQuant is not escha.
     fn escha_sidecars(

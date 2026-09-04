@@ -587,6 +587,9 @@ impl EschaProj {
         mid: &GpuTensor,
         y: &GpuTensor,
         slots: usize,
+        // `(expert_offsets, sorted_slot_index)` for the grouped GEMM, or
+        // `None` to force the per-slot GEMV. Decode passes `None`.
+        grouped: Option<(&GpuTensor, &GpuTensor)>,
     ) -> HipResult<()> {
         let (ic, oc) = (w.k, w.m);
         let tk = match w.gpu_dtype {
@@ -605,7 +608,24 @@ impl EschaProj {
             rdna_compute::EschaXGroup::PerSlot
         };
         gpu.escha_h128_batched("escha_h128_in_batched", x, &self.rin, ids, xh, ic, slots, xg)?;
-        gpu.escha_gemv_native_moe_k8_indexed_batched(&self.ptr0, ids, xh, mid, oc, ic, slots, tk)?;
+        match grouped {
+            // BATCHED: one group holding every slot. The indexed GEMV re-reads
+            // the weight ONCE PER SLOT — correct for MoE, where each slot is a
+            // different expert, and 512x the weight traffic for a dense linear
+            // where every token shares one weight. The grouped WMMA GEMM reads
+            // it once per (layer, batch) instead, which is the same fix that
+            // took the 35B's expert path from 4.525 to 2.657 ms/token.
+            Some((offsets, iota)) if slots > 1 => {
+                gpu.escha_gemm_native_moe_grouped_wmma(
+                    &self.ptr0, offsets, iota, xh, mid, oc, ic, slots, 1, tk,
+                )?;
+            }
+            _ => {
+                gpu.escha_gemv_native_moe_k8_indexed_batched(
+                    &self.ptr0, ids, xh, mid, oc, ic, slots, tk,
+                )?;
+            }
+        }
         gpu.escha_h128_batched(
             "escha_h128_out_batched",
             mid,
