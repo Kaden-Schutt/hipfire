@@ -3993,6 +3993,50 @@ pub fn download_hidden_block(
     Ok(out)
 }
 
+/// S7: batch the draft noise embeddings into a single launch.
+///
+/// Uploads the `block` token IDs once into the persistent `noise_tokens`
+/// plane (i32 IDs stored as F32 bits, same cosmetic pattern as the
+/// `positions_*` planes) and runs one `embedding_lookup_q8_batched` over
+/// all `b` rows directly into `draft_scratch.x` ([b*h]).
+///
+/// Returns `true` when the fast path ran. Returns `false` — leaving every
+/// buffer untouched — when the route predicates fail, in which case the
+/// caller runs the legacy per-token loop. Route: Q8_0 target embedding,
+/// exact gfx1100, `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, `1 <= b <=
+/// max_block_size`. The batched kernel dequantizes each row with the same
+/// per-element math as the scalar loop, so the plane is bit-identical.
+pub fn build_dflash_noise_embeddings(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    block: &[u32],
+    h: usize,
+    draft_scratch: &mut DflashScratch,
+) -> HipResult<bool> {
+    if !matches!(
+        target.weights.embd_format,
+        hipfire_runtime::llama::EmbeddingFormat::Q8_0
+    ) {
+        return Ok(false);
+    }
+    if !gpu.draft_collapse_fused_enabled() {
+        return Ok(false);
+    }
+    let b = block.len();
+    if b == 0 || b > draft_scratch.max_block_size {
+        return Ok(false);
+    }
+    let ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
+    let id_view = draft_scratch.noise_tokens.sub_offset(0, b);
+    let id_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
+    let out_view = draft_scratch.x.sub_offset(0, b * h);
+    gpu.embedding_lookup_q8_batched(&target.weights.token_embd, &out_view, &id_view, b, h)?;
+    Ok(true)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // DFlash spec step — one speculative decode iteration
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4266,22 +4310,28 @@ pub fn spec_step_dflash(
         // into draft_scratch.x on GPU (no host round-trip). Target and draft
         // share the same Gpu, so the embedding lookup can target the draft's
         // scratch buffer. Avoids 16 × D2H + one H2D per iter (~1 ms saved).
-        for (i, &tok) in block.iter().enumerate() {
-            let dst = draft_scratch.x.sub_offset(i * h, h);
-            match target.weights.embd_format {
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+        // S7: on the measured gfx1100 + Q8_0 route the 16 scalar lookups
+        // collapse into one batched embedding (token IDs uploaded once into
+        // the persistent noise plane). Every other format/arch/switch keeps
+        // the loop below byte-for-byte.
+        if !build_dflash_noise_embeddings(gpu, target, &block, h, draft_scratch)? {
+            for (i, &tok) in block.iter().enumerate() {
+                let dst = draft_scratch.x.sub_offset(i * h, h);
+                match target.weights.embd_format {
+                    hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                        gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+                    }
+                    hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                        gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+                    }
+                    hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                        gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+                    }
+                    hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                        gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+                    }
+                    _ => panic!("dflash: unsupported target embedding format for noise lookup"),
                 }
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-                }
-                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
             }
         }
 
