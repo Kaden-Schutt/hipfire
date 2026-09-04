@@ -14044,16 +14044,44 @@ impl Gpu {
                 &mut n_val as *mut _ as *mut c_void,
             ]
         };
-        let func = &self.functions[entry];
         let grid = (slots * (n / 128)) as u32;
         // Counted so the "160 H128 launches per token" budget is a MEASURED
         // number in the G4 gate, not a claim in a comment. Relaxed ordering:
         // this is a diagnostic tally, nothing synchronises on it.
         crate::ESCHA_H128_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [128, 1, 1], 0, None, &mut params)
-        }
+        // `launch_maybe_blob`, NOT a raw `launch_kernel(.., None, ..)`.
+        //
+        // This runs INSIDE the forward pass, so under graph capture a
+        // null-stream launch is not ordered against the captured stream that
+        // the surrounding GEMVs use — those go through `launch_maybe_blob`
+        // already. The mixture was a genuine data race: the G5 gate's
+        // reference arm scored 0.000361 and 0.000152 on two runs of the SAME
+        // binary against the SAME reference, which failed its own negative
+        // control and made the whole gate unusable. Setting either
+        // HIP_LAUNCH_BLOCKING=1 or HIPFIRE_GRAPH=0 restored determinism —
+        // that is what identified capture as the trigger.
+        let entry_name = entry.to_string();
+        let (a_p, r_p, i_p, o_p, n_v, xb_v) = (a_ptr, r_ptr, i_ptr, o_ptr, n_val, xb);
+        let is_in = entry == "escha_h128_in_batched";
+        self.launch_maybe_blob(
+            &entry_name,
+            [grid, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p);
+                b.push_ptr(r_p);
+                b.push_ptr(i_p);
+                b.push_ptr(o_p);
+                b.push_i32(n_v);
+                if is_in {
+                    b.push_i32(xb_v);
+                }
+                b
+            },
+        )
     }
 
     /// SwiGLU over the f16-rounded merged `gate_up` output, batched across
@@ -14090,19 +14118,26 @@ impl Gpu {
             &mut h_ptr as *mut _ as *mut c_void,
             &mut inter_i as *mut _ as *mut c_void,
         ];
-        let func = &self.functions["escha_swiglu_batched"];
         let bx = 256u32;
         let gx = (inter as u32).div_ceil(bx);
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [gx, slots as u32, 1],
-                [bx, 1, 1],
-                0,
-                None,
-                &mut params,
-            )
-        }
+        // Capture-aware, for the same reason as `escha_h128_batched` above:
+        // a null-stream launch inside the forward pass is not ordered against
+        // the captured stream the surrounding GEMVs run on.
+        let (y_p, h_p, inter_v) = (y_ptr, h_ptr, inter_i);
+        self.launch_maybe_blob(
+            "escha_swiglu_batched",
+            [gx, slots as u32, 1],
+            [bx, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(y_p);
+                b.push_ptr(h_p);
+                b.push_i32(inter_v);
+                b
+            },
+        )
     }
 
     /// Escha-W2 routed GEMV for the indexed (GPU-top-K) decode path: one
