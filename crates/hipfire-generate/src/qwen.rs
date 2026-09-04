@@ -361,7 +361,28 @@ pub fn ep_serve_qwen35_dense_tp(
     );
 
     let t_prefill = Instant::now();
-    for (chunk_index, chunk) in prompt_ids.chunks(32).enumerate() {
+    // Chunk at the rank's prefill batch, not a fixed 32: M=32 misses the MMQ
+    // batch floor (128) and fires the per-layer collectives 16x more often
+    // than the chunk the TP prefill re-chunks to internally (8k prompt on
+    // 2x gfx1100: 72.1 -> 54.7 s wall).
+    let tp_prefill_chunk = match m.ep.as_ref() {
+        Some(EpState { gpus, .. }) => {
+            qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1)
+        }
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "dense TP serve without EP state",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    for (chunk_index, chunk) in prompt_ids.chunks(tp_prefill_chunk).enumerate() {
         if check_abort(id) {
             ep_emit_abort(stdout, id, m, 0);
             return;
@@ -395,7 +416,7 @@ pub fn ep_serve_qwen35_dense_tp(
                 weights,
                 configs,
                 chunk,
-                chunk_index * 32,
+                chunk_index * tp_prefill_chunk,
                 kv_caches,
                 dn_states,
                 scratches,
