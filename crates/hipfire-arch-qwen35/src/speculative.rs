@@ -1967,6 +1967,10 @@ pub struct DdtreeScratch {
     /// cycle via `memcpy_htod` before calling `verify_dflash_block_tree`.
     /// Allocated as Raw bytes (4 × max_n) since there's no i32 DType.
     pub parent_indices: GpuTensor,
+    /// S8: persistent scratch for the fused LM-head + top-K direct kernel.
+    /// `Some` only on exact gfx1100 with the route enabled; the proposal
+    /// path falls back to the materializing GEMM + topk when `None`.
+    pub topk_direct: Option<DdtreeTopkScratch>,
 }
 
 impl DdtreeScratch {
@@ -1975,17 +1979,89 @@ impl DdtreeScratch {
         let max_n = 1 + max_budget;
         let attn_bias = gpu.alloc_tensor(&[max_n * max_n], rdna_compute::DType::F32)?;
         let parent_indices = gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
+        let topk_direct = DdtreeTopkScratch::new(gpu);
 
         Ok(Self {
             max_n,
             attn_bias,
             parent_indices,
+            topk_direct,
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.attn_bias);
         let _ = gpu.free_tensor(self.parent_indices);
+        if let Some(td) = self.topk_direct {
+            td.free_gpu(gpu);
+        }
+    }
+}
+
+/// S8: persistent scratch for the fused MQ4V2 LM-head + greedy top-K/
+/// log-sum-exp kernel (`Gpu::mq4v2_lmhead_topk_direct_gfx1100`). Allocated
+/// once at session start so the in-cycle DDTree proposal path performs no
+/// alloc/free, no H2D, and no JIT. Absent on non-gfx1100, when
+/// `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1`, or when allocation fails (the caller
+/// then stays on the materializing GEMM + `topk_logsumexp_batched_f32`
+/// path byte-for-byte).
+///
+/// `ctl` holds the kernel's arrival counter + generation word and is zeroed
+/// once here; the kernel self-resets both before returning, and HIP stream
+/// serialization guarantees a quiescent gap between launches, so no host
+/// reinit ever happens in-cycle.
+pub struct DdtreeTopkScratch {
+    /// Per-(wg, lane) top-K partials + online (max, sumexp) pairs.
+    pub partials: GpuTensor,
+    /// [2] i32: grid-barrier arrival counter + generation (zeroed at new()).
+    pub ctl: GpuTensor,
+    /// [TDK_N_MAX * TDK_MAX_K] f32 storage; kernel writes i32 ids.
+    pub top_idx: GpuTensor,
+    /// [TDK_N_MAX * TDK_MAX_K] f32 log-probs.
+    pub top_logp: GpuTensor,
+}
+
+impl DdtreeTopkScratch {
+    /// Allocate on exact gfx1100 with the fast route enabled; `None`
+    /// otherwise (allocation failure included — never fails the session).
+    pub fn new(gpu: &mut Gpu) -> Option<Self> {
+        if !(gpu.arch_caps.is_gfx1100() && gpu.arch == "gfx1100")
+            || gpu.flags.ddtree_topk_direct_off
+        {
+            return None;
+        }
+        let mk = rdna_compute::mq4v2_topk_direct::TDK_N_MAX
+            * rdna_compute::mq4v2_topk_direct::TDK_MAX_K;
+        let partials = gpu
+            .alloc_tensor(
+                &[rdna_compute::mq4v2_topk_direct::ddtree_topk_partials_bytes()],
+                rdna_compute::DType::Raw,
+            )
+            .ok()?;
+        let ctl = gpu.alloc_tensor(&[8], rdna_compute::DType::Raw).ok()?;
+        let top_idx = gpu.alloc_tensor(&[mk], rdna_compute::DType::F32).ok()?;
+        let top_logp = gpu.alloc_tensor(&[mk], rdna_compute::DType::F32).ok()?;
+        // One-time counter zeroing; afterwards the kernel owns ctl entirely.
+        if gpu.hip.memset(&ctl.buf, 0, 8).is_err() {
+            let _ = gpu.free_tensor(partials);
+            let _ = gpu.free_tensor(ctl);
+            let _ = gpu.free_tensor(top_idx);
+            let _ = gpu.free_tensor(top_logp);
+            return None;
+        }
+        Some(Self {
+            partials,
+            ctl,
+            top_idx,
+            top_logp,
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.partials);
+        let _ = gpu.free_tensor(self.ctl);
+        let _ = gpu.free_tensor(self.top_idx);
+        let _ = gpu.free_tensor(self.top_logp);
     }
 }
 
@@ -6033,6 +6109,10 @@ fn run_dflash_draft_for_topk_gpu(
     // genuine draft samples, which is what the q-exploiting SWOR verify needs to
     // be distribution-exact. `None` ⇒ the default deterministic GPU top-k.
     sample: Option<(f32, &mut u64)>,
+    // S8: persistent scratch for the fused LM-head + top-K kernel. `Some` only
+    // when the gfx1100 direct route may arm; the MQ4G256V2 `sample=None` branch
+    // below checks every remaining predicate and falls back byte-for-byte.
+    topk_scratch: Option<&DdtreeTopkScratch>,
 ) -> HipResult<(Vec<u32>, Vec<f32>, Option<GpuTensor>)> {
     // The 3rd return is the draft logits kept ON DEVICE (`[batch·vocab]`),
     // populated only in `sample` mode — the fused GPU SWOR walk softmaxes them
@@ -6123,8 +6203,68 @@ fn run_dflash_draft_for_topk_gpu(
     // Step 4: lm_head → [batch × vocab] logits (GPU-resident).
     let batch = b - 1;
     let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-    let logits_batch = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
     let w_out = &target.weights.output;
+
+    // S8 fused route: for the greedy (sample=None) DDTree proposal on exact
+    // gfx1100 with an MQ4G256V2 lm_head, skip the [batch × vocab] logits
+    // materialization entirely: one resident-workgroup kernel computes the
+    // MQ4V2 WMMA tiles and folds them straight into per-row top-K ids +
+    // log-probs. Every failed predicate (kill switch, arch, format, shape,
+    // missing scratch) keeps the materializing path below byte-for-byte.
+    let fused_topk_armed = sample.is_none()
+        && matches!(w_out.gpu_dtype, rdna_compute::DType::MQ4G256V2)
+        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch == "gfx1100"
+        && !gpu.flags.ddtree_topk_direct_off
+        && batch <= rdna_compute::mq4v2_topk_direct::TDK_N_MAX
+        && k <= rdna_compute::mq4v2_topk_direct::TDK_MAX_K
+        && h % 256 == 0
+        && topk_scratch.is_some();
+    if fused_topk_armed {
+        let tds = topk_scratch.expect("checked is_some");
+        let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        let fused_result = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)
+            .and_then(|_| {
+                gpu.mq4v2_lmhead_topk_direct_gfx1100(
+                    &w_out.buf,
+                    &rotated,
+                    &tds.partials,
+                    &tds.ctl,
+                    &tds.top_idx,
+                    &tds.top_logp,
+                    vocab,
+                    h,
+                    batch,
+                    k,
+                )
+            });
+        let _ = gpu.free_tensor(rotated);
+        match fused_result {
+            Ok(()) => {
+                // D2H just the top-K outputs from the persistent scratch —
+                // same byte shape as the materializing path's step 6.
+                let mut idx_host: Vec<i32> = vec![0i32; batch * k];
+                let mut val_host: Vec<f32> = vec![0f32; batch * k];
+                let idx_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, batch * k * 4)
+                };
+                let val_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(val_host.as_mut_ptr() as *mut u8, batch * k * 4)
+                };
+                gpu.hip.memcpy_dtoh(idx_bytes, &tds.top_idx.buf)?;
+                gpu.hip.memcpy_dtoh(val_bytes, &tds.top_logp.buf)?;
+                let top_tokens: Vec<u32> = idx_host.into_iter().map(|x| x as u32).collect();
+                return Ok((top_tokens, val_host, None));
+            }
+            Err(e) => {
+                // Pre-launch predicate/JIT failure: fall through to the
+                // materializing path (nothing was enqueued on error).
+                eprintln!("ddtree topk-direct: fused route unavailable ({e}); using GEMM+topk path");
+            }
+        }
+    }
+
+    let logits_batch = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
     let gemm_result = match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
@@ -6985,6 +7125,7 @@ pub fn spec_step_ddtree_batched(
         } else {
             None
         },
+        scratch.topk_direct.as_ref(),
     )?;
     // SWOR verify needs the draw-ordered candidates per position; `top_tokens` is
     // already in Gumbel-draw order (rank 0 = first drawn) in sample mode.
