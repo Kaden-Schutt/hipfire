@@ -26,6 +26,7 @@ pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
+pub mod mq4v2_topk_direct;
 pub mod norm;
 pub mod pool;
 pub mod profile;
