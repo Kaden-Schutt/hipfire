@@ -30,6 +30,11 @@
 // with (K/256) % KW == 0, KTOP in 1..=8, M arbitrary (clamped tail rows are
 // discarded).
 //
+// X arrives as F32 FWHT-rotated hidden and is converted to F16 INLINE at the
+// WMMA load (`(_Float16)`, RNE — bit-identical to the `convert_f32_to_f16`
+// staging kernel, which uses the same cast). This drops the convert launch
+// from the fused path; the WMMA b-fragment values are exactly the oracle's.
+//
 // Grid:  [WG_COUNT, 1, 1] — host-computed as min(m_tiles, 1344) and
 //        statically proven resident: __launch_bounds__(32, 14) is met by the
 //        compiler (amdgpu-waves-per-eu check; 78 VGPRs, phase-2 LDS promoted
@@ -67,7 +72,8 @@
 // Scratch layout (one Raw alloc, element offsets):
 //   partials[(wg * 32 + lane) * KMAX * 2]     : per-(wg,lane) top-K (f32,i32)
 //   partials[WGM*32*KMAX*2 + (wg*32+lane)*2]  : per-(wg,lane) online max/se
-//   ctl[0] = arrival counter, ctl[1] = generation (separate 8-byte alloc)
+// ctl (176 B, zeroed once): [0] launch counter, [1] release word,
+// [2..44) per-32-wg arrival slots (monotonic, never reset).
 // (A column's 16 tile rows split across lanes ml and ml+16 — even/odd row
 //  parity — so partials are per-LANE, 32 per workgroup, and phase 2 merges
 //  both halves of each column.)
@@ -90,7 +96,7 @@ typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 extern "C" __launch_bounds__(32, 14) __global__ void
 mq4v2_lmhead_topk_direct_gfx1100(
     const char* __restrict__ A,        // [M, K] MQ4G256V2 packed (136 B / 256-K group)
-    const _Float16* __restrict__ X,    // [N, K] fp16 rotated hidden
+    const float* __restrict__ X,       // [N, K] f32 rotated hidden (RNE-converted inline)
     float* __restrict__ partials,      // [TDK_WG_MAX*16*TDK_MAX_K*2 + TDK_WG_MAX*16*2]
     int* __restrict__ ctl,             // [2]: arrival counter, generation
     int* __restrict__ top_idx,         // [N * K]
@@ -122,7 +128,7 @@ mq4v2_lmhead_topk_direct_gfx1100(
     // every lane must issue its loads; their tile cells are discarded via
     // col_live. Mirrors the oracle's safe_batch clamp.
     const int safe_col = col_live ? ml : 0;
-    const _Float16* x_base = X + (long long)safe_col * K;
+    const float* x_base = X + (long long)safe_col * K;
 
     for (int tile = wg; tile < m_tiles; tile += nwg) {
         const int row0 = tile << 4;
@@ -159,7 +165,7 @@ mq4v2_lmhead_topk_direct_gfx1100(
                 (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
             const _Float16 zp1 =
                 (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
-            const _Float16* xg = x_base + g * 256;
+            const float* xf = x_base + g * 256;
 
             _Pragma("unroll")
             for (int kt = 0; kt < 16; kt++) {
@@ -188,7 +194,11 @@ mq4v2_lmhead_topk_direct_gfx1100(
                 a_reg[14] = sc_h * (_Float16)(float)((pk1 >> 24) & 0xFu) + zp_h;
                 a_reg[15] = sc_h * (_Float16)(float)((pk1 >> 28) & 0xFu) + zp_h;
 
-                half16_t b_reg = *(const half16_t*)(xg + k_off);
+                // Inline RNE f32->f16 (bit-identical to convert_f32_to_f16).
+                const float* xkt = xf + k_off;
+                half16_t b_reg;
+                _Pragma("unroll")
+                for (int i = 0; i < 16; i++) b_reg[i] = (_Float16)xkt[i];
 
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
             }
@@ -245,19 +255,31 @@ mq4v2_lmhead_topk_direct_gfx1100(
     }
     __threadfence();
 
-    // ---- grid-wide generation barrier (resident grid only) -----------------
+    // ---- two-level arrival barrier (resident grid only) ----------------------
+    // A single global arrival counter would serialize 1344 atomicAdds on the
+    // critical path (~200 us). Instead each 32-wg cohort bumps its own slot
+    // (42 slots, monotonic, never reset — stream serialization makes reuse
+    // safe); wg 0 spins the slots to (launch * size) then publishes release.
+    // Others spin on release CHANGING from the value observed before their
+    // phase-1 work — at most one release per launch can intervene, so this
+    // is exact without any per-launch published index.
+    const int slots = (nwg + 31) >> 5;
+    const int slot = wg >> 5;
+    const int go_seen = (lane == 0) ? atomicAdd(&ctl[1], 0) : 0;
+    __threadfence();
     if (lane == 0) {
-        const int gen_seen = atomicAdd(&ctl[1], 0); // acquire-read generation
-        const int arrived = atomicAdd(&ctl[0], 1) + 1;
-        if (arrived == nwg) {
-            ctl[0] = 0;                    // reset for the NEXT launch (stream-serial)
+        atomicAdd(&ctl[2 + slot], 1);
+        if (wg == 0) {
+            const int idx = atomicAdd(&ctl[0], 1) + 1;
+            for (int st = 0; st < slots; st++) {
+                const int sz = (st == slots - 1) ? (nwg - (st << 5)) : 32;
+                while (atomicAdd(&ctl[2 + st], 0) < idx * sz) { }
+            }
             __threadfence();
-            atomicAdd(&ctl[1], 1);         // release: flip generation
+            ctl[1] = idx;
+            __threadfence();
         } else {
-            int g;
-            do {
-                g = atomicAdd(&ctl[1], 0); // acquire spin
-            } while (g == gen_seen);
+            while (atomicAdd(&ctl[1], 0) == go_seen) { }
         }
     }
     __syncwarp();

@@ -432,8 +432,19 @@ fn main() {
             DType::Raw,
         )
         .expect("alloc partials");
-    let ctl = gpu.alloc_tensor(&[8], DType::Raw).expect("alloc ctl");
-    gpu.hip.memset(&ctl.buf, 0, 8).expect("zero ctl");
+    let ctl = gpu
+        .alloc_tensor(
+            &[rdna_compute::mq4v2_topk_direct::ddtree_topk_ctl_bytes()],
+            DType::Raw,
+        )
+        .expect("alloc ctl");
+    gpu.hip
+        .memset(
+            &ctl.buf,
+            0,
+            rdna_compute::mq4v2_topk_direct::ddtree_topk_ctl_bytes(),
+        )
+        .expect("zero ctl");
 
     let mut all_ok = true;
 

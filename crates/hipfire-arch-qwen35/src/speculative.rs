@@ -2013,7 +2013,7 @@ impl DdtreeScratch {
 pub struct DdtreeTopkScratch {
     /// Per-(wg, lane) top-K partials + online (max, sumexp) pairs.
     pub partials: GpuTensor,
-    /// [2] i32: grid-barrier arrival counter + generation (zeroed at new()).
+    /// Barrier words (launch counter, release, arrival slots; zeroed at new()).
     pub ctl: GpuTensor,
     /// [TDK_N_MAX * TDK_MAX_K] f32 storage; kernel writes i32 ids.
     pub top_idx: GpuTensor,
@@ -2038,11 +2038,23 @@ impl DdtreeTopkScratch {
                 rdna_compute::DType::Raw,
             )
             .ok()?;
-        let ctl = gpu.alloc_tensor(&[8], rdna_compute::DType::Raw).ok()?;
+        let ctl = gpu
+            .alloc_tensor(
+                &[rdna_compute::mq4v2_topk_direct::ddtree_topk_ctl_bytes()],
+                rdna_compute::DType::Raw,
+            )
+            .ok()?;
         let top_idx = gpu.alloc_tensor(&[mk], rdna_compute::DType::F32).ok()?;
         let top_logp = gpu.alloc_tensor(&[mk], rdna_compute::DType::F32).ok()?;
-        // One-time counter zeroing; afterwards the kernel owns ctl entirely.
-        if gpu.hip.memset(&ctl.buf, 0, 8).is_err() {
+        // One-time barrier-word zeroing; afterwards the kernel owns ctl entirely.
+        if gpu
+            .hip
+            .memset(
+                &ctl.buf,
+                0,
+                rdna_compute::mq4v2_topk_direct::ddtree_topk_ctl_bytes(),
+            )
+            .is_err() {
             let _ = gpu.free_tensor(partials);
             let _ = gpu.free_tensor(ctl);
             let _ = gpu.free_tensor(top_idx);
