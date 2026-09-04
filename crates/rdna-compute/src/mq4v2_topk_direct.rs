@@ -46,8 +46,7 @@ pub const TDK_N_MAX: usize = 16;
 pub const TDK_CTL_WORDS: usize = 44;
 
 /// Bytes required for the `ctl` scratch tensor (zeroed once at allocation;
-/// sense-reversing barrier words with in-kernel resets — safe under HIP
-/// stream serialization, so no host reinit ever happens in-cycle).
+/// all words are monotonic — the kernel never resets them).
 pub fn ddtree_topk_ctl_bytes() -> usize {
     TDK_CTL_WORDS * 4
 }
