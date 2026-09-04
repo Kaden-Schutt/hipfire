@@ -102,6 +102,9 @@
           "presence_penalty": 1.5,
           "repeat_penalty": 1.0
         }
+      },
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq"
       }
     },
     "qwen3.5:27b": {
@@ -144,6 +147,9 @@
           "presence_penalty": 1.5,
           "repeat_penalty": 1.0
         }
+      },
+      "dflash": {
+        "file": "qwen35-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.5:35b-a3b": {
@@ -697,6 +703,9 @@
       "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
       "triattn": {
         "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
+      },
+      "dflash": {
+        "file": "qwen36-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.8:27b-mq3-xt": {
@@ -725,6 +734,9 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
       }
     },
     "qwen3.8:27b-mq3": {
@@ -753,6 +765,9 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
       }
     },
     "qwen3.8:27b-mq3-pro": {
@@ -781,6 +796,9 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
       }
     },
     "qwen3.8:27b-mq4-xt": {
@@ -809,6 +827,9 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.8:27b": {
@@ -837,6 +858,9 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.8:27b-mq4-pro": {
@@ -865,6 +889,9 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.8:27b-mq5-xt": {
@@ -1060,7 +1087,10 @@
       "min_vram_gb": 8.8,
       "desc": "MQ6, higher quality",
       "default_kv_mode": "q8",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq"
+      }
     },
     "qwen3.5:27b-mq6": {
       "repo": "hipfire-models/qwen3.5-27b",
@@ -1076,14 +1106,20 @@
       "min_vram_gb": 6.1,
       "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending — see issue #113. Sub-9B MQ3 not shipped — see #114.",
       "default_kv_mode": "q8",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq"
+      }
     },
     "qwen3.5:27b-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen3.5-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
+      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only.",
+      "dflash": {
+        "file": "qwen35-27b-dflash-mq3.hfq"
+      }
     },
     "qwen3.6:27b-mq3": {
       "recommended_settings": {
@@ -1096,7 +1132,10 @@
       "file": "qwen3.6-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0)."
+      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0).",
+      "dflash": {
+        "file": "qwen36-27b-dflash-mq3.hfq"
+      }
     },
     "qwen3.5:27b-draft-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
