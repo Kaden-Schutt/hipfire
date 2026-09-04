@@ -28036,28 +28036,37 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
-        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
-        // base kernel (one wave32 per 16x16 tile) launches too few waves to
-        // cover 96 CUs. Capture-SAFE (unlike the mw_lds tier below): the
-        // kernel is deterministic (fixed wave-order LDS reduction, no
-        // atomics), launches via launch_maybe_blob (blob ABI recorded under
-        // capture), and its symbols carry the replay.rs kernarg contract, so
-        // verify-graph capture bakes ks4_lds and every replayed cycle keeps
-        // the win. Only Redline tape recording keeps the base contract.
-        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the ksplit
-        // and ldsstage kernels (flags.residual_ksplit_off) and restores the
-        // base oracle. The ldsstage kernel (gfx1100 port of the gfx12
-        // ldsstage design) is opt-in via HIPFIRE_RESIDUAL_LDSSTAGE=1
-        // (flags.residual_ldsstage) wherever K % 512 == 0: it beats ks4 by
-        // ~8% on hipx (53% vs 48% of roofline) but missed the 70% gate — 126
-        // VGPRs cap it at 1 WG/CU — so ks4 stays the default until register
-        // pressure is addressed.
+        // Exact gfx1100 DFlash verify tier: slab-synchronized X-in-LDS for
+        // N<=16, where the base kernel (one wave32 per 16x16 tile) launches
+        // too few waves to cover 96 CUs. Capture-SAFE (unlike the mw_lds tier
+        // below): the kernel is deterministic (fixed wave-order LDS reduction,
+        // no atomics), launches via launch_maybe_blob (blob ABI recorded under
+        // capture), and its symbol carries the replay.rs kernarg contract, so
+        // verify-graph capture bakes xlds and every replayed cycle keeps the
+        // win. Only Redline tape recording keeps the base contract.
+        // Kill switches: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables the whole tier
+        // (flags.residual_ksplit_off) and restores the base oracle;
+        // HIPFIRE_RESIDUAL_XLDS_OFF=1 drops back to the ks table
+        // (flags.residual_xlds_off, ks4 for the verify shapes). The ldsstage
+        // kernel (gfx1100 port of the gfx12 ldsstage design, opt-in via
+        // HIPFIRE_RESIDUAL_LDSSTAGE=1 wherever K % 512 == 0) stays as a
+        // measurement reference behind xlds. xlds is the default wherever
+        // K % 512 == 0 (both verify shapes qualify): it stages each 512-K
+        // slab's 16x512 fp16 X tile cooperatively in LDS so the WMMA loop's B
+        // operands come from ds_load with no vmcnt drain between WMMAs (ISA
+        // gate), removing the ~1,600 per-launch X drains that cap every ks
+        // variant at ~50% of roofline.
         if !self.replay.is_recording()
             && !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && batch_size <= 16
         {
+            if !self.flags.residual_xlds_off && k % 512 == 0 && k > 0 {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
+                    a_raw, x, y, m, k, batch_size,
+                );
+            }
             if self.flags.residual_ldsstage && k % 512 == 0 && k > 0 {
                 return self
                     .gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(a_raw, x, y, m, k, batch_size);
@@ -28514,6 +28523,106 @@ impl Gpu {
         self.ensure_kernel(
             MODULE,
             kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC,
+            FUNC,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// MQ4V2 gfx1100 slab-synchronized X-in-LDS residual — DFlash verify tier
+    /// (N<=16) default wherever K % 512 == 0.
+    ///
+    /// One 16x16 output tile per 8-wave block; each 512-K slab's 16x512 fp16 X
+    /// tile is staged cooperatively in LDS (16 KiB) and each wave consumes its
+    /// 64-K quarter from LDS (ds_load, no vmcnt drain between WMMAs), with
+    /// per-wave global weight loads prefetched to VGPRs at the slab top.
+    /// Wave-0 fixed-order reduce with a single Y +=. Exact gfx1100 only.
+    /// Grid: ceil(M/16) x ceil(N/16); block 256; static LDS 24 KiB; FP16 X
+    /// once; blob-safe 48 B ABI + profile timer. Preserves fused `Y += W@X`.
+    /// Requires K % 512 == 0 (both verify shapes qualify); otherwise falls
+    /// back to ks4 (or the ks table / base when ks4 cannot run), so direct
+    /// callers never observe an Err for odd-K shapes. fp32 association
+    /// differs from base AND ks: bit-exactness NOT claimed (parity gate:
+    /// relL2 <= 5e-5 vs base). Kill switch HIPFIRE_RESIDUAL_XLDS_OFF=1.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if k % 512 != 0 {
+            let g = k / 256;
+            if k % 256 == 0 && g >= 4 && g % 4 == 0 {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, 4,
+                );
+            }
+            if let Some(kw) = Self::residual_ksplit_kw(k) {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, kw,
+                );
+            }
+            return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_xlds: exact gfx1100 required (got {})",
+                    self.arch
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds";
+        const FUNC: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_xlds";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_KSPLIT_LDS_SRC,
             FUNC,
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;

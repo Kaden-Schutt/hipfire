@@ -584,8 +584,8 @@ impl Gpu {
     /// `gemm_mq4g256v2_residual_wmma`; the only difference is `x_f16`
     /// (DType::F16, e.g. an S4 sidecar) is wired straight in, bypassing
     /// `ensure_fp16_x` and its `convert_f32_to_f16` launch. Tier selection
-    /// mirrors that function: ldsstage opt-in, split-K table, base
-    /// fallback (`residual_ksplit_off` forces base). Any shape outside the
+    /// mirrors that function: xlds default (K % 512 == 0), ldsstage opt-in,
+    /// split-K table, base fallback (`residual_ksplit_off` forces base). Any shape outside the
     /// routed verify domain (non-gfx1100, `batch_size > 16`, `K % 256 != 0`)
     /// returns Err so the caller keeps the old path.
     pub fn gemm_mq4g256v2_residual_wmma_f16(
@@ -620,6 +620,23 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
+        // xlds default mirror (same predicate as the F32 entry): slab-
+        // synchronized X-in-LDS wherever K % 512 == 0 unless
+        // HIPFIRE_RESIDUAL_XLDS_OFF=1 (falls through to ldsstage/ks below).
+        if !self.flags.residual_xlds_off && k % 512 == 0 {
+            return self.gemm_residual_f16_one(
+                a_raw,
+                x_f16,
+                y,
+                m,
+                k,
+                batch_size,
+                "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_KSPLIT_LDS_SRC,
+                "gemm_mq4g256v2_residual_wmma_gfx1100_xlds",
+                [256, 1, 1],
+            );
+        }
         // ldsstage opt-in mirror (same predicate as the F32 entry).
         if self.flags.residual_ldsstage && k % 512 == 0 {
             return self.gemm_residual_f16_one(

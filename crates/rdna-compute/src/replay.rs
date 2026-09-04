@@ -853,6 +853,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_xlds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
@@ -1491,6 +1492,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_xlds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
@@ -7069,6 +7071,7 @@ mod tests {
             "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_xlds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",

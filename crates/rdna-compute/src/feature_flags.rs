@@ -179,8 +179,15 @@ pub struct FeatureFlags {
     /// residual tier (N<=16 DFlash verify) and restores the historical base
     /// kernel on the policy path. Default OFF (tier live). Test harnesses use
     /// this to force the base oracle now that the tier is capture-safe.
-    /// Disables BOTH the ksplit and ldsstage kernels.
+    /// Disables the ksplit, ldsstage, AND xlds kernels.
     pub residual_ksplit_off: bool,
+    /// `HIPFIRE_RESIDUAL_XLDS_OFF=1` opts the exact-gfx1100 N<=16 tier out of
+    /// the xlds kernel (slab-synchronized X-in-LDS) back to the ks table
+    /// (ks4 for the DFlash verify shapes). Default OFF (xlds live wherever
+    /// K % 512 == 0): xlds removes the per-WMMA X-fragment vmcnt drain by
+    /// staging each 512-K slab's X tile in LDS. `HIPFIRE_RESIDUAL_KSPLIT_OFF=1`
+    /// still restores the base oracle above all of these.
+    pub residual_xlds_off: bool,
     /// `HIPFIRE_RESIDUAL_LDSSTAGE=1` opts the exact-gfx1100 N<=16 tier into
     /// the ldsstage kernel wherever K % 512 == 0. Default OFF (ks table wins):
     /// ldsstage beats ks4 by ~8% (53% vs 48% of roofline on hipx) but missed
@@ -535,6 +542,7 @@ impl FeatureFlags {
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
+            residual_xlds_off: value("HIPFIRE_RESIDUAL_XLDS_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: value("HIPFIRE_RESIDUAL_LDSSTAGE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
@@ -795,6 +803,7 @@ impl FeatureFlags {
             graph_moe: true,
             force_blob_path: false,
             residual_ksplit_off: false,
+            residual_xlds_off: false,
             residual_ldsstage: false,
             gemm_dump: false,
             deterministic: false,

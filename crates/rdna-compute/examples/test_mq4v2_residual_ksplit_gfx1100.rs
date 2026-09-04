@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 
 //! MQ4V2 residual split-K LDS parity + timing sweep on exact gfx1100, plus the
-//! LDS-staged (gfx12-port) `ldsstage` arm.
+//! LDS-staged (gfx12-port) `ldsstage` arm and the slab-synchronized X-in-LDS
+//! `xlds` arm (N<=16 tier default).
 //!
 //! Loads REAL weight bytes for layer-0 out_proj (M=5120,K=6144) and down_proj
 //! (M=5120,K=17408) from qwen3.8-27b.mq4, random finite F32 X at N=1,8,16,
@@ -15,7 +16,9 @@
 //! non-finite. Split-K changes fp32 association order, so bit-exactness is
 //! NOT required. The `ldsstage` arm (kw column prints `lds`, requires
 //! K % 512 == 0) runs the same gate and the same timing discipline against
-//! the same base reference and f64 floor.
+//! the same base reference and f64 floor. The `xlds` arm (prints `xlds`,
+//! same K % 512 == 0 requirement) likewise: slab-quarter association differs
+//! from base AND ks, so only relL2 <= 5e-5 plus no-farther-from-f64 gates it.
 //!
 //! Association-floor documentation: for each (shape, N) the harness also
 //! builds an f64 host reference — real weights dequantized with the exact
@@ -678,11 +681,76 @@ fn main() {
                     p.label, n, "lds"
                 );
             }
+            // XLDS arm (slab-synchronized X-in-LDS, N<=16 tier default): same
+            // f64 floor + relL2 <= 5e-5 gate, same timing discipline (32
+            // warmups, 200 launches/sample, 3 samples, min+median). K % 512
+            // == 0 required (both verify shapes qualify); association differs
+            // from base AND ks, so bit-exactness is NOT required — only the
+            // relL2 gate plus no-farther-from-f64-truth than base.
+            if k % 512 == 0 {
+                let d_y_xlds = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y xlds");
+                htod_f32(&gpu, &d_y_xlds, &y_init);
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_xlds(&d_a, &d_x, &d_y_xlds, m, k, n)
+                    .unwrap_or_else(|e| panic!("xlds launch failed: {e:?}"));
+                sync(&gpu);
+                let y_xlds = gpu.download_f32(&d_y_xlds).expect("download xlds");
+                let finite_xlds = is_finite(&y_xlds);
+                let r_xlds_base = rel_l2(&y_xlds, &y_ref);
+                let ma_xlds = max_abs_diff(&y_xlds, &y_ref);
+                let y_xlds64: Vec<f64> = y_xlds.iter().map(|&v| v as f64).collect();
+                let r_xlds_f64 = rel_l2_f64(&y_xlds64, &y_f64);
+                let ma_xlds_f64 = y_xlds64
+                    .iter()
+                    .zip(y_f64.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f64, f64::max);
+                let bigfrac_xlds = y_xlds
+                    .iter()
+                    .zip(y_ref.iter())
+                    .filter(|(a, b)| (**a - **b).abs() as f64 > BIG_DIFF)
+                    .count() as f64
+                    / y_xlds.len() as f64;
+                let ok_xlds = finite_xlds && r_xlds_base <= PARITY_TOL;
+                if !ok_xlds {
+                    all_ok = false;
+                    eprintln!("  FAIL parity {} N={n} xlds: relL2(xlds,base)={r_xlds_base:.3e} maxAbs={ma_xlds:.3e} finite={finite_xlds}", p.label);
+                }
+                htod_f32(&gpu, &d_y_xlds, &y_init);
+                for _ in 0..WARMUP {
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
+                        &d_a, &d_x, &d_y_xlds, m, k, n,
+                    )
+                    .unwrap();
+                }
+                sync(&gpu);
+                let mut us_xlds: Vec<f64> = Vec::with_capacity(SAMPLES);
+                for _ in 0..SAMPLES {
+                    htod_f32(&gpu, &d_y_xlds, &y_init);
+                    us_xlds.push(time_batch(&mut gpu, &mut |gm: &mut Gpu| {
+                        gm.gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
+                            &d_a, &d_x, &d_y_xlds, m, k, n,
+                        )
+                        .unwrap()
+                    }));
+                }
+                us_xlds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med_xlds = median(us_xlds.clone());
+                let status_xlds = if ok_xlds { "OK" } else { "FAIL" };
+                println!(
+                    "{:>10} {:>3} {:>4} {:>12.3e} {:>12.3e} {:>7} {:>12.3e} {:>12.3e} {:>12.3e} {:>12.3e} {:>9.2e} {:>10.1} {:>10.1} [{status_xlds}]",
+                    p.label, n, "xlds", r_xlds_base, ma_xlds, finite_xlds, r_base_f64, r_xlds_f64, ma_xlds_f64, rms_ref, bigfrac_xlds, us_xlds[0], med_xlds
+                );
+            } else {
+                println!(
+                    "{:>10} {:>3} {:>4}  SKIP (K % 512 != 0, xlds requires K % 512 == 0)",
+                    p.label, n, "xlds"
+                );
+            }
         }
     }
 
     if all_ok {
-        eprintln!("\nPASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, ldsstage relL2(lds,base)<=5e-5, all finite, Y+=W@X preserved");
+        eprintln!("\nPASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, ldsstage relL2(lds,base)<=5e-5, xlds relL2(xlds,base)<=5e-5, all finite, Y+=W@X preserved");
     } else {
         eprintln!("\nFAIL: one or more parity checks violated relL2<=5e-5 or finiteness");
         std::process::exit(1);
