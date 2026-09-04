@@ -12,17 +12,10 @@
 // (which targets gfx11 / RDNA3). Compile this file with
 //   hipcc --offload-arch=gfx1200  (or gfx1201, ...).
 //
-// SCAFFOLD STATUS (2026-04-26):
-//   This file is NOT yet wired into dispatch.rs. It compiles for gfx12
-//   targets and is intended as the canonical pattern reference for the
-//   five remaining gfx12 WMMA ports (qkvza-hfq4, gate_up-hfq4, plus
-//   the three hfq6 variants). Runtime correctness must be validated on
-//   real RDNA4 hardware (9070 XT / R9700) via test_kernels before any
-//   dispatch.rs site is allowed to route here. The C-output mapping
-//   below is a HYPOTHESIS derived from CK trait math and has NOT been
-//   confirmed against silicon — see the channel-test note at the
-//   write-back loop. See `.skills/hipfire-arch-port/` for the port
-//   workflow.
+// STATUS: production gfx12 WMMA path, wired into dispatch. The C-output
+// mapping below was validated 2026-04-27 in this file's channel-test on
+// R9700 — the same map its `gemm_gate_up_mq4g256v2_wmma.gfx12.hip` sibling
+// documents.
 //
 // Differences from the gfx11 kernel:
 //   1. WMMA builtin: __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12
@@ -34,11 +27,12 @@
 //        lane (tid >> 4) = 0  -> carries K = [0..7]  of the 16-K tile
 //        lane (tid >> 4) = 1  -> carries K = [8..15] of the 16-K tile
 //      Each lane therefore loads HALF as much per WMMA tile as gfx11.
-//   4. C-output mapping (HYPOTHESIS — see below):
-//        gfx11 (validated, commit b7ac66a):
-//          acc[j] = C[2*j + (tid>>4)][tid & 15]
-//        gfx12 (UNVERIFIED, derived from CK kCM0/kCM1PerLane swap):
-//          acc[j] = C[8*(tid>>4) + j][tid & 15]
+//   4. C-output mapping (validated 2026-04-27 in the QKV scaffold's
+//      channel-test on R9700):
+//        gfx11: acc[j] = C[2*j + (tid>>4)][tid & 15]    (rows interleaved)
+//        gfx12: acc[j] = C[8*(tid>>4) + j][tid & 15]    (rows contiguous —
+//                                                        group 0: rows 0..7,
+//                                                        group 1: rows 8..15)
 //
 // Reference (ROCm 7.x):
 //   /opt/rocm/include/ck_tile/ops/gemm/warp/warp_gemm_attribute_wmma_impl_base_traits.hpp
@@ -165,10 +159,8 @@ extern "C" __global__ void gemm_qkv_mq4g256v2_wmma_gfx12(
     }
 
     // --- Output ---
-    //
-    // gfx12 wave32 WMMA C-mapping HYPOTHESIS — DO NOT TRUST WITHOUT
-    // CHANNEL-TEST ON REAL HARDWARE. Derived from the CK trait swap
-    // (warp_gemm_attribute_wmma_impl_base_traits.hpp):
+    // gfx12 wave32 WMMA C-mapping (validated 2026-04-27 in this file's
+    // channel-test on R9700; same map the gate_up gfx12 sibling documents):
     //
     //   gfx11: kCMLane=2, kCM0PerLane=8, kCM1PerLane=1
     //          -> acc[j] = C[2*j + (tid>>4)][tid & 15]  (rows interleaved)
@@ -176,12 +168,6 @@ extern "C" __global__ void gemm_qkv_mq4g256v2_wmma_gfx12(
     //          -> acc[j] = C[8*(tid>>4) + j][tid & 15]  (rows contiguous)
     //
     // i.e. lane group 0 holds output rows 0..7, lane group 1 rows 8..15.
-    // The gfx11 mapping was silently wrong for ~6 weeks before being fixed
-    // in commit b7ac66a — assume the same risk here. Validation recipe
-    // (from that fix): add `if (blockIdx.x == 0 && blockIdx.y == 0)
-    // printf("tid=%d j=%d row=%d col=%d acc=%f\\n", tid, j, out_row,
-    // out_col, acc[j]);` and compare against a CPU reference for a small
-    // golden case. Adjust the (j, k_grp) -> out_row formula until it matches.
     const int out_col = batch_start + m_lane;  // batch index
     if (out_col < N) {
         #pragma unroll
