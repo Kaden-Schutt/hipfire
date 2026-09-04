@@ -254,6 +254,34 @@ fn find<'a>(
 /// `gate_up` code tensor's presence AND its quant type, so a checkpoint that
 /// happened to carry a same-named tensor of another format is rejected by the
 /// loader rather than mis-decoded.
+/// Leaf name for a DENSE escha linear: `{p}.{proj}.escha_{leaf}`.
+///
+/// Distinct from `escha_leaf`, which is MoE-shaped
+/// (`{p}.mlp.experts.{proj}_proj.escha_{leaf}`). Here `proj` is the full path
+/// below the layer — `linear_attn.in_proj_qkv`, `self_attn.q_proj`,
+/// `mlp.gate_proj` — because the dense export codes every projection in place
+/// rather than gathering experts under one name.
+pub fn escha_dense_leaf(p: &str, proj: &str, leaf: &str) -> String {
+    format!("{p}.{proj}.escha_{leaf}")
+}
+
+/// Is this individual dense projection escha-coded?
+///
+/// Keyed on the CODE tensor's quant type, exactly as `layer_is_escha` is: a
+/// projection is escha if and only if its code is qt=42/43. Presence of the
+/// name alone is not enough — `escha_config` and friends are optional leaves
+/// (§1.4 of the design doc), and the required trio is code/rin/rout.
+///
+/// Per-projection rather than per-layer because the dense 27B mixes K within
+/// a layer: `mlp.gate_proj` is K=2 while `mlp.up_proj` is K=3, so nothing at
+/// layer granularity can describe it.
+pub fn dense_proj_is_escha(hfq: &HfqFile, p: &str, proj: &str, resolve: NameResolver) -> bool {
+    resolve(&escha_dense_leaf(p, proj, "code"))
+        .into_iter()
+        .find_map(|c| hfq.find_tensor_info(&c))
+        .is_some_and(|i| i.quant_type == 42 || i.quant_type == 43)
+}
+
 pub fn layer_is_escha(hfq: &HfqFile, p: &str, resolve: NameResolver) -> bool {
     resolve(&escha_leaf(p, "gate_up", "code"))
         .into_iter()
@@ -630,9 +658,42 @@ fn decode_projection(
 
 #[cfg(test)]
 mod tests {
+    use super::escha_dense_leaf;
+    use super::escha_leaf;
     use super::slot_extent;
     use super::EschaWeightStore;
     use rdna_compute::DType;
+
+    /// The dense and MoE leaf namers are NOT interchangeable, and using the
+    /// wrong one yields a name that simply is not in the file — which reads
+    /// as "this projection is not escha" and silently takes the plain-weight
+    /// path. Pin both against names copied out of the real checkpoints.
+    #[test]
+    fn dense_and_moe_leaf_names_do_not_collide() {
+        let p = "model.language_model.layers.0";
+        // 27B dense export, verbatim from model.safetensors.index.json.
+        assert_eq!(
+            escha_dense_leaf(p, "linear_attn.in_proj_qkv", "code"),
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.escha_code"
+        );
+        assert_eq!(
+            escha_dense_leaf(p, "mlp.gate_proj", "rin"),
+            "model.language_model.layers.0.mlp.gate_proj.escha_rin"
+        );
+        assert_eq!(
+            escha_dense_leaf(p, "self_attn.q_proj", "rout"),
+            "model.language_model.layers.0.self_attn.q_proj.escha_rout"
+        );
+        // 35B MoE export gathers experts under one name instead.
+        assert_eq!(
+            escha_leaf(p, "gate_up", "code"),
+            "model.language_model.layers.0.mlp.experts.gate_up_proj.escha_code"
+        );
+        assert_ne!(
+            escha_dense_leaf(p, "mlp.gate_proj", "code"),
+            escha_leaf(p, "gate", "code")
+        );
+    }
 
     /// The packing arithmetic, at the real A3B shapes, against the sizes the
     /// allocator-granularity diagnosis is built on. A slot stride that is not
