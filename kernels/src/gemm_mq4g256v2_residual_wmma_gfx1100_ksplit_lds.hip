@@ -147,7 +147,8 @@ GEN_RESID_KSPLIT_LDS(8)
 // blockIdx.y*16) with 8 waves (256 threads). K is walked in 512-wide slabs
 // (slab = 2x G256 groups). Per slab:
 //   1. ALL 256 threads cooperatively stage the slab's X tile
-//      (16 batch rows x 512 K fp16 = 16 KiB) from global to LDS
+//      (16 batch rows x 512 K fp16, row-padded to 514 for bank freedom) from
+//      global to LDS
 //      (each thread moves 32 fp16 = 4x dwordx4 of its batch row),
 //      then __syncthreads;
 //   2. each wave prefetches its 64-K quarter's weights (2 header u32 +
@@ -167,8 +168,9 @@ GEN_RESID_KSPLIT_LDS(8)
 // C[2*j+(lane>>4)][lane&15], fused Y += once by wave 0.
 //
 // Grid:  [ceil(M/16), ceil(N/16), 1]
-// Block: [256, 1, 1]. Static LDS 16 KiB (staged_x[16][512] fp16) + 8 KiB
-// (red[8][8][32] floats) = 24 KiB; dynamic shared_mem=0. Requires K % 512 == 0
+// Block: [256, 1, 1]. Static LDS 16448 B (staged_x[16][514] fp16, 1-dword
+// row pad kills the 16-way bank conflict) + 8 KiB (red[8][8][32] floats) =
+// 24640 B; dynamic shared_mem=0. Requires K % 512 == 0
 // and K > 0 (launcher falls back to ks4 / ks table / base otherwise).
 // Deterministic (fixed wave-order LDS reduction, no atomics) hence
 // capture-safe; same 48 B kernarg ABI as ks. fp32 association differs from
@@ -196,7 +198,13 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
     const int slabs = K / 512;
     const char* row_base = A + (long long)safe_row * row_bytes;
     // 16 batch rows x 512 K fp16 X slab tile + 8-wave fp32 acc reduce buffer.
-    __shared__ __align__(16) _Float16 staged_x[16 * 512];
+    // Row stride is 514 fp16 (257 dwords, ODD): with the natural 512 stride
+    // (256 dwords = 0 mod 32 banks) all 16 lanes' same-offset fragments land
+    // in the same LDS bank (16-way conflict ~16x LDS latency per ds_load,
+    // measured ~2x slower than ks4); the 1-dword pad gives lane ml bank
+    // (ml + C) mod 32 — 16 distinct banks, conflict-free. LDS total
+    // 16*514*2 + 8192 = 24640 B <= 32 KiB.
+    __shared__ __align__(16) _Float16 staged_x[16 * 514];
     __shared__ float red[8][8][32];
     // Cooperative X-fill assignment: thread tid stages 32 fp16 (4x dwordx4)
     // of batch slot sb = tid>>4 at K-chunk st = tid&15. Tails replicate row 0.
@@ -204,7 +212,6 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
     const int st = tid & 15;
     const int sb_row = (batch_start + sb < N) ? (batch_start + sb) : 0;
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    // This wave's fixed 64-K quarter of every slab (uniform per wave).
     const int group_in_slab = wave >> 2;
     const int quarter = wave & 3;
     const int frag_base = quarter * 4;
@@ -213,7 +220,7 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
         // global X traffic of the launch; vmcnt waits live here, at the slab
         // boundary, never in the consume loop below.
         const _Float16* x_src = X + (long long)sb_row * K + slab * 512 + st * 32;
-        _Float16* x_dst = staged_x + sb * 512 + st * 32;
+        _Float16* x_dst = staged_x + sb * 514 + st * 32;
         #pragma unroll
         for (int i = 0; i < 4; ++i)
             ((resid_xlds_uint4v_t*)x_dst)[i] = ((const resid_xlds_uint4v_t*)x_src)[i];
@@ -242,7 +249,7 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_xlds(
         // via ds_load (lgkmcnt, never vmcnt); the body is ds_load +
         // base-kernel DQ VALU + wmma. Weight payloads were prefetched to
         // VGPRs above, so the loop issues no global loads of its own.
-        const _Float16* b_base = staged_x + ml * 512 + wave * 64;
+        const _Float16* b_base = staged_x + ml * 514 + wave * 64;
         {
             half16_t a_reg;
             #define RESID_XLDS_DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
