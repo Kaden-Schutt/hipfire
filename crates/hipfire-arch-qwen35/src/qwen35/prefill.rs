@@ -4777,6 +4777,16 @@ pub(crate) fn batch_chunk_delta_net_attn(
         )?;
     }
 
+    // Escha dense biases, applied at the ONE point the whole if/else chain
+    // above converges — five branches fill `dn_qkv_batch`/`dn_z_batch`, and a
+    // bias added in some but not others is a silent wrong answer. Must land
+    // before sigmoid/conv1d consume these. `in_proj_a`/`in_proj_b` (beta/
+    // alpha) have no bias: escha's `ignore` list keeps them plain weights.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.dn_qkv_batch, &b.qkv, n, b.qkv.numel())?;
+        gpu.bias_add_f32(&pbs.dn_z_batch, &b.z, n, b.z.numel())?;
+    }
+
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
         &pbs.dn_beta_batch,
@@ -5146,6 +5156,12 @@ pub(crate) fn batch_chunk_delta_net_attn(
         arch_has_wmma,
     )?;
 
+    // out_proj's bias lands on the residual stream. After the residual add is
+    // the same value as before it — both additive.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
+    }
+
     Ok(())
 }
 
@@ -5325,6 +5341,14 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         )?;
     }
 
+    // Escha dense biases on gate/up, at the point the branches converge and
+    // before SwiGLU consumes them — a bias applied after the activation would
+    // be a different function, not a rounding difference.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+        gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+    }
+
     // SwiGLU activation feeding w_down. For MQ, we need the
     // output FWHT-rotated so it matches the pre-rotated w_down
     // weights. For HFQ, plain silu_mul is enough. silu_mul_f32
@@ -5370,6 +5394,11 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+
+    // down_proj's bias, likewise onto the residual stream.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+    }
 
     Ok(())
 }
@@ -5617,6 +5646,15 @@ pub(crate) fn batch_chunk_full_attn_attn(
         batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
     }
 
+    // Escha dense biases on q/k/v, where the branches converge and BEFORE the
+    // Q/gate deinterleave and q_norm consume them — after either would be a
+    // different function, not a rounding difference.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.fa_q_full_batch, &b.q, n, b.q.numel())?;
+        gpu.bias_add_f32(&pbs.fa_k_batch, &b.k, n, b.k.numel())?;
+        gpu.bias_add_f32(&pbs.fa_v_batch, &b.v, n, b.v.numel())?;
+    }
+
     // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
     gpu.deinterleave_f32_batched(
         &pbs.fa_q_full_batch,
@@ -5820,6 +5858,12 @@ pub(crate) fn batch_chunk_full_attn_attn(
         arch_has_wmma,
     )?;
 
+    // o_proj's bias, onto the residual stream — additive, so after the
+    // residual add is the same value as before it.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
+    }
+
     Ok(())
 }
 
@@ -5997,6 +6041,11 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             n,
         )?;
     }
+    // Escha gate/up biases, before SwiGLU consumes them.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+        gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+    }
     let fa_w_down_is_mq = matches!(
         layer.w_down.gpu_dtype,
         DType::MQ4G256
@@ -6034,6 +6083,11 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+
+    // down_proj's bias, onto the residual stream.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+    }
 
     Ok(())
 }

@@ -4972,7 +4972,66 @@ fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
 }
 
+/// Add the escha dense export's additive output biases.
+///
+/// Applied here, at the ONE exit of `run_proj`, rather than inside each
+/// arm: every op has several branches that fill the same output buffers
+/// (prerotated / scalar-prep / execute-steps), and a bias added in some
+/// branches but not others is a silent wrong answer, not a crash.
+///
+/// Correct AFTER the projection for the same reason it is correct after a
+/// residual add — both are additive and commute.
+///
+/// No-op for every model without escha biases, which is all of them but
+/// the 27B.
+fn apply_proj_biases(
+gpu: &mut Gpu,
+op: &OpBinding,
+layer: &LayerWeights,
+s: &Qwen35Scratch,
+) -> Result<(), DispatchError> {
+    // `bias_add_f32` and not `add_inplace_f32`: the same helper serves decode
+    // (batch = 1) and the batched prefill path, so both use one primitive and
+    // cannot drift.
+    let add = |gpu: &mut Gpu, y: &GpuTensor, b: &GpuTensor| -> Result<(), DispatchError> {
+        let n = b.numel();
+        gpu.bias_add_f32(y, b, 1, n)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    };
+    match (op_code(op), layer) {
+        (q35_op::PROJ_QKVZA, LayerWeights::DeltaNet(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.dn_qkv, &b.qkv)?;
+                add(gpu, &s.dn_z, &b.z)?;
+            }
+        }
+        (q35_op::PROJ_QKV, LayerWeights::FullAttn(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.fa_q_full, &b.q)?;
+                add(gpu, &s.fa_k, &b.k)?;
+                add(gpu, &s.fa_v, &b.v)?;
+            }
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::DeltaNet(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.gate_ffn, &b.gate)?;
+                add(gpu, &s.up, &b.up)?;
+            }
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::FullAttn(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.gate_ffn, &b.gate)?;
+                add(gpu, &s.up, &b.up)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl<'a> ForwardBindings for Qwen35Bindings<'a> {
+
+
     fn run_proj(
         &mut self,
         gpu: &mut Gpu,
@@ -5180,8 +5239,11 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             },
             other => return Err(DispatchError::Hip(format!("unknown PROJ opcode {other}"))),
         };
-        res.map_err(|e| DispatchError::Hip(e.to_string()))
+        res.map_err(|e| DispatchError::Hip(e.to_string()))?;
+        apply_proj_biases(gpu, op, self.layer, self.s)
     }
+
+
 
     fn run_residual_gemv(
         &mut self,
@@ -5266,7 +5328,29 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             }
             other => Err(HipError::new(0, &format!("unknown RESID opcode {other}"))),
         })();
-        res.map_err(|e| DispatchError::Hip(e.to_string()))
+        res.map_err(|e| DispatchError::Hip(e.to_string()))?;
+        // `out_proj`/`o_proj` and `down_proj` write into the residual stream,
+        // so their bias lands on `s.x`. Adding it after the residual add is
+        // the same value as adding it before — both additive.
+        let s = self.s;
+        let bias = match self.layer {
+            LayerWeights::DeltaNet(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+            LayerWeights::FullAttn(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+            _ => None,
+        };
+        if let Some((bo, bdown)) = bias {
+            let which = match op_code(op) {
+                q35_op::RESID_WO => Some(bo),
+                q35_op::RESID_DOWN_SWIGLU => Some(bdown),
+                _ => None,
+            };
+            if let Some(b) = which {
+                let n = b.numel();
+                gpu.bias_add_f32(&s.x, b, 1, n)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn run_norm(
