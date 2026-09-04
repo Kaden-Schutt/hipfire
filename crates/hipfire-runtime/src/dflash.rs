@@ -617,6 +617,39 @@ fn hfq_weight(
     Ok(wt)
 }
 
+impl DflashLayerWeights {
+    /// Consume one layer's weights, releasing every GPU tensor including the
+    /// AWQ/paro sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
+    /// carries one scale tensor per weight per layer). Shared by the
+    /// success-path `DflashWeights::free_gpu` and the `load` error path so a
+    /// failed load frees completed layers without duplicating this list.
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_norm);
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        let _ = gpu.free_tensor(self.q_norm);
+        let _ = gpu.free_tensor(self.k_norm);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.w_gate.free_all(gpu);
+        self.w_up.free_all(gpu);
+        self.w_down.free_all(gpu);
+        if let Some(t) = self.attn_conv_base {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(w) = self.attn_conv_proj {
+            w.free_all(gpu);
+        }
+        if let Some(t) = self.mlp_conv_base {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(w) = self.mlp_conv_proj {
+            w.free_all(gpu);
+        }
+    }
+}
+
 impl DflashWeights {
     /// True when the selector (candidate proposal) path is available.
     pub fn has_candidate_selector(&self) -> bool {
@@ -625,22 +658,105 @@ impl DflashWeights {
             && self.successor_codebook.is_some()
     }
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        let fc = hfq_weight(
+        // Transactional construction. Every GPU tensor allocated below is
+        // recorded in `live_t` (plain F32) / `live_w` (weight + sidecars) and
+        // taken exactly once into its final owner; completed layers accumulate
+        // in `layers`. Any failure frees the completed layers plus every
+        // recorded-but-unplaced tensor before returning Err — a bare `?`
+        // would leak them (`GpuTensor`/`DeviceBuffer` have no `Drop`). The
+        // leaf loaders (`hfq_weight`, `hfq_tensor_f32`) are single-alloc and
+        // need no cover. Mirrors the `or_free!` style in
+        // `hipfire-arch-qwen35`'s `load_dflash_state`.
+        let mut live_t: Vec<Option<GpuTensor>> = Vec::new();
+        let mut live_w: Vec<Option<WeightTensor>> = Vec::new();
+        let mut layers: Vec<DflashLayerWeights> = Vec::with_capacity(cfg.n_layers);
+        macro_rules! gt {
+            ($e:expr) => {{
+                match $e {
+                    Ok(t) => {
+                        live_t.push(Some(t));
+                        live_t.len() - 1
+                    }
+                    Err(e) => {
+                        for l in layers.drain(..) {
+                            l.free_gpu(gpu);
+                        }
+                        for slot in live_w.iter_mut() {
+                            if let Some(w) = slot.take() {
+                                w.free_all(gpu);
+                            }
+                        }
+                        for slot in live_t.iter_mut() {
+                            if let Some(t) = slot.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }};
+        }
+        macro_rules! wt {
+            ($e:expr) => {{
+                match $e {
+                    Ok(w) => {
+                        live_w.push(Some(w));
+                        live_w.len() - 1
+                    }
+                    Err(e) => {
+                        for l in layers.drain(..) {
+                            l.free_gpu(gpu);
+                        }
+                        for slot in live_w.iter_mut() {
+                            if let Some(w) = slot.take() {
+                                w.free_all(gpu);
+                            }
+                        }
+                        for slot in live_t.iter_mut() {
+                            if let Some(t) = slot.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }};
+        }
+        macro_rules! take_t {
+            ($i:expr) => {
+                live_t[$i]
+                    .take()
+                    .expect("dflash load: F32 slot taken twice")
+            };
+        }
+        macro_rules! take_w {
+            ($i:expr) => {
+                live_w[$i]
+                    .take()
+                    .expect("dflash load: weight slot taken twice")
+            };
+        }
+        let i_fc = wt!(hfq_weight(
             hfq,
             gpu,
             "fc.weight",
             cfg.hidden,
             cfg.num_extract() * cfg.hidden,
-        )?;
-        let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
-        let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
+        ));
+        let i_hidden_norm = gt!(hfq_tensor_f32(
+            hfq,
+            gpu,
+            "hidden_norm.weight",
+            vec![cfg.hidden]
+        ));
+        let i_norm = gt!(hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden]));
 
         let conv_k = cfg.conv_kernel_size.unwrap_or(2);
         let conv_g = cfg.conv_group_size.unwrap_or(16);
         let conv_groups = cfg.hidden / conv_g;
         let proj_m = 2 * conv_k * conv_groups;
 
-        let mut layers = Vec::with_capacity(cfg.n_layers);
+        // (`layers` is declared above so the `gt!`/`wt!` error arms can free it.)
         for i in 0..cfg.n_layers {
             let p = format!("layers.{i}");
             // Attempt DFlash2 conv weights; absent on legacy drafts.
@@ -656,12 +772,12 @@ impl DflashWeights {
                 };
                 if hfq.tensor_data(&key).is_some() {
                     // shape 2*K*H
-                    Some(hfq_tensor_f32(
+                    Some(gt!(hfq_tensor_f32(
                         hfq,
                         gpu,
                         &key,
                         vec![2 * conv_k * cfg.hidden],
-                    )?)
+                    )))
                 } else {
                     None
                 }
@@ -677,7 +793,7 @@ impl DflashWeights {
                     alt
                 };
                 if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
+                    Some(wt!(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)))
                 } else {
                     None
                 }
@@ -693,12 +809,12 @@ impl DflashWeights {
                     alt
                 };
                 if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_tensor_f32(
+                    Some(gt!(hfq_tensor_f32(
                         hfq,
                         gpu,
                         &key,
                         vec![2 * conv_k * cfg.hidden],
-                    )?)
+                    )))
                 } else {
                     None
                 }
@@ -714,110 +830,125 @@ impl DflashWeights {
                     alt
                 };
                 if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
+                    Some(wt!(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)))
                 } else {
                     None
                 }
             } else {
                 None
             };
-            let layer = DflashLayerWeights {
-                attn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.input_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                wq: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    cfg.q_dim(),
-                    cfg.hidden,
-                )?,
-                wk: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wv: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wo: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    cfg.hidden,
-                    cfg.q_dim(),
-                )?,
-                q_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                k_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                ffn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                w_gate: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_up: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_down: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    cfg.hidden,
-                    cfg.intermediate,
-                )?,
-                attn_conv_base,
-                attn_conv_proj,
-                mlp_conv_base,
-                mlp_conv_proj,
-            };
-            layers.push(layer);
+            // Stage every field as a slot index first: a failure below frees
+            // the staged slots (plus completed layers) via `gt!`/`wt!`, and
+            // the `take_*!` push itself is infallible.
+            let i_attn_norm = gt!(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.input_layernorm.weight"),
+                vec![cfg.hidden],
+            ));
+            let i_wq = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.q_proj.weight"),
+                cfg.q_dim(),
+                cfg.hidden,
+            ));
+            let i_wk = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.k_proj.weight"),
+                cfg.kv_dim(),
+                cfg.hidden,
+            ));
+            let i_wv = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.v_proj.weight"),
+                cfg.kv_dim(),
+                cfg.hidden,
+            ));
+            let i_wo = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.o_proj.weight"),
+                cfg.hidden,
+                cfg.q_dim(),
+            ));
+            let i_q_norm = gt!(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.q_norm.weight"),
+                vec![cfg.head_dim],
+            ));
+            let i_k_norm = gt!(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.k_norm.weight"),
+                vec![cfg.head_dim],
+            ));
+            let i_ffn_norm = gt!(hfq_tensor_f32(
+                hfq,
+                gpu,
+                &format!("{p}.post_attention_layernorm.weight"),
+                vec![cfg.hidden],
+            ));
+            let i_w_gate = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.gate_proj.weight"),
+                cfg.intermediate,
+                cfg.hidden,
+            ));
+            let i_w_up = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.up_proj.weight"),
+                cfg.intermediate,
+                cfg.hidden,
+            ));
+            let i_w_down = wt!(hfq_weight(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.down_proj.weight"),
+                cfg.hidden,
+                cfg.intermediate,
+            ));
+            layers.push(DflashLayerWeights {
+                attn_norm: take_t!(i_attn_norm),
+                wq: take_w!(i_wq),
+                wk: take_w!(i_wk),
+                wv: take_w!(i_wv),
+                wo: take_w!(i_wo),
+                q_norm: take_t!(i_q_norm),
+                k_norm: take_t!(i_k_norm),
+                ffn_norm: take_t!(i_ffn_norm),
+                w_gate: take_w!(i_w_gate),
+                w_up: take_w!(i_w_up),
+                w_down: take_w!(i_w_down),
+                attn_conv_base: attn_conv_base.map(|j| take_t!(j)),
+                attn_conv_proj: attn_conv_proj.map(|j| take_w!(j)),
+                mlp_conv_base: mlp_conv_base.map(|j| take_t!(j)),
+                mlp_conv_proj: mlp_conv_proj.map(|j| take_w!(j)),
+            });
         }
 
         // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side
         // Exact HFQ names are `candidate_selector.hidden_projection.weight`,
         // `candidate_selector.predecessor_codebook`, `candidate_selector.successor_codebook`.
         // Optional fallback `.weight` suffix is tolerated but not required.
-        let selector_hidden_proj = if cfg.selector_rank.is_some() {
+        // Slot index (`take_w!`n below); the codebooks between here and the
+        // take are host-side only and cannot fail with GPU memory held.
+        let i_selector_hidden_proj = if cfg.selector_rank.is_some() {
             let rank = cfg.selector_rank.unwrap();
             let candidates = [
                 "candidate_selector.hidden_projection.weight",
                 "selector.hidden_projection.weight",
                 "selector.hidden_proj.weight",
             ];
-            let mut found = None;
+            let mut found: Option<usize> = None;
             for n in candidates {
                 if hfq.tensor_data(n).is_some() {
-                    found = Some(hfq_weight(hfq, gpu, n, rank, cfg.hidden)?);
+                    found = Some(wt!(hfq_weight(hfq, gpu, n, rank, cfg.hidden)));
                     break;
                 }
             }
@@ -896,6 +1027,12 @@ impl DflashWeights {
                 (None, None, None, None)
             };
 
+        let fc = take_w!(i_fc);
+        let hidden_norm = take_t!(i_hidden_norm);
+        let norm = take_t!(i_norm);
+        let selector_hidden_proj = i_selector_hidden_proj.map(|j| take_w!(j));
+        debug_assert!(live_t.iter().all(|s| s.is_none()));
+        debug_assert!(live_w.iter().all(|s| s.is_none()));
         let has_mq = std::iter::once(&fc)
             .chain(layers.iter().flat_map(|l| {
                 let mut v: Vec<&WeightTensor> =
@@ -924,8 +1061,20 @@ impl DflashWeights {
             });
         if has_mq {
             // MQ dispatch needs the engine's FWHT sign tables uploaded
-            // (matches `gemv_mq4g256_with_rotate`'s setup).
-            gpu.ensure_mq_signs()?;
+            // (matches `gemv_mq4g256_with_rotate`'s setup). A failure here
+            // must still release the weights above before returning Err.
+            if let Err(e) = gpu.ensure_mq_signs() {
+                fc.free_all(gpu);
+                let _ = gpu.free_tensor(hidden_norm);
+                let _ = gpu.free_tensor(norm);
+                for l in layers {
+                    l.free_gpu(gpu);
+                }
+                if let Some(w) = selector_hidden_proj {
+                    w.free_all(gpu);
+                }
+                return Err(e);
+            }
         }
 
         Ok(DflashWeights {
@@ -951,29 +1100,7 @@ impl DflashWeights {
         let _ = gpu.free_tensor(self.hidden_norm);
         let _ = gpu.free_tensor(self.norm);
         for l in self.layers {
-            let _ = gpu.free_tensor(l.attn_norm);
-            l.wq.free_all(gpu);
-            l.wk.free_all(gpu);
-            l.wv.free_all(gpu);
-            l.wo.free_all(gpu);
-            let _ = gpu.free_tensor(l.q_norm);
-            let _ = gpu.free_tensor(l.k_norm);
-            let _ = gpu.free_tensor(l.ffn_norm);
-            l.w_gate.free_all(gpu);
-            l.w_up.free_all(gpu);
-            l.w_down.free_all(gpu);
-            if let Some(t) = l.attn_conv_base {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(w) = l.attn_conv_proj {
-                w.free_all(gpu);
-            }
-            if let Some(t) = l.mlp_conv_base {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(w) = l.mlp_conv_proj {
-                w.free_all(gpu);
-            }
+            l.free_gpu(gpu);
         }
         if let Some(w) = self.selector_hidden_proj {
             w.free_all(gpu);
@@ -1346,13 +1473,36 @@ impl DflashScratch {
         if let Some(v) = s.v_ctx_cached.pop() {
             let _ = gpu.free_tensor(v);
         }
-        s.k_full_cached = Some(gpu.alloc_tensor(&[w_full * kvd], DType::F32)?);
-        s.v_full_cached = Some(gpu.alloc_tensor(&[w_full * kvd], DType::F32)?);
-        s.k_cat_full = Some(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)?);
-        s.v_cat_full = Some(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)?);
+        // The base scratch `s` is fully owned here: any failure below frees
+        // it before returning Err — a bare `?` would leak it (no `Drop` on
+        // the GPU-owning types), including when the failure follows the pop
+        // above. Same class as the `or_free!` sites in `load_dflash_state`.
+        //
+        // Each allocation is parked in `s` the moment it succeeds, so the
+        // error arm's `s.free_gpu` also covers every earlier allocation of
+        // this ladder: with the tensors held as locals until the end, a
+        // failure on the 2nd..5th alloc freed `s` but leaked the locals
+        // (hw-gate Fable seat on #691, run 33900101473).
+        macro_rules! alloc_or_free {
+            ($e:expr) => {
+                match $e {
+                    Ok(t) => t,
+                    Err(e) => {
+                        s.free_gpu(gpu);
+                        return Err(e);
+                    }
+                }
+            };
+        }
+        s.k_full_cached = Some(alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32)));
+        s.v_full_cached = Some(alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32)));
+        s.k_cat_full = Some(alloc_or_free!(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)));
+        s.v_cat_full = Some(alloc_or_free!(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)));
         // positions_k holds the last w_full context rows + the B noise rows
         // (the forward uploads only that suffix; every layer's span is one).
-        let new_positions_k = gpu.alloc_tensor(&[w_full + b], DType::F32)?;
+        // Allocate before freeing the old buffer so a failure still leaves
+        // `s` intact for the error arm above.
+        let new_positions_k = alloc_or_free!(gpu.alloc_tensor(&[w_full + b], DType::F32));
         let _ = gpu.free_tensor(std::mem::replace(&mut s.positions_k, new_positions_k));
         // The ctx bound is the target's physical capacity, not the window —
         // l may cross w_full (the last layer's span just slides).
@@ -1380,7 +1530,38 @@ impl DflashScratch {
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
 
-        let mq_x_rot = if with_mq {
+        // Transactional construction: every `alloc_tensor` below goes through
+        // `at!`, which records the tensor in `live`; each index is taken
+        // exactly once when the struct is built. On failure the error arm
+        // frees everything recorded so far and returns — a bare `?` would
+        // leak (`GpuTensor`/`DeviceBuffer` have no `Drop`). Same style as the
+        // `gt!`/`wt!` slots in `DflashWeights::load` above.
+        let mut live: Vec<Option<GpuTensor>> = Vec::new();
+        macro_rules! at {
+            ($shape:expr) => {{
+                match gpu.alloc_tensor($shape, DType::F32) {
+                    Ok(t) => {
+                        live.push(Some(t));
+                        live.len() - 1
+                    }
+                    Err(e) => {
+                        for slot in live.iter_mut() {
+                            if let Some(t) = slot.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }};
+        }
+        macro_rules! take {
+            ($i:expr) => {
+                live[$i].take().expect("dflash scratch slot taken twice")
+            };
+        }
+
+        let i_mq_x_rot = if with_mq {
             // Sized for a CHUNK of the worst-case MQ rotation, not the whole
             // first-call prefix. The rotations called through `gemm_dispatch`
             // are:
@@ -1401,93 +1582,109 @@ impl DflashScratch {
             // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
             // 1K prefix tokens (negligible vs seconds-scale prefill).
             let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
-            Some(gpu.alloc_tensor(&[widest], DType::F32)?)
+            Some(at!(&[widest]))
         } else {
             None
         };
 
         // DFlash2 optional buffers: allocated only when the config declares them.
-        let (conv_temp, conv_dynamic, selector_proj, topk_ids, topk_vals) = {
-            let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
-            let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
-            let ct = if need_conv {
-                Some(gpu.alloc_tensor(&[b * h], DType::F32)?)
-            } else {
-                None
-            };
-            let cd = if need_conv {
-                let k = cfg.conv_kernel_size.unwrap();
-                let g = cfg.conv_group_size.unwrap();
-                let groups = h / g;
-                let stride = 2 * k * groups;
-                Some(gpu.alloc_tensor(&[b * stride], DType::F32)?)
-            } else {
-                None
-            };
-            let sp = if need_selector {
-                let rank = cfg.selector_rank.unwrap();
-                Some(gpu.alloc_tensor(&[b * rank], DType::F32)?)
-            } else {
-                None
-            };
-            let (ti, tv) = if need_selector {
-                let kk = cfg.selector_top_k.unwrap();
-                // ids as i32 stored in F32 buffer (reinterprets), vals as f32
-                (
-                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
-                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
-                )
-            } else {
-                (None, None)
-            };
-            (ct, cd, sp, ti, tv)
+        // Slot indices (`take!`n at the build below).
+        let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
+        let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
+        let i_conv_temp = if need_conv { Some(at!(&[b * h])) } else { None };
+        let i_conv_dynamic = if need_conv {
+            let k = cfg.conv_kernel_size.unwrap();
+            let g = cfg.conv_group_size.unwrap();
+            let groups = h / g;
+            let stride = 2 * k * groups;
+            Some(at!(&[b * stride]))
+        } else {
+            None
+        };
+        let i_selector_proj = if need_selector {
+            let rank = cfg.selector_rank.unwrap();
+            Some(at!(&[b * rank]))
+        } else {
+            None
+        };
+        let (i_topk_ids, i_topk_vals) = if need_selector {
+            let kk = cfg.selector_top_k.unwrap();
+            // ids as i32 stored in F32 buffer (reinterprets), vals as f32
+            (Some(at!(&[b * kk])), Some(at!(&[b * kk])))
+        } else {
+            (None, None)
         };
 
         // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
         // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
         // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
         // = 128 MB. Trivial vs 24 GB VRAM.
-        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
-        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut kv_idx: Vec<(usize, usize)> = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_warmed_up = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
-            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            kv_idx.push((at!(&[l * kvd]), at!(&[l * kvd])));
             draft_ffn_graphs.push(HashMap::new());
             draft_ffn_warmed_up.push(HashSet::new());
         }
 
+        let i_x = at!(&[b * h]);
+        let i_x_norm = at!(&[b * h]);
+        let i_q = at!(&[b * qd]);
+        let i_k_noise = at!(&[b * kvd]);
+        let i_v_noise = at!(&[b * kvd]);
+        let i_gate = at!(&[b * inter]);
+        let i_up = at!(&[b * inter]);
+        let i_gate_up = at!(&[b * inter]);
+        let i_attn_out = at!(&[b * qd]);
+        let i_residual = at!(&[b * h]);
+
+        let i_target_hidden = at!(&[l * ne * h]);
+        let i_target_hidden_proj = at!(&[l * h]);
+
+        let i_k_cat = at!(&[tot * kvd]);
+        let i_v_cat = at!(&[tot * kvd]);
+
+        let i_positions_q = at!(&[b]);
+        let i_positions_k = at!(&[tot]);
+
+        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        for (ik, iv) in kv_idx {
+            k_ctx_cached.push(take!(ik));
+            v_ctx_cached.push(take!(iv));
+        }
+        debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
 
-            x: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            x_norm: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            q: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            k_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            v_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            gate: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            residual: gpu.alloc_tensor(&[b * h], DType::F32)?,
+            x: take!(i_x),
+            x_norm: take!(i_x_norm),
+            q: take!(i_q),
+            k_noise: take!(i_k_noise),
+            v_noise: take!(i_v_noise),
+            gate: take!(i_gate),
+            up: take!(i_up),
+            gate_up: take!(i_gate_up),
+            attn_out: take!(i_attn_out),
+            residual: take!(i_residual),
 
-            target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
-            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
+            target_hidden: take!(i_target_hidden),
+            target_hidden_proj: take!(i_target_hidden_proj),
 
-            k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
-            v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
+            k_cat: take!(i_k_cat),
+            v_cat: take!(i_v_cat),
 
-            positions_q: gpu.alloc_tensor(&[b], DType::F32)?,
-            positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
+            positions_q: take!(i_positions_q),
+            positions_k: take!(i_positions_k),
 
-            mq_x_rot,
-            conv_temp,
-            conv_dynamic,
-            selector_proj,
-            topk_ids,
-            topk_vals,
+            mq_x_rot: i_mq_x_rot.map(|j| take!(j)),
+            conv_temp: i_conv_temp.map(|j| take!(j)),
+            conv_dynamic: i_conv_dynamic.map(|j| take!(j)),
+            selector_proj: i_selector_proj.map(|j| take!(j)),
+            topk_ids: i_topk_ids.map(|j| take!(j)),
+            topk_vals: i_topk_vals.map(|j| take!(j)),
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,

@@ -1048,18 +1048,35 @@ pub fn build_generic_dflash_speculator(
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.
     // new_with_mq only for an MQ-quantized draft.
-    let scratch = if weights.has_mq {
+    // Transactional: `weights` and `scratch` own GPU memory with no `Drop`,
+    // so each fallible step below frees what is already owned before
+    // returning Err (same class as the `or_free!` chain in
+    // `hipfire-arch-qwen35`'s `load_dflash_state`).
+    let scratch = match if weights.has_mq {
         DflashScratch::new_with_mq(gpu, &config, block_size, ctx_capacity, true)
-            .map_err(|e| format!("{e}"))?
+            .map_err(|e| format!("{e}"))
     } else {
-        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))?
+        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))
+    } {
+        Ok(s) => s,
+        Err(e) => {
+            weights.free_gpu(gpu);
+            return Err(e);
+        }
     };
     let _ = draft_hfq;
 
     // Tell the target which residual-hidden layers to capture (the drafter's
     // target_layer_ids), and mint the per-target verify scratch.
     target.set_dflash_extract_layers(config.target_layer_ids.clone());
-    let verify_scratch = target.new_spec_scratch(gpu, block_size)?;
+    let verify_scratch = match target.new_spec_scratch(gpu, block_size) {
+        Ok(v) => v,
+        Err(e) => {
+            weights.free_gpu(gpu);
+            scratch.free_gpu(gpu);
+            return Err(e);
+        }
+    };
 
     Ok(Box::new(GenericDflashSpeculator {
         weights,
