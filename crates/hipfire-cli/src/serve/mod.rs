@@ -1107,9 +1107,7 @@ impl ServeRuntime {
         meta: &Mutex<ServeMeta>,
         minimum_max_seq: Option<u64>,
     ) -> Result<hipfire_config::ResolvedConfig> {
-        let (tag, entry) = self
-            .registry
-            .model(model)
+        let (tag, entry) = crate::registry_entry_for_path(&self.paths, &self.registry, model)
             .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
             .unwrap_or((None, None));
         let mut path = find_model_path(&self.paths, &self.registry, model);

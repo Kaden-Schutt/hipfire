@@ -1783,7 +1783,7 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// line — whenever any OTHER entry declaring the same file still has its own
 /// target file present in the models dir.
 fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
-    let resolved = registry.model(&args.model);
+    let resolved = registry_entry_for_path(paths, registry, &args.model);
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
@@ -1877,8 +1877,7 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
 fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let loaded_registry = load_registry(&paths.registry);
     let registry = &loaded_registry.registry;
-    let (canonical, entry) = registry
-        .model(&args.model)
+    let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
     let mut model_path = find_model_path(paths, registry, &args.model);
@@ -2451,6 +2450,36 @@ fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<Pa
         .cloned()
         .collect()
 }
+
+/// Resolve a user-supplied model input to its registry entry, if it has one.
+///
+/// A path-form input receives registry identity (sidecars, kv/max_seq policy,
+/// rm targets) only when it IS the installed artifact: `canonicalize(input)`
+/// must equal `canonicalize(models_dir.join(entry.file))` for some entry.
+/// Both sides are canonicalized so a symlink inside the models directory
+/// (e.g. `qwen3.8-27b.mq4-xt` pointing out at `~/qcal`) still matches by
+/// target. A path that merely shares a basename with an entry file gets no
+/// entry and loads as (or removes as) a bare artifact.
+///
+/// Non-path inputs (tags, aliases, bare file names with no on-disk doppelganger
+/// in the current directory) go through [`RegistryV1::model`], which keeps
+/// tag/alias/`qwen3.5:` normalization and the bare `entry.file` match.
+pub(crate) fn registry_entry_for_path<'registry>(
+    paths: &Paths,
+    registry: &'registry RegistryV1,
+    input: &str,
+) -> Option<(&'registry str, &'registry ModelEntry)> {
+    let candidate = Path::new(input);
+    if input.contains('/') || input.contains('\\') || candidate.is_file() {
+        let canonical_input = fs::canonicalize(candidate).ok()?;
+        return registry.models.iter().find_map(|(tag, entry)| {
+            let canonical_installed = fs::canonicalize(paths.models.join(&entry.file)).ok()?;
+            (canonical_installed == canonical_input).then(|| (tag.as_str(), entry))
+        });
+    }
+    registry.model(input)
+}
+
 pub(crate) fn find_model_path(
     paths: &Paths,
     registry: &RegistryV1,
@@ -2647,6 +2676,9 @@ pub(crate) fn load_params(
 /// or `on`, no explicit draft is set (`params["draft"]`, e.g. from
 /// `developer.dflash_draft`), and `entry.dflash` names a pulled file, wire
 /// it: `on` without the file fails closed, `auto` logs one line and runs AR.
+/// With no entry at all the artifact is not registry-managed (e.g. a path
+/// that merely shares a basename with an entry file): `auto` runs AR as a
+/// bare artifact, but `on` fails closed instead of silently running AR.
 /// The sidecar is looked up in `models_dir` first — `find_model_path`
 /// canonicalizes, so a symlinked target's parent is wherever the artifact
 /// really lives, not the models directory the draft was pulled into — then
@@ -2670,6 +2702,12 @@ fn resolve_dflash_sidecar(
         return Ok(());
     }
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
+        if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
+            bail!(
+                "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+                model_path.display()
+            );
+        }
         return Ok(());
     };
     let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
@@ -4059,8 +4097,7 @@ fn open_bench_engine(
     serde_json::Value,
 )> {
     let registry = load_registry(&paths.registry).registry;
-    let (tag, entry) = registry
-        .model(&args.model)
+    let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
         .unwrap_or((None, None));
     let mut path = find_model_path(paths, &registry, &args.model);
@@ -7407,6 +7444,175 @@ mod tests {
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }
+
+    #[test]
+    fn rm_foreign_same_basename_path_removes_only_that_file() {
+        // PR #686 hw-gate regression: `hipfire rm /elsewhere/qwen3.6-27b.mq4`
+        // basename-matched the `qwen3.6:27b` entry and deleted the installed
+        // target plus its sidecars while the installed target stayed. A path
+        // that merely shares a basename gets no registry identity: only that
+        // file goes.
+        let paths = test_paths("rm-foreign-basename");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.6-27b.mq4", "qwen36-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let elsewhere = paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let foreign = elsewhere.join("qwen3.6-27b.mq4");
+        fs::write(&foreign, b"lookalike").unwrap();
+        let registry = rm_test_registry(&[(
+            "qwen3.6:27b",
+            "qwen3.6-27b.mq4",
+            Some("qwen36-27b-dflash-mq4.hfq"),
+        )]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: foreign.display().to_string(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!foreign.exists(), "the named foreign file is removed");
+        assert!(
+            paths.models.join("qwen3.6-27b.mq4").exists(),
+            "installed target stays"
+        );
+        assert!(
+            paths.models.join("qwen36-27b-dflash-mq4.hfq").exists(),
+            "installed sidecars stay"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_installed_path_removes_target_and_sidecars() {
+        // The same removal by installed path keeps master behaviour: target
+        // plus declared sidecars go.
+        let paths = test_paths("rm-installed-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.6-27b.mq4", "qwen36-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[(
+            "qwen3.6:27b",
+            "qwen3.6-27b.mq4",
+            Some("qwen36-27b-dflash-mq4.hfq"),
+        )]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: paths.models.join("qwen3.6-27b.mq4").display().to_string(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.6-27b.mq4").exists(),
+            "installed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen36-27b-dflash-mq4.hfq").exists(),
+            "declared sidecar goes with its target"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_entry_for_path_matches_symlinked_artifact() {
+        // `qwen3.8-27b.mq4-xt` is a symlink out of the models dir: the input
+        // and the installed entry file canonicalize to the same target, so
+        // the entry (and its sidecar) still resolve. A same-basename file
+        // elsewhere canonicalizes elsewhere and gets no entry.
+        let paths = test_paths("registry-entry-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let elsewhere = paths.root.join("qcal");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let real = elsewhere.join("qwen3.8-27b-weights.mq4");
+        fs::write(&real, b"weights").unwrap();
+        std::os::unix::fs::symlink(&real, paths.models.join("qwen3.8-27b.mq4-xt")).unwrap();
+        let foreign_dir = paths.root.join("foreign");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("qwen3.8-27b.mq4-xt");
+        fs::write(&foreign, b"lookalike").unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b-mq4-xt", "qwen3.8-27b.mq4-xt", None)]);
+        let installed = paths.models.join("qwen3.8-27b.mq4-xt").display().to_string();
+        let (tag, _) = registry_entry_for_path(&paths, &registry, &installed)
+            .expect("symlinked installed artifact must match by canonical target");
+        assert_eq!(tag, "qwen3.8:27b-mq4-xt");
+        assert!(
+            registry_entry_for_path(&paths, &registry, &foreign.display().to_string()).is_none(),
+            "same-basename foreign file gets no registry entry"
+        );
+        assert!(
+            registry_entry_for_path(&paths, &registry, "qwen3.8:27b-mq4-xt").is_some(),
+            "tag form still resolves"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn load_params_dflash_on_fails_closed_for_non_registry_artifact() {
+        // `on` + a path with no registry entry + no explicit draft fails
+        // closed with the not-managed message instead of silently running AR
+        // (Fable's earlier note on unregistered basenames). `auto` on the
+        // same file still runs AR as a bare artifact.
+        let paths = test_paths("dflash-on-foreign-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        let foreign_dir = paths.root.join("elsewhere");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("qwen3.6-27b.mq4");
+        fs::write(&foreign, b"lookalike").unwrap();
+        assert!(
+            registry_entry_for_path(
+                &paths,
+                &rm_test_registry(&[("qwen3.6:27b", "qwen3.6-27b.mq4", None)]),
+                &foreign.display().to_string()
+            )
+            .is_none(),
+            "precondition: foreign path has no entry"
+        );
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &foreign,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .expect_err("on without registry identity must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("not a registry-managed artifact"), "{message}");
+        assert!(message.contains("developer.dflash_draft"), "{message}");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &foreign,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert!(
+            params.get("draft").is_none(),
+            "auto on a bare artifact runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
 
     #[test]
     fn run_spec_dflash_projects_inherited_draft_after_config_off() {
