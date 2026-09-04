@@ -1676,6 +1676,14 @@ pub(crate) fn parse_state_quant(
 // ─── Core arch carrier load ─────────────────────────────────────────────
 
 /// Hard-error free for unfinished qwen35 finish path: bundle + optional VL.
+///
+/// `free_qwen35_bundle` returns every buffer to the GPU pool; only a drain
+/// hands the VRAM back to the driver, and `unload_model` is normally the
+/// one that drains. A load that fails here never reaches `unload_model`,
+/// so without the drain the whole target (~15 GB on a 27B) stayed pooled —
+/// the hw-gate Fable seat measured ~5 GB retained after a refused
+/// `dflash_mode=on` load on top of the next resident model, compounding on
+/// every lazy serve retry. Mirror `unload_model`: invalidate graphs, drain.
 fn rollback_unfinished_qwen35(
     err: String,
     bundle: Qwen35Bundle,
@@ -1689,6 +1697,8 @@ fn rollback_unfinished_qwen35(
     if let Some(vw) = vision_weights {
         vw.free_gpu(gpu);
     }
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
     if notes.is_empty() {
         err
     } else {
