@@ -1839,8 +1839,15 @@ fn gemm_dispatch(
             // MQ4 v2 (qt=44): same 136 B stride as v1 but fp16 per-128 header.
             // Uses the dedicated v2 batched lm_head kernel so header decode is
             // correct; rotation is identical FWHT path.
-            let scratch = mq_x_rot.expect("MQ4V2 dispatch requires mq_x_rot scratch");
-            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            // S7: per-chunk route — chunks that hit the gfx1100 ksplit tier
+            // (batch 2..=16, default policy) rotate to F16 and run the
+            // overwrite ksplit GEMM; everything else (n==1 GEMV tails,
+            // chunked first-call prefixes, capture/replay, kill switch)
+            // keeps the legacy loop byte-for-byte.
+            let scratch_f16 = mq_x_rot_f16;
+            let max_chunk = (mq_x_rot.expect("MQ4V2 dispatch requires mq_x_rot scratch").shape[0]
+                / w.k)
+                .max(1);
             let mut chunked: HipResult<()> = Ok(());
             let mut row = 0;
             while row < batch {
@@ -1857,18 +1864,48 @@ fn gemm_dispatch(
                         break;
                     }
                 } else {
-                    let rot_view = scratch.sub_offset(0, n * w.k);
-                    if let Err(e) =
-                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
-                    {
-                        chunked = Err(e);
-                        break;
-                    }
-                    if let Err(e) =
-                        gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
-                    {
-                        chunked = Err(e);
-                        break;
+                    let route =
+                        gpu.draft_collapse_mq4v2_route(w.k, n, w.awq_scale.is_some());
+                    if route == rdna_compute::dflash_draft_fusion::DraftCollapseV2::Off {
+                        let scratch =
+                            mq_x_rot.expect("MQ4V2 dispatch requires mq_x_rot scratch");
+                        let rot_view = scratch.sub_offset(0, n * w.k);
+                        if let Err(e) = crate::llama::rotate_x_mq_batched_for(
+                            gpu, w, &x_chunk, &rot_view, w.k, n,
+                        ) {
+                            chunked = Err(e);
+                            break;
+                        }
+                        if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(
+                            &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                        ) {
+                            chunked = Err(e);
+                            break;
+                        }
+                    } else {
+                        let scratch = scratch_f16
+                            .expect("MQ4V2 collapse requires mq_x_rot_f16 scratch");
+                        let rot_f16 = scratch.sub_offset(0, n * w.k);
+                        if let Err(e) =
+                            gpu.mq_rotate_x_f16_dflash(&x_chunk, &rot_f16, w.k, n)
+                        {
+                            chunked = Err(e);
+                            break;
+                        }
+                        let rdna_compute::dflash_draft_fusion::DraftCollapseV2::OverwriteKsplit {
+                            kw,
+                        } = route
+                        else {
+                            unreachable!("route != Off here")
+                        };
+                        if let Err(e) = gpu
+                            .gemm_mq4g256v2_overwrite_ksplit_lds_dflash(
+                                &w.buf, &rot_f16, &y_chunk, w.m, w.k, n, kw,
+                            )
+                        {
+                            chunked = Err(e);
+                            break;
+                        }
                     }
                 }
                 row += n;

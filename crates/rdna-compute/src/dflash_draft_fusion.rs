@@ -29,6 +29,34 @@ pub enum DraftCollapseGemm {
     OverwriteKsplitDet,
 }
 
+/// Which overwrite GEMM the S7 fast path may use for one MQ4G256V2 dispatch.
+///
+/// Mirrors the gfx1100 production tier in
+/// [`Gpu::gemm_mq4g256v2_residual_wmma`]: non-replay, non-capture,
+/// `batch <= 16`, default ksplit policy (`HIPFIRE_RESIDUAL_KSPLIT_OFF` and
+/// opt-in `HIPFIRE_RESIDUAL_LDSSTAGE` both veto). Anything else resolves to
+/// [`Off`](DraftCollapseV2::Off) so the caller keeps today's path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DraftCollapseV2 {
+    Off,
+    OverwriteKsplit { kw: u32 },
+}
+
+/// Mirror of the private `residual_ksplit_kw` K-split picker in gemm.rs:
+/// `kw` waves for K/256 groups (`want` 4 below K=8192, else 8), falling back
+/// down the [want, 4, 2] ladder. `None` routes to the base kernel.
+fn draft_collapse_ksplit_kw(k: usize) -> Option<usize> {
+    if k % 256 != 0 || k == 0 {
+        return None;
+    }
+    let g = k / 256;
+    let want = if k <= 8192 { 4 } else { 8 };
+    [want, 4, 2]
+        .into_iter()
+        .filter(|&kw| kw <= want)
+        .find(|&kw| g >= kw && g % kw == 0)
+}
+
 impl Gpu {
     /// S7 route check for one MQ4G256 draft GEMM (`m` rows, `k` cols, `batch` rows).
     ///
@@ -72,6 +100,112 @@ impl Gpu {
         } else {
             DraftCollapseGemm::OverwriteKsplitDet
         }
+    }
+    /// S7 route check for one MQ4G256V2 draft GEMM (`k` cols, `batch` rows).
+    ///
+    /// Mirrors the gfx1100 ksplit tier of `gemm_mq4g256v2_residual_wmma`:
+    /// exact gfx1100, kill switch unset, no replay recording, no graph
+    /// capture (capture keeps the base-kernel contract), `2 <= batch <= 16`,
+    /// default ksplit policy, resolvable split width, no AWQ sidecar.
+    pub fn draft_collapse_mq4v2_route(
+        &self,
+        k: usize,
+        batch: usize,
+        has_awq: bool,
+    ) -> DraftCollapseV2 {
+        if !self.arch_caps.is_gfx1100() || self.arch != "gfx1100" {
+            return DraftCollapseV2::Off;
+        }
+        if self.flags.draft_collapse_off {
+            return DraftCollapseV2::Off;
+        }
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return DraftCollapseV2::Off;
+        }
+        if batch <= 1 || batch > 16 {
+            return DraftCollapseV2::Off;
+        }
+        if has_awq {
+            return DraftCollapseV2::Off;
+        }
+        if self.flags.residual_ksplit_off || self.flags.residual_ldsstage {
+            return DraftCollapseV2::Off;
+        }
+        match draft_collapse_ksplit_kw(k) {
+            Some(kw) if kw == 2 || kw == 4 || kw == 8 => {
+                DraftCollapseV2::OverwriteKsplit { kw: kw as u32 }
+            }
+            _ => DraftCollapseV2::Off,
+        }
+    }
+
+    /// Overwrite split-K LDS MQ4G256V2 GEMM: `y = W @ x_f16` (no residual,
+    /// no pre-zero fill, no fp16-cache convert). `x_f16` is caller-owned F16
+    /// ([batch, k]); `y` is F32 ([batch, m]). `kw` is 2, 4, or 8.
+    pub fn gemm_mq4g256v2_overwrite_ksplit_lds_dflash(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        kw: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let sym: &str = match kw {
+            2 => "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2",
+            4 => "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4",
+            8 => "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "gemm_mq4g256v2_overwrite_ksplit_lds_dflash: kw must be 2, 4, or 8",
+                ));
+            }
+        };
+        // One module per symbol (repo convention); shared collapse source.
+        self.ensure_kernel(sym, COLLAPSE_SRC, sym)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = ((m + 15) / 16) as u32;
+        let batch_tiles = ((batch_size + 15) / 16) as u32;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "mq4v2_overwrite_ksplit_dflash", bytes);
+        let result = self.launch_maybe_blob(
+            sym,
+            [row_tiles, batch_tiles, 1],
+            [32 * kw, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// S7 master switch for the non-GEMM fusions (dual RMSNorm, finish

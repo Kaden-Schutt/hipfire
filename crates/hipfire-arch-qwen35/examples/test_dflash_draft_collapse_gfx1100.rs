@@ -228,12 +228,13 @@ fn dump_forward(
     outdir: &Path,
 ) -> HipResult<()> {
     use hip_bridge::HipResult;
-    let b = cfg.block_size;
+    // Gate-matching geometry: the MERGESORT gate overrides --block-size 16
+    // (the artifact declares 8), so run B=16 here too.
+    let b = 16usize;
     let h = cfg.hidden;
     let ne = cfg.num_extract();
     let ctx_cap = 256usize;
     let l = 64usize;
-    assert!(b <= 16, "test expects block_size <= 16");
     eprintln!(
         "draft: n_layers={} hidden={h} inter={} b={b} l={l} collapse_off={}",
         cfg.n_layers,
