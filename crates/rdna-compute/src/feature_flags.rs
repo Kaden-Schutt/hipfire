@@ -300,6 +300,29 @@ pub struct FeatureFlags {
     /// HIPFIRE_FUSE_QKV_BIAS_DEBUG=1. Default off. Resolved once at init so the
     /// default-on fold hot path takes no per-launch `env::var` lock.
     pub fuse_qkv_bias_debug: bool,
+
+    // ── DFlash launch-fusion kill switches (prescaffold, all no-ops) ────
+    // Each `HIPFIRE_*_OFF=1` disables its slice's fast route and restores the
+    // pre-change path. All default OFF (fast routes live once slices land);
+    // nothing reads these fields yet — composers wire them in per slice.
+    /// S1: `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1` restores the memcpy-loop snapshot.
+    pub dn_snapshot_bulk_off: bool,
+    /// S2: `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF=1` restores the row-copy loops.
+    pub hidden_scatter_fuse_off: bool,
+    /// S3: `HIPFIRE_MQ_F16_PROJECTION_OFF=1` restores F32 producers + convert.
+    pub mq_f16_projection_off: bool,
+    /// S4: `HIPFIRE_MQ_F16_RESIDUAL_OFF=1` restores F32 residual producers.
+    pub mq_f16_residual_off: bool,
+    /// S5: `HIPFIRE_GDN_PRE_FUSE_OFF=1` restores unfused GDN pre-kernels.
+    pub gdn_pre_fuse_off: bool,
+    /// S6: `HIPFIRE_FA_BATCH_FUSE_OFF=1` restores unbatched FA prep/KV writes.
+    pub fa_batch_fuse_off: bool,
+    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings.
+    pub draft_collapse_off: bool,
+    /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
+    pub ddtree_topk_direct_off: bool,
+    /// S9: `HIPFIRE_MQ_PROLOGUE_FUSE_OFF=1` restores producer+GEMM pairs.
+    pub mq_prologue_fuse_off: bool,
 }
 
 impl FeatureFlags {
@@ -596,6 +619,23 @@ impl FeatureFlags {
             // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
             fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
             fuse_qkv_bias_debug: value("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
+
+            // DFlash launch-fusion kill switches: `_OFF=1` disables, all no-ops.
+            dn_snapshot_bulk_off: value("HIPFIRE_DN_SNAPSHOT_BULK_OFF").ok().as_deref()
+                == Some("1"),
+            hidden_scatter_fuse_off: value("HIPFIRE_HIDDEN_SCATTER_FUSE_OFF").ok().as_deref()
+                == Some("1"),
+            mq_f16_projection_off: value("HIPFIRE_MQ_F16_PROJECTION_OFF").ok().as_deref()
+                == Some("1"),
+            mq_f16_residual_off: value("HIPFIRE_MQ_F16_RESIDUAL_OFF").ok().as_deref()
+                == Some("1"),
+            gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
+            fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
+            draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
+            ddtree_topk_direct_off: value("HIPFIRE_DDTREE_TOPK_DIRECT_OFF").ok().as_deref()
+                == Some("1"),
+            mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
+                == Some("1"),
         }
     }
 
@@ -793,6 +833,15 @@ impl FeatureFlags {
             dflash_q8_lmhead_wmma: true,
             fuse_qkv_bias: true,
             fuse_qkv_bias_debug: false,
+            dn_snapshot_bulk_off: false,
+            hidden_scatter_fuse_off: false,
+            mq_f16_projection_off: false,
+            mq_f16_residual_off: false,
+            gdn_pre_fuse_off: false,
+            fa_batch_fuse_off: false,
+            draft_collapse_off: false,
+            ddtree_topk_direct_off: false,
+            mq_prologue_fuse_off: false,
         }
     }
 }

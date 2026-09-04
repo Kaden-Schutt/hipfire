@@ -1234,6 +1234,13 @@ pub struct DflashScratch {
     // single-call requirement: max(max_ctx × num_extract*hidden,
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
+    // Launch-fusion prescaffold (S7): F16 twin of `mq_x_rot` (same element
+    // count, half the bytes). Allocated/freed but never written or read yet.
+    pub mq_x_rot_f16: Option<GpuTensor>,
+    // Launch-fusion prescaffold (S7): persistent noise-token-ID plane.
+    // S7 uploads the draft token IDs once instead of 16 scalar embeddings.
+    // i32 IDs stored as F32 (same cosmetic pattern as `positions_*`).
+    pub noise_tokens: GpuTensor, // [B]
 
     // DFlash2 optional scratch: conv temp/dynamic and selector buffers.
     // Allocated only when the loaded draft actually needs them.
@@ -1405,6 +1412,13 @@ impl DflashScratch {
         } else {
             None
         };
+        // Prescaffold F16 twin: same element count as `mq_x_rot`.
+        let mq_x_rot_f16 = if with_mq {
+            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+            Some(gpu.alloc_tensor(&[widest], DType::F16)?)
+        } else {
+            None
+        };
 
         // DFlash2 optional buffers: allocated only when the config declares them.
         let (conv_temp, conv_dynamic, selector_proj, topk_ids, topk_vals) = {
@@ -1483,6 +1497,8 @@ impl DflashScratch {
             positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
 
             mq_x_rot,
+            mq_x_rot_f16,
+            noise_tokens: gpu.alloc_tensor(&[b], DType::F32)?,
             conv_temp,
             conv_dynamic,
             selector_proj,
@@ -1575,6 +1591,10 @@ impl DflashScratch {
         if let Some(t) = self.mq_x_rot {
             let _ = gpu.free_tensor(t);
         }
+        if let Some(t) = self.mq_x_rot_f16 {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(self.noise_tokens);
         for t in [
             self.conv_temp,
             self.conv_dynamic,

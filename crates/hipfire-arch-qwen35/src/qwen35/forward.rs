@@ -7,6 +7,7 @@
 
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::MropeCtx;
 use super::config::Qwen35Config;
@@ -4454,6 +4455,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4484,6 +4486,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4531,6 +4534,7 @@ pub fn forward_prefill_dense_tp(
                                 kv_layer_idx,
                                 layer_idx,
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4561,6 +4565,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
