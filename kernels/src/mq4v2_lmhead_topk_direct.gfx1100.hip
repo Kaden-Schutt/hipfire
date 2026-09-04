@@ -255,34 +255,41 @@ mq4v2_lmhead_topk_direct_gfx1100(
     }
     __threadfence();
 
-    // ---- two-level arrival barrier (resident grid only) ----------------------
-    // A single global arrival counter would serialize 1344 atomicAdds on the
-    // critical path (~200 us). Instead each 32-wg cohort bumps its own slot
-    // (42 slots, monotonic, never reset — stream serialization makes reuse
-    // safe); wg 0 spins the slots to (launch * size) then publishes release.
-    // Others spin on release CHANGING from the value observed before their
-    // phase-1 work — at most one release per launch can intervene, so this
-    // is exact without any per-launch published index.
+    // ---- sense-reversing two-level barrier (resident grid only) --------------
+    // A single global arrival counter serializes nwg atomicAdds on the
+    // critical path. Instead each 32-wg cohort bumps its own slot; the
+    // cohort-last arrival resets its slot and bumps the global collector;
+    // the global-last arrival resets the collector and flips the release
+    // sense. Resets are safe: a reset happens only after every contributor
+    // bumped (all spinning on sense by then), and stream serialization
+    // separates launches. Spinners exit on release CHANGING from the value
+    // observed before their phase-1 work — the sense flips exactly once per
+    // launch, so early and late observers are both exact. Fully symmetric:
+    // no workgroup has a special role, no absolute counts, no grid-size
+    // assumptions (slots/sizes derive from gridDim every launch).
+    // ctl: [0] global collector, [1] release sense, [2..44) arrival slots.
     const int slots = (nwg + 31) >> 5;
     const int slot = wg >> 5;
+    const int slot_size = (slot == slots - 1) ? (nwg - (slot << 5)) : 32;
     const int go_seen = (lane == 0) ? atomicAdd(&ctl[1], 0) : 0;
     __threadfence();
     if (lane == 0) {
-        atomicAdd(&ctl[2 + slot], 1);
-        if (wg == 0) {
-            const int idx = atomicAdd(&ctl[0], 1) + 1;
-            for (int st = 0; st < slots; st++) {
-                const int sz = (st == slots - 1) ? (nwg - (st << 5)) : 32;
-                while (atomicAdd(&ctl[2 + st], 0) < idx * sz) { }
+        const int p = atomicAdd(&ctl[2 + slot], 1);
+        if (p == slot_size - 1) {
+            ctl[2 + slot] = 0; // reset: whole cohort bumped
+            __threadfence();
+            const int q = atomicAdd(&ctl[0], 1);
+            if (q == slots - 1) {
+                ctl[0] = 0; // reset: all cohorts collected
+                __threadfence();
+                ctl[1] = go_seen ^ 1; // release: flip sense
+                __threadfence();
             }
-            __threadfence();
-            ctl[1] = idx;
-            __threadfence();
         } else {
             while (atomicAdd(&ctl[1], 0) == go_seen) { }
         }
     }
-    __syncwarp();
+    __syncthreads();
 
     // ---- phase 2: workgroup c reduces column c ------------------------------
     const int col = wg;
