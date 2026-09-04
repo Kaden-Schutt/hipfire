@@ -19,6 +19,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+md5 = "0.8"
 hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }

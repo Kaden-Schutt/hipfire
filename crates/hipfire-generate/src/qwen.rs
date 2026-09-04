@@ -71,6 +71,29 @@ pub struct EpSampling {
     pub min_p: Option<f32>,
 }
 
+/// Which EP serve body owns an arch_id. Pure so the dispatch contract is
+/// unit-testable. Archs without an `EpArch` (LFM2, Cohere2, anything new) must
+/// NOT reach a serve body: the old `_ => ep_serve_ds4` fallthrough ran the
+/// DeepSeek4 EP protocol against foreign weights instead of refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpServeTarget {
+    Minimax,
+    Qwen35DenseTp,
+    Deepseek4,
+    UnsupportedArch(u32),
+}
+
+/// EP serve dispatch by arch_id. 9/10/5|6 keep their existing servers;
+/// anything else is an explicit refusal, never a wrong-server fallthrough.
+pub fn ep_serve_target(arch_id: u32) -> EpServeTarget {
+    match arch_id {
+        10 => EpServeTarget::Minimax,
+        5 | 6 => EpServeTarget::Qwen35DenseTp,
+        9 => EpServeTarget::Deepseek4,
+        other => EpServeTarget::UnsupportedArch(other),
+    }
+}
+
 pub fn generate_ep(
     m: &mut LoadedModel,
     stdout: &mut std::io::Stdout,
@@ -225,8 +248,8 @@ pub fn generate_ep(
         hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
-    match m.arch_id {
-        10 => ep_serve_minimax(
+    match ep_serve_target(m.arch_id) {
+        EpServeTarget::Minimax => ep_serve_minimax(
             m,
             stdout,
             id,
@@ -237,7 +260,7 @@ pub fn generate_ep(
             primed_think,
             sampling,
         ),
-        5 | 6 => ep_serve_qwen35_dense_tp(
+        EpServeTarget::Qwen35DenseTp => ep_serve_qwen35_dense_tp(
             m,
             stdout,
             id,
@@ -249,7 +272,7 @@ pub fn generate_ep(
             primed_think,
             sampling,
         ),
-        _ => ep_serve_ds4(
+        EpServeTarget::Deepseek4 => ep_serve_ds4(
             m,
             stdout,
             id,
@@ -261,6 +284,26 @@ pub fn generate_ep(
             stop,
             sampling,
         ),
+        EpServeTarget::UnsupportedArch(arch) => {
+            // Fail closed: no EpArch exists for this arch_id (LFM2, Cohere2,
+            // anything new), so there is no correct server to call. Name the
+            // arch rather than running another arch's EP protocol against
+            // foreign weights.
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "EP generate not supported for arch_id={arch} \
+                     (only 9/DeepSeek4, 10/MiniMax and dense 5|6 Qwen3.5 \
+                     have an EP serve path)"
+                ),
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 }
 
@@ -2075,7 +2118,16 @@ pub fn generate_dflash(
         .as_ref()
         .map(|s| s.ctx_capacity())
         .unwrap_or(usize::MAX);
-    if prompt_tokens.len().saturating_add(max_tokens) > spec_ctx_capacity {
+    let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
+    // Shared margin with the `generate_spec` hard guard below: prompt +
+    // budget + one draft block must fit, so any request the loop would refuse
+    // falls back to AR here instead of erroring after `gen_start`.
+    if !spec_ctx_request_fits(
+        prompt_tokens.len(),
+        max_tokens,
+        spec_block_size,
+        spec_ctx_capacity,
+    ) {
         emit_qwen_ar_info(
             stdout,
             id,
@@ -2430,8 +2482,10 @@ pub fn generate_dflash(
                 im_end_token,
             );
         let semantic_stop = run.semantic_stop.is_some();
-        let hit_length_cap =
-            qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
+        // A ctx-exhausted mid-loop break is a length stop even when the token
+        // budget is unspent: same `length` + no-store path as the cap below.
+        let hit_length_cap = run.ctx_exhausted
+            || qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
         // Prefer producer-visible channel; fall back to finish Token events.
         let visible = if !run.finish.visible_text.is_empty() {
             run.finish.visible_text.clone()
@@ -2637,12 +2691,13 @@ pub fn generate_dflash(
         let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
         // Semantic stop / decoded_eot at the budget boundary is stop/tool_calls,
         // not length — same rule as the qwen_semantic_v2 path.
-        let hit_length_cap = qwen_dflash_hit_length_cap(
-            run.generated,
-            max_tokens,
-            run.finish.decoded_eot,
-            run.semantic_stop.is_some(),
-        );
+        let hit_length_cap = run.ctx_exhausted
+            || qwen_dflash_hit_length_cap(
+                run.generated,
+                max_tokens,
+                run.finish.decoded_eot,
+                run.semantic_stop.is_some(),
+            );
         let finish_reason = if hit_length_cap {
             "length"
         } else if !emit_tool_calls.is_empty() {
@@ -2977,12 +3032,11 @@ pub fn generate_spec(
         let _ = stdout.flush();
         return None;
     }
+    // Shared margin with the `generate_dflash` entry fallback above (same
+    // predicate): without eviction the entry already diverted these to AR,
+    // so this is belt-and-suspenders for direct `generate_spec` callers.
     if m.eviction.is_none()
-        && prompt_tokens
-            .len()
-            .saturating_add(max_tokens)
-            .saturating_add(block_size)
-            > ctx_capacity
+        && !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity)
     {
         emit_active_attempt_error(
             stdout,
@@ -3110,15 +3164,25 @@ pub fn generate_spec(
     let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
         Ok(e) => e,
         Err(e) => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("{}", e),
-                "validation",
-                false,
-                false,
+            // Post-prefill failure: the target's KV/DeltaNet/drafter hidden
+            // already advanced and host seq_pos/conversation_tokens were
+            // cleared on a cold start. Fail closed like every other
+            // post-prefill error exit (prefill/step Err, realign, forced
+            // terminal): live rollback first, then one correlated error —
+            // otherwise the next turn LCPs against a dirty GPU
+            // (audit-Dflash Broken 4).
+            let msg = format!("make_spec_emitter: {e}");
+            let ep = production_fail_closed_rollback_live(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                slot,
+                spec.as_mut(),
             );
-            let _ = stdout.flush();
+            emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
             return None;
         }
     };
@@ -3141,6 +3205,11 @@ pub fn generate_spec(
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
     let mut generated = 0usize;
+    // Set when the mid-loop `position + block_size >= ctx_capacity` break
+    // fires: the draft's context-indexed structures cannot host another
+    // full block, so the epilogue must report a length stop
+    // (`finish_reason=length`, no cache store) rather than a natural stop.
+    let mut ctx_exhausted = false;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -3356,6 +3425,7 @@ pub fn generate_spec(
             return None;
         }
         if position.saturating_add(block_size) >= ctx_capacity {
+            ctx_exhausted = true;
             break;
         }
 
@@ -3948,6 +4018,7 @@ pub fn generate_spec(
         finish,
         grammar_violated,
         semantic_stop,
+        ctx_exhausted,
         fail_closed_rollback,
         prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
         total_s: t_end.duration_since(t0).as_secs_f64(),
@@ -6310,3 +6381,23 @@ mod deepseek4_reasoning_prefix_tests {
 }
 
 // --- iter appended ---
+
+#[cfg(test)]
+mod ep_serve_target_tests {
+    use super::{ep_serve_target, EpServeTarget};
+
+    #[test]
+    fn known_ep_archs_keep_their_servers_but_all_others_refuse() {
+        // Adjacent supported: DS4, MiniMax and dense Qwen3.5 keep their servers.
+        assert_eq!(ep_serve_target(9), EpServeTarget::Deepseek4);
+        assert_eq!(ep_serve_target(10), EpServeTarget::Minimax);
+        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35DenseTp);
+        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35DenseTp);
+        // No EpArch exists for these: explicit refusal naming the arch,
+        // never the old wrong-server DS4 fallthrough.
+        assert_eq!(ep_serve_target(11), EpServeTarget::UnsupportedArch(11));
+        assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
+        assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
+        assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    }
+}

@@ -276,26 +276,29 @@ impl Qwen2Weights {
 
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `LlamaWeights::free_gpu` and `Qwen35Weights::free_gpu`
-    /// — the daemon calls this on unload to actually return VRAM.
+    /// — the daemon calls this on unload to actually return VRAM. Linear
+    /// weights go through `WeightTensor::free_all` so any PARO / AWQ sidecar
+    /// (none are allocated for Qwen2 today, but the forward already reads
+    /// `awq_scale`) is released with the buffer instead of leaking per reload.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
         if !self.tied_lm_head {
-            let _ = gpu.free_tensor(self.output.buf);
+            self.output.free_all(gpu);
         }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
+            l.wq.free_all(gpu);
             let _ = gpu.free_tensor(l.wq_bias);
-            let _ = gpu.free_tensor(l.wk.buf);
+            l.wk.free_all(gpu);
             let _ = gpu.free_tensor(l.wk_bias);
-            let _ = gpu.free_tensor(l.wv.buf);
+            l.wv.free_all(gpu);
             let _ = gpu.free_tensor(l.wv_bias);
-            let _ = gpu.free_tensor(l.wo.buf);
+            l.wo.free_all(gpu);
             let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+            l.w_gate.free_all(gpu);
+            l.w_up.free_all(gpu);
+            l.w_down.free_all(gpu);
         }
     }
 }

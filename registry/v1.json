@@ -113,6 +113,11 @@
           "repeat_penalty": 1.0
         }
       },
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq",
+        "sha256": "97457f684b8f0b195e631025a63da0a92286d1c77751e58caf0cd470457a6b25",
+        "size_bytes": 557265920
+      },
       "sha256": "ba83acf5bfd5d4e334b0afc26d779734e31623bb7f74e807c3581dfecb3128ad",
       "size_bytes": 5313750016,
       "arch_id": 5,
@@ -158,6 +163,11 @@
           "presence_penalty": 1.5,
           "repeat_penalty": 1.0
         }
+      },
+      "dflash": {
+        "file": "qwen35-27b-dflash-mq4.hfq",
+        "sha256": "3d428b97c1911a9ad815cc52fbee080306852c1dafad6b1b17bb70bd68010301",
+        "size_bytes": 919401472
       },
       "sha256": "ea615949ddf6a180eee03ff6fde39f7e51148f153b1b05f82258b9953088576e",
       "size_bytes": 14984158208,
@@ -792,6 +802,11 @@
         "sha256": "d6cb8026841830cfeb82d2709453aa753f65b5596bfb9cc9c085c808fda6ad22",
         "size_bytes": 2359324
       },
+      "dflash": {
+        "file": "qwen36-27b-dflash-mq4.hfq",
+        "sha256": "bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70",
+        "size_bytes": 919401472
+      },
       "sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
       "size_bytes": 14984158208,
       "arch_id": 5,
@@ -823,6 +838,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq",
+        "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
+        "size_bytes": 984978432
       },
       "sha256": "3e04fc8db80bda557b965ec60ac876cf2500fced7f340624f3fcbeae134af5c5",
       "size_bytes": 11777616896,
@@ -856,6 +876,11 @@
           "reasoning_effort": "xhigh"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq",
+        "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
+        "size_bytes": 984978432
+      },
       "sha256": "09c3544690aceca29e1822d79adab6ffcc8fd9e4b58359fe8dfb185ef49811c9",
       "size_bytes": 12618796032,
       "arch_id": 5,
@@ -887,6 +912,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq",
+        "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
+        "size_bytes": 984978432
       },
       "sha256": "394c50966bf4f68172df8eb34cd7ded8f9d0576c9ef24ea6ba639a88c184f795",
       "size_bytes": 13184433152,
@@ -920,6 +950,11 @@
           "reasoning_effort": "xhigh"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq",
+        "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+        "size_bytes": 1209603072
+      },
       "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
       "size_bytes": 14980361216,
       "arch_id": 5,
@@ -952,6 +987,11 @@
           "reasoning_effort": "xhigh"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq",
+        "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+        "size_bytes": 1209603072
+      },
       "sha256": "5bb556a6cc84035234995c017c9791aa3951ad1eae4cf8c8172b0eaef399e507",
       "size_bytes": 15662615552,
       "arch_id": 5,
@@ -983,6 +1023,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq",
+        "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+        "size_bytes": 1209603072
       },
       "sha256": "e6f2ac87042b9e314c323f00bc499a6304cd5624021ae501ce90b12a3a7ea3fa",
       "size_bytes": 16464182272,
@@ -1215,6 +1260,11 @@
       "desc": "MQ6, higher quality",
       "default_kv_mode": "q8",
       "quant_recipe": "v3-awq-f1",
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq",
+        "sha256": "97457f684b8f0b195e631025a63da0a92286d1c77751e58caf0cd470457a6b25",
+        "size_bytes": 557265920
+      },
       "sha256": "69b0e3b2be99a7fcab17f82bae2a2f1342ac32ee96d421347726815a69e78ce4",
       "size_bytes": 7296132096,
       "arch_id": 5,
@@ -1239,6 +1289,11 @@
       "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending \u2014 see issue #113. Sub-9B MQ3 not shipped \u2014 see #114.",
       "default_kv_mode": "q8",
       "quant_recipe": "v3-awq-f1",
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq",
+        "sha256": "97457f684b8f0b195e631025a63da0a92286d1c77751e58caf0cd470457a6b25",
+        "size_bytes": 557265920
+      },
       "sha256": "c379dbbc90d7faf5e7281f01310b4e3f3e76587a6e951a0c7b6a809eeae5550b",
       "size_bytes": 4569785344,
       "arch_id": 5,
@@ -1250,6 +1305,11 @@
       "size_gb": 10.7,
       "min_vram_gb": 12,
       "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only.",
+      "dflash": {
+        "file": "qwen35-27b-dflash-mq3.hfq",
+        "sha256": "b3526f2f8ffce5a2483f6d74fd1e78af2b8eebe9249e5b55177ed0e0c58f53fc",
+        "size_bytes": 703132672
+      },
       "sha256": "58fdaf54ec3c4be9372bd44b4754e198e7ff6d7129c6abdaec76c1ac70fb092b",
       "size_bytes": 11784735744,
       "arch_id": 5,
@@ -1267,6 +1327,11 @@
       "size_gb": 10.7,
       "min_vram_gb": 12,
       "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s \u03c4=7.0).",
+      "dflash": {
+        "file": "qwen36-27b-dflash-mq3.hfq",
+        "sha256": "f5fc4bef4c15229f940f8ead6c04723b04308321c4a9584c3318d364cadf1728",
+        "size_bytes": 703132672
+      },
       "sha256": "6b650a7d6cb4e2447dd67da7a87cb5e57956e98eff676a498a7586e3b3cc9298",
       "size_bytes": 11776322560,
       "arch_id": 5,

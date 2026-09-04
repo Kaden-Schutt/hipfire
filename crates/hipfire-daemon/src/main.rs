@@ -1338,6 +1338,12 @@ fn main() {
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
+                    // DFlash mirrors mtp: on = fail closed on a missing/unloadable draft.
+                    dflash: match dflash_mode {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None, // "auto" → loader default
+                    },
                     mtp: match mtp_mode.as_str() {
                         "on" => Some(true),
                         "off" => Some(false),
