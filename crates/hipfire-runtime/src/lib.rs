@@ -63,9 +63,9 @@ pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
+pub mod weight_manifest;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
-pub mod weight_manifest;
 pub mod weight_store;
 
 pub mod emit_text;
