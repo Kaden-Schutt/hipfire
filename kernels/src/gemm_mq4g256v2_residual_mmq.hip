@@ -7,7 +7,12 @@
 #include <stdint.h>
 #include <math.h>
 
-// Experimental HFQ4-G256 MMQ residual GEMM for RDNA3/RDNA3.5.
+// Production MQ4G256V2 (qt=44) MMQ residual GEMM for gfx1100/gfx1151.
+//
+// Selected as the fast path when `batch >= 128 && batch % 128 == 0`
+// (see `crates/rdna-compute/src/gemm.rs:17860-17909` and the qkv/qkvza/
+// gate_up/residual call sites); otherwise the WMMA residual path runs.
+// Applies the scale per 128-K half (`kt < 8` select), not a per-256 V1-ism.
 //
 // This mirrors the important parts of llama.cpp's AMD MMQ path:
 // - pre-quantize the activation matrix into block_q8_1_mmq DS4 layout
