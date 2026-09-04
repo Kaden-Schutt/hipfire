@@ -208,17 +208,6 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
         let k = k_from_code_shape(&meta.shape)?;
         let qt = quant_type_for_k(k)?;
 
-        // Verbatim: the code stream is copied byte-for-byte. memcmp on the
-        // round-trip is the post-condition (G1).
-        tensors.push(HfqTensor {
-            name: format!("{proj}.escha_code"),
-            quant_type: qt,
-            shape: meta.shape.iter().map(|&d| d as u32).collect(),
-            group_size: 16,
-            data: data.to_vec(),
-            spilled_len: 0,
-        });
-
         // Fold the optional end-to-end scales into rin/rout — one f32 pair per
         // projection, per row when the tensor is E-stacked.
         let (rin_m, rin_d) = find(&format!("{proj}.escha_rin"))
@@ -233,6 +222,91 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             s_in.as_deref(),
             s_out.as_deref(),
         );
+
+        // ── FOLD MODE ────────────────────────────────────────────────────
+        // `HIPFIRE_ESCHA_FOLD=mq6|mq4v2` bakes the H128 rotations and both
+        // diagonals into the weight and emits an ORDINARY `{proj}.weight`,
+        // so the runtime needs no escha awareness in the forward pass at all
+        // (see `escha_fold`). The trellis code is NOT emitted in this mode —
+        // shipping both would double the file for no reader.
+        //
+        // Trade, stated plainly: 2-bit residency is exchanged for escha's
+        // quantisation QUALITY in a container hipfire already runs at full
+        // speed. Default is off; unfolded output is unchanged byte-for-byte.
+        if let Some(fold_fmt) = fold_format() {
+            let ri_f: Vec<f32> = ri.clone();
+            let ro_f: Vec<f32> = ro.clone();
+            let (ic_f, oc_f) = (ri_f.len(), ro_f.len());
+            let code_i16: Vec<i16> = data
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let w_bits = hipfire_quantize::escha_ref::reconstruct(&code_i16, ic_f, oc_f, k as usize);
+            let folded = hipfire_quantize::escha_fold::fold_escha_linear(&w_bits, ic_f, oc_f, &ri_f, &ro_f)?;
+            let s1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+            let s2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+            let (bytes, qt_f) = match fold_fmt {
+                DenseFormat::Mq4V2 => (
+                    crate::quant_fwht::quantize_mq4g256v2(&folded, oc_f, ic_f, &s1, &s2),
+                    QuantType::MQ4G256V2,
+                ),
+                _ => (
+                    crate::quant_fwht::quantize_mq6g256v2(&folded, oc_f, ic_f, &s1, &s2),
+                    QuantType::MQ6G256V2,
+                ),
+            };
+            tensors.push(HfqTensor {
+                name: format!("{proj}.weight"),
+                quant_type: qt_f,
+                shape: vec![oc_f as u32, ic_f as u32],
+                group_size: 256,
+                data: bytes,
+                spilled_len: 0,
+            });
+            // A bias CANNOT be folded — it is additive, and no weight matrix
+            // absorbs it. `WeightTensor` has no bias slot today, so a folded
+            // model with biases in the file has them silently IGNORED at load.
+            // That is the same failure class as the dropped MTP head: it does
+            // not crash, it quietly degrades. Measured on the 27B, the bias is
+            // ~1.3% of a projection's output magnitude — small per layer,
+            // compounding over 64.
+            //
+            // So refuse, unless the caller says explicitly that they want an
+            // artifact with the biases dropped (which is legitimate for
+            // measuring the fold in isolation, and is how the first folded 27B
+            // was benchmarked at PPL 13.91).
+            if let Some((bm, bd)) = find(&format!("{proj}.bias")) {
+                if std::env::var("HIPFIRE_ESCHA_FOLD_DROP_BIAS").as_deref() != Ok("1") {
+                    return Err(format!(
+                        "{proj}: fold mode cannot represent the additive bias, and the runtime \
+                         has no bias slot to apply it — the folded model would silently ignore \
+                         it. Add bias support, or set HIPFIRE_ESCHA_FOLD_DROP_BIAS=1 to \
+                         acknowledge shipping an artifact without it."
+                    ));
+                }
+                tensors.push(HfqTensor {
+                    name: format!("{proj}.bias"),
+                    quant_type: QuantType::F16,
+                    shape: bm.shape.iter().map(|&d| d as u32).collect(),
+                    group_size: 0,
+                    data: bd.to_vec(),
+                    spilled_len: 0,
+                });
+            }
+            continue;
+        }
+
+        // Verbatim: the code stream is copied byte-for-byte. memcmp on the
+        // round-trip is the post-condition (G1).
+        tensors.push(HfqTensor {
+            name: format!("{proj}.escha_code"),
+            quant_type: qt,
+            shape: meta.shape.iter().map(|&d| d as u32).collect(),
+            group_size: 16,
+            data: data.to_vec(),
+            spilled_len: 0,
+        });
+
         tensors.push(f32_tensor(
             &format!("{proj}.escha_rin_eff"),
             &rin_m.shape,
@@ -243,6 +317,7 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             &rout_m.shape,
             ro,
         ));
+
 
         if let Some((bm, bd)) = find(&format!("{proj}.bias")) {
             tensors.push(HfqTensor {
@@ -608,6 +683,19 @@ pub(crate) enum DenseFormat {
 /// against 0.3 and 708.0 with both excluded — and buys 0.0002 KLD, because
 /// neither is where down-quanting pays.
 const DENSE_DEFAULT_KEEP_Q8: [&str; 2] = ["mlp.gate", "shared_expert"];
+
+/// `HIPFIRE_ESCHA_FOLD` — when set, escha-coded linears are FOLDED into
+/// ordinary `{proj}.weight` tensors instead of shipped as trellis code.
+///
+/// `mq6` (recommended) or `mq4v2`. Unset means the normal escha output,
+/// byte-for-byte unchanged. See `escha_fold` for the algebra and the trade.
+fn fold_format() -> Option<DenseFormat> {
+    match std::env::var("HIPFIRE_ESCHA_FOLD").ok().as_deref() {
+        Some("mq6") => Some(DenseFormat::Mq6),
+        Some("mq4v2") => Some(DenseFormat::Mq4V2),
+        _ => None,
+    }
+}
 
 fn dense_format_for(name: &str) -> DenseFormat {
     let Ok(spec) = std::env::var("HIPFIRE_ESCHA_DENSE") else {
