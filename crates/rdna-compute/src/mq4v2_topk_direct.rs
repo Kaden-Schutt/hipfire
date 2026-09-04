@@ -51,9 +51,7 @@ const SRC: &str = include_str!("../../../kernels/src/mq4v2_lmhead_topk_direct.gf
 
 /// Bytes required for the `partials` scratch tensor.
 pub fn ddtree_topk_partials_bytes() -> usize {
-    // Per-(wg, lane) lists over all 32 lanes (each column's tile rows split
-    // across the lane-parity halves) + per-(wg, lane) online (max, sumexp).
-    (TDK_WG_MAX * 32 * TDK_MAX_K * 2 + TDK_WG_MAX * 32 * 2) * 4
+    (TDK_WG_MAX * 16 * TDK_MAX_K * 2 + TDK_WG_MAX * 16 * 2) * 4
 }
 
 impl Gpu {
