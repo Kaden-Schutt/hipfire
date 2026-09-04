@@ -453,11 +453,11 @@
           "repeat_penalty": 1.0
         }
       },
-      "repo": "",
+      "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
       "file": "qwen3.6-35b-a3b-escha.q8",
       "size_gb": 12.34,
       "min_vram_gb": 16,
-      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Default and most faithful. Dense weights are a bit-exact repack of Escha's per-row int8 into per-32-block Q8_0. PPL 7.6864, 684 tok/s prefill, 47 tok/s decode, 12.94 GB resident. Experts are identical across all three; only the dense tensors differ. Local-only until published: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent — a digest of a file nobody can fetch verifies nothing and reads like a published one."
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Default and most faithful. Dense weights are a bit-exact repack of Escha's per-row int8 into per-32-block Q8_0. PPL 7.6864, 684 tok/s prefill, 47 tok/s decode, 12.94 GB resident. Experts are identical across all three; only the dense tensors differ."
     },
     "qwen3.6:35b-a3b-mq3p": {
       "recommended_settings": {
@@ -1641,11 +1641,11 @@
           "repeat_penalty": 1.0
         }
       },
-      "repo": "",
+      "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
       "file": "qwen3.6-35b-a3b-escha.mq6",
       "size_gb": 11.84,
       "min_vram_gb": 15,
-      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ6. +17% decode for +0.10% PPL — the best speed/quality trade of the three. PPL 7.6940, KLD 0.0079 vs the q8 arm, 725 tok/s prefill, 55 tok/s decode, 12.45 GB resident. Experts are identical across all three; only the dense tensors differ. Local-only until published: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent — a digest of a file nobody can fetch verifies nothing and reads like a published one."
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ6. +17% decode for +0.10% PPL — the best speed/quality trade of the three. PPL 7.6940, KLD 0.0079 vs the q8 arm, 725 tok/s prefill, 55 tok/s decode, 12.45 GB resident. Experts are identical across all three; only the dense tensors differ."
     },
     "qwen3.6:35b-a3b-escha-mq4": {
       "recommended_settings": {
@@ -1682,11 +1682,11 @@
           "repeat_penalty": 1.0
         }
       },
-      "repo": "",
+      "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
       "file": "qwen3.6-35b-a3b-escha.mq4",
       "size_gb": 11.39,
       "min_vram_gb": 14,
-      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ4. Fastest, and the only one with a visible quality cost: PPL 8.0643 (+4.9%), KLD 0.0590 vs the q8 arm. 886 tok/s prefill, 63 tok/s decode, 12.04 GB resident. Experts are identical across all three; only the dense tensors differ. Local-only until published: `repo` is empty and `hipfire pull` refuses the tag, so `sha256`/`size_bytes` are deliberately absent — a digest of a file nobody can fetch verifies nothing and reads like a published one."
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ4. Fastest, and the only one with a visible quality cost: PPL 8.0643 (+4.9%), KLD 0.0590 vs the q8 arm. 886 tok/s prefill, 63 tok/s decode, 12.04 GB resident. Experts are identical across all three; only the dense tensors differ."
     }
   },
   "aliases": {
