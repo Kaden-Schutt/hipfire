@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 crossterm = "0.29"
 hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
