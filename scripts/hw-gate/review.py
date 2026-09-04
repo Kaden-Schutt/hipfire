@@ -283,6 +283,12 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
                 continue
             raise ReviewError(last_error)
         obj = extract_json(last_text)
+        if obj is None and phase == "decide":
+            # Fable sometimes writes its verdict as a markdown headline instead
+            # of JSON (run 33905366422); accept the decide-phase headline.
+            obj = _markdown_decision(last_text)
+            if obj is not None:
+                return obj
         if obj is None:
             last_error = f"omp {phase}: no JSON object in assistant text: {last_text[:500]!r}"
             if attempt == 0:
@@ -426,6 +432,37 @@ def _parse_omp_stdout(stdout: str) -> tuple[str | None, dict | None]:
         return None, None
     obj = extract_json(last_text)
     return last_text, obj
+DECISION_WORDS = ("merge-staging", "hold", "block")
+
+
+def _markdown_decision(text: str) -> dict | None:
+    """Fallback for a seat that wrote prose instead of JSON.
+
+    Fable's decide output is occasionally a markdown report whose headline is
+    the verdict (`## hw-gate decide — PR #691: **merge-staging**` or
+    `**decision:** block`). Run 33905366422 (#691) had a complete, correct
+    investigation end in `no JSON object in assistant text` because of that.
+    Returns a minimal decision dict so the floor logic sees a real decision;
+    the full text is kept as announcement/rationale and in fable_raw.
+    """
+    import re as _re
+    head = text[:2000]
+    for pat in (
+        r"^#{1,4}\s+hw-gate\s+decide[^\n]*?\*\*(merge-staging|hold|block)\*\*",
+        r"\*\*decision:?\*\*\s*[:=]?\s*`?(merge-staging|hold|block)`?",
+        r"\bdecision:?\s*[:=]?\s*`?(merge-staging|hold|block)`?\s*(?:[.\n]|$)",
+    ):
+        m = _re.search(pat, head, _re.IGNORECASE | _re.MULTILINE)
+        if m:
+            word = m.group(1).lower()
+            return {
+                "decision": word,
+                "announcement": text[:6000],
+                "rationale": text[:6000],
+                "markdown_fallback": True,
+            }
+    return None
+
 
 
 def _list_registry_fixtures(checkout: str, models_dir: str) -> list[tuple[str, str]]:
@@ -1362,14 +1399,20 @@ def _run_decide(args) -> int:
                 else:
                     last_text, obj = _parse_omp_stdout(stdout_text)
                     if obj is None:
-                        fable_unavailable = True
-                        fable_error_reason = "omp decide: no JSON object in assistant text"
-                        sys.stderr.write(f"fable omp failed: {fable_error_reason}\n")
-                        sys.stderr.write(f"fable assistant text (tail): {(last_text or '')[-2000:]!r}\n")
-                        fable_raw = {"assistant_text_tail": (last_text or "")[-4000:], "stderr_tail": stderr_text[-4000:]}
-                        investigation = []
-                        unproven = []
-                        decision = None
+                        md = _markdown_decision(last_text or "")
+                        if md is not None:
+                            decision = md
+                            fable_raw = {"assistant_text_tail": (last_text or "")[-4000:], "stderr_tail": stderr_text[-4000:], "markdown_fallback": True}
+                            sys.stderr.write("fable decide: no JSON object; accepted markdown verdict from the report headline\n")
+                        else:
+                            fable_unavailable = True
+                            fable_error_reason = "omp decide: no JSON object in assistant text"
+                            sys.stderr.write(f"fable omp failed: {fable_error_reason}\n")
+                            sys.stderr.write(f"fable assistant text (tail): {(last_text or '')[-2000:]!r}\n")
+                            fable_raw = {"assistant_text_tail": (last_text or "")[-4000:], "stderr_tail": stderr_text[-4000:]}
+                            investigation = []
+                            unproven = []
+                            decision = None
                     else:
                         decision = obj
                         inv = obj.get("investigation")
@@ -1432,6 +1475,8 @@ def _run_decide(args) -> int:
             sys.stderr.write(f"fable omp failed: {e}\n")
             investigation = []
             unproven = []
+            # omp_review's error text carries the assistant tail; keep it in the artifact.
+            fable_raw = {"assistant_text_tail": str(e)[-4000:]}
             # evidence_dir_val remains as arg value if any
     # Ensure evidence_dir_val is set for decision.json even in non-investigate case
     if investigate and child_env and not evidence_dir_val:

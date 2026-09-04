@@ -548,7 +548,7 @@ def test_verdict_unparseable_needs_human_exit1():
 # decide e2e
 # ---------------------------------------------------------------------------
 
-def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dict | None = None, sol_final="greenlight", fable_response: dict | None = None, hw_run_result="success", merge_409=False, checkout_extra_files: dict | None = None):
+def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dict | None = None, sol_final="greenlight", fable_response: dict | None = None, hw_run_result="success", merge_409=False, checkout_extra_files: dict | None = None, fable_text: str | None = None):
     checkout, base, head = _make_repo(tmp / "checkout_d", files=checkout_extra_files)
     select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":["foo.rs"],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
     if select_extra:
@@ -575,10 +575,8 @@ def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dic
     verdict_path.write_text(json.dumps(sol_verdict_file))
     system_prompt = tmp / "fable.md"
     system_prompt.write_text("fable prompt")
-    if fable_response is None:
-        fable_response = {"phase":"decide","decision":"merge-staging","agrees_with_sol":True,"override":None,"regressions":[],"further_evidence_wanted":[],"rationale":"fable rationale","announcement":"Fable merges."}
     resp_path = tmp / "resp.json"
-    resp_path.write_text(json.dumps([{"json": fable_response}]))
+    resp_path.write_text(json.dumps([{"text": fable_text}] if fable_text is not None else [{"json": fable_response}]))
     call_count = tmp / "omp_count"
     gh_log = tmp / "gh_log.jsonl"
     gh_comments = tmp / "gh_comments.json"
@@ -610,6 +608,31 @@ def test_decide_hard_floor_beats_merge():
     gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
     merges_calls = [a for a in gh_calls if ("merges" in a[1] if len(a)>1 else False)]
     assert len(merges_calls) == 0
+
+def test_decide_markdown_headline_is_a_decision():
+    # Run 33905366422 (#691): Fable returned a full markdown report whose
+    # headline carried the verdict ("## hw-gate decide — PR #691:
+    # **merge-staging**") and review.py reported "no JSON object in assistant
+    # text", decision=None, decision_final=hold. The fallback must turn that
+    # into the verdict the seat wrote.
+    tmp = Path(tempfile.mkdtemp())
+    md = ("## hw-gate decide — PR #1: **merge-staging**\n\n"
+          "Sol's `needs-human` rested on one claim; I resolved it and closed the gaps on hardware.\n\n"
+          "### Verified\n\n- batteries pass on both lanes\n- the rewrite is behaviour-preserving across 20 turns\n")
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_decide(tmp, fable_text=md)
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "merge-staging", data
+    assert data["decision"]["decision"] == "merge-staging"
+    assert data["decision"]["markdown_fallback"] is True
+    assert data["merged"] is not None
+    # and a report without any verdict word still falls back to unavailable
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, *_ = _run_decide(tmp, fable_text="I investigated a lot and have findings but no headline.")
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "hold"
+    assert data["decision"] is None
+    assert data["fable_error"].startswith("omp decide: no JSON object in assistant text")
+    assert data["fable_raw"]["assistant_text_tail"]
 
 def test_decide_override_needs_human_to_merge():
     tmp = Path(tempfile.mkdtemp())
