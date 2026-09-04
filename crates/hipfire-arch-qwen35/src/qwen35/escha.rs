@@ -614,6 +614,47 @@ pub fn load_escha_dense_linear(
     })
 }
 
+/// Run one escha-coded dense linear.
+///
+/// The whole point of the format lives in these three steps, in this order:
+///
+/// ```text
+///   xh  = f16( H128(x * rin) * RS )      escha_h128_in
+///   mid = xh @ W                         plain GEMV on the decoded weight
+///   y   = H128(mid) * RS * rout + bias   escha_h128_out, then the bias
+/// ```
+///
+/// Skipping either H128 does NOT crash. It produces a full-rank, finite,
+/// entirely plausible activation that is simply wrong — which is why this is
+/// one function rather than three calls open-coded at ten call sites.
+///
+/// The bias goes on AFTER the output transform, per `ref.py::dense_linear`.
+/// Folding it in before the H128 would be rotated along with the signal and
+/// is the single easiest way to get this silently wrong.
+///
+/// `xh` and `mid` are caller-owned scratch so a layer can reuse one pair
+/// across its projections instead of allocating per call.
+pub fn escha_dense_linear_forward(
+    gpu: &mut Gpu,
+    lin: &EschaDenseLinear,
+    x: &GpuTensor,
+    xh: &GpuTensor,
+    mid: &GpuTensor,
+    y: &GpuTensor,
+) -> HipResult<()> {
+    gpu.escha_h128("escha_h128_in", x, &lin.rin, xh)?;
+    // Plain `weight_gemv`, NOT `weight_gemv_prerotated`. The escha stores
+    // decode to Q8_0/F16, neither of which wants an FWHT rotation, and `xh`
+    // is already H128-rotated — handing it to the prerotated path as well
+    // would rotate a rotated activation.
+    hipfire_runtime::llama::weight_gemv(gpu, &lin.w, xh, mid)?;
+    gpu.escha_h128("escha_h128_out", mid, &lin.rout, y)?;
+    if let Some(b) = lin.bias.as_ref() {
+        gpu.add_inplace_f32(y, b)?;
+    }
+    Ok(())
+}
+
 /// Upload a bias as f32 regardless of whether it was stored F16 or F32.
 fn read_bias_f32(gpu: &mut Gpu, qt: u8, data: &[u8], oc: usize) -> HipResult<GpuTensor> {
     let mut v = Vec::with_capacity(oc);
