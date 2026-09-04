@@ -283,62 +283,87 @@ fn sim_baseline_ids(logits: &[f32], vocab: usize, b: usize, k: usize) -> Vec<i32
 }
 
 /// Host simulation of the candidate kernel's selection: nwg single-wave
-/// workgroups take strided 16-row tiles; lane c keeps a running replacement
-/// top-K over rows tile*16 + 2j + (c>>4); thread 0 merges per-wg lists in
-/// ascending wg order with strict-> insertion.
+/// workgroups take strided 16-row tiles; lane `c` holds the column's even
+/// rows (row0 + 2j), lane `c+16` the odd rows (row0 + 2j + 1). Phase 2 lane l
+/// merges wgs w ≡ l (mod 32) in ascending w, parity half 0 then 1; lane 0
+/// then merges the 32 lane lists in ascending lane order. All merges use
+/// strict-> sorted insertion, mirroring the kernel exactly.
 fn sim_candidate_ids(logits: &[f32], vocab: usize, b: usize, k: usize) -> Vec<i32> {
     let m_tiles = vocab.div_ceil(16);
     let nwg = m_tiles.min(rdna_compute::mq4v2_topk_direct::TDK_WG_MAX);
+    let insert = |fv: &mut [f32], fi: &mut [i32], v: f32, i: i32| {
+        let mut ins = k;
+        for q in (0..k).rev() {
+            if v > fv[q] {
+                ins = q;
+            }
+        }
+        if ins < k {
+            for q in (ins + 1..k).rev() {
+                fv[q] = fv[q - 1];
+                fi[q] = fi[q - 1];
+            }
+            fv[ins] = v;
+            fi[ins] = i;
+        }
+    };
     let mut out = vec![0i32; b * k];
     for c in 0..b {
         let row = &logits[c * vocab..(c + 1) * vocab];
-        let mut lists: Vec<Vec<(f32, i32)>> = Vec::with_capacity(nwg);
+        // Per-(wg, parity) running replacement lists for this column.
+        let mut lists: Vec<Vec<(f32, i32)>> = vec![Vec::new(); nwg * 2];
         for w in 0..nwg {
-            let mut lv = vec![f32::NEG_INFINITY; k];
-            let mut li = vec![0i32; k];
-            let mut tile = w;
-            while tile < m_tiles {
-                let row0 = tile * 16;
-                for j in 0..8 {
-                    let r = row0 + 2 * j + (c >> 4);
-                    if r >= vocab {
-                        continue;
-                    }
-                    let v = row[r];
-                    let (mut mj, mut mv) = (0usize, lv[0]);
-                    for q in 1..k {
-                        if lv[q] < mv {
-                            mv = lv[q];
-                            mj = q;
+            for half in 0..2usize {
+                let mut lv = vec![f32::NEG_INFINITY; k];
+                let mut li = vec![0i32; k];
+                let mut tile = w;
+                while tile < m_tiles {
+                    let row0 = tile * 16;
+                    for j in 0..8 {
+                        let r = row0 + 2 * j + half;
+                        if r >= vocab {
+                            continue;
+                        }
+                        let v = row[r];
+                        let (mut mj, mut mv) = (0usize, lv[0]);
+                        for q in 1..k {
+                            if lv[q] < mv {
+                                mv = lv[q];
+                                mj = q;
+                            }
+                        }
+                        if v > mv {
+                            lv[mj] = v;
+                            li[mj] = r as i32;
                         }
                     }
-                    if v > mv {
-                        lv[mj] = v;
-                        li[mj] = r as i32;
+                    tile += nwg;
+                }
+                lists[w * 2 + half] = lv.into_iter().zip(li).collect();
+            }
+        }
+        // Lane-strided merge: lane l covers w ≡ l (mod 32), half ascending.
+        let mut lane_lists: Vec<Vec<(f32, i32)>> = vec![Vec::new(); 32];
+        for l in 0..32usize {
+            let mut fv = vec![f32::NEG_INFINITY; k];
+            let mut fi = vec![0i32; k];
+            let mut w = l;
+            while w < nwg {
+                for half in 0..2 {
+                    for &(v, i) in &lists[w * 2 + half] {
+                        insert(&mut fv, &mut fi, v, i);
                     }
                 }
-                tile += nwg;
+                w += 32;
             }
-            lists.push(lv.into_iter().zip(li).collect());
+            lane_lists[l] = fv.into_iter().zip(fi).collect();
         }
+        // Final: lane 0 merges lane lists in ascending lane order.
         let mut fv = vec![f32::NEG_INFINITY; k];
         let mut fi = vec![0i32; k];
-        for lst in &lists {
+        for lst in &lane_lists {
             for &(v, i) in lst {
-                let mut ins = k;
-                for q in (0..k).rev() {
-                    if v > fv[q] {
-                        ins = q;
-                    }
-                }
-                if ins < k {
-                    for q in (ins + 1..k).rev() {
-                        fv[q] = fv[q - 1];
-                        fi[q] = fi[q - 1];
-                    }
-                    fv[ins] = v;
-                    fi[ins] = i;
-                }
+                insert(&mut fv, &mut fi, v, i);
             }
         }
         out[c * k..(c + 1) * k].copy_from_slice(&fi);

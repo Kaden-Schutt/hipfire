@@ -64,9 +64,12 @@
 //          top_logp[c*K + j] = val - (max + log(se)).
 //
 // Scratch layout (one Raw alloc, element offsets):
-//   partials[wg * 16 * KMAX * 2]              : per-(wg,lane) top-K (f32,i32)
-//   partials[WGM*16*KMAX*2 + wg * 16 * 2]     : per-(wg,lane) online max/se
+//   partials[(wg * 32 + lane) * KMAX * 2]     : per-(wg,lane) top-K (f32,i32)
+//   partials[WGM*32*KMAX*2 + (wg*32+lane)*2]  : per-(wg,lane) online max/se
 //   ctl[0] = arrival counter, ctl[1] = generation (separate 8-byte alloc)
+// (A column's 16 tile rows split across lanes ml and ml+16 — even/odd row
+//  parity — so partials are per-LANE, 32 per workgroup, and phase 2 merges
+//  both halves of each column.)
 //
 // Numerics note: logits are bit-identical to the baseline ks-tier GEMM for
 // the same KW. sumexp partials use an fp32 online rescale tree, not the
@@ -228,14 +231,14 @@ mq4v2_lmhead_topk_direct_gfx1100(
 
     // ---- stage per-(wg, lane) partials -------------------------------------
     if (col_live) {
-        float* dst = partials + ((size_t)wg * 16 + (size_t)ml) * TDK_MAX_K * 2;
+        float* dst = partials + ((size_t)wg * 32 + (size_t)lane) * TDK_MAX_K * 2;
         #pragma unroll
         for (int j = 0; j < TDK_MAX_K; j++) {
             dst[j * 2 + 0] = run_val[j];
             *reinterpret_cast<int*>(&dst[j * 2 + 1]) = run_idx[j];
         }
-        float* onl = partials + (size_t)TDK_WG_MAX * 16 * TDK_MAX_K * 2
-                    + ((size_t)wg * 16 + (size_t)ml) * 2;
+        float* onl = partials + (size_t)TDK_WG_MAX * 32 * TDK_MAX_K * 2
+                    + ((size_t)wg * 32 + (size_t)lane) * 2;
         onl[0] = run_max;
         onl[1] = run_se;
     }
@@ -262,18 +265,77 @@ mq4v2_lmhead_topk_direct_gfx1100(
     const int col = wg;
     if (col >= N) return;
 
-    if (lane == 0) {
-        float f_val[TDK_MAX_K];
-        int f_idx[TDK_MAX_K];
+    // Lane l merges the per-(wg, lane) lists of column `col` for wgs
+    // w = l, l+32, ... in ascending w order, half-parity 0 then 1 (lane col
+    // holds even rows, lane col+16 odd rows). Private lists are built with
+    // the same strict-> sorted insertion as the oracle's serial merge.
+    float pv[TDK_MAX_K];
+    int pi[TDK_MAX_K];
+    #pragma unroll
+    for (int j = 0; j < TDK_MAX_K; j++) { pv[j] = -INFINITY; pi[j] = 0; }
+    float p_max = -INFINITY;
+    float p_se = 0.0f;
+    const float* onl_base = partials + (size_t)TDK_WG_MAX * 32 * TDK_MAX_K * 2;
+    for (int w = lane; w < nwg; w += 32) {
         #pragma unroll
-        for (int j = 0; j < TDK_MAX_K; j++) { f_val[j] = -INFINITY; f_idx[j] = 0; }
-        for (int w = 0; w < nwg; w++) {
-            const float* src = partials + ((size_t)w * 16 + (size_t)col) * TDK_MAX_K * 2;
+        for (int half = 0; half < 2; half++) {
+            const float* src =
+                partials + ((size_t)w * 32 + (size_t)(col + 16 * half)) * TDK_MAX_K * 2;
             #pragma unroll
             for (int j = 0; j < TDK_MAX_K; j++) {
                 if (j >= KTOP) break;
                 const float v = src[j * 2 + 0];
                 const int i = *reinterpret_cast<const int*>(&src[j * 2 + 1]);
+                int ins = KTOP;
+                #pragma unroll
+                for (int q = TDK_MAX_K - 1; q >= 0; q--) {
+                    if (q < KTOP && v > pv[q]) ins = q;
+                }
+                if (ins < KTOP) {
+                    for (int q = KTOP - 1; q > ins; q--) {
+                        pv[q] = pv[q - 1];
+                        pi[q] = pi[q - 1];
+                    }
+                    pv[ins] = v;
+                    pi[ins] = i;
+                }
+            }
+            const float wm = onl_base[((size_t)w * 32 + (size_t)(col + 16 * half)) * 2 + 0];
+            const float ws = onl_base[((size_t)w * 32 + (size_t)(col + 16 * half)) * 2 + 1];
+            if (wm > p_max) {
+                p_se = p_se * expf(p_max - wm) + ws;
+                p_max = wm;
+            } else if (wm > -INFINITY) {
+                // Skip empty (-inf, 0) partials: expf(-inf - -inf) is NaN.
+                p_se += ws * expf(wm - p_max);
+            }
+        }
+    }
+
+    __shared__ float s_red[32][TDK_MAX_K * 2];
+    __shared__ float s_onl[32][2];
+    #pragma unroll
+    for (int j = 0; j < TDK_MAX_K; j++) {
+        s_red[lane][j * 2 + 0] = pv[j];
+        *reinterpret_cast<int*>(&s_red[lane][j * 2 + 1]) = pi[j];
+    }
+    s_onl[lane][0] = p_max;
+    s_onl[lane][1] = p_se;
+    __syncwarp();
+
+    // Lane 0: final serial merge over the 32 lane lists in ascending lane
+    // order (deterministic; mirrors the harness simulation), then log_z.
+    if (lane == 0) {
+        float f_val[TDK_MAX_K];
+        int f_idx[TDK_MAX_K];
+        #pragma unroll
+        for (int j = 0; j < TDK_MAX_K; j++) { f_val[j] = -INFINITY; f_idx[j] = 0; }
+        for (int l = 0; l < 32; l++) {
+            #pragma unroll
+            for (int j = 0; j < TDK_MAX_K; j++) {
+                if (j >= KTOP) break;
+                const float v = s_red[l][j * 2 + 0];
+                const int i = *reinterpret_cast<const int*>(&s_red[l][j * 2 + 1]);
                 int ins = KTOP;
                 #pragma unroll
                 for (int q = TDK_MAX_K - 1; q >= 0; q--) {
@@ -289,20 +351,15 @@ mq4v2_lmhead_topk_direct_gfx1100(
                 }
             }
         }
-        // Row (max, sumexp) from the online partials, same ascending-wg order.
         float row_max = -INFINITY;
         float row_se = 0.0f;
-        const float* onl_base =
-            partials + (size_t)TDK_WG_MAX * 16 * TDK_MAX_K * 2;
-        for (int w = 0; w < nwg; w++) {
-            const float wm = onl_base[((size_t)w * 16 + (size_t)col) * 2 + 0];
-            const float ws = onl_base[((size_t)w * 16 + (size_t)col) * 2 + 1];
+        for (int l = 0; l < 32; l++) {
+            const float wm = s_onl[l][0];
+            const float ws = s_onl[l][1];
             if (wm > row_max) {
                 row_se = row_se * expf(row_max - wm) + ws;
                 row_max = wm;
             } else if (wm > -INFINITY) {
-                // Skip empty-workgroup (-inf, 0) partials: expf(-inf - -inf)
-                // would be NaN and 0 * NaN poisons the row sum.
                 row_se += ws * expf(wm - row_max);
             }
         }
