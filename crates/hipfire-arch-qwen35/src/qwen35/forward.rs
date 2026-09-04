@@ -907,6 +907,19 @@ pub struct Qwen35Scratch {
     pub gate_ffn: GpuTensor,   // [hidden_dim]
     pub up: GpuTensor,         // [hidden_dim]
     pub ffn_hidden: GpuTensor, // [hidden_dim]
+    /// Escha trellis scratch: the H128-rotated activation `xh` feeding one
+    /// projection's GEMV. Sized to the LARGEST `ic` any projection uses
+    /// (hidden_dim, for down_proj) so one buffer serves them all.
+    ///
+    /// Separate from `x`/`tmp` because each escha projection rotates the SAME
+    /// input with its OWN `rin` — the whole reason the fused MQ paths cannot
+    /// serve a trellis layer. Reusing the layer input here would corrupt the
+    /// next projection's source.
+    ///
+    /// `mid` needs no buffer: `escha_h128_out_batched` stages its 128-lane
+    /// block into LDS and syncs before writing, so it is safe in place and
+    /// the projection's own output tensor serves as both.
+    pub escha_xh: GpuTensor, // [max(hidden_dim, dim)]
     pub ffn_out: GpuTensor,    // [dim]
 
     // Sampling
@@ -1079,6 +1092,9 @@ impl Qwen35Scratch {
             gate_ffn: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
             up: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
             ffn_hidden: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
+            escha_xh: tracked_tensor!(
+                gpu.alloc_tensor(&[config.hidden_dim.max(config.dim)], DType::F32)
+            ),
             ffn_out: tracked_tensor!(gpu.alloc_tensor(&[dim], DType::F32)),
 
             logits: tracked_tensor!(gpu.alloc_tensor(&[config.vocab_size], DType::F32)),

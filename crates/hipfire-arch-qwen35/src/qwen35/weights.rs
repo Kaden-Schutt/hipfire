@@ -44,6 +44,25 @@ pub struct DeltaNetLayerWeights {
     /// other model, which is why they are Option rather than a zero vector:
     /// a zero add per projection per layer is real work for no effect.
     pub biases: Option<DeltaNetBiases>,
+    /// Escha trellis metadata, one per coded projection. `Some` only when the
+    /// weights are `Escha2T16`/`Escha3T16`, which is the signal this layer
+    /// must bypass the fused MQ paths entirely — each projection needs its
+    /// own rin-rotated activation, so FusedQkvza/gate_up have nothing to
+    /// share.
+    pub escha: Option<DeltaNetEscha>,
+}
+
+/// See `DeltaNetLayerWeights::escha`.
+pub struct DeltaNetEscha {
+    pub qkv: crate::qwen35::escha::EschaProj,
+    pub z: crate::qwen35::escha::EschaProj,
+    pub o: crate::qwen35::escha::EschaProj,
+    pub gate: crate::qwen35::escha::EschaProj,
+    pub up: crate::qwen35::escha::EschaProj,
+    pub down: crate::qwen35::escha::EschaProj,
+    /// `slots`-long run of zeros for the indexed GEMV; sized for the largest
+    /// batch the model was built for so decode (slots=1) reads a prefix.
+    pub ids: GpuTensor,
 }
 
 /// See `DeltaNetLayerWeights::biases`. Each is `[oc]` f32, applied to the
@@ -73,6 +92,20 @@ pub struct FullAttnLayerWeights {
     pub w_down: WeightTensor,
     /// See `DeltaNetLayerWeights::biases`.
     pub biases: Option<FullAttnBiases>,
+    /// See `DeltaNetLayerWeights::escha`.
+    pub escha: Option<FullAttnEscha>,
+}
+
+/// See `DeltaNetLayerWeights::escha`.
+pub struct FullAttnEscha {
+    pub q: crate::qwen35::escha::EschaProj,
+    pub k: crate::qwen35::escha::EschaProj,
+    pub v: crate::qwen35::escha::EschaProj,
+    pub o: crate::qwen35::escha::EschaProj,
+    pub gate: crate::qwen35::escha::EschaProj,
+    pub up: crate::qwen35::escha::EschaProj,
+    pub down: crate::qwen35::escha::EschaProj,
+    pub ids: GpuTensor,
 }
 
 /// See `DeltaNetLayerWeights::biases`.

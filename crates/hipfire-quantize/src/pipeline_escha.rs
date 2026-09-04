@@ -246,6 +246,13 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             let s1 = crate::quant_fwht::gen_fwht_signs(42, 256);
             let s2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
             let (bytes, qt_f) = match fold_fmt {
+                DenseFormat::F16Fold => {
+                    let mut b = Vec::with_capacity(folded.len() * 2);
+                    for v in &folded {
+                        b.extend_from_slice(&hipfire_quantize::float16::f32_to_f16(*v).to_le_bytes());
+                    }
+                    (b, QuantType::F16)
+                }
                 DenseFormat::Mq4V2 => (
                     crate::quant_fwht::quantize_mq4g256v2(&folded, oc_f, ic_f, &s1, &s2),
                     QuantType::MQ4G256V2,
@@ -357,7 +364,9 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                 let is_embed = prefix.contains("embed_tokens") || prefix.contains("token_embd");
                 let fmt = if is_embed { DenseFormat::Q8_0 } else { dense_format_for(prefix) };
                 let (data, qt, gs) = match fmt {
-                    DenseFormat::Q8_0 => (
+                    // F16Fold only ever reaches the FOLD branch above; the
+                    // non-escha dense tensors it never touches stay Q8_0.
+                    DenseFormat::F16Fold | DenseFormat::Q8_0 => (
                         int8_rows_to_q8_0(&w8, &as_u16(sd), oc, ic)?,
                         QuantType::Q8F16,
                         32u32,
@@ -615,6 +624,7 @@ pub(crate) enum DenseFormat {
     /// MQ4G256V2 — the container the comparable mq4 SKU uses for exactly
     /// these tensors, and the one with the widest kernel coverage.
     Mq4V2,
+    F16Fold,
 }
 
 /// `HIPFIRE_ESCHA_DENSE=mq6` down-quantises every non-embedding int8 tensor.
@@ -693,6 +703,12 @@ fn fold_format() -> Option<DenseFormat> {
     match std::env::var("HIPFIRE_ESCHA_FOLD").ok().as_deref() {
         Some("mq6") => Some(DenseFormat::Mq6),
         Some("mq4v2") => Some(DenseFormat::Mq4V2),
+        // `f16` folds WITHOUT re-quantising. It is an ATTRIBUTION tool, not a
+        // shipping format (~50 GB): it isolates escha's own 2-bit quality by
+        // removing the fold's second quantisation step, so a gap against a
+        // native MQ6 baseline can be split between "escha's codec" and "my
+        // re-quantisation".
+        Some("f16") => Some(DenseFormat::F16Fold),
         _ => None,
     }
 }

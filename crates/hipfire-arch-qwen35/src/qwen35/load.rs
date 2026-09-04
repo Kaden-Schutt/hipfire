@@ -3692,6 +3692,7 @@ pub fn load_weights_dense_tp_rank(
                             w_up: w_up_opt.take().unwrap(),
                             w_down: w_down_opt.take().unwrap(),
                             biases: None,
+                            escha: None,
                         }))
                     })();
                     match layer_res {
@@ -3889,6 +3890,7 @@ pub fn load_weights_dense_tp_rank(
                             w_up: w_up_opt.take().unwrap(),
                             w_down: w_down_opt.take().unwrap(),
                             biases: None,
+                            escha: None,
                         }))
                     })();
                     match layer_res {
