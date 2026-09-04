@@ -312,6 +312,38 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        42 | 43 => {
+            // Escha-W2 trellis code, kept VERBATIM — the 2-bit/3-bit stream is
+            // decoded inside the GEMV, never at load. That is the whole point
+            // of the format: an 11.16 GB resident 27B instead of 22.63 GB
+            // folded, at better quality (PPL 11.8654 vs 13.6957).
+            //
+            // Opaque raw buffer like the MQ arms above, but the resemblance
+            // ends there: an escha weight is NOT self-contained. It needs its
+            // `escha_rin_eff`/`escha_rout_eff` vectors and an H128 on both
+            // sides of the GEMV, which is why `EschaDenseLinear` exists and
+            // why the fused MQ paths (FusedQkv/FusedQkvza/gate_up) CANNOT
+            // consume one — each projection needs its own rin-rotated
+            // activation. A layer holding these must route through
+            // `escha::escha_dense_linear_forward`.
+            //
+            // `m`/`k` are the logical output/input dims; the buffer length is
+            // the tile-packed code, not m*k of anything.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: if quant_type == 42 {
+                    DType::Escha2T16
+                } else {
+                    DType::Escha3T16
+                },
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         31 => {
             // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw).
             // Opaque raw buffer, same pattern as MQ4(13)/MQ6(15); the GEMV
