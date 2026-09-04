@@ -5,14 +5,16 @@
 #include <hip/hip_runtime.h>
 
 // Batched gfx1100 Qwen3.5 full-attention preparation. Generalizes the
-// single-token qwen35_fa_prep_gfx1100 arithmetic to a [18, N] grid: the first
-// 16 workgroup-rows reproduce deinterleave_f32_batched plus one 256-wide
-// rmsnorm_f32 Q row each, the final two reproduce the K rmsnorm rows, and
-// each head then applies the same partial half-split RoPE locally from the
-// per-row positions buffer. There are no cross-workgroup dependencies.
+// single-token qwen35_fa_prep_gfx1100 arithmetic to a [NQ+NK, N] grid: the
+// first NQ workgroup-rows reproduce deinterleave_f32_batched plus one
+// 256-wide rmsnorm_f32 Q row each, the final NK reproduce the K rmsnorm
+// rows, and each head then applies the same partial half-split RoPE locally
+// from the per-row positions buffer. There are no cross-workgroup
+// dependencies.
 //
-// Fixed admitted shape: Q=16 heads, K=2 heads, head_dim=256, n_rot=64.
-// Grid: [18, batch_size, 1]. Block: [256, 1, 1]. Static LDS: 1 KiB.
+// Admitted shapes: Q heads NQ in {16, 24} (kernel arg, uniform per grid so
+// the branch is free), K heads NK from the grid x extent, head_dim=256,
+// n_rot=64. Grid: [NQ+NK, batch_size, 1]. Block: [256, 1, 1]. Static LDS: 1 KiB.
 //
 // Bit-exactness vs the four-launch sequence it replaces:
 // - gate/Q values come from the same interleaved words deinterleave reads;
@@ -23,20 +25,20 @@
 //   and positions[b] + pos_offset phase, per (row, head, i).
 extern "C" __launch_bounds__(256, 1)
 __global__ void qwen35_fa_prep_batched_gfx1100(
-    const float* __restrict__ q_interleaved, // [N x 16 x 256 x 2]
-    float* __restrict__ q,                   // [N x 16 x 256]
-    float* __restrict__ gate,                // [N x 16 x 256]
-    float* __restrict__ k,                   // [N x 2 x 256], in-place in/out
+    const float* __restrict__ q_interleaved, // [N x NQ x 256 x 2]
+    float* __restrict__ q,                   // [N x NQ x 256]
+    float* __restrict__ gate,                // [N x NQ x 256]
+    float* __restrict__ k,                   // [N x NK x 256], in-place in/out
     const float* __restrict__ q_weight,      // [256]
     const float* __restrict__ k_weight,      // [256]
     const int* __restrict__ positions,       // [N] physical KV slots
     float eps,
     float freq_base,
     int pos_offset, // added to positions[b] for the RoPE angle only
+    int n_q_heads, // Q-head split point (16 or 24); K heads fill the grid rest
+    int n_kv_heads, // K-head count (2 or 4); guards the grid x extent
     int batch_size)
 {
-    constexpr int NQ = 16;
-    constexpr int NK = 2;
     constexpr int HD = 256;
     constexpr int NROT = 64;
     constexpr int HALF = NROT / 2;
@@ -45,24 +47,24 @@ __global__ void qwen35_fa_prep_batched_gfx1100(
 
     const int head_slot = blockIdx.x;
     const int b = blockIdx.y;
-    if (head_slot >= NQ + NK || b >= batch_size) return;
+    if (head_slot >= n_q_heads + n_kv_heads || b >= batch_size) return;
     const int tid = threadIdx.x;
-    const bool is_q = head_slot < NQ;
-    const int head = is_q ? head_slot : head_slot - NQ;
+    const bool is_q = head_slot < n_q_heads;
+    const int head = is_q ? head_slot : head_slot - n_q_heads;
 
     float v;
     const float* weight;
     float* out;
     if (is_q) {
-        const long long row = (long long)b * NQ * HD + (long long)head * HD;
+        const long long row = (long long)b * n_q_heads * HD + (long long)head * HD;
         const float* src_row =
-            q_interleaved + (long long)b * NQ * HD * 2 + (long long)head * HD * 2;
+            q_interleaved + (long long)b * n_q_heads * HD * 2 + (long long)head * HD * 2;
         v = src_row[tid];
         gate[row + tid] = src_row[tid + HD];
         weight = q_weight;
         out = q + row;
     } else {
-        const long long row = (long long)b * NK * HD + (long long)head * HD;
+        const long long row = (long long)b * n_kv_heads * HD + (long long)head * HD;
         out = k + row;
         v = out[tid];
         weight = k_weight;

@@ -5603,9 +5603,12 @@ fn batch_chunk_full_attn_prepare(
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
-    // same RoPE expression/phase); the triattn tap needs pre-RoPE Q, legacy
-    // interleaved RoPE needs its own kernel, and every other shape/arch/ctx
-    // keeps the old path. HIPFIRE_FA_BATCH_FUSE_OFF=1 restores it byte-for-byte.
+    // same RoPE expression/phase, explicit old-TU FMA formation); the triattn
+    // tap needs pre-RoPE Q, legacy interleaved RoPE needs its own kernel, and
+    // every other shape/arch/ctx keeps the old path.
+    // HIPFIRE_FA_BATCH_FUSE_OFF=1 restores it byte-for-byte.
+    // Admitted geometries are 16Q/2K and 24Q/4K (Qwen3.8-27B FA is 24/4);
+    // HD must be 256 and n_rot 64.
     let fa_prep_n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     // 39aa358: in DDTree verify, rotate at DEPTH positions; KV writes below
     // still use flat physical slots. The fused kernel takes the same buffer
@@ -5615,15 +5618,17 @@ fn batch_chunk_full_attn_prepare(
     } else {
         &pbs.positions
     };
+    let fa_prep_shape_ok = matches!(
+        (config.n_heads, config.n_kv_heads),
+        (16, 2) | (24, 4)
+    ) && config.head_dim == 256
+        && fa_prep_n_rot == 64;
     let fa_prep_fused_ok = fusion == DflashFusionCtx::ChainVerify
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.fa_batch_fuse_off
         && !gpu.flags.rope_interleaved_legacy
         && !hipfire_runtime::triattn::tap_enabled()
-        && config.n_heads == 16
-        && config.n_kv_heads == 2
-        && config.head_dim == 256
-        && fa_prep_n_rot == 64
+        && fa_prep_shape_ok
         && n >= 1;
     if fa_prep_fused_ok {
         gpu.qwen35_fa_prep_batched_gfx1100(
@@ -5637,6 +5642,8 @@ fn batch_chunk_full_attn_prepare(
             config.norm_eps,
             config.rope_theta,
             kv_cache.compact_offset as i32,
+            config.n_heads,
+            config.n_kv_heads,
             n,
         )?;
     } else {
