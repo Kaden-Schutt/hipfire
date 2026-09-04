@@ -1743,60 +1743,92 @@ impl GdnTape {
                 _ => unreachable!("LA layer type mismatch in replay_gdn"),
             };
 
-            // 1. conv1d + SiLU + split — advances conv_state, writes
-            //    (q_raw, k_raw, v) into scratch.
-            gpu.conv1d_silu_split_f32_n(
-                &self.q_raw_scratch,
-                &self.k_raw_scratch,
-                &self.v_scratch,
-                &self.qkv_bufs[la_idx],
-                conv_weight,
-                &dn_state.conv_states[la_idx],
-                k_dim,
-                v_dim,
-                n_steps,
-            )?;
-
-            // 2. L2 norm(Q) + L2 norm(K) + scale(Q).
-            gpu.fused_qk_l2_norm_scale_f32_batched(
-                &self.q_raw_scratch,
-                &self.k_raw_scratch,
-                n_key_heads,
-                hd,
-                1.0 / (hd as f32).sqrt(),
-                config.norm_eps,
-                n_steps,
-            )?;
-
-            // 3. Repeat-interleave if GQA.
-            if n_key_heads < n_v_heads {
-                let ratio = n_v_heads / n_key_heads;
-                gpu.repeat_interleave_qk_f32_batched(
+            // S5-gdn-pre-tape-fusion fast path: one launch for conv1d + QK
+            // norm/interleave from the taped raw qkv. The launcher enforces
+            // the exact route (gfx1100, hd == 128, consistent dims,
+            // 1 <= n_steps <= 16); any decline runs the pre-change steps
+            // 1-3 below launch-for-launch. q_raw/k_raw keep the old
+            // in-place-norm postcondition (normed values), so step 4 and
+            // every later consumer observe identical bytes.
+            let fused = if gpu.flags.gdn_pre_fuse_off {
+                false
+            } else {
+                gpu.dflash_gdn_pre_replay_gfx1100(
+                    &self.qkv_bufs[la_idx],
+                    conv_weight,
+                    &dn_state.conv_states[la_idx],
                     &self.q_raw_scratch,
                     &self.k_raw_scratch,
+                    &self.v_scratch,
                     &self.q_scratch,
                     &self.k_scratch,
+                    n_v_heads,
                     n_key_heads,
-                    ratio,
                     hd,
+                    k_dim,
+                    v_dim,
+                    self.qkv_dim,
+                    n_steps,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                )?
+            };
+            if !fused {
+                // 1. conv1d + SiLU + split — advances conv_state, writes
+                //    (q_raw, k_raw, v) into scratch.
+                gpu.conv1d_silu_split_f32_n(
+                    &self.q_raw_scratch,
+                    &self.k_raw_scratch,
+                    &self.v_scratch,
+                    &self.qkv_bufs[la_idx],
+                    conv_weight,
+                    &dn_state.conv_states[la_idx],
+                    k_dim,
+                    v_dim,
                     n_steps,
                 )?;
-            } else {
-                let bytes = n_steps * k_dim * 4;
-                gpu.hip.memcpy_dtod_at(
-                    &self.q_scratch.buf,
-                    0,
-                    &self.q_raw_scratch.buf,
-                    0,
-                    bytes,
+
+                // 2. L2 norm(Q) + L2 norm(K) + scale(Q).
+                gpu.fused_qk_l2_norm_scale_f32_batched(
+                    &self.q_raw_scratch,
+                    &self.k_raw_scratch,
+                    n_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                    n_steps,
                 )?;
-                gpu.hip.memcpy_dtod_at(
-                    &self.k_scratch.buf,
-                    0,
-                    &self.k_raw_scratch.buf,
-                    0,
-                    bytes,
-                )?;
+
+                // 3. Repeat-interleave if GQA.
+                if n_key_heads < n_v_heads {
+                    let ratio = n_v_heads / n_key_heads;
+                    gpu.repeat_interleave_qk_f32_batched(
+                        &self.q_raw_scratch,
+                        &self.k_raw_scratch,
+                        &self.q_scratch,
+                        &self.k_scratch,
+                        n_key_heads,
+                        ratio,
+                        hd,
+                        n_steps,
+                    )?;
+                } else {
+                    let bytes = n_steps * k_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &self.q_scratch.buf,
+                        0,
+                        &self.q_raw_scratch.buf,
+                        0,
+                        bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &self.k_scratch.buf,
+                        0,
+                        &self.k_raw_scratch.buf,
+                        0,
+                        bytes,
+                    )?;
+                }
             }
 
             // 4. GDN recurrence — advances S_state.
