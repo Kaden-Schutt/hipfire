@@ -42,3 +42,8 @@ required-features = ["deltanet"]
 name = "qwen_dense_tp2_parity"
 path = "examples/qwen_dense_tp2_parity.rs"
 required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_gdn_pre_gfx1100"
+path = "examples/test_dflash_gdn_pre_gfx1100.rs"
+required-features = ["deltanet"]
