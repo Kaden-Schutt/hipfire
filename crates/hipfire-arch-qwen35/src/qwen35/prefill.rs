@@ -1490,6 +1490,14 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32
+        // Escha-W2 trellis codes. Admissible NOT because any batched GEMM can
+        // read them — none can — but because the escha arms added to the LA
+        // and FFN chunk functions intercept BEFORE those matchers and run
+        // `EschaProj::forward` for the whole batch instead. Refusing here
+        // would drop the layer to the per-token path, which is what made a
+        // native 27B prefill at 11.7 tok/s against a decode of 11.0: prefill
+        // was doing decode's work once per token.
+        | DType::Escha2T16 | DType::Escha3T16
     );
     if always_ok {
         return true;
@@ -4553,7 +4561,24 @@ pub(crate) fn batch_chunk_delta_net_attn(
     }
 
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-    if is_6bit
+    //
+    // ESCHA FIRST: a trellis layer bypasses every fused arm below. Each
+    // projection rotates the same normed input with its OWN rin, so the fused
+    // kernels have nothing to share and cannot read a trellis code. `is_mq` is
+    // false for Escha2T16/3T16, so the rmsnorm above already left the normed
+    // (unrotated) activation in `x_rot_batch` — exactly what escha wants,
+    // since it applies its own H128 per projection.
+    //
+    // `in_proj_a`/`in_proj_b` stay on the ordinary batched GEMM: escha's
+    // `ignore` list leaves them uncoded.
+    if let Some(e) = layer.escha.as_ref() {
+        e.qkv.forward(gpu, &layer.wqkv, &e.ids, &pbs.x_rot_batch,
+                      &pbs.escha_xh_batch, &pbs.dn_qkv_batch, &pbs.dn_qkv_batch, n)?;
+        e.z.forward(gpu, &layer.wz, &e.ids, &pbs.x_rot_batch,
+                    &pbs.escha_xh_batch, &pbs.dn_z_batch, &pbs.dn_z_batch, n)?;
+        batched_gemm_single_weight(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
+        batched_gemm_single_weight(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
+    } else if is_6bit
         && all_same_dtype(&[
             layer.wqkv.gpu_dtype,
             layer.wz.gpu_dtype,
@@ -5145,6 +5170,16 @@ pub(crate) fn batch_chunk_delta_net_attn(
     } else {
         &pbs.dn_normed_batch
     };
+    if let Some(e) = layer.escha.as_ref() {
+        // Trellis wo: project into the ffn scratch, then accumulate into the
+        // residual. The fused epilogue folds those together but cannot read a
+        // trellis code; the split add is exact, both terms being plain f32.
+        // Input is the UNROTATED gated-norm output: escha applies its own
+        // H128, so `dn_normed_batch` and not the MQ-rotated variant.
+        e.o.forward(gpu, &layer.wo, &e.ids, &pbs.dn_normed_batch,
+                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+    } else {
     dispatch_batched_gemm_epilogue(
         gpu,
         pbs,
@@ -5155,6 +5190,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+    }
 
     // out_proj's bias lands on the residual stream. After the residual add is
     // the same value as before it — both additive.
@@ -5178,6 +5214,35 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
+    // ── ESCHA TRELLIS FFN ───────────────────────────────────────────────
+    // Whole FFN in one branch: plain rmsnorm (escha applies its own H128, so a
+    // pre-rotated input would be rotated twice), gate and up as separate
+    // trellis GEMVs, SwiGLU, then down accumulated into the residual. The
+    // fused gate_up kernel cannot serve this — the two projections have
+    // different rin and it could not read a trellis code regardless.
+    if let Some(e) = layer.escha.as_ref() {
+        gpu.rmsnorm_batched(
+            &pbs.x_batch, &layer.ffn_norm, &pbs.x_norm_batch, n, layer.w_gate.k,
+            config.norm_eps,
+        )?;
+        e.gate.forward(gpu, &layer.w_gate, &e.ids, &pbs.x_norm_batch,
+                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n)?;
+        e.up.forward(gpu, &layer.w_up, &e.ids, &pbs.x_norm_batch,
+                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+            gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+        }
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        e.down.forward(gpu, &layer.w_down, &e.ids, &pbs.ffn_hidden_batch,
+                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+        }
+        return Ok(());
+    }
+
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
         layer.w_gate.gpu_dtype,
@@ -5485,7 +5550,20 @@ pub(crate) fn batch_chunk_full_attn_attn(
     }
 
     // 2. Batched 3-way QKV projection (wq+wk+wv).
-    if qkv_is_6bit && qkv_same_dtype {
+    // ESCHA FIRST: a trellis layer takes none of the arms below — they cannot
+    // read a trellis code, and each projection needs its own rin-rotated
+    // activation so there is nothing for a fused q/k/v kernel to share.
+    // `qkv_is_mq` is false for Escha2T16/3T16, so the rmsnorm above left the
+    // normed (unrotated) activation in `x_rot_batch`, which is what escha
+    // wants.
+    if let Some(e) = layer.escha.as_ref() {
+        e.q.forward(gpu, &layer.wq, &e.ids, &pbs.x_rot_batch,
+                    &pbs.escha_xh_batch, &pbs.fa_q_full_batch, &pbs.fa_q_full_batch, n)?;
+        e.k.forward(gpu, &layer.wk, &e.ids, &pbs.x_rot_batch,
+                    &pbs.escha_xh_batch, &pbs.fa_k_batch, &pbs.fa_k_batch, n)?;
+        e.v.forward(gpu, &layer.wv, &e.ids, &pbs.x_rot_batch,
+                    &pbs.escha_xh_batch, &pbs.fa_v_batch, &pbs.fa_v_batch, n)?;
+    } else if qkv_is_6bit && qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvHfq6G256,
@@ -5847,6 +5925,14 @@ pub(crate) fn batch_chunk_full_attn_attn(
     } else {
         &pbs.fa_attn_out_batch
     };
+    if let Some(e) = layer.escha.as_ref() {
+        // Trellis o_proj from the UNROTATED attention output, then accumulate.
+        // The fused epilogue is SKIPPED, not supplemented: it writes into the
+        // residual itself, so running both would count this projection twice.
+        e.o.forward(gpu, &layer.wo, &e.ids, &pbs.fa_attn_out_batch,
+                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+    } else {
     dispatch_batched_gemm_epilogue(
         gpu,
         pbs,
@@ -5857,6 +5943,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+    }
 
     // o_proj's bias, onto the residual stream — additive, so after the
     // residual add is the same value as before it.
@@ -5880,6 +5967,35 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
+    // ── ESCHA TRELLIS FFN ───────────────────────────────────────────────
+    // Whole FFN in one branch: plain rmsnorm (escha applies its own H128, so a
+    // pre-rotated input would be rotated twice), gate and up as separate
+    // trellis GEMVs, SwiGLU, then down accumulated into the residual. The
+    // fused gate_up kernel cannot serve this — the two projections have
+    // different rin and it could not read a trellis code regardless.
+    if let Some(e) = layer.escha.as_ref() {
+        gpu.rmsnorm_batched(
+            &pbs.x_batch, &layer.ffn_norm, &pbs.x_norm_batch, n, layer.w_gate.k,
+            config.norm_eps,
+        )?;
+        e.gate.forward(gpu, &layer.w_gate, &e.ids, &pbs.x_norm_batch,
+                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n)?;
+        e.up.forward(gpu, &layer.w_up, &e.ids, &pbs.x_norm_batch,
+                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+            gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+        }
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        e.down.forward(gpu, &layer.w_down, &e.ids, &pbs.ffn_hidden_batch,
+                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n)?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+        }
+        return Ok(());
+    }
+
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
     let fa_ffn_is_mq = matches!(
@@ -8312,6 +8428,23 @@ fn batched_gemm_single_weight(
     n: usize,
 ) -> HipResult<()> {
     match w.gpu_dtype {
+        // F16: `linear_attn.in_proj_a`/`in_proj_b` on the escha exports, which
+        // escha's `ignore` list leaves uncoded while every sibling projection
+        // is a trellis code. `plain_gemm_key_for` already sanctions this exact
+        // mapping; this match simply had no arm for it, which surfaced as
+        // "weight dtype F16 has no single-weight batched dispatch yet" the
+        // moment escha layers were admitted to batched prefill.
+        DType::F16 => run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+        ),
         DType::MQ4G256 | DType::HFQ4G256 => run_plain_gemm_key(
             gpu,
             hipfire_dispatch::types::KernelKey::GemmHfq4G256,

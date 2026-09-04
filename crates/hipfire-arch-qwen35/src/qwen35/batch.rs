@@ -63,6 +63,18 @@ pub struct PrefillBatchScratch {
     pub up_batch: GpuTensor,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
+    /// Escha trellis scratch: the H128-rotated activations feeding one
+    /// projection's batched GEMV, `[max_batch, max(hidden_dim, dim)]`.
+    ///
+    /// Cannot share `x_rot_batch` or `ffn_hidden_batch`: each escha projection
+    /// rotates the SAME input with its OWN `rin`, and for `down_proj` the
+    /// ffn hidden state IS the input, so writing xh there would destroy it.
+    pub escha_xh_batch: GpuTensor,
+    /// Escha projection output before it is accumulated into the residual,
+    /// `[max_batch, dim]`. The fused epilogue writes straight into the
+    /// residual; the trellis GEMV has no residual variant, so out_proj and
+    /// down_proj land here first.
+    pub escha_y_batch: GpuTensor,
 
     // FWHT-rotated dn_normed [N × v_dim] feeding wo for MQ4 weights.
     // Decode path handles this via an internal mq_x_rot scratch inside
@@ -262,6 +274,8 @@ impl PrefillBatchScratch {
             gate_ffn_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             up_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            escha_xh_batch: alloc!(&[max_batch * hidden_dim.max(dim)], DType::F32),
+            escha_y_batch: alloc!(&[max_batch * dim], DType::F32),
             dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
