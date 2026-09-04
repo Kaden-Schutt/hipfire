@@ -8042,6 +8042,18 @@ fn run_fa_layer_body(
         weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
     }
 
+    // Escha q/k/v biases. THIS is the path the 27B's full-attention layers
+    // actually take: `fa_batched_ok` refuses MQ6 weights, so the batched arm
+    // never runs and `batch_chunk_full_attn_fallback` walks tokens through
+    // here instead. Adding them to `batch_chunk_full_attn_attn` alone moved
+    // PPL by exactly zero, which is how the wrong route was caught.
+    // Must precede the Q/gate deinterleave and q_norm.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.fa_q_full, &b.q, 1, b.q.numel())?;
+        gpu.bias_add_f32(&s.fa_k, &b.k, 1, b.k.numel())?;
+        gpu.bias_add_f32(&s.fa_v, &b.v, 1, b.v.numel())?;
+    }
+
     gpu.deinterleave_f32(
         &s.fa_q_full,
         &s.fa_q,
@@ -8146,6 +8158,12 @@ fn run_fa_layer_body(
             }],
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
+
+    // o_proj bias onto the residual stream (additive, so order with the
+    // residual add does not matter).
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.x, &b.o, 1, b.o.numel())?;
     }
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
@@ -8253,7 +8271,17 @@ fn run_fa_layer_body(
         weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
     }
+
+    // gate/up biases BEFORE the SwiGLU that `weight_gemv_swiglu_residual`
+    // applies; after it would be a different function.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.gate_ffn, &b.gate, 1, b.gate.numel())?;
+        gpu.bias_add_f32(&s.up, &b.up, 1, b.up.numel())?;
+    }
     weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.x, &b.down, 1, b.down.numel())?;
+    }
 
     Ok(())
 }
