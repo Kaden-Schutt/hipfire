@@ -165,9 +165,18 @@ impl Gpu {
         let x_f16_ptr = self.ensure_fp16_x(x_f32, n * k)?;
 
         let m_tiles = m.div_ceil(16);
+        // HIPFIRE_TDK_WGS=<n> debug/acceptance knob: caps the grid below
+        // TDK_WG_MAX (occupancy proof only ever needs grid <= 1344, so any
+        // smaller grid is trivially resident). Lets the harness sweep
+        // phase-1 parallelism vs barrier/phase-2 tail.
+        let cap: usize = std::env::var("HIPFIRE_TDK_WGS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|c: usize| c.clamp(1, TDK_WG_MAX))
+            .unwrap_or(TDK_WG_MAX);
         // Host-computed resident grid: statically bounded by
         // __launch_bounds__(32, 14) → 14 blocks/CU × 96 CU = 1344.
-        let wgs = m_tiles.min(TDK_WG_MAX) as u32;
+        let wgs = m_tiles.min(cap) as u32;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;

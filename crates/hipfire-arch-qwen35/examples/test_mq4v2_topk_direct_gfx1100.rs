@@ -606,6 +606,29 @@ fn main() {
     }
     sync(&gpu);
 
+    // Grid-size sweep: phase-1 parallelism vs barrier/phase-2 tail.
+    for &cap in &[96usize, 192, 384, 768, 1344] {
+        std::env::set_var("HIPFIRE_TDK_WGS", cap.to_string());
+        for _ in 0..WARMUP {
+            gpu.mq4v2_lmhead_topk_direct_gfx1100(
+                &d_a, &d_x, &partials, &ctl, &d_idx, &d_val, m, k_dim, b, ktop,
+            )
+            .unwrap();
+        }
+        sync(&gpu);
+        let mut ss: Vec<f64> = Vec::new();
+        for _ in 0..SAMPLES {
+            ss.push(time_batch(&mut gpu, &mut |g: &mut Gpu| {
+                g.mq4v2_lmhead_topk_direct_gfx1100(
+                    &d_a, &d_x, &partials, &ctl, &d_idx, &d_val, m, k_dim, b, ktop,
+                )
+                .unwrap();
+            }));
+        }
+        println!("sweep wgs={cap:>4} fused med={:.1} min={:.1}", median(ss.clone()), ss.iter().fold(f64::INFINITY, |a, &x| a.min(x)));
+    }
+    std::env::remove_var("HIPFIRE_TDK_WGS");
+
     let mut s_base: Vec<f64> = Vec::new();
     let mut s_gemm: Vec<f64> = Vec::new();
     let mut s_cand: Vec<f64> = Vec::new();
