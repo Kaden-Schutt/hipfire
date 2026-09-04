@@ -1488,6 +1488,197 @@ mod tests {
         legacy.free_gpu(&mut gpu);
     }
 
+    /// #666 G3 pinned-fixture lifecycle evidence.
+    ///
+    /// On the same tracker fixture as the parity oracle: production load
+    /// through the manifest route, decode, existing-reset smoke (decode
+    /// again after `reset_session_state` with identical output), unload via
+    /// the sole consuming owner (`ArchModel::free_gpu`), immediate reload
+    /// with identical decode, a deterministic post-upload fault whose
+    /// rollback returns every resident store allocation (store accounting:
+    /// allocations == releases on the failed path), and an immediate retry
+    /// that decodes identically. Skips cleanly when the fixture or a GPU is
+    /// absent.
+    #[test]
+    fn pinned_fixture_lifecycle_fault_retry_reload() {
+        let Some(fixture) = pinned_fixture_path() else {
+            return;
+        };
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("g3-lifecycle: no GPU; skipping");
+            return;
+        };
+        let prompt = "The capital of France is located in";
+        let max_seq = 64usize;
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .expect("pinned fixture tokenizer");
+        let prompt_tokens = tokenizer.encode(prompt);
+        let cask = CaskConfig::default();
+
+        // First production load + decode (warms store resident accounting).
+        test_support::reset();
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = max_seq;
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for first load");
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("production load");
+        drop(ctx);
+        let allocations = test_support::resident_allocations();
+        assert!(
+            allocations > 0,
+            "production load must publish resident store allocations"
+        );
+        eprintln!("g3-lifecycle: warm-baseline resident allocations = {allocations}");
+        let baseline = greedy_decode(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            &mut bundle.kv,
+            &bundle.scratch,
+            &prompt_tokens,
+            8,
+        );
+        eprintln!("g3-lifecycle: first decode = {baseline:?}");
+
+        // Existing-reset smoke: reset_session_state leaves the model reusable
+        // and the next decode is byte-identical.
+        hipfire_runtime::arch_model::ArchModel::reset_session_state(&mut bundle, &mut gpu)
+            .expect("existing reset smoke");
+        let after_reset = greedy_decode(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            &mut bundle.kv,
+            &bundle.scratch,
+            &prompt_tokens,
+            8,
+        );
+        assert_eq!(after_reset, baseline, "reset must not change decode output");
+
+        // Unload through the sole consuming owner (ArchModel::free_gpu drains
+        // the attached store and frees weights/scratch/KV).
+        Box::new(bundle).free_gpu(&mut gpu);
+        eprintln!("g3-lifecycle: unloaded via ArchModel::free_gpu");
+
+        // Immediate reload decodes identically.
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = max_seq;
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for reload");
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("immediate reload");
+        drop(ctx);
+        let after_reload = greedy_decode(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            &mut bundle.kv,
+            &bundle.scratch,
+            &prompt_tokens,
+            8,
+        );
+        assert_eq!(after_reload, baseline, "immediate reload decode parity");
+
+        // Deterministic post-upload fault on the next load: it must fail and
+        // roll back every resident allocation (no legacy fallback). Store
+        // accounting is reset so the failed path alone is measured:
+        // allocations == releases after the rollback.
+        test_support::reset();
+        test_support::arm_fail_after_upload(1);
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = max_seq;
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for fault");
+        let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
+            Ok(_) => panic!("post-upload fault unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        drop(ctx);
+        test_support::clear_faults();
+        assert!(
+            error.contains("test fault injected after resident upload"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            test_support::resident_allocations(),
+            test_support::resident_releases(),
+            "fault rollback must return every resident allocation (zero-free)"
+        );
+        eprintln!("g3-lifecycle: deterministic fault rolled back — error {error:?}");
+
+        // Immediate retry after the fault decodes identically.
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = max_seq;
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for retry");
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("immediate retry");
+        drop(ctx);
+        let after_retry = greedy_decode(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            &mut bundle.kv,
+            &bundle.scratch,
+            &prompt_tokens,
+            8,
+        );
+        assert_eq!(after_retry, baseline, "immediate retry decode parity");
+        Box::new(bundle).free_gpu(&mut gpu);
+        eprintln!(
+            "g3-lifecycle: PASS — load/reset/unload/reload/fault/retry all decode identically"
+        );
+    }
+
+    fn pinned_fixture_path() -> Option<String> {
+        let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/.hipfire/models/qwen3-0.6b-llama.mq4")
+        });
+        const PINNED_SIZE: u64 = 495_181_824;
+        const PINNED_MD5: &str = "2579e10ba3a988818386f2b07632ee01";
+        let Ok(meta) = std::fs::metadata(&fixture) else {
+            eprintln!("g3-lifecycle: fixture absent ({fixture}); skipping");
+            return None;
+        };
+        assert_eq!(
+            meta.len(),
+            PINNED_SIZE,
+            "fixture size mismatch — not the pinned qwen3:0.6b artifact (md5 {PINNED_MD5})"
+        );
+        Some(fixture)
+    }
+
+    fn hfq_clone(path: &str) -> HfqFile {
+        HfqFile::open(std::path::Path::new(path)).expect("reopen pinned fixture")
+    }
+
+    /// Greedy argmax decode over `prompt_tokens` followed by `generated`
+    /// self-generated tokens, one token per committed position.
+    fn greedy_decode(
+        gpu: &mut rdna_compute::Gpu,
+        weights: &LlamaWeights,
+        config: &LlamaConfig,
+        kv: &mut KvCache,
+        scratch: &ForwardScratch,
+        prompt_tokens: &[u32],
+        generated: usize,
+    ) -> Vec<u32> {
+        let mut next_token: u32 = 0;
+        let mut out = Vec::new();
+        let total = prompt_tokens.len() + generated;
+        assert!(total <= kv.max_seq, "position budget vs KV max_seq");
+        for pos in 0..total {
+            let token = if pos < prompt_tokens.len() {
+                prompt_tokens[pos]
+            } else {
+                next_token
+            };
+            forward_scratch_embed(gpu, weights, config, token, pos, scratch).expect("embed");
+            forward_scratch_compute(gpu, weights, config, 0, kv, scratch).expect("compute");
+            let logits = gpu.download_f32(&scratch.logits).expect("logits");
+            next_token = argmax_index(&logits) as u32;
+            out.push(token);
+        }
+        out
+    }
+
     fn argmax_index(logits: &[f32]) -> usize {
         let mut best = 0usize;
         for (index, value) in logits.iter().enumerate() {
