@@ -2614,6 +2614,13 @@ fn verify_dflash_block_inner(
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
     let tree_verify_present = tree_verify.is_some();
+    // Launch-fusion prescaffold: frozen AR/verify discriminator. Linear chain
+    // verify (`tree_verify` is `None`) arms `ChainVerify`; tree verify stays `Off`.
+    let fusion = if tree_verify.is_none() {
+        qwen35::DflashFusionCtx::ChainVerify
+    } else {
+        qwen35::DflashFusionCtx::Off
+    };
     let moe_lmhead_graph_env =
         hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let moe_lmhead_graph_ok =
@@ -2758,6 +2765,7 @@ fn verify_dflash_block_inner(
             gdn_tape,
             verify_scratch,
             ctx,
+            fusion,
         )
     } else if verify_graph_ok {
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
@@ -2818,6 +2826,7 @@ fn verify_dflash_block_inner(
                 gdn_tape,
                 tree_verify,
                 false, // DFlash computes all verify logits from final_hidden below
+                fusion,
             );
             r.and_then(|_| {
                 gpu.hip.stream_synchronize(
@@ -2857,6 +2866,7 @@ fn verify_dflash_block_inner(
                 gdn_tape,
                 tree_verify,
                 false, // DFlash computes all verify logits from final_hidden below
+                fusion,
             );
             let r = if r.is_ok() && capture_lmhead_argmax {
                 r.and_then(|_| {
@@ -2949,6 +2959,7 @@ fn verify_dflash_block_inner(
             None,  // mask_override: speculative verify path doesn't use the MTP probe hook
             None,  // max_layer: DFlash verify always runs the full stack
             false, // DFlash computes all verify logits from final_hidden below
+            fusion,
         )
     };
 
@@ -3224,6 +3235,7 @@ fn dflash_direct_verify_forward(
     final_hidden: &GpuTensor,
     gdn_tape: Option<&mut GdnTape>,
     pbs: &qwen35::PrefillBatchScratch,
+    fusion: qwen35::DflashFusionCtx,
 ) -> HipResult<()> {
     qwen35::forward_prefill_batch_single_chunk_captured_opts(
         gpu,
@@ -3240,6 +3252,7 @@ fn dflash_direct_verify_forward(
         gdn_tape,
         None,
         false, // DFlash computes all verify logits from final_hidden
+        fusion,
     )
 }
 
@@ -3260,6 +3273,7 @@ fn run_retained_verify_forward(
     gdn_tape: Option<&mut GdnTape>,
     verify_scratch: &VerifyScratch,
     ctx: &mut RetainedCtx<'_>,
+    fusion: qwen35::DflashFusionCtx,
 ) -> HipResult<()> {
     let pbs = verify_scratch.prefill_batch.as_ref().ok_or_else(|| {
         retained_hip_error("retained DFlash verify requires a persistent PrefillBatchScratch")
@@ -3283,6 +3297,7 @@ fn run_retained_verify_forward(
                 final_hidden,
                 gdn_tape,
                 pbs,
+                fusion,
             );
             if result.is_ok() {
                 ctx.state.note_prime_success(ctx.binding.clone());
@@ -3308,6 +3323,7 @@ fn run_retained_verify_forward(
                     final_hidden,
                     gdn_tape,
                     pbs,
+                    fusion,
                 );
             }
             // A prepared route may only retain a kernarg scalar that provably
@@ -3328,6 +3344,7 @@ fn run_retained_verify_forward(
                     final_hidden,
                     gdn_tape,
                     pbs,
+                    fusion,
                 )
                 .map_err(CaptureFailure::Forward)?;
                 gpu.hip

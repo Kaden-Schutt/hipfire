@@ -11,6 +11,7 @@ use super::batch::PrefillBatchScratch;
 use super::config::LayerType;
 use super::config::MaskEmbedOverride;
 use super::config::Qwen35Config;
+use super::config::DflashFusionCtx;
 use super::config::TreeVerifyCtx;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
@@ -545,6 +546,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         gdn_tape,
         tree_verify,
         true,
+        DflashFusionCtx::Off,
     )
 }
 
@@ -564,7 +566,9 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     needs_last_token_logits: bool,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
+    let _ = fusion;
     let n = tokens.len();
     debug_assert!(
         n > 0 && n <= pbs.max_batch,
@@ -766,6 +770,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         needs_last_token_logits,
         None, // max_layer: single-chunk captured path always runs the full stack
         None, // routed_out: non-EP single-GPU path
+        fusion,
     )
 }
 
@@ -851,6 +856,7 @@ pub fn forward_prefill_batch_capped(
         None,
         true,
         Some(max_batch_cap),
+        DflashFusionCtx::Off,
     )
 }
 
@@ -889,6 +895,7 @@ pub fn forward_prefill_batch_with_pbs(
         mask_override,
         max_layer,
         true, // preserve legacy post-condition: scratch.logits is last-token logits
+        DflashFusionCtx::Off,
     )
 }
 
@@ -928,6 +935,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     forward_prefill_batch_with_pbs_opts_inner(
         gpu,
@@ -947,6 +955,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         max_layer,
         needs_last_token_logits,
         None,
+        fusion,
     )
 }
 
@@ -969,6 +978,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
     max_batch_cap: Option<usize>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -1319,6 +1329,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 needs_last_token_logits,
                 max_layer,
                 None, // routed_out: non-EP single-GPU path
+                fusion,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -3710,6 +3721,7 @@ pub(crate) fn forward_prefill_chunk(
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
     routed_out: Option<&GpuTensor>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     forward_batch_chunk_impl(
         gpu,
@@ -3734,6 +3746,7 @@ pub(crate) fn forward_prefill_chunk(
         max_layer,
         routed_out,
         BatchSemantics::Sequential,
+        fusion,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -4052,40 +4065,23 @@ pub(crate) fn batch_chunk_upload_positions(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn batch_chunk_delta_net_attn(
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S3-f16-projection-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_delta_net_input_projection(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
-    dn_state: &mut DeltaNetState,
     n: usize,
     dim: usize,
-    k_dim: usize,
-    v_dim: usize,
-    n_v_heads: usize,
-    hd: usize,
-    batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
-    gdn_tape: Option<&crate::speculative::GdnTape>,
-    tape_offset: usize,
-    delta_layer_idx: usize,
     q8_wmma_arch: bool,
-    arch_has_wmma: bool,
-    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
-    // activation to match its pre-rotated weights; HFQ4 uses
-    // plain rmsnormed activations. The GEMM kernels themselves
-    // are dtype-agnostic — they just consume whatever [N × K]
-    // activation buffer we point them at.
-    // GAP NOTE: this matcher (and the 7 sibling dense LA/FA
-    // matchers in this file) wires MQ3G256Lloyd through the
-    // gemm_*_mq3g256_lloyd_wmma family. MQ2G256Lloyd remains
-    // unwired — to add it, update is_batchable_la, ALL 8 is_mq*
-    // matchers, AND add a Lloyd-MQ2-specific GEMM dispatch arm
-    // together (the all-together corruption-prevention rule from
-    // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
-    // is wired in a separate PR (issue #182).
+    let _ = fusion;
     let is_mq = matches!(
         layer.wqkv.gpu_dtype,
         DType::MQ4G256
@@ -4329,7 +4325,34 @@ pub(crate) fn batch_chunk_delta_net_attn(
             n,
         )?;
     }
+    Ok(())
 
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S5-gdn-pre-tape-fusion.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// Returns `tree_parents` so the caller's statement/launch order is unchanged.
+fn batch_chunk_delta_net_pre_gdn<'a>(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    dn_state: &mut DeltaNetState,
+    n: usize,
+    k_dim: usize,
+    v_dim: usize,
+    n_v_heads: usize,
+    hd: usize,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'a>>,
+    gdn_tape: Option<&crate::speculative::GdnTape>,
+    tape_offset: usize,
+    delta_layer_idx: usize,
+    fusion: DflashFusionCtx,
+) -> HipResult<Option<&'a GpuTensor>> {
+    let _ = fusion;
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
         &pbs.dn_beta_batch,
@@ -4382,7 +4405,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // kernels are READ-ONLY on dn_state (don't advance it) —
     // caller runs linear replay on the accepted spine
     // post-acceptance to commit the trajectory.
-    let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+    let tree_parents = tree_verify.and_then(|c| c.parent_indices);
     if let Some(parents) = tree_parents {
         gpu.conv1d_silu_split_tree_f32_n(
             &pbs.dn_q_raw_batch,
@@ -4475,6 +4498,128 @@ pub(crate) fn batch_chunk_delta_net_attn(
         gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
+    Ok(tree_parents)
+
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_delta_net_output_projection(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    n_v_heads: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let _ = fusion;
+    // Batched gated output norm.
+    gpu.gated_norm_f32_batched(
+        &pbs.dn_attn_out_batch,
+        &pbs.dn_z_batch,
+        &layer.norm_weight,
+        &pbs.dn_normed_batch,
+        n_v_heads,
+        config.linear_value_head_dim,
+        config.norm_eps,
+        n,
+    )?;
+
+    // Batched wo + residual/partial.
+    //
+    // For MQ weights, the decode path's weight_gemv_residual
+    // internally FWHT-rotates dn_normed into mq_x_rot before
+    // calling gemv_hfq{4,6}g256_residual (MQ weights are pre-rotated
+    // at quant time; math requires dot(rot(W), rot(x)) = dot(W,x)).
+    // For HFQ weights no rotation is needed — the activation
+    // feeds gemm_hfq{4,6}g256_residual directly.
+    let wo_is_mq = matches!(
+        layer.wo.gpu_dtype,
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+            | DType::MQ3G256Lloyd
+            | DType::MFP4G32
+    );
+    let wo_input = if wo_is_mq {
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.dn_normed_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+        &pbs.dn_normed_rot_batch
+    } else {
+        &pbs.dn_normed_batch
+    };
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.wo,
+        wo_input,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
+    Ok(())
+
+}
+
+pub(crate) fn batch_chunk_delta_net_attn(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    dn_state: &mut DeltaNetState,
+    n: usize,
+    dim: usize,
+    k_dim: usize,
+    v_dim: usize,
+    n_v_heads: usize,
+    hd: usize,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    gdn_tape: Option<&crate::speculative::GdnTape>,
+    tape_offset: usize,
+    delta_layer_idx: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
+    // activation to match its pre-rotated weights; HFQ4 uses
+    // plain rmsnormed activations. The GEMM kernels themselves
+    // are dtype-agnostic — they just consume whatever [N × K]
+    // activation buffer we point them at.
+    // GAP NOTE: this matcher (and the 7 sibling dense LA/FA
+    // matchers in this file) wires MQ3G256Lloyd through the
+    // gemm_*_mq3g256_lloyd_wmma family. MQ2G256Lloyd remains
+    // unwired — to add it, update is_batchable_la, ALL 8 is_mq*
+    // matchers, AND add a Lloyd-MQ2-specific GEMM dispatch arm
+    // together (the all-together corruption-prevention rule from
+    // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
+    // is wired in a separate PR (issue #182).
+    batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+
+    let tree_parents = batch_chunk_delta_net_pre_gdn(gpu, layer, config, pbs, dn_state, n, k_dim, v_dim, n_v_heads, hd, batch_semantics, tree_verify, gdn_tape, tape_offset, delta_layer_idx, fusion)?;
 
     // Gated Delta Net — tree variant reads per-token S from
     // s_tape[parent] (or pre-block s_q8_init at root); linear
@@ -4641,80 +4786,29 @@ pub(crate) fn batch_chunk_delta_net_attn(
         }
     }
 
-    // Batched gated output norm.
-    gpu.gated_norm_f32_batched(
-        &pbs.dn_attn_out_batch,
-        &pbs.dn_z_batch,
-        &layer.norm_weight,
-        &pbs.dn_normed_batch,
-        n_v_heads,
-        config.linear_value_head_dim,
-        config.norm_eps,
-        n,
-    )?;
-
-    // Batched wo + residual/partial.
-    //
-    // For MQ weights, the decode path's weight_gemv_residual
-    // internally FWHT-rotates dn_normed into mq_x_rot before
-    // calling gemv_hfq{4,6}g256_residual (MQ weights are pre-rotated
-    // at quant time; math requires dot(rot(W), rot(x)) = dot(W,x)).
-    // For HFQ weights no rotation is needed — the activation
-    // feeds gemm_hfq{4,6}g256_residual directly.
-    let wo_is_mq = matches!(
-        layer.wo.gpu_dtype,
-        DType::MQ4G256
-            | DType::MQ4G256V2
-            | DType::MQ4CG256
-            | DType::MQ6G256
-            | DType::MQ6G256V2
-            | DType::MQ5G256V2
-            | DType::MQ3G256
-            | DType::MQ3G256V2
-            | DType::MQ2G256V2
-            | DType::MQ3G256Lloyd
-            | DType::MFP4G32
-    );
-    let wo_input = if wo_is_mq {
-        rotate_x_mq_batched_for(
-            gpu,
-            &layer.wo,
-            &pbs.dn_normed_batch,
-            &pbs.dn_normed_rot_batch,
-            layer.wo.k,
-            n,
-        )?;
-        &pbs.dn_normed_rot_batch
-    } else {
-        &pbs.dn_normed_batch
-    };
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.wo,
-        wo_input,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+    batch_chunk_delta_net_output_projection(gpu, layer, config, pbs, n, n_v_heads, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn batch_chunk_delta_net_ffn(
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S3-f16-projection-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_delta_net_ffn_gate_up(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
     n: usize,
     dim: usize,
-    hidden_dim: usize,
     q8_wmma_arch: bool,
-    arch_has_wmma: bool,
-    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
+    let _ = fusion;
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
         layer.w_gate.gpu_dtype,
@@ -4882,7 +4976,28 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             n,
         )?;
     }
+    Ok(())
 
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_delta_net_ffn_down(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    pbs: &PrefillBatchScratch,
+    hidden_dim: usize,
+    n: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let _ = fusion;
     // SwiGLU activation feeding w_down. For MQ, we need the
     // output FWHT-rotated so it matches the pre-rotated w_down
     // weights. For HFQ, plain silu_mul is enough. silu_mul_f32
@@ -4928,36 +5043,48 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+    Ok(())
+
+}
+
+pub(crate) fn batch_chunk_delta_net_ffn(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    hidden_dim: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    batch_chunk_delta_net_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+
+    batch_chunk_delta_net_ffn_down(gpu, layer, pbs, hidden_dim, n, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn batch_chunk_full_attn_attn(
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S3-f16-projection-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_full_attn_input_projection(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
-    s: &Qwen35Scratch,
-    kv_cache: &llama::KvCache,
     n: usize,
     dim: usize,
-    start_pos: usize,
-    max_ctx_len: usize,
-    ctx: &DispatchCtx,
-    batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     q8_wmma_arch: bool,
-    arch_has_wmma: bool,
-    kv_layer_idx: usize,
-    layer_idx: usize,
-    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    // Fully batched FA layer. Mirrors the FA branch of
-    // forward_scratch_layers kernel-for-kernel, but every
-    // launch covers all N tokens at once.
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    let q_dim = config.n_heads * config.head_dim;
+    let _ = fusion;
     let qkv_is_mq = matches!(
         layer.wq.gpu_dtype,
         DType::MQ4G256
@@ -5176,7 +5303,32 @@ pub(crate) fn batch_chunk_full_attn_attn(
         batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
         batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
     }
+    Ok(())
 
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S6-fa-prep-q8-pair.
+///
+/// Same statements, same order, same launches as the inlined block.
+fn batch_chunk_full_attn_prepare(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    kv_layer_idx: usize,
+    layer_idx: usize,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let _ = fusion;
     // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
     gpu.deinterleave_f32_batched(
         &pbs.fa_q_full_batch,
@@ -5335,7 +5487,27 @@ pub(crate) fn batch_chunk_full_attn_attn(
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
     }
+    Ok(())
 
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_full_attn_output_projection(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let _ = fusion;
     // 8. Fused sigmoid(gate) * attn_out, element-wise over the
     // full [N × q_dim] tensor.
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
@@ -5379,23 +5551,63 @@ pub(crate) fn batch_chunk_full_attn_attn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+    Ok(())
+
+}
+
+pub(crate) fn batch_chunk_full_attn_attn(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    dim: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    kv_layer_idx: usize,
+    layer_idx: usize,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    // Fully batched FA layer. Mirrors the FA branch of
+    // forward_scratch_layers kernel-for-kernel, but every
+    // launch covers all N tokens at once.
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    let q_dim = config.n_heads * config.head_dim;
+    batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+
+    batch_chunk_full_attn_prepare(gpu, layer, config, pbs, s, kv_cache, n, start_pos, max_ctx_len, ctx, batch_semantics, tree_verify, kv_layer_idx, layer_idx, fusion)?;
+
+    batch_chunk_full_attn_output_projection(gpu, layer, pbs, n, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn batch_chunk_full_attn_ffn(
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S3-f16-projection-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_full_attn_ffn_gate_up(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
     n: usize,
     dim: usize,
-    hidden_dim: usize,
     q8_wmma_arch: bool,
-    arch_has_wmma: bool,
-    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
+    let _ = fusion;
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
     let fa_ffn_is_mq = matches!(
@@ -5560,6 +5772,28 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             n,
         )?;
     }
+    Ok(())
+
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
+///
+/// Same statements, same order, same launches as the inlined block.
+/// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
+/// from inside this hook after S3/S4 land.
+fn batch_chunk_full_attn_ffn_down(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    pbs: &PrefillBatchScratch,
+    hidden_dim: usize,
+    n: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let _ = fusion;
     let fa_w_down_is_mq = matches!(
         layer.w_down.gpu_dtype,
         DType::MQ4G256
@@ -5597,6 +5831,25 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+    Ok(())
+
+}
+
+pub(crate) fn batch_chunk_full_attn_ffn(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    hidden_dim: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    batch_chunk_full_attn_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+    batch_chunk_full_attn_ffn_down(gpu, layer, pbs, hidden_dim, n, q8_wmma_arch, arch_has_wmma, epilogue, fusion)?;
 
     Ok(())
 }
@@ -7087,6 +7340,7 @@ pub(crate) fn forward_batch_chunk_impl(
     max_layer: Option<usize>,
     routed_out: Option<&GpuTensor>,
     batch_semantics: BatchSemantics<'_>,
+    fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -7223,6 +7477,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     q8_wmma_arch,
                     arch_has_wmma,
                     BatchEpilogue::Residual,
+                    fusion,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,
@@ -7235,6 +7490,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     q8_wmma_arch,
                     arch_has_wmma,
                     BatchEpilogue::Residual,
+                    fusion,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -7264,6 +7520,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     kv_layer_idx,
                     layer_idx,
                     BatchEpilogue::Residual,
+                    fusion,
                 )?;
                 batch_chunk_full_attn_ffn(
                     gpu,
@@ -7276,6 +7533,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     q8_wmma_arch,
                     arch_has_wmma,
                     BatchEpilogue::Residual,
+                    fusion,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {

@@ -1489,6 +1489,7 @@ fn mtp_shared_verify_accept_rollback(
         None,
         None,
         false,
+        qwen35::DflashFusionCtx::Off,
     )?;
 
     let w_out = &trunk_weights.output;
@@ -2168,6 +2169,7 @@ pub fn spec_step_mtp(
         None,  // mask_override
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
+        qwen35::DflashFusionCtx::Off,
     )?;
 
     // ── 5. Per-position lm_head + batched argmax ─────────────────────────
@@ -2546,6 +2548,7 @@ pub fn spec_step_mtp_compressed(
         None,  // mask_override
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
+        qwen35::DflashFusionCtx::Off,
     )?;
 
     // ── 3. Trunk batched lm_head over verify positions ─────────────────────
