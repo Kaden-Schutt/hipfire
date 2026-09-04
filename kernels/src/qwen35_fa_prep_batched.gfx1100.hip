@@ -67,23 +67,11 @@ __global__ void qwen35_fa_prep_batched_gfx1100(
         v = out[tid];
         weight = k_weight;
     }
-
-    // Match rmsnorm_f32's 256-thread shared-memory reduction exactly.
-    sdata[tid] = v * v;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    const float rms = rsqrtf(sdata[0] / (float)HD + eps);
-    const float normed = v * weight[tid] * rms;
-    out[tid] = normed;
-    // Lagging waves still read sdata[0] as the sum of squares; rsqrtf of the negative value written below returns NaN.
-    __syncthreads();
-    sdata[tid] = normed;
-    __syncthreads();
-
     // Match rope_partial_halfsplit_batched_f32's source expression and pair mapping.
+    // The two outputs MUST use explicit fmaf in the exact formation the old
+    // kernel's TU contracts to (probed on gfx1100: o[i] fuses the v0 term as
+    // fma(v0, trig, +/-(v1*trig')) on both sides). Default fp-contract in this
+    // TU fuses the opposite way and drifts ~2% of words by 1 ULP.
     if (tid < HALF) {
         const int pos = positions[b] + pos_offset;
         const float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)NROT);
@@ -92,7 +80,7 @@ __global__ void qwen35_fa_prep_batched_gfx1100(
         const float sin_a = sinf(angle);
         const float x0 = sdata[tid];
         const float x1 = sdata[tid + HALF];
-        out[tid] = x0 * cos_a - x1 * sin_a;
-        out[tid + HALF] = x0 * sin_a + x1 * cos_a;
+        out[tid] = fmaf(x0, cos_a, -(x1 * sin_a));
+        out[tid + HALF] = fmaf(x0, sin_a, x1 * cos_a);
     }
 }
