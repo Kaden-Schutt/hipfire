@@ -1543,17 +1543,16 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // (gfx1100/1101/1102/1150/1151 + gfx1200/1201) but gate the gfx11 half
     // behind HIPFIRE_MQV2_GFX11_WMMA != "0" — setting
     // HIPFIRE_MQV2_GFX11_WMMA=0 restores the per-token fallback ONLY on
-    // gfx11, leaving gfx12 untouched. Lockstep with the HasWmma predicate
-    // on GemmMq*G256V2* keys and with gemm_mq*g256v2's has_wmma() guard.
+    // gfx11, leaving gfx12 untouched. Delegates to the shared
+    // `hipfire_runtime::llama::mqv2_wmma_batchable` rule (shared home for
+    // the dtype/arch/kill-switch set). NOTE: `llama::is_batchable_la` does
+    // NOT delegate to it — the llama chunk path has no V2 arms, so llama
+    // refuses V2 everywhere; only this qwen35 caller admits V2. Lockstep with
+    // the HasWmma predicate on GemmMq*G256V2* keys and with
+    // gemm_mq*g256v2's has_wmma() guard.
     // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands.
-    let mqv2_with_wmma = matches!(
+    let mqv2_with_wmma = llama::mqv2_wmma_batchable(
         dt,
-        DType::MQ4G256V2
-            | DType::MQ6G256V2
-            | DType::MQ5G256V2
-            | DType::MQ3G256V2
-            | DType::MQ2G256V2
-    ) && mqv2_gfx11_wmma_enabled_from_env(
         hipfire_config::developer_var("HIPFIRE_MQV2_GFX11_WMMA")
             .ok()
             .as_deref(),
@@ -1582,24 +1581,6 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || bf16_with_gfx942
 }
 
-/// Helper for MQ2/3/4/5/6G256V2 (qt44,47-50) batched prefill admit: gfx12 always, gfx11
-/// gated by HIPFIRE_MQV2_GFX11_WMMA != "0". Public for testability, mirrors
-/// `mq6_batched_admit_enabled_from_env` / `q8_prefill_wmma_enabled_from_env`.
-/// `value` is the raw env var (None = unset → default ON); only Some("0")
-/// disables the gfx11 path. Gfx12 is unaffected by the env var.
-pub(crate) fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
-    let gfx11_enabled = value != Some("0");
-    if matches!(arch, "gfx1200" | "gfx1201") {
-        true
-    } else if matches!(
-        arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-    ) {
-        gfx11_enabled
-    } else {
-        false
-    }
-}
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
 /// `fa_batched_ok` guard, and later EP state preflight. Validates every
@@ -8152,44 +8133,44 @@ mod tests {
     #[test]
     fn qwen35_is_batchable_la_mq4_v2_env_escape() {
         // HIPFIRE_MQV2_GFX11_WMMA=0 restores fallback ONLY on gfx11; gfx12
-        // remains admitted. Use the helper directly to avoid global env
+        // remains admitted. Use the shared helper directly to avoid global env
         // mutation flakiness in parallel tests — is_batchable_la delegates
-        // to this helper verbatim.
+        // to `llama::mqv2_wmma_batchable`, which calls this helper verbatim.
         for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
             assert!(
-                !mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                !llama::mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
                 "env=0 should disable {arch}"
             );
             assert!(
-                mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                llama::mqv2_gfx11_wmma_enabled_from_env(None, arch),
                 "unset should enable {arch}"
             );
             assert!(
-                mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
+                llama::mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
                 "env=1 should enable {arch}"
             );
         }
         for arch in ["gfx1200", "gfx1201"] {
             assert!(
-                mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                llama::mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
                 "gfx12 unaffected by env=0 on {arch}"
             );
             assert!(
-                mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                llama::mqv2_gfx11_wmma_enabled_from_env(None, arch),
                 "gfx12 enabled without env on {arch}"
             );
         }
         for arch in ["gfx1010", "gfx942", "gfx1030", "gfx1103", "gfx1152"] {
             assert!(
-                !mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                !llama::mqv2_gfx11_wmma_enabled_from_env(None, arch),
                 "non-WMMA {arch} must never admit"
             );
             assert!(
-                !mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                !llama::mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
                 "non-WMMA {arch} with env=0"
             );
             assert!(
-                !mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
+                !llama::mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
                 "non-WMMA {arch} with env=1"
             );
         }
@@ -8239,6 +8220,94 @@ mod tests {
         assert_eq!(rdna_compute::MQ3G256V2_GROUP_BYTES, 104);
         assert_eq!(rdna_compute::MQ2G256V2_GROUP_BYTES, 72);
         assert_eq!(rdna_compute::MQ4V2_GROUP_BYTES, 136);
+    }
+
+    #[test]
+    fn mqv2_admit_llama_qwen35_lockstep() {
+        // True contract (PR #690 hw-gate regression): llama and qwen35 agree
+        // on every NON-V2 dtype, but for the V2 family they deliberately
+        // diverge — qwen35's `forward_prefill_chunk` has V2 dispatch arms
+        // (206 hits) so it admits V2 via the shared
+        // `llama::mqv2_wmma_batchable` rule, while llama's chunk path has no
+        // V2 arms (`qkv_is_mq`/`wo_is_mq`/`ffn_is_mq`/`w_down_is_mq` list
+        // only V1 dtypes) so `llama::is_batchable_la` refuses V2 everywhere
+        // and stays on per-token decode. Admitting V2 to the llama path
+        // would skip the FWHT rotate and run V1 `hfq4g256` launchers on V2
+        // blobs — silently incoherent prefill.
+        // Non-V2 agreement across the 5-arch sample.
+        let non_v2 = [
+            DType::MQ4G256,
+            DType::HFQ4G256,
+            DType::MQ6G256,
+            DType::MQ3G256,
+            DType::MFP4G32,
+            DType::Q8_0,
+        ];
+        for dt in non_v2 {
+            for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030", "gfx1010"] {
+                assert_eq!(
+                    llama::is_batchable_la(dt, arch),
+                    is_batchable_la(dt, arch),
+                    "lockstep drift for {dt:?} on {arch}"
+                );
+            }
+        }
+        // V2 divergence: qwen35 admits on gfx11/gfx12 (kill-switch at its
+        // default ON here — both gates read `HIPFIRE_MQV2_GFX11_WMMA`
+        // identically, so with the var unset gfx11 admits), refuses
+        // pre-WMMA; llama refuses on all 5 arches.
+        let v2 = [
+            DType::MQ4G256V2,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+            DType::MQ4CG256,
+        ];
+        for dt in v2 {
+            for arch in ["gfx1100", "gfx1151"] {
+                // MQ4CG256 is gfx12-only by intent in BOTH callers.
+                if dt == DType::MQ4CG256 {
+                    assert!(
+                        !is_batchable_la(dt, arch),
+                        "qwen35 must refuse {dt:?} on {arch}"
+                    );
+                } else {
+                    assert!(
+                        is_batchable_la(dt, arch),
+                        "qwen35 should admit {dt:?} on {arch}"
+                    );
+                }
+                assert!(
+                    !llama::is_batchable_la(dt, arch),
+                    "llama must refuse {dt:?} on {arch}"
+                );
+            }
+            assert!(
+                is_batchable_la(dt, "gfx1201"),
+                "qwen35 should admit {dt:?} on gfx1201"
+            );
+            assert!(
+                !llama::is_batchable_la(dt, "gfx1201"),
+                "llama must refuse {dt:?} on gfx1201"
+            );
+            for arch in ["gfx1030", "gfx1010"] {
+                assert!(
+                    !is_batchable_la(dt, arch),
+                    "qwen35 must refuse {dt:?} on {arch}"
+                );
+                assert!(
+                    !llama::is_batchable_la(dt, arch),
+                    "llama must refuse {dt:?} on {arch}"
+                );
+            }
+        }
+        // Absolute pins so the test also fails if the shared rule itself
+        // regresses, not just on caller drift.
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));
+        assert!(!is_batchable_la(DType::MQ4G256V2, "gfx1030"));
+        assert!(!is_batchable_la(DType::MQ4CG256, "gfx1100"));
+        assert!(!llama::is_batchable_la(DType::MQ4G256V2, "gfx1201"));
     }
 
     #[test]
