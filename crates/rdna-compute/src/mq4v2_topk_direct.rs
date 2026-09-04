@@ -42,8 +42,9 @@ use crate::dispatch::{Gpu, GpuTensor};
 /// the launcher's grid clamp depend on these; keep in sync.
 pub const TDK_MAX_K: usize = 8;
 pub const TDK_N_MAX: usize = 16;
-/// 96 CU x 8 resident one-wave blocks (static `__launch_bounds__(32, 8)`).
-pub const TDK_WG_MAX: usize = 768;
+/// 96 CU x 14 resident one-wave blocks (static `__launch_bounds__(32, 14)`,
+/// occupancy proven by the amdgpu-waves-per-eu compile check; 78 VGPRs).
+pub const TDK_WG_MAX: usize = 1344;
 
 const MODULE: &str = "mq4v2_lmhead_topk_direct_gfx1100";
 const FUNC: &str = "mq4v2_lmhead_topk_direct_gfx1100";
@@ -165,7 +166,7 @@ impl Gpu {
 
         let m_tiles = m.div_ceil(16);
         // Host-computed resident grid: statically bounded by
-        // __launch_bounds__(32, 8) → 8 blocks/CU × 96 CU = 768.
+        // __launch_bounds__(32, 14) → 14 blocks/CU × 96 CU = 1344.
         let wgs = m_tiles.min(TDK_WG_MAX) as u32;
 
         let mut a_ptr = a_raw.buf.as_ptr();
