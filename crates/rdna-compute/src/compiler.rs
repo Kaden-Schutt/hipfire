@@ -515,6 +515,16 @@ impl KernelCompiler {
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
+        // ks4-flag experiment (exp/ks4-flags): env-driven extra hipcc flags
+        // for the ksplit residual module only (symbols ks2/ks4/ks8 all live
+        // in this one module). Space-separated; empty/missing = today.
+        // `module_flags` already participates in `hash_parts`, so each flag
+        // variant recompiles under its own cache key (no ABI bump needed).
+        if arch == "gfx1100" && name == "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds" {
+            return hipfire_config::developer_var("HIPFIRE_KSPLIT_HIPCC_FLAGS")
+                .map(|raw| raw.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default();
+        }
         // Radiowave-selected spill-free RM2/BV6 schedule.
         if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
             vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
