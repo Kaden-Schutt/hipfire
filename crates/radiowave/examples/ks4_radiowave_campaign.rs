@@ -241,6 +241,7 @@ dis = subprocess.run([objdump, '--disassemble', '--mcpu=gfx1100', co], capture_o
 def sym_range(name, lines):
     s = next(i for i, l in enumerate(lines) if '<' + name + '>:' in l)
     e = next((i for i, l in enumerate(lines[s+1:], s+1) if re.search(r'^\s*[0-9a-f]+\s*<\w', l)), len(lines))
+    return lines[s:e]
 focus = '{focus}'
 body = sym_range(focus, dis)
 base = addr_of(body[0])
