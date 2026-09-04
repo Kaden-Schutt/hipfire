@@ -23,6 +23,7 @@ pub mod bf16_loader;
 pub mod cache_plan;
 #[cfg(feature = "deltanet")]
 pub mod cask;
+pub mod chatml;
 pub mod config;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;

@@ -100,7 +100,7 @@ fn main() {
         let next = argmax(&logits);
         gen.push(next);
         // common MiniMax/Qwen EOS ids; stop early if hit
-        if matches!(next, 200020 | 151643 | 151645 | 2) {
+        if matches!(next, 200020 | hipfire_runtime::chatml::ENDOFTEXT | hipfire_runtime::chatml::IM_END | 2) {
             break;
         }
         logits =

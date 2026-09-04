@@ -199,7 +199,7 @@ pub fn from_config_value(
         }
     }
     let eos_token_ids = if eos_token_ids.is_empty() {
-        vec![151645]
+        vec![hipfire_runtime::chatml::IM_END]
     } else {
         eos_token_ids
     };

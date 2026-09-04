@@ -65,7 +65,7 @@ impl ArchModel for MapleBundle {
 /// Maple's end-of-turn token. The checkpoint ships the Qwen tokenizer and
 /// `config.json` declares `eos_token_id` 151645 (`<|im_end|>`), not the
 /// `<|endoftext|>` (151643) that a vocab heuristic would pick.
-pub const MAPLE_EOS_FALLBACK: u32 = 151645;
+pub const MAPLE_EOS_FALLBACK: u32 = hipfire_runtime::chatml::IM_END;
 
 /// Resolve the end-of-turn id from the tokenizer, falling back to the
 /// config-declared ChatML id.
