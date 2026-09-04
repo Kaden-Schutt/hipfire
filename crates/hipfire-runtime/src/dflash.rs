@@ -1477,6 +1477,12 @@ impl DflashScratch {
         // it before returning Err — a bare `?` would leak it (no `Drop` on
         // the GPU-owning types), including when the failure follows the pop
         // above. Same class as the `or_free!` sites in `load_dflash_state`.
+        //
+        // Each allocation is parked in `s` the moment it succeeds, so the
+        // error arm's `s.free_gpu` also covers every earlier allocation of
+        // this ladder: with the tensors held as locals until the end, a
+        // failure on the 2nd..5th alloc freed `s` but leaked the locals
+        // (hw-gate Fable seat on #691, run 33900101473).
         macro_rules! alloc_or_free {
             ($e:expr) => {
                 match $e {
@@ -1488,19 +1494,15 @@ impl DflashScratch {
                 }
             };
         }
-        let k_full = alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32));
-        let v_full = alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32));
-        let k_cat = alloc_or_free!(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32));
-        let v_cat = alloc_or_free!(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32));
+        s.k_full_cached = Some(alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32)));
+        s.v_full_cached = Some(alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32)));
+        s.k_cat_full = Some(alloc_or_free!(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)));
+        s.v_cat_full = Some(alloc_or_free!(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)));
         // positions_k holds the last w_full context rows + the B noise rows
         // (the forward uploads only that suffix; every layer's span is one).
         // Allocate before freeing the old buffer so a failure still leaves
         // `s` intact for the error arm above.
         let new_positions_k = alloc_or_free!(gpu.alloc_tensor(&[w_full + b], DType::F32));
-        s.k_full_cached = Some(k_full);
-        s.v_full_cached = Some(v_full);
-        s.k_cat_full = Some(k_cat);
-        s.v_cat_full = Some(v_cat);
         let _ = gpu.free_tensor(std::mem::replace(&mut s.positions_k, new_positions_k));
         // The ctx bound is the target's physical capacity, not the window —
         // l may cross w_full (the last layer's span just slides).
