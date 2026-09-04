@@ -426,10 +426,9 @@ pub fn load_escha_moe_experts(
     };
 
     let (mut gate_ups, gate_up_owner) = decode_projection(
-        hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store, resolve,
-    )?;
+        hfq, gpu, p, "gate_up", expert_ids, n_exp, gu, store, resolve, escha_leaf)?;
     let (mut downs, down_owner) =
-        match decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve) {
+        match decode_projection(hfq, gpu, p, "down", expert_ids, n_exp, dn, store, resolve, escha_leaf) {
             Ok(ok) => ok,
             Err(error) => {
                 // The gate_up blob is already on the device and its per-expert
@@ -508,6 +507,134 @@ fn escha_dtype(trellis_k: usize) -> DType {
 /// byte-identical to the per-allocation version: `escha_bare_to_*` takes a
 /// base pointer and a size, and both are unchanged.
 #[allow(clippy::too_many_arguments)]
+/// How a projection's leaves are named. `escha_leaf` for the MoE export,
+/// `escha_dense_leaf` for the dense one — the two namespaces are disjoint and
+/// nothing else about the decode differs, so the namer is a parameter rather
+/// than a second copy of this function.
+pub type LeafNamer = fn(&str, &str, &str) -> String;
+
+/// One escha-coded DENSE linear, loaded and ready for the forward pass.
+///
+/// The dense export (Qwen3.8-27B) codes every projection in place rather than
+/// gathering experts, so there is no expert table and no routing — just a
+/// weight, the two rotation vectors, and the additive bias the end-to-end
+/// fine-tune leaves behind.
+pub struct EschaDenseLinear {
+    /// Decoded weight when `store` is Q8_0/F16, or the verbatim trellis code
+    /// when it is Native.
+    pub w: WeightTensor,
+    /// `escha_rin_eff`, `[ic]` f32 — pre-multiplied into x before the input
+    /// H128.
+    pub rin: GpuTensor,
+    /// `escha_rout_eff`, `[oc]` f32 — applied after the output H128.
+    pub rout: GpuTensor,
+    /// `bias`, `[oc]`. Present on the 27B, absent on the 35B. Base
+    /// Qwen3.8-27B has `attention_bias: false` and no MLP bias, so this is
+    /// purely Escha's additive output correction and is applied AFTER the
+    /// output transform, per `ref.py::dense_linear`. Applying it before the
+    /// H128 would be silently wrong rather than a crash.
+    pub bias: Option<GpuTensor>,
+    /// Buffer owning `w`'s bytes; freed with the layer.
+    pub owner: GpuTensor,
+}
+
+/// Load one dense escha linear: `{p}.{proj}` with `[ic, oc]`.
+///
+/// `proj` is the full path below the layer (`linear_attn.in_proj_qkv`,
+/// `mlp.gate_proj`, `self_attn.q_proj`). Reuses `decode_projection` at
+/// `n_exp = 1` — a dense linear is exactly the degenerate case of one expert,
+/// and duplicating that decode would mean two places to keep bit-exact
+/// against the oracle.
+#[allow(clippy::too_many_arguments)]
+pub fn load_escha_dense_linear(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    proj: &str,
+    ic: usize,
+    oc: usize,
+    store: EschaWeightStore,
+    resolve: NameResolver,
+) -> HipResult<EschaDenseLinear> {
+    let (mut ws, owner) = decode_projection(
+        hfq,
+        gpu,
+        p,
+        proj,
+        &[0],
+        1,
+        (ic, oc),
+        store,
+        resolve,
+        escha_dense_leaf,
+    )?;
+    if ws.len() != 1 {
+        return Err(HipError::new(
+            0,
+            &format!("escha: {p}.{proj} decoded {} slots, expected 1", ws.len()),
+        ));
+    }
+    let w = ws.remove(0);
+    let rin = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rin_eff"), ic, resolve)?;
+    let rout = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rout_eff"), oc, resolve)?;
+
+    // Bias is OPTIONAL by the leaf contract (§1.4): an export without the
+    // end-to-end stage ships none and must still load. So absence is not an
+    // error — but a bias of the wrong length is, because it would broadcast
+    // or truncate into plausible-looking output.
+    let bias_name = format!("{p}.{proj}.bias");
+    let bias = match find(hfq, &bias_name, resolve) {
+        None => None,
+        Some((info, data)) => {
+            let elems = match info.quant_type {
+                1 => data.len() / 2, // F16
+                2 => data.len() / 4, // F32
+                other => {
+                    return Err(HipError::new(
+                        0,
+                        &format!("escha: {bias_name} has quant_type {other} (expected F16 or F32)"),
+                    ))
+                }
+            };
+            if elems != oc {
+                return Err(HipError::new(
+                    0,
+                    &format!("escha: {bias_name} has {elems} elements, expected oc = {oc}"),
+                ));
+            }
+            Some(read_bias_f32(gpu, info.quant_type, &data, oc)?)
+        }
+    };
+    Ok(EschaDenseLinear {
+        w,
+        rin,
+        rout,
+        bias,
+        owner,
+    })
+}
+
+/// Upload a bias as f32 regardless of whether it was stored F16 or F32.
+fn read_bias_f32(gpu: &mut Gpu, qt: u8, data: &[u8], oc: usize) -> HipResult<GpuTensor> {
+    let mut v = Vec::with_capacity(oc);
+    match qt {
+        1 => {
+            for c in data.chunks_exact(2) {
+                v.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])));
+            }
+        }
+        _ => {
+            for c in data.chunks_exact(4) {
+                v.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+    }
+    v.truncate(oc);
+    gpu.upload_f32(&v, &[oc])
+}
+
+
+#[allow(clippy::too_many_arguments)]
 fn decode_projection(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -518,9 +645,10 @@ fn decode_projection(
     shape: (usize, usize),
     store: EschaWeightStore,
     resolve: NameResolver,
+    namer: LeafNamer,
 ) -> HipResult<(Vec<WeightTensor>, GpuTensor)> {
     let (ic, oc) = shape;
-    let name = escha_leaf(p, proj, "code");
+    let name = namer(p, proj, "code");
     let (info, data) = find(hfq, &name, resolve)
         .ok_or_else(|| HipError::new(0, &format!("escha: tensor not found: {name}")))?;
     let k = k_from_quant_type(info.quant_type, &name)?;
