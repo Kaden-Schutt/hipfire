@@ -349,6 +349,13 @@ const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
 /// Exact `gfx1201` only — not gfx1200 or other gfx12 variants.
 const PREFILL_DEFAULT_BATCH_GFX1201: usize = 384;
 
+/// gfx1151-measured default prefill chunk size (Strix Halo).
+///
+/// Measured on the native escha 27B at an 8k prompt: 256 -> 52 tok/s,
+/// **512 -> 73 tok/s**, 1024 -> 69 tok/s. gfx1151 had been falling through to
+/// the generic 256 and leaving 40% of prefill on the table.
+const PREFILL_DEFAULT_BATCH_GFX1151: usize = 512;
+
 /// Architecture default for prefill chunk size when
 /// `HIPFIRE_PREFILL_MAX_BATCH` is unset or invalid.
 #[inline]
@@ -357,6 +364,8 @@ fn prefill_max_batch_for_arch(arch: &str) -> usize {
         PREFILL_DEFAULT_BATCH_GFX1100
     } else if arch == "gfx1201" {
         PREFILL_DEFAULT_BATCH_GFX1201
+    } else if arch == "gfx1151" {
+        PREFILL_DEFAULT_BATCH_GFX1151
     } else {
         PREFILL_MAX_BATCH
     }
@@ -4582,12 +4591,36 @@ pub(crate) fn batch_chunk_delta_net_attn(
         let offsets = gpu.upload_raw(&off_bytes, &[2])?;
         let grouped = Some((&offsets, &e.iota));
 
-        e.qkv.forward(gpu, &layer.wqkv, &e.ids, &pbs.x_rot_batch,
-                      &pbs.escha_xh_batch, &pbs.dn_qkv_batch, &pbs.dn_qkv_batch, n, grouped)?;
-        e.z.forward(gpu, &layer.wz, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.dn_z_batch, &pbs.dn_z_batch, n, grouped)?;
+        e.qkv.forward(
+            gpu,
+            &layer.wqkv,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_qkv_batch,
+            n,
+            grouped,
+        )?;
+        e.z.forward(
+            gpu,
+            &layer.wz,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_z_batch,
+            n,
+            grouped,
+        )?;
         batched_gemm_single_weight(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
-        batched_gemm_single_weight(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
+        batched_gemm_single_weight(
+            gpu,
+            &layer.w_alpha,
+            &pbs.x_rot_batch,
+            &pbs.dn_alpha_batch,
+            n,
+        )?;
     } else if is_6bit
         && all_same_dtype(&[
             layer.wqkv.gpu_dtype,
@@ -5196,20 +5229,29 @@ pub(crate) fn batch_chunk_delta_net_attn(
         // trellis code; the split add is exact, both terms being plain f32.
         // Input is the UNROTATED gated-norm output: escha applies its own
         // H128, so `dn_normed_batch` and not the MQ-rotated variant.
-        e.o.forward(gpu, &layer.wo, &e.ids, &pbs.dn_normed_batch,
-                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
+        e.o.forward(
+            gpu,
+            &layer.wo,
+            &e.ids,
+            &pbs.dn_normed_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
     } else {
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.wo,
-        wo_input,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+        dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            wo_input,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+        )?;
     }
 
     // out_proj's bias lands on the residual stream. After the residual add is
@@ -5252,20 +5294,51 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         let grouped = Some((&offsets, &e.iota));
 
         gpu.rmsnorm_batched(
-            &pbs.x_batch, &layer.ffn_norm, &pbs.x_norm_batch, n, layer.w_gate.k,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &pbs.x_norm_batch,
+            n,
+            layer.w_gate.k,
             config.norm_eps,
         )?;
-        e.gate.forward(gpu, &layer.w_gate, &e.ids, &pbs.x_norm_batch,
-                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n, grouped)?;
-        e.up.forward(gpu, &layer.w_up, &e.ids, &pbs.x_norm_batch,
-                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n, grouped)?;
+        e.gate.forward(
+            gpu,
+            &layer.w_gate,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.gate_ffn_batch,
+            n,
+            grouped,
+        )?;
+        e.up.forward(
+            gpu,
+            &layer.w_up,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.up_batch,
+            &pbs.up_batch,
+            n,
+            grouped,
+        )?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
             gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
         }
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
-        e.down.forward(gpu, &layer.w_down, &e.ids, &pbs.ffn_hidden_batch,
-                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
+        e.down.forward(
+            gpu,
+            &layer.w_down,
+            &e.ids,
+            &pbs.ffn_hidden_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
@@ -5597,12 +5670,39 @@ pub(crate) fn batch_chunk_full_attn_attn(
         let offsets = gpu.upload_raw(&off_bytes, &[2])?;
         let grouped = Some((&offsets, &e.iota));
 
-        e.q.forward(gpu, &layer.wq, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.fa_q_full_batch, &pbs.fa_q_full_batch, n, grouped)?;
-        e.k.forward(gpu, &layer.wk, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.fa_k_batch, &pbs.fa_k_batch, n, grouped)?;
-        e.v.forward(gpu, &layer.wv, &e.ids, &pbs.x_rot_batch,
-                    &pbs.escha_xh_batch, &pbs.fa_v_batch, &pbs.fa_v_batch, n, grouped)?;
+        e.q.forward(
+            gpu,
+            &layer.wq,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_q_full_batch,
+            n,
+            grouped,
+        )?;
+        e.k.forward(
+            gpu,
+            &layer.wk,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_k_batch,
+            n,
+            grouped,
+        )?;
+        e.v.forward(
+            gpu,
+            &layer.wv,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.fa_v_batch,
+            &pbs.fa_v_batch,
+            n,
+            grouped,
+        )?;
     } else if qkv_is_6bit && qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
@@ -5979,20 +6079,29 @@ pub(crate) fn batch_chunk_full_attn_attn(
         // Trellis o_proj from the UNROTATED attention output, then accumulate.
         // The fused epilogue is SKIPPED, not supplemented: it writes into the
         // residual itself, so running both would count this projection twice.
-        e.o.forward(gpu, &layer.wo, &e.ids, &pbs.fa_attn_out_batch,
-                    &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
+        e.o.forward(
+            gpu,
+            &layer.wo,
+            &e.ids,
+            &pbs.fa_attn_out_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
     } else {
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.wo,
-        fa_wo_input,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+        dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            fa_wo_input,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+        )?;
     }
 
     // o_proj's bias, onto the residual stream — additive, so after the
@@ -6035,20 +6144,51 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         let grouped = Some((&offsets, &e.iota));
 
         gpu.rmsnorm_batched(
-            &pbs.x_batch, &layer.ffn_norm, &pbs.x_norm_batch, n, layer.w_gate.k,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &pbs.x_norm_batch,
+            n,
+            layer.w_gate.k,
             config.norm_eps,
         )?;
-        e.gate.forward(gpu, &layer.w_gate, &e.ids, &pbs.x_norm_batch,
-                       &pbs.escha_xh_batch, &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n, grouped)?;
-        e.up.forward(gpu, &layer.w_up, &e.ids, &pbs.x_norm_batch,
-                     &pbs.escha_xh_batch, &pbs.up_batch, &pbs.up_batch, n, grouped)?;
+        e.gate.forward(
+            gpu,
+            &layer.w_gate,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.gate_ffn_batch,
+            n,
+            grouped,
+        )?;
+        e.up.forward(
+            gpu,
+            &layer.w_up,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.up_batch,
+            &pbs.up_batch,
+            n,
+            grouped,
+        )?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
             gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
         }
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
-        e.down.forward(gpu, &layer.w_down, &e.ids, &pbs.ffn_hidden_batch,
-                       &pbs.escha_xh_batch, &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped)?;
+        e.down.forward(
+            gpu,
+            &layer.w_down,
+            &e.ids,
+            &pbs.ffn_hidden_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
         gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
         if let Some(b) = layer.biases.as_ref() {
             gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
@@ -8737,8 +8877,8 @@ mod tests {
 
     #[test]
     fn prefill_max_batch_arch_defaults() {
-        // Exact gfx1100 / gfx1201 alone get the measured defaults; every other
-        // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
+        // Exact gfx1100 / gfx1201 / gfx1151 get the measured defaults; every
+        // other string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
         // Pure helper — no process env mutation.
         assert_eq!(prefill_max_batch_for_arch("gfx1100"), 512);
         assert_eq!(
@@ -8750,7 +8890,14 @@ mod tests {
             prefill_max_batch_for_arch("gfx1201"),
             PREFILL_DEFAULT_BATCH_GFX1201
         );
-        for arch in ["gfx1200", "gfx1151", "gfx942", "unknown"] {
+        // gfx1151 measured on the native escha 27B at an 8k prompt:
+        // 256 -> 52 tok/s, 512 -> 73, 1024 -> 69.
+        assert_eq!(prefill_max_batch_for_arch("gfx1151"), 512);
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1151"),
+            PREFILL_DEFAULT_BATCH_GFX1151
+        );
+        for arch in ["gfx1200", "gfx1152", "gfx942", "unknown"] {
             assert_eq!(
                 prefill_max_batch_for_arch(arch),
                 PREFILL_MAX_BATCH,

@@ -224,5 +224,5 @@ __device__ __forceinline__ void escha_decode_tile_lds(
         }                                                                      \
     }
 
-ESCHA_WMMA_GEMM(escha_gemm_grouped_wmma_k2, 2, 1)
-ESCHA_WMMA_GEMM(escha_gemm_grouped_wmma_k3, 3, 1)
+ESCHA_WMMA_GEMM(escha_gemm_grouped_wmma_k2, 2, 8)
+ESCHA_WMMA_GEMM(escha_gemm_grouped_wmma_k3, 3, 8)

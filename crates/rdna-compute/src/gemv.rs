@@ -13982,11 +13982,19 @@ impl Gpu {
                 (slots / g) * n
             }
         };
-        if a.numel() != want_a {
+        // `>=`, not `==`, for the same reason as `out` below: the kernel reads
+        // exactly `want_a` elements, so an oversized source is safe. Equality
+        // here broke batched prefill for the DENSE escha path outright. Prefill
+        // scratch is sized for the maximum chunk, so any shorter chunk was
+        // rejected for being too BIG — a 2009-token prompt yields a 217-slot
+        // chunk against 256-slot scratch and failed with "a has 1310720
+        // elements, need 1111040". The dense 27B could then only prefill
+        // token-by-token through the decode path, at ~10 tok/s.
+        if a.numel() < want_a {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "escha_h128_batched: a has {} elements, need {want_a}",
+                    "escha_h128_batched: a has {} elements, need at least {want_a}",
                     a.numel()
                 ),
             ));
