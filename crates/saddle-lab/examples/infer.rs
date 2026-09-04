@@ -462,10 +462,38 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .filter(|&n: &usize| n > 0);
 
-    // Prefill (zero-alloc scratch path)
+    // Prefill. Text-only takes the BATCHED path; the per-token loop below is
+    // only for VL (interleaved image embeddings) and for the logit probe, which
+    // needs a distribution per position.
+    //
+    // The loop runs the DECODE kernel once per prompt token, so it prefills at
+    // decode speed — ~13 minutes for an 8k prompt on the dense 27B. Batched
+    // prefill does the same work through the MMQ/WMMA path in seconds. Nothing
+    // required the slow path for text; it was just what this example did.
     let t_pf = Instant::now();
+    let use_batched = !vl_mode && logit_probe.is_none();
+    if use_batched {
+        qwen35::forward_prefill_batch(
+            &mut gpu,
+            &weights,
+            &text_config,
+            &prompt_tokens,
+            0,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("forward_prefill_batch failed");
+    }
     let mut visual_idx = 0usize;
     for (pos, &token) in prompt_tokens.iter().enumerate() {
+        if use_batched {
+            break;
+        }
         if vl_mode && token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
             let vt = visual_tokens.as_ref().unwrap();
             let emb = &vt[visual_idx * text_config.dim..(visual_idx + 1) * text_config.dim];
