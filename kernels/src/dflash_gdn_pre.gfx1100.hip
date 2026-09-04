@@ -48,6 +48,9 @@
 
 #define GDN_PRE_HD 128
 #define GDN_PRE_BLOCK 256
+// Max fused rows (host launcher caps n/n_steps <= 16; LDS stages one row
+// per slot, see the Q/K two-phase restructure below).
+#define GDN_PRE_MAXN 16
 
 // Verbatim causal depthwise 4-tap conv + SiLU + ring update for one
 // (row, channel). `W` is conv_w, `S` is conv_state, `C` the channel.
@@ -103,8 +106,10 @@ __global__ void dflash_gdn_pre_capture_gfx1100(
     int tape_offset,
     float q_scale,
     float eps) {
-    __shared__ float q_s[GDN_PRE_HD];
-    __shared__ float k_s[GDN_PRE_HD];
+    __shared__ float q_s[GDN_PRE_MAXN][GDN_PRE_HD];
+    __shared__ float k_s[GDN_PRE_MAXN][GDN_PRE_HD];
+    __shared__ float q_inv[GDN_PRE_MAXN];
+    __shared__ float k_inv[GDN_PRE_MAXN];
 
     const float* W = conv_w;
     float* S = conv_state;
@@ -115,6 +120,14 @@ __global__ void dflash_gdn_pre_capture_gfx1100(
     if (bx < n_key_heads) {
         // Q/K head block: owns Q channels [h*HD,(h+1)*HD) and K channels
         // [k_dim+h*HD,k_dim+(h+1)*HD). Threads 0..127 take Q, 128..255 take K.
+        //
+        // Two phases: (1) the causal conv row loop runs barrier-free (each
+        // channel and its conv_state ring lane are thread-exclusive) and
+        // stages conv outputs into LDS rows; (2) after ONE barrier the
+        // verbatim 32-lane norm tree runs per row, then ALL 256 threads
+        // scatter normed/scaled/repeated outputs (order-free stores).
+        // Bit-exact: same conv order, same reduction order, same store
+        // addresses and values as the old launch sequence.
         const int h = bx;
         for (int t = 0; t < n_tokens; ++t) {
             const long long in_row = (long long)t * qkv_dim;
@@ -125,44 +138,50 @@ __global__ void dflash_gdn_pre_capture_gfx1100(
                 const int c = h * GDN_PRE_HD + tid;
                 GDN_PRE_CONV_STEP(qkv_in[in_row + c], c, result);
                 q_raw[qk_row + c] = result;
-                q_s[tid] = result;
+                q_s[t][tid] = result;
                 tape_qkv[tape_row + c] = qkv_in[in_row + c];
             } else {
                 const int d = tid - GDN_PRE_HD;
                 const int c = k_dim + h * GDN_PRE_HD + d;
                 GDN_PRE_CONV_STEP(qkv_in[in_row + c], c, result);
                 k_raw[qk_row + h * GDN_PRE_HD + d] = result;
-                k_s[d] = result;
+                k_s[t][d] = result;
                 tape_qkv[tape_row + c] = qkv_in[in_row + c];
             }
-            __syncthreads();
-            // Verbatim interleave-kernel reduction for this single head.
-            if (tid < 32) {
+        }
+        __syncthreads();
+        // Verbatim interleave-kernel reduction, one row at a time; the
+        // reciprocals spill to LDS for the widened store phase.
+        if (tid < 32) {
+            for (int t = 0; t < n_tokens; ++t) {
                 float q_sq = 0.0f;
                 for (int d = tid; d < GDN_PRE_HD; d += 32)
-                    q_sq += q_s[d] * q_s[d];
+                    q_sq += q_s[t][d] * q_s[t][d];
                 for (int o = 16; o > 0; o >>= 1)
                     q_sq += __shfl_xor(q_sq, o);
-                float q_inv_norm = rsqrtf(q_sq + eps);
+                q_inv[t] = rsqrtf(q_sq + eps);
                 float k_sq = 0.0f;
                 for (int d = tid; d < GDN_PRE_HD; d += 32)
-                    k_sq += k_s[d] * k_s[d];
+                    k_sq += k_s[t][d] * k_s[t][d];
                 for (int o = 16; o > 0; o >>= 1)
                     k_sq += __shfl_xor(k_sq, o);
-                float k_inv_norm = rsqrtf(k_sq + eps);
-                const long long dst_row = (long long)t * n_v_heads * GDN_PRE_HD;
-                for (int d = tid; d < GDN_PRE_HD; d += 32) {
-                    float qv = q_s[d] * q_inv_norm;
-                    qv *= q_scale;
-                    float kv = k_s[d] * k_inv_norm;
-                    for (int r = 0; r < ratio; ++r) {
-                        const int vh = h * ratio + r;
-                        q_dst[dst_row + vh * GDN_PRE_HD + d] = qv;
-                        k_dst[dst_row + vh * GDN_PRE_HD + d] = kv;
-                    }
-                }
+                k_inv[t] = rsqrtf(k_sq + eps);
             }
-            __syncthreads();
+        }
+        __syncthreads();
+        for (int t = 0; t < n_tokens; ++t) {
+            const float qi = q_inv[t];
+            const float ki = k_inv[t];
+            const long long dst_row = (long long)t * n_v_heads * GDN_PRE_HD;
+            for (int i = tid; i < GDN_PRE_HD * ratio; i += GDN_PRE_BLOCK) {
+                const int d = i / ratio;
+                const int vh = h * ratio + (i % ratio);
+                float qv = q_s[t][d] * qi;
+                qv *= q_scale;
+                float kv = k_s[t][d] * ki;
+                q_dst[dst_row + vh * GDN_PRE_HD + d] = qv;
+                k_dst[dst_row + vh * GDN_PRE_HD + d] = kv;
+            }
         }
         return;
     }
@@ -228,65 +247,77 @@ __global__ void dflash_gdn_pre_replay_gfx1100(
     int n_steps,
     float q_scale,
     float eps) {
-    __shared__ float q_s[GDN_PRE_HD];
-    __shared__ float k_s[GDN_PRE_HD];
+    __shared__ float q_s[GDN_PRE_MAXN][GDN_PRE_HD];
+    __shared__ float k_s[GDN_PRE_MAXN][GDN_PRE_HD];
+    __shared__ float q_inv[GDN_PRE_MAXN];
+    __shared__ float k_inv[GDN_PRE_MAXN];
 
     const float* W = conv_w;
     float* S = conv_state;
     const int tid = threadIdx.x;
     const int bx = blockIdx.x;
     const int v_blocks = (v_dim + GDN_PRE_BLOCK - 1) / GDN_PRE_BLOCK;
-
     if (bx < n_key_heads) {
         // Q/K head block. Same conv + reduction as capture, but the raw
         // scratch keeps the OLD in-place-norm postcondition (normed values),
         // matching fused_qk_l2_norm_scale_f32_batched's two ordered
-        // multiplies exactly.
+        // multiplies exactly. Same two-phase shape as capture: barrier-free
+        // conv staging, ONE barrier, verbatim 32-lane reductions spilling
+        // reciprocals to LDS, then a 256-wide store scatter (the r == 0 lane
+        // keeps the single in-place q_raw/k_raw write per element).
         const int h = bx;
         for (int t = 0; t < n_steps; ++t) {
             const long long in_row = (long long)t * qkv_dim;
-            const long long qk_row = (long long)t * k_dim;
             float result = 0.0f;
             if (tid < GDN_PRE_HD) {
                 const int c = h * GDN_PRE_HD + tid;
                 GDN_PRE_CONV_STEP(qkv_tape[in_row + c], c, result);
-                q_s[tid] = result;
+                q_s[t][tid] = result;
             } else {
                 const int d = tid - GDN_PRE_HD;
                 const int c = k_dim + h * GDN_PRE_HD + d;
                 GDN_PRE_CONV_STEP(qkv_tape[in_row + c], c, result);
-                k_s[d] = result;
+                k_s[t][d] = result;
             }
-            __syncthreads();
-            if (tid < 32) {
+        }
+        __syncthreads();
+        if (tid < 32) {
+            for (int t = 0; t < n_steps; ++t) {
                 float q_sq = 0.0f;
                 for (int d = tid; d < GDN_PRE_HD; d += 32)
-                    q_sq += q_s[d] * q_s[d];
+                    q_sq += q_s[t][d] * q_s[t][d];
                 for (int o = 16; o > 0; o >>= 1)
                     q_sq += __shfl_xor(q_sq, o);
-                float q_inv_norm = rsqrtf(q_sq + eps);
+                q_inv[t] = rsqrtf(q_sq + eps);
                 float k_sq = 0.0f;
                 for (int d = tid; d < GDN_PRE_HD; d += 32)
-                    k_sq += k_s[d] * k_s[d];
+                    k_sq += k_s[t][d] * k_s[t][d];
                 for (int o = 16; o > 0; o >>= 1)
                     k_sq += __shfl_xor(k_sq, o);
-                float k_inv_norm = rsqrtf(k_sq + eps);
-                const long long dst_row = (long long)t * n_v_heads * GDN_PRE_HD;
-                for (int d = tid; d < GDN_PRE_HD; d += 32) {
-                    // Old in-place order: q *= inv, then q *= scale.
-                    float qv = q_s[d] * q_inv_norm;
-                    qv *= q_scale;
-                    float kv = k_s[d] * k_inv_norm;
+                k_inv[t] = rsqrtf(k_sq + eps);
+            }
+        }
+        __syncthreads();
+        for (int t = 0; t < n_steps; ++t) {
+            const float qi = q_inv[t];
+            const float ki = k_inv[t];
+            const long long qk_row = (long long)t * k_dim;
+            const long long dst_row = (long long)t * n_v_heads * GDN_PRE_HD;
+            for (int i = tid; i < GDN_PRE_HD * ratio; i += GDN_PRE_BLOCK) {
+                const int d = i / ratio;
+                const int r = i % ratio;
+                // Old in-place order: q *= inv, then q *= scale.
+                float qv = q_s[t][d] * qi;
+                qv *= q_scale;
+                float kv = k_s[t][d] * ki;
+                if (r == 0) {
                     q_raw[qk_row + h * GDN_PRE_HD + d] = qv;
                     k_raw[qk_row + h * GDN_PRE_HD + d] = kv;
-                    for (int r = 0; r < ratio; ++r) {
-                        const int vh = h * ratio + r;
-                        q_dst[dst_row + vh * GDN_PRE_HD + d] = qv;
-                        k_dst[dst_row + vh * GDN_PRE_HD + d] = kv;
-                    }
                 }
+                const int vh = h * ratio + r;
+                q_dst[dst_row + vh * GDN_PRE_HD + d] = qv;
+                k_dst[dst_row + vh * GDN_PRE_HD + d] = kv;
             }
-            __syncthreads();
         }
         return;
     }
