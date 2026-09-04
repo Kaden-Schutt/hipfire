@@ -1771,21 +1771,60 @@ fn report_progress(downloaded: u64, total: Option<u64>, elapsed: Duration) {
 
 fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
     let loaded = load_registry(&paths.registry);
-    let resolved = loaded.registry.model(&args.model);
-    let path = find_model_path(paths, &loaded.registry, &args.model)
+    rm_with_registry(paths, &loaded.registry, args)
+}
+
+/// Remove one model and its sidecars. A declared DFlash draft sidecar is
+/// shared: several registry entries can name the same `dflash.file` (e.g.
+/// `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`, and `qwen3.8:27b-mq4-xt` all declare
+/// `qwen38-27b-dflash-mq4.hfq`). Deleting it while a sibling declarer is
+/// still on disk leaves those siblings running AR under `dflash_mode=auto`
+/// or refusing to load under `on`, so the sidecar is kept — with one stderr
+/// line — whenever any OTHER entry declaring the same file still has its own
+/// target file present in the models dir.
+fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    let resolved = registry.model(&args.model);
+    let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
         bail!("model not found: {}", path.display());
     }
     let mut targets = BTreeSet::from([path.clone()]);
-    if let Some((_, entry)) = resolved {
+    // A shared DFlash sidecar that must survive this removal: (file, keepers).
+    let mut kept_sidecar: Option<(String, String)> = None;
+    if let Some((tag, entry)) = resolved {
         targets.extend(
-            [&entry.triattn, &entry.mtp, &entry.dspark, &entry.dflash]
+            [&entry.triattn, &entry.mtp, &entry.dspark]
                 .into_iter()
                 .flatten()
                 .map(|sidecar| paths.models.join(&sidecar.file))
                 .filter(|path| path.is_file()),
         );
+        if let Some(sidecar) = entry.dflash.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .dflash
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_sidecar = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
     }
     if let (Some(parent), Some(file)) = (
         path.parent(),
@@ -1828,6 +1867,9 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
         fs::remove_file(&target)
             .with_context(|| format!("failed to remove {}", target.display()))?;
         println!("removed {}", target.display());
+    }
+    if let Some((file, keepers)) = kept_sidecar {
+        eprintln!("keeping DFlash sidecar {file}: still declared by {keepers}");
     }
     Ok(())
 }
@@ -7206,6 +7248,163 @@ mod tests {
         )
         .unwrap();
         assert!(params.get("draft").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// Minimal in-memory registry for rm tests: (tag, target file, dflash file).
+    fn rm_test_registry(entries: &[(&str, &str, Option<&str>)]) -> RegistryV1 {
+        let mut models = BTreeMap::new();
+        for (tag, file, dflash) in entries {
+            models.insert(
+                (*tag).to_owned(),
+                ModelEntry {
+                    repo: "test/repo".into(),
+                    file: (*file).to_owned(),
+                    size_gb: 1.0,
+                    min_vram_gb: 1.0,
+                    desc: "rm test".into(),
+                    dflash: dflash.map(|draft| hipfire_registry::Sidecar {
+                        file: draft.into(),
+                        sha256: None,
+                        size_bytes: None,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        RegistryV1 {
+            schema_version: hipfire_registry::REGISTRY_SCHEMA_VERSION,
+            generated_at: "test".into(),
+            _comment: None,
+            models,
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn rm_keeps_shared_dflash_sidecar_while_sibling_target_present() {
+        // The hw-gate regression on PR #686: `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`,
+        // and `qwen3.8:27b-mq4-xt` all declare `qwen38-27b-dflash-mq4.hfq`.
+        // Removing one target must keep the sidecar while a sibling declarer's
+        // target file is still on disk.
+        let paths = test_paths("rm-shared-sidecar-kept");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq4",
+            "qwen3.8-27b.mq4-pro",
+            "qwen38-27b-dflash-mq4.hfq",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[
+            (
+                "qwen3.8:27b",
+                "qwen3.8-27b.mq4",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-pro",
+                "qwen3.8-27b.mq4-pro",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-xt",
+                "qwen3.8-27b.mq4-xt",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+        ]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b.mq4").exists(),
+            "sibling target stays"
+        );
+        assert!(
+            paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "shared sidecar is kept while a sibling declarer is on disk"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_dflash_sidecar_with_last_declaring_target() {
+        // `qwen3.8:27b` still declares the sidecar in the registry, but its
+        // target file was never downloaded — a registry row alone must not pin
+        // the sidecar once the last on-disk declarer is removed.
+        let paths = test_paths("rm-shared-sidecar-last");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4-pro", "qwen38-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[
+            (
+                "qwen3.8:27b",
+                "qwen3.8-27b.mq4",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-pro",
+                "qwen3.8-27b.mq4-pro",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+        ]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "sidecar goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_without_dflash_declaration_leaves_draft_file_alone() {
+        // A tag with no dflash declaration keeps master behaviour: its target
+        // goes, and a draft file it never declared is not an rm target.
+        let paths = test_paths("rm-no-dflash");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::write(paths.models.join("qwen3.8-27b.mq4"), b"fixture").unwrap();
+        fs::write(paths.models.join("qwen38-27b-dflash-mq4.hfq"), b"draft").unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b", "qwen3.8-27b.mq4", None)]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "an undeclared draft file is never an rm target"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
