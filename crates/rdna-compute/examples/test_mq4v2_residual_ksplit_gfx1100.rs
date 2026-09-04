@@ -16,6 +16,10 @@
 //! NOT required. The `ldsstage` arm (kw column prints `lds`, requires
 //! K % 512 == 0) runs the same gate and the same timing discipline against
 //! the same base reference and f64 floor.
+//! The `pf2`/`pf4` arms (exp/ks4-prefetch) run the depth-2/depth-4
+//! software-prefetched ks4 variants wherever kw=4 is runnable and gate EXACT
+//! bitwise equality with the ks4 kw=4 single-launch output (any nonzero
+//! bitwise-diff count fails the run), plus the same relL2/timing columns.
 //!
 //! Association-floor documentation: for each (shape, N) the harness also
 //! builds an f64 host reference — real weights dequantized with the exact
@@ -678,13 +682,92 @@ fn main() {
                     p.label, n, "lds"
                 );
             }
+            // Prefetch arms (exp/ks4-prefetch, KILL EXPERIMENT): depth-2
+            // `ks4_pf_lds` and depth-4 `ks4_pf4_lds` must be BIT-IDENTICAL to
+            // ks4 kw=4 (same dequant/WMMA/reduce order — exact u32 equality,
+            // not relL2). Fresh ks4 single-launch reference per (proj, N),
+            // same timing discipline (32 warmups, 200 launches/sample,
+            // 3 samples, min+median) against the same base reference.
+            if runnable.contains(&4) {
+                let d_y_ksref = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y ksref");
+                htod_f32(&gpu, &d_y_ksref, &y_init);
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(&d_a, &d_x, &d_y_ksref, m, k, n, 4)
+                    .expect("ks4 kw=4 ref launch failed");
+                sync(&gpu);
+                let y_ksref = gpu.download_f32(&d_y_ksref).expect("download ks4 ref");
+                for &depth in &[2u8, 4u8] {
+                    let tag = if depth == 2 { "pf2" } else { "pf4" };
+                    let d_y_pf = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y pf");
+                    htod_f32(&gpu, &d_y_pf, &y_init);
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ks4_pf_lds(&d_a, &d_x, &d_y_pf, m, k, n, depth)
+                        .unwrap_or_else(|e| panic!("{tag} launch failed: {e:?}"));
+                    sync(&gpu);
+                    let y_pf = gpu.download_f32(&d_y_pf).expect("download pf");
+                    let finite_pf = is_finite(&y_pf);
+                    let ndiff = y_pf
+                        .iter()
+                        .zip(y_ksref.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    eprintln!("  pf-exact {} N={n} {tag}: bitwise_diffs_vs_ks4={ndiff}/{} finite={finite_pf}", p.label, y_pf.len());
+                    let r_pf_base = rel_l2(&y_pf, &y_ref);
+                    let ma_pf = max_abs_diff(&y_pf, &y_ref);
+                    let y_pf64: Vec<f64> = y_pf.iter().map(|&v| v as f64).collect();
+                    let r_pf_f64 = rel_l2_f64(&y_pf64, &y_f64);
+                    let ma_pf_f64 = y_pf64
+                        .iter()
+                        .zip(y_f64.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f64, f64::max);
+                    let bigfrac_pf = y_pf
+                        .iter()
+                        .zip(y_ref.iter())
+                        .filter(|(a, b)| (**a - **b).abs() as f64 > BIG_DIFF)
+                        .count() as f64
+                        / y_pf.len() as f64;
+                    let ok_pf = finite_pf && ndiff == 0 && r_pf_base <= PARITY_TOL;
+                    if !ok_pf {
+                        all_ok = false;
+                        eprintln!("  FAIL parity {} N={n} {tag}: ndiff={ndiff} relL2(pf,base)={r_pf_base:.3e} maxAbs={ma_pf:.3e} finite={finite_pf}", p.label);
+                    }
+                    htod_f32(&gpu, &d_y_pf, &y_init);
+                    for _ in 0..WARMUP {
+                        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_ks4_pf_lds(
+                            &d_a, &d_x, &d_y_pf, m, k, n, depth,
+                        )
+                        .unwrap();
+                    }
+                    sync(&gpu);
+                    let mut us_pf: Vec<f64> = Vec::with_capacity(SAMPLES);
+                    for _ in 0..SAMPLES {
+                        htod_f32(&gpu, &d_y_pf, &y_init);
+                        us_pf.push(time_batch(&mut gpu, &mut |gm: &mut Gpu| {
+                            gm.gemm_mq4g256v2_residual_wmma_gfx1100_ks4_pf_lds(
+                                &d_a, &d_x, &d_y_pf, m, k, n, depth,
+                            )
+                            .unwrap()
+                        }));
+                    }
+                    us_pf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med_pf = median(us_pf.clone());
+                    let status_pf = if ok_pf { "OK" } else { "FAIL" };
+                    println!(
+                        "{:>10} {:>3} {:>4} {:>12.3e} {:>12.3e} {:>7} {:>12.3e} {:>12.3e} {:>12.3e} {:>12.3e} {:>9.2e} {:>10.1} {:>10.1} [{status_pf}]",
+                        p.label, n, tag, r_pf_base, ma_pf, finite_pf, r_base_f64, r_pf_f64, ma_pf_f64, rms_ref, bigfrac_pf, us_pf[0], med_pf
+                    );
+                }
+            } else {
+                println!(
+                    "{:>10} {:>3} {:>4}  SKIP (kw=4 not runnable, pf requires (K/256)%4==0)",
+                    p.label, n, "pf2/pf4"
+                );
+            }
         }
     }
-
     if all_ok {
-        eprintln!("\nPASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, ldsstage relL2(lds,base)<=5e-5, all finite, Y+=W@X preserved");
+        eprintln!("\nPASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, ldsstage relL2(lds,base)<=5e-5, pf2/pf4 bit-identical to ks4 kw=4, all finite, Y+=W@X preserved");
     } else {
-        eprintln!("\nFAIL: one or more parity checks violated relL2<=5e-5 or finiteness");
+        eprintln!("\nFAIL: one or more parity checks violated relL2<=5e-5, pf bit-exactness, or finiteness");
         std::process::exit(1);
     }
 }

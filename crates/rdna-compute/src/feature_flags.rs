@@ -187,6 +187,12 @@ pub struct FeatureFlags {
     /// the 70% gate — 126 VGPRs cap it at 1 WG/CU — so ks4 stays the default
     /// until register pressure is addressed.
     pub residual_ldsstage: bool,
+    /// `HIPFIRE_RESIDUAL_KSPLIT_PF=1` (exp/ks4-prefetch, KILL EXPERIMENT)
+    /// routes the exact-gfx1100 N<=16 tier's kw=4 shapes to the depth-2
+    /// software-prefetched `ks4_pf_lds` kernel; `=2` selects the depth-4
+    /// `ks4_pf4_lds` kernel. Any other value (including unset) keeps ks4.
+    /// Bit-identical to ks4 by construction; the parity example gates this.
+    pub residual_ksplit_pf: u8,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -535,6 +541,11 @@ impl FeatureFlags {
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
+            residual_ksplit_pf: match value("HIPFIRE_RESIDUAL_KSPLIT_PF").ok().as_deref() {
+                Some("1") => 1,
+                Some("2") => 2,
+                _ => 0,
+            },
             residual_ldsstage: value("HIPFIRE_RESIDUAL_LDSSTAGE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
@@ -795,6 +806,7 @@ impl FeatureFlags {
             graph_moe: true,
             force_blob_path: false,
             residual_ksplit_off: false,
+            residual_ksplit_pf: 0,
             residual_ldsstage: false,
             gemm_dump: false,
             deterministic: false,
