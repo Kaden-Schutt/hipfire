@@ -510,11 +510,46 @@ impl KernelCompiler {
         self.compiled.entry(func_name.to_string()).or_insert(path);
     }
 
+    /// Module owning the ks2/ks4/ks8 ksplit residual symbols. The ks4
+    /// radiowave sweep (exp/ks4-radiowave) drives every candidate through this
+    /// module's flags so the parity+bench batteries stay authoritative.
+    const KSPLIT_MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds";
+
+    /// Pure constructor for the ksplit experiment flags. Split out so unit
+    /// tests can prove cache-key separation without touching the process env
+    /// snapshot (which freezes once per process).
+    fn ksplit_module_flags(flags_raw: Option<&str>, defines_raw: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = flags_raw
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        out.extend(
+            defines_raw
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(|tok| format!("-D{tok}")),
+        );
+        out
+    }
+
     fn module_flags_for(
         arch: &str,
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
+        // ks4-radiowave experiment (exp/ks4-radiowave; HIPCC-flags half ported
+        // from exp/ks4-flags@bc95e8b13): env-driven extra hipcc flags for the
+        // ksplit residual module only. HIPFIRE_KSPLIT_HIPCC_FLAGS is
+        // space-separated raw flags; HIPFIRE_KS4_DEFINES is space-separated
+        // `NAME[=value]` tokens, each passed as `-D<tok>`. Empty/missing =
+        // today. `module_flags` already participates in `hash_parts`, so each
+        // variant recompiles under its own cache key (no ABI bump needed).
+        if arch == "gfx1100" && name == Self::KSPLIT_MODULE {
+            let flags = hipfire_config::developer_var("HIPFIRE_KSPLIT_HIPCC_FLAGS").ok();
+            let defines = hipfire_config::developer_var("HIPFIRE_KS4_DEFINES").ok();
+            return Self::ksplit_module_flags(flags.as_deref(), defines.as_deref());
+        }
         // Radiowave-selected spill-free RM2/BV6 schedule.
         if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
             vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
@@ -1790,6 +1825,120 @@ mod tests {
         assert_ne!(
             control.cache_hash(module, source),
             gfx1100.cache_hash(module, source)
+        );
+    }
+
+    #[test]
+    fn ksplit_module_flags_empty_is_today() {
+        // Empty/missing env = today's flags: no module flags, so hash_parts
+        // takes the no-module-flags path exactly as before this change.
+        assert!(KernelCompiler::ksplit_module_flags(None, None).is_empty());
+        assert!(KernelCompiler::ksplit_module_flags(Some(""), Some("   ")).is_empty());
+        let source = "__global__ void ks4() {}";
+        let before = KernelCompiler::hash_parts(
+            source,
+            "gfx1100",
+            "",
+            &[],
+            "hipcc 7.2",
+            SchedulerProfile::Default,
+        );
+        let after = KernelCompiler::hash_parts(
+            source,
+            "gfx1100",
+            "",
+            &KernelCompiler::ksplit_module_flags(None, None),
+            "hipcc 7.2",
+            SchedulerProfile::Default,
+        );
+        assert_eq!(
+            before, after,
+            "empty ksplit env must keep the cache key byte-identical"
+        );
+    }
+
+    #[test]
+    fn ksplit_module_flags_map_flags_and_defines() {
+        assert_eq!(
+            KernelCompiler::ksplit_module_flags(Some("-O3 -mllvm -foo"), None),
+            vec!["-O3", "-mllvm", "-foo"],
+        );
+        assert_eq!(
+            KernelCompiler::ksplit_module_flags(None, Some("KS4_W_LOADFORM=1 KS4_X_LOADFORM=2")),
+            vec!["-DKS4_W_LOADFORM=1", "-DKS4_X_LOADFORM=2"],
+        );
+        assert_eq!(
+            KernelCompiler::ksplit_module_flags(Some("-O3"), Some("KS4_UNROLL=2")),
+            vec!["-O3", "-DKS4_UNROLL=2"],
+        );
+    }
+
+    #[test]
+    fn ksplit_variants_hash_distinctly() {
+        let source = "__global__ void ks4() {}";
+        let hash = |flags: Vec<String>| {
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1100",
+                "",
+                &flags,
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+            )
+        };
+        let base = hash(KernelCompiler::ksplit_module_flags(None, None));
+        let flags_a = hash(KernelCompiler::ksplit_module_flags(
+            Some("-mllvm -misched=gcn-iterative-ilp"),
+            None,
+        ));
+        let def_a = hash(KernelCompiler::ksplit_module_flags(None, Some("KS4_W_LOADFORM=1")));
+        let def_b = hash(KernelCompiler::ksplit_module_flags(None, Some("KS4_W_LOADFORM=2")));
+        println!("ksplit cache_hash base={base} flags_a={flags_a} def_a={def_a} def_b={def_b}");
+        assert_ne!(base, flags_a);
+        assert_ne!(base, def_a);
+        assert_ne!(def_a, def_b, "distinct define strings must key separately");
+    }
+
+    #[test]
+    fn ksplit_arm_is_module_and_arch_exact() {
+        // The muse_rm_bt schedule arm is intact, unrelated modules stay empty
+        // even on gfx1100, and the ksplit arm stays silent off gfx1100.
+        let cumode = HashSet::new();
+        assert_eq!(
+            KernelCompiler::module_flags_for(
+                "gfx1100",
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt",
+                &cumode
+            ),
+            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()],
+        );
+        assert!(KernelCompiler::module_flags_for("gfx1100", "other_module", &cumode).is_empty());
+        assert!(KernelCompiler::module_flags_for(
+            "gfx1201",
+            KernelCompiler::KSPLIT_MODULE,
+            &cumode
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn ksplit_module_flags_for_matches_env() {
+        // Consistency probe (deterministic in any ambient env because no unit
+        // test in this binary mutates process env): module_flags_for must
+        // return exactly what the pure helper builds from the live env. Run in
+        // fresh processes to prove wiring:
+        //   cargo test -p rdna-compute ksplit_module_flags_for_matches_env
+        //   HIPFIRE_KSPLIT_HIPCC_FLAGS="-O3" HIPFIRE_KS4_DEFINES="KS4_W_LOADFORM=1" \
+        //     cargo test -p rdna-compute ksplit_module_flags_for_matches_env -- --nocapture
+        let flags = std::env::var("HIPFIRE_KSPLIT_HIPCC_FLAGS").ok();
+        let defines = std::env::var("HIPFIRE_KS4_DEFINES").ok();
+        let expected = KernelCompiler::ksplit_module_flags(flags.as_deref(), defines.as_deref());
+        let observed =
+            KernelCompiler::module_flags_for("gfx1100", KernelCompiler::KSPLIT_MODULE, &HashSet::new());
+        println!("KSPLIT_MODULE_FLAGS observed={observed:?}");
+        assert_eq!(
+            observed, expected,
+            "module_flags_for ksplit arm must honor both envs exactly"
         );
     }
 
