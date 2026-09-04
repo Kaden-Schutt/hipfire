@@ -4412,6 +4412,53 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     fusion: DflashFusionCtx,
 ) -> HipResult<Option<&'a GpuTensor>> {
     let _ = fusion;
+    // S5-gdn-pre-tape-fusion fast path: one launch for sigmoid(alpha/beta) +
+    // tape writes + conv + QK norm/interleave. Chain verify is sequential
+    // with no tree parents, so success returns None. Every failed predicate
+    // (kill switch, non-sequential batch, non-GQA route, tape absence or
+    // overflow, ineligible shapes/arch) runs the pre-change sequence below
+    // launch-for-launch.
+    if fusion == DflashFusionCtx::ChainVerify
+        && !gpu.flags.gdn_pre_fuse_off
+        && matches!(batch_semantics, BatchSemantics::Sequential)
+        && config.linear_num_key_heads < n_v_heads
+        && (1..=16).contains(&n)
+    {
+        if let Some(tape) = gdn_tape.as_ref() {
+            if tape_offset + n <= tape.max_n {
+                let fused = gpu.dflash_gdn_pre_capture_gfx1100(
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    &pbs.dn_qkv_batch,
+                    &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    &pbs.dn_v_batch,
+                    &pbs.dn_q_batch,
+                    &pbs.dn_k_batch,
+                    &tape.qkv_bufs[delta_layer_idx],
+                    &tape.alpha_bufs[delta_layer_idx],
+                    &tape.beta_bufs[delta_layer_idx],
+                    n_v_heads,
+                    config.linear_num_key_heads,
+                    hd,
+                    k_dim,
+                    v_dim,
+                    tape.qkv_dim,
+                    n,
+                    tape_offset,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                )?;
+                if fused {
+                    return Ok(None);
+                }
+            }
+        }
+    }
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
         &pbs.dn_beta_batch,
