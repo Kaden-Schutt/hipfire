@@ -241,7 +241,6 @@ dis = subprocess.run([objdump, '--disassemble', '--mcpu=gfx1100', co], capture_o
 def sym_range(name, lines):
     s = next(i for i, l in enumerate(lines) if '<' + name + '>:' in l)
     e = next((i for i, l in enumerate(lines[s+1:], s+1) if re.search(r'^\s*[0-9a-f]+\s*<\w', l)), len(lines))
-    return lines[s:e]
 focus = '{focus}'
 body = sym_range(focus, dis)
 base = addr_of(body[0])
@@ -252,9 +251,16 @@ for l in body:
         if m and a is not None:
             t = base + int(m.group(1), 16)
             if t < a: spans.append((t, a))
-assert spans, 'no loop back-edge found in ' + focus
-t, a = max(spans, key=lambda s: s[1] - s[0])
-vmcnt_loop = sum(1 for l in body if addr_of(l) is not None and t <= addr_of(l) <= a and re.search(r's_waitcnt.*vmcnt', l))
+if spans:
+    t, a = max(spans, key=lambda s: s[1] - s[0])
+    vmcnt_loop = sum(1 for l in body if addr_of(l) is not None and t <= addr_of(l) <= a and re.search(r's_waitcnt.*vmcnt', l))
+    loop_note = ''
+else:
+    # No backward data-loop edge: the scheduler unrolled/restructured the
+    # group loop (seen under KS4_VGPR_CAP with spills). No honest in-loop
+    # count exists; record null rather than a misleading 0.
+    vmcnt_loop = None
+    loop_note = '; no loop back-edge (unrolled/restructured under this variant)'
 os.remove(co)
 # parity: worst relL2 + N=16 ks4 rows (out_proj/down_proj).
 par = open(os.path.join(ev, 'parity.log')).read()
@@ -290,7 +296,7 @@ row = dict(campaign='ks4-radiowave', schema=1, candidate=id_, recipe=recipe, def
     symbol_out=sym.get('L0 out_proj (residual)'), symbol_down=sym.get('L0 down_proj (residual)')),
   prompt_md5='{model_md5}', binary_md5=dict(parity='{parity_md5}', bench='{bench_md5}'),
   spill=spill, shippable=(pass_ and not spill), verdict=verdict,
-  reason=('parity relL2<=5e-5 gate' if pass_ else 'parity FAIL relL2>5e-5 or non-finite') + ('; spill/scratch nonzero: never shippable' if spill else ''),
+  reason=('parity relL2<=5e-5 gate' if pass_ else 'parity FAIL relL2>5e-5 or non-finite') + ('; spill/scratch nonzero: never shippable' if spill else '') + loop_note,
   evidence=dict(parity_log=os.path.join(ev, 'parity.log'), bench_log=os.path.join(ev, 'bench.log'), manifest=os.path.join(ev, 'manifest.json')))
 open(ledger, 'a').write(json.dumps(row, sort_keys=True) + '\n')
 print(json.dumps(dict(candidate=id_, verdict=verdict, worst_relL2=worst, spill=spill,
