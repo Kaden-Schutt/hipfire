@@ -65,7 +65,11 @@ const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
-fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+/// Public so gates outside the loader (e.g.
+/// `examples/test_escha_dense_linear_gpu_vs_cpu.rs`) resolve names through the
+/// SAME aliasing the production load uses. A gate with its own copy of this
+/// would stop testing what actually runs the moment the two drifted.
+pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(4);
     let mut push = |s: String| {
         if !out.iter().any(|x| x == &s) {

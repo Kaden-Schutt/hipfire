@@ -536,6 +536,11 @@ pub struct EschaDenseLinear {
     pub bias: Option<GpuTensor>,
     /// Buffer owning `w`'s bytes; freed with the layer.
     pub owner: GpuTensor,
+    /// One-element `[0]` slot table, so the BATCHED H128 kernels can serve a
+    /// dense linear as the degenerate single-slot case. See
+    /// `escha_dense_linear_forward` for why the batched form and not the
+    /// single one.
+    pub ids0: GpuTensor,
 }
 
 /// Load one dense escha linear: `{p}.{proj}` with `[ic, oc]`.
@@ -605,12 +610,18 @@ pub fn load_escha_dense_linear(
             Some(read_bias_f32(gpu, info.quant_type, &data, oc)?)
         }
     };
+    // `ids` holds a 32-bit signed INTEGER, declared F32 only because
+    // rdna_compute::DType has no integer variant — the same deliberate
+    // reinterpretation `EschaMoeTables::ids` documents. A dense linear is
+    // slot 0 of a one-entry table, so the bytes are four zeros.
+    let ids0 = gpu.upload_f32(&[f32::from_bits(0)], &[1])?;
     Ok(EschaDenseLinear {
         w,
         rin,
         rout,
         bias,
         owner,
+        ids0,
     })
 }
 
@@ -642,13 +653,41 @@ pub fn escha_dense_linear_forward(
     mid: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    gpu.escha_h128("escha_h128_in", x, &lin.rin, xh)?;
+    // BATCHED H128, even for a single vector. The two variants differ in
+    // OUTPUT TYPE, not just shape: `escha_h128_in` writes `__half*` (it is the
+    // G3 parity form, matching `ref.py`'s f16 return) while
+    // `escha_h128_in_batched` writes `float*`. Using the single form with an
+    // f32 scratch buffer silently produced a zero activation — the f16 pairs
+    // reinterpret as denormal-scale f32 — which then flowed through the GEMV
+    // as zeros and left only the bias in the output. Caught by
+    // `test_escha_dense_linear_gpu_vs_cpu` before any of this was wired.
+    let ic = lin.w.k;
+    let oc = lin.w.m;
+    gpu.escha_h128_batched(
+        "escha_h128_in_batched",
+        x,
+        &lin.rin,
+        &lin.ids0,
+        xh,
+        ic,
+        1,
+        rdna_compute::EschaXGroup::Broadcast,
+    )?;
     // Plain `weight_gemv`, NOT `weight_gemv_prerotated`. The escha stores
     // decode to Q8_0/F16, neither of which wants an FWHT rotation, and `xh`
     // is already H128-rotated — handing it to the prerotated path as well
     // would rotate a rotated activation.
     hipfire_runtime::llama::weight_gemv(gpu, &lin.w, xh, mid)?;
-    gpu.escha_h128("escha_h128_out", mid, &lin.rout, y)?;
+    gpu.escha_h128_batched(
+        "escha_h128_out_batched",
+        mid,
+        &lin.rout,
+        &lin.ids0,
+        y,
+        oc,
+        1,
+        rdna_compute::EschaXGroup::Broadcast,
+    )?;
     if let Some(b) = lin.bias.as_ref() {
         gpu.add_inplace_f32(y, b)?;
     }
