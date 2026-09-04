@@ -648,6 +648,27 @@ def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo:
     return "\n".join(parts)
 
 
+# The diff is already capped at 400 KB below; the evidence had no cap, and the
+# first kernel-bucket run (#690, 33892920406) inlined ~2.5 MB of Redline
+# capture dumps: 1.36 M tokens against a 1 M window, both seats returned
+# nothing. run.py now elides the dumps at the source; this is the backstop
+# so no future field can push a seat prompt past the window again.
+EVIDENCE_PROMPT_CAP = 600 * 1024
+
+
+def evidence_for_prompt(evidence: dict | None) -> str:
+    if evidence is None:
+        return "(missing — hw-run did not produce evidence)"
+    text = json.dumps(evidence, indent=2, sort_keys=True)
+    raw = text.encode("utf-8")
+    if len(raw) <= EVIDENCE_PROMPT_CAP:
+        return text
+    return (
+        raw[:EVIDENCE_PROMPT_CAP].decode("utf-8", errors="ignore")
+        + f"\n\n[hw-gate.json truncated at {EVIDENCE_PROMPT_CAP} bytes of {len(raw)}; read the full file under the evidence directory]"
+    )
+
+
 def build_verdict_prompt(prelim_prompt: str, prelim: dict | None, evidence: dict | None, select: dict, hw_run_result: str) -> str:
     parts: list[str] = []
     parts.append(prelim_prompt)
@@ -657,11 +678,8 @@ def build_verdict_prompt(prelim_prompt: str, prelim: dict | None, evidence: dict
     parts.append("")
     parts.append(f"hw-run result: {hw_run_result}")
     parts.append("")
-    if evidence is not None:
-        parts.append("hw-gate.json:")
-        parts.append(json.dumps(evidence, indent=2, sort_keys=True))
-    else:
-        parts.append("hw-gate.json: (missing — hw-run did not produce evidence)")
+    parts.append("hw-gate.json:")
+    parts.append(evidence_for_prompt(evidence))
     return "\n".join(parts)
 
 
@@ -702,11 +720,8 @@ def build_decide_prompt(select: dict, prelim: dict | None, evidence: dict | None
     parts.append("Sol prelim (prelim.json prelim field):")
     parts.append(json.dumps(prelim, indent=2, sort_keys=True) if prelim is not None else "null")
     parts.append("")
-    if evidence is not None:
-        parts.append("hw-gate.json evidence:")
-        parts.append(json.dumps(evidence, indent=2, sort_keys=True))
-    else:
-        parts.append("hw-gate.json: missing")
+    parts.append("hw-gate.json evidence:")
+    parts.append(evidence_for_prompt(evidence))
     parts.append("")
     parts.append("Sol verdict (verdict.json verdict+floor):")
     parts.append(json.dumps(sol_verdict_obj, indent=2, sort_keys=True) if sol_verdict_obj is not None else "null")

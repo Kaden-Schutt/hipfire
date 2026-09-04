@@ -773,7 +773,36 @@ def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -
         else:
             reason = "no boolean parity summary in report (fail closed)"
             status = "fail"
-    return {"report": report, "exit": exit_code, "stderr_tail": stderr[-2000:] if stderr else "", "status": status, "reason": reason}
+    return {"report": elide_captures(report), "exit": exit_code, "stderr_tail": stderr[-2000:] if stderr else "", "status": status, "reason": reason}
+
+
+# Keys under which redline_daemon_harness.py stores raw per-dispatch capture
+# dumps. They are what makes the report large (516 KB per lane on #690's
+# first kernel-bucket run) and carry nothing a reviewer reads: the verdict
+# fields (`pass`, `sequence_stable`, `measurement`, `aql_shadow`, failures)
+# stay. The full report is still on disk as hw-gate-logs/redline.json.
+_CAPTURE_KEYS = {"captures", "dispatches", "packets", "raw"}
+
+
+def elide_captures(report):
+    """Return `report` with capture dumps replaced by their size, recursively.
+
+    Both seat prompts embed the merged evidence JSON verbatim; with the dumps
+    in, #690's decide prompt was 1.36 M tokens against a 1 M window and both
+    seats returned nothing (run 33892920406).
+    """
+    if isinstance(report, dict):
+        out = {}
+        for key, value in report.items():
+            if key in _CAPTURE_KEYS and isinstance(value, (list, dict)) and len(json.dumps(value)) > 4096:
+                n = len(value)
+                out[key] = f"<{n} entries elided; full report in hw-gate-logs/redline.json>"
+            else:
+                out[key] = elide_captures(value)
+        return out
+    if isinstance(report, list):
+        return [elide_captures(v) for v in report]
+    return report
 
 
 def render_md(evidence: dict) -> str:
