@@ -51,14 +51,24 @@
 
 // Verbatim causal depthwise 4-tap conv + SiLU + ring update for one
 // (row, channel). `W` is conv_w, `S` is conv_state, `C` the channel.
+//
+// The accumulation uses EXPLICIT fmaf (not the source-ordered `+` chain):
+// the old kernel's SASS contracts the sum as
+//   acc = w3*x; acc += w2*s0; acc += w1*s1; acc += w0*s2
+// with one rounding per step (v_mul + 3x v_fmac), and the backend does NOT
+// reliably rediscover that tree from `+` source in every block shape (the V
+// region compiled strict and drifted 1 ULP on the parity gate). fmaf pins
+// the exact old tree in all six instantiations (capture Q/K/V, replay
+// Q/K/V). Weight/state loads stay in-place (see conv1d_silu_split.hip).
 #define GDN_PRE_CONV_STEP(X, C, Y)                                            \
     do {                                                                      \
         float x = (X);                                                        \
         float s0 = (S)[(C) * 3];                                              \
         float s1 = (S)[(C) * 3 + 1];                                          \
         float s2 = (S)[(C) * 3 + 2];                                          \
-        float y = (W)[(C) * 4 + 3] * x + (W)[(C) * 4 + 2] * s0                \
-                + (W)[(C) * 4 + 1] * s1 + (W)[(C) * 4] * s2;                   \
+        float y = fmaf((W)[(C) * 4 + 3], x, (W)[(C) * 4 + 2] * s0);            \
+        y = fmaf((W)[(C) * 4 + 1], s1, y);                                    \
+        y = fmaf((W)[(C) * 4], s2, y);                                        \
         float r = y / (1.0f + expf(-y));                                      \
         (S)[(C) * 3 + 2] = s1;                                                \
         (S)[(C) * 3 + 1] = s0;                                                \
