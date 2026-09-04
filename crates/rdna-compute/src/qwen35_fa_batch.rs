@@ -7,8 +7,8 @@
 //!
 //! Both kernels are bit-exact folds of the launches they replace (see the
 //! `.hip` headers); admission (gfx1100, `DflashFusionCtx::ChainVerify`,
-//! exact 16Q/2K + HD256 + NROT64 shapes, kill switch) is enforced by the
-//! `batch_chunk_full_attn_prepare` caller and the `KvWriteQ8_0Batched`
+//! exact 16Q/2K or 24Q/4K + HD256 + NROT64 shapes, kill switch) is enforced
+//! by the `batch_chunk_full_attn_prepare` caller and the `KvWriteQ8_0Batched`
 //! dispatch arm. The launchers only validate shapes and enqueue via
 //! `launch_maybe_blob` with a retained `KernargBlob`, so they stay
 //! hipGraph-capture safe.
@@ -25,16 +25,16 @@ const FA_PREP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip");
 const KV_PAIR_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_pair_batched.gfx1100.hip");
-
-/// Fixed prep geometry: 16 Q heads + 2 K heads, head_dim 256, n_rot 64.
-const FA_NQ: u32 = 16;
-const FA_NK: u32 = 2;
+/// Admitted prep geometries (Q heads, K heads): 16/2 and 24/4, head_dim 256,
+/// n_rot 64. The kernel takes the Q-head split as a grid-uniform arg, so one
+/// symbol serves both; the launcher validates the pair.
+pub const FA_PREP_BATCHED_GEOMETRIES: [(usize, usize); 2] = [(16, 2), (24, 4)];
 
 #[cfg(feature = "deltanet")]
 impl Gpu {
     /// Batched gfx1100 full-attention prep. Folds deinterleave + Q/K rmsnorm
-    /// + partial half-split RoPE (4 launches) into one `[18, batch_size]`
-    /// grid of 256-thread blocks.
+    /// + partial half-split RoPE (4 launches) into one `[n_q+n_kv,
+    /// batch_size]` grid of 256-thread blocks.
     ///
     /// `k` is read pre-norm and written post-norm+rope in place. `positions`
     /// carries the physical KV slots; `pos_offset` (`compact_offset`) shifts
@@ -53,6 +53,8 @@ impl Gpu {
         eps: f32,
         freq_base: f32,
         pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -60,6 +62,12 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 1,
                 "qwen35_fa_prep_batched_gfx1100 is certified only on gfx1100",
+            ));
+        }
+        if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1100 requires 16Q/2K or 24Q/4K heads",
             ));
         }
         if batch_size == 0 {
@@ -84,6 +92,8 @@ impl Gpu {
         let ep = eps;
         let fb = freq_base;
         let po = pos_offset;
+        let nq = n_q_heads as i32;
+        let nkv = n_kv_heads as i32;
         let mut bs = batch_size as i32;
         let mut params: Vec<*mut c_void> = vec![
             &qip as *const _ as *mut c_void,
@@ -96,10 +106,12 @@ impl Gpu {
             &ep as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
             &po as *const _ as *mut c_void,
+            &nq as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
         // Per (head, token): interleaved read + norm read + q/gate/k writes.
-        let bytes = batch_size * ((FA_NQ + FA_NK) as usize * 256 * 4 * 2);
+        let bytes = batch_size * ((n_q_heads + n_kv_heads) * 256 * 4 * 2);
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -108,7 +120,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "qwen35_fa_prep_batched_gfx1100",
-            [FA_NQ + FA_NK, batch_size as u32, 1],
+            [(n_q_heads + n_kv_heads) as u32, batch_size as u32, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -124,6 +136,8 @@ impl Gpu {
                 b.push_f32(ep);
                 b.push_f32(fb);
                 b.push_i32(po);
+                b.push_i32(nq);
+                b.push_i32(nkv);
                 b.push_i32(bs);
                 b
             },
