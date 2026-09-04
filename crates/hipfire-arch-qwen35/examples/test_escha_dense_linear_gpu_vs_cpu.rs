@@ -234,8 +234,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             den += (*b as f64) * (*b as f64);
         }
         let rel_rms = (num / den.max(1e-30)).sqrt();
+        // Timed: is the native trellis path fast enough to justify wiring it
+        // into the layer forward? Weight bytes differ per store, so report
+        // achieved bandwidth as well as raw time — the native store moves ~3x
+        // fewer bytes than Q8_0 for the same maths.
+        let iters = 200usize;
+        for _ in 0..10 {
+            escha_dense_linear_forward(&mut gpu, &lin, &xg, &xh, &mid, &yg)?;
+        }
+        gpu.hip.device_synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            escha_dense_linear_forward(&mut gpu, &lin, &xg, &xh, &mid, &yg)?;
+        }
+        gpu.hip.device_synchronize()?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let wbytes = match store {
+            EschaWeightStore::Native => (ic * oc * k) as f64 / 8.0,
+            EschaWeightStore::F16 => (ic * oc * 2) as f64,
+            EschaWeightStore::Q8_0 => (ic * oc) as f64 * 34.0 / 32.0,
+            EschaWeightStore::F32 => (ic * oc * 4) as f64,
+        };
         println!(
-            "  store={store:?}: rel_rms {rel_rms:.3e}  worst_abs {worst:.3e}  non-finite {nonfinite}"
+            "  store={store:?}: rel_rms {rel_rms:.3e}  worst_abs {worst:.3e}  non-finite {nonfinite}               {us:.1} us/call  {:.1} GB/s  weights {:.1} MB",
+            wbytes / us / 1e3,
+            wbytes / 1e6
         );
         // F16 must be tight; Q8_0 carries its own re-quantisation error and is
         // reported rather than gated, so the two are not held to one bar.
