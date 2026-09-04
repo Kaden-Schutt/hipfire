@@ -128,15 +128,11 @@ fn test_prep(gpu: &mut Gpu, n: usize) {
 }
 
 fn test_kv_pair(gpu: &mut Gpu, n: usize) {
-    // Noncontiguous slots reaching the top of the arena (wrap-adjacent).
-    let slots: Vec<i32> = (0..n)
-        .map(|b| match b % 4 {
-            0 => (CAP - 1 - b / 4) as i32,
-            1 => (b * 5 + 1) as i32 % CAP as i32,
-            2 => 0,
-            _ => (CAP / 2 + b) as i32 % CAP as i32,
-        })
-        .collect();
+    // Unique noncontiguous slots spanning the arena (11 is coprime to 48).
+    // Uniqueness is required: two rows sharing a slot race in the OLD kernel
+    // too (concurrent blocks, one launch), so duplicates can never be
+    // byte-compared across runs. Production batches always use distinct slots.
+    let slots: Vec<i32> = (0..n).map(|b| ((b * 11 + 5) % CAP) as i32).collect();
     assert!(slots.iter().all(|&p| p >= 0 && (p as usize) < CAP));
     let pos = upload_pos(gpu, &slots);
 
