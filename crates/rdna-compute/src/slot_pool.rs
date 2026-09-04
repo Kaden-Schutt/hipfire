@@ -230,7 +230,15 @@ mod tests {
         // the budget, so `new` correctly returned Ok and the `unwrap_err` here
         // panicked. The test's comment said "8.7 TB", off by 1000x; the
         // refusal it is checking was never actually being exercised.
-        let e = SlotPool::new(8, 4_000_000, PPB).unwrap_err();
+        //
+        // Calls `preflight_checks` directly (not `SlotPool::new`) because
+        // `SlotPool::new` goes through the config-gated `preflight_alloc`,
+        // whose `auto` default stands down on discrete GPUs and GPU-less CI
+        // runners. The unguarded checks are deterministic on every machine.
+        let cap = 4_000_000usize.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
+        let total = (cap * PPB) as u64 * 8 * 2;
+        let e = crate::kv_slots::preflight_checks(total, R9700_VRAM_BYTES, "SlotPool arena")
+            .unwrap_err();
         assert!(e.contains("budget") || e.contains("GiB"), "unexpected: {e}");
     }
 }

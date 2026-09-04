@@ -3878,13 +3878,14 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 /// release its weights, `MemAvailable` is still depressed here and this stops
 /// the sweep instead of taking the box down.
 ///
-/// `memory.oom_guard=false` (`HIPFIRE_OOM_GUARD=0`) opts out: on a
-/// discrete-GPU box an overshoot is a plain failed hipMalloc, not a desktop
-/// kill, and a sweep that wants to probe past the headroom is the operator's
-/// call.
+/// `memory.oom_guard` (default `auto`) opts out or forces the check on: this
+/// process never initializes a GPU, so `auto` falls back to host swap state —
+/// with swap an overcommit degrades rather than kills and the check stands
+/// down; without swap it stays up. A discrete-GPU box that wants the check
+/// anyway pins `memory.oom_guard=true`.
 fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
-    if !hipfire_config::oom_guard_enabled() {
-        eprintln!("memory headroom guard disabled (memory.oom_guard=false)");
+    if !hipfire_config::oom_guard_effective(None) {
+        eprintln!("memory headroom guard inactive (memory.oom_guard); continuing sweep");
         return Ok(());
     }
     let registry = load_registry(&paths.registry).registry;
