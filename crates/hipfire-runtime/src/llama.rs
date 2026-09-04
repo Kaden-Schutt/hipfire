@@ -1844,10 +1844,50 @@ pub fn prefill_forward(
 /// largest physical_cap any consumer sets up.
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// Kill-switch for the MQ-V2 (qt44 + neutral qt47-50) gfx11 WMMA prefill path:
+/// gfx12 (`gfx1200`/`gfx1201`) is always admitted, gfx11
+/// (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151`) is admitted unless
+/// `HIPFIRE_MQV2_GFX11_WMMA=0`, anything else is rejected. Defined here as
+/// the shared home for the qwen35 caller (`qwen35::is_batchable_la`);
+/// `llama::is_batchable_la` does NOT delegate to it (see below).
+/// `value` is the raw env var (None = unset → default ON); only `Some("0")`
+/// disables the gfx11 path. Gfx12 is unaffected by the env var.
+pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+    let gfx11_enabled = value != Some("0");
+    if matches!(arch, "gfx1200" | "gfx1201") {
+        true
+    } else if matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+    ) {
+        gfx11_enabled
+    } else {
+        false
+    }
+}
+
+/// Admit rule for the MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`)
+/// in batched WMMA prefill: dtype set × arch set × the
+/// `HIPFIRE_MQV2_GFX11_WMMA` kill-switch in one function. Only
+/// `qwen35::is_batchable_la` delegates here — qwen35's
+/// `forward_prefill_chunk` has V2 dispatch arms, while the llama chunk path
+/// does not (see `llama::is_batchable_la`).
+/// `MQ4CG256` (qt45) stays gfx12-only in its caller and is intentionally
+/// NOT part of this rule.
+pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str) -> bool {
+    matches!(
+        dt,
+        DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    ) && mqv2_gfx11_wmma_enabled_from_env(mqv2_gfx11_wmma, arch)
+}
+
 /// Is this dtype/arch combination eligible for the batched WMMA prefill
-/// kernels? Matches `qwen35::is_batchable_la` exactly so plain Qwen3 and
-/// hybrid Qwen3.5 share one rule and stay in lockstep when new dtypes or
-/// arches gain WMMA support.
+/// kernels? NOTE: unlike `qwen35::is_batchable_la`, this does NOT admit the
+/// MQ-V2 family — see the `never_v2` refusal below.
 pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
@@ -1880,21 +1920,30 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             arch,
             "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
         );
-    // MQ4G256V2 / MQ4CG256 batched prefill + batched lm_head GEMM exist only
-    // on gfx12 (gfx1200/gfx1201). Outside gfx12, fall back to per-token decode
-    // rather than dispatching a gfx12 WMMA kernel. Lockstep with
-    // qwen35::is_batchable_la (qt44/qt45).
-    // Extended to neutral V2 family qt47-50.
-    let mq4_v2_gfx12 = matches!(
+    // MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`, qt44/qt47-50)
+    // plus `MQ4CG256` (qt45): REFUSED on every arch. `forward_prefill_chunk`
+    // has no V2 arms — its per-layer dtype matchers (`qkv_is_mq` ~:2570,
+    // `wo_is_mq` ~:3025, `ffn_is_mq` ~:3117, `w_down_is_mq` ~:3248) list only
+    // `MQ4G256|MQ6G256|MQ3G256|MFP4G32`, so an admitted V2 model would skip
+    // the FWHT rotate and run the V1 `hfq4g256` launchers
+    // (`gemm_qkv_hfq4g256`, `gemm_hfq4g256_residual`, `gemm_gate_up_hfq4g256`)
+    // on V2 blobs — silently incoherent prefill. Per-token decode is the
+    // only correct llama path for V2 until those arms exist. qwen35's chunk
+    // path DOES have the V2 arms, so `qwen35::is_batchable_la` keeps
+    // admitting V2 via the shared `mqv2_wmma_batchable` rule above.
+    let never_v2 = matches!(
         dt,
         DType::MQ4G256V2
-            | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
             | DType::MQ3G256V2
             | DType::MQ2G256V2
-    ) && matches!(arch, "gfx1200" | "gfx1201");
-    wmma_only || mq3_gfx10_scalar || mq4_v2_gfx12
+            | DType::MQ4CG256
+    );
+    if never_v2 {
+        return false;
+    }
+    wmma_only || mq3_gfx10_scalar
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
@@ -8253,20 +8302,18 @@ mod tests {
     }
 
     #[test]
-    fn is_batchable_la_mq4_v2_gfx12_only() {
-        // MQ4G256V2 / MQ4CG256 batched prefill is gfx12-only; other arches
-        // fall back to per-token decode.
-        for arch in ["gfx1200", "gfx1201"] {
-            assert!(
-                is_batchable_la(DType::MQ4G256V2, arch),
-                "MQ4G256V2 should batch on {arch}"
-            );
-            assert!(
-                is_batchable_la(DType::MQ4CG256, arch),
-                "MQ4CG256 should batch on {arch}"
-            );
-        }
-        for arch in ["gfx1010", "gfx1100", "gfx942"] {
+    fn is_batchable_la_mq4_v2_refused_everywhere() {
+        // `forward_prefill_chunk` has no V2 arms (its `qkv_is_mq` ~:2570,
+        // `wo_is_mq` ~:3025, `ffn_is_mq` ~:3117, `w_down_is_mq` ~:3248
+        // matchers list only V1 dtypes), so llama must refuse MQ4G256V2 and
+        // MQ4CG256 on EVERY arch — including gfx11/gfx12 — and stay on
+        // per-token decode. qwen35's chunk path has the arms and keeps the
+        // shared `mqv2_wmma_batchable` rule; see
+        // `qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12` for the admit side.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+            "gfx1010", "gfx1030", "gfx942",
+        ] {
             assert!(
                 !is_batchable_la(DType::MQ4G256V2, arch),
                 "MQ4G256V2 must fall back on {arch}"
@@ -8279,18 +8326,19 @@ mod tests {
     }
 
     #[test]
-    fn is_batchable_la_v2_family_gfx12_only() {
-        for arch in ["gfx1200", "gfx1201"] {
-            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 gfx12");
-            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 gfx12");
-            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 gfx12");
-            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 gfx12");
-        }
-        for arch in ["gfx1010", "gfx1100", "gfx942"] {
-            assert!(!is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 fallback");
-            assert!(!is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 fallback");
-            assert!(!is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 fallback");
-            assert!(!is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 fallback");
+    fn is_batchable_la_v2_family_refused_everywhere() {
+        // Neutral V2 family (qt47-50): same refusal as MQ4G256V2 — no V2 arms
+        // in the llama chunk path, so refuse on every arch (including
+        // gfx11/gfx12). Mirrors `qwen35_is_batchable_la_v2_family_gfx11_and_gfx12`
+        // on the admit side.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+            "gfx1010", "gfx1030", "gfx942",
+        ] {
+            assert!(!is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 fallback on {arch}");
+            assert!(!is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 fallback on {arch}");
+            assert!(!is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 fallback on {arch}");
+            assert!(!is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 fallback on {arch}");
         }
         assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
         assert_ne!(DType::MQ3G256, DType::MQ3G256V2);

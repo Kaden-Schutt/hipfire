@@ -132,6 +132,11 @@ pub struct SpecLoadCfg {
     pub mtp: Option<bool>,
     /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
     pub mtp_k: Option<usize>,
+    /// Qwen DFlash draft enable, lowered from `dflash_mode`: `Some(true)` =
+    /// `on` (fail the load when the draft is missing or unloadable),
+    /// `Some(false)` = `off` (skip), `None` = `auto` (load when present,
+    /// log-and-AR fallback otherwise).
+    pub dflash: Option<bool>,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

@@ -105,7 +105,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
-| `HIPFIRE_DFLASH_DRAFT` | retired engine read | Still appears in legacy gate scripts; product draft discovery uses typed speculation/load policy and registry/filename matching. |
+| `HIPFIRE_DFLASH_DRAFT` | explicit draft path (overrides the registry sidecar); empty opts out | Legacy `developer.dflash_draft` read; still appears in legacy gate scripts. |
 | `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` restores uncapped legacy behavior | Caps draft-side context storage; over-cap requests fall back to AR |
 | `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |

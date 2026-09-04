@@ -165,13 +165,14 @@ fn batch_eligible_only_qwen_text_single_gpu() {
 }
 
 #[test]
-fn batch_eligible_allows_dense_lfm11_and_preserves_qwen() {
+fn batch_eligible_refuses_lfm11_and_preserves_qwen() {
     let _l = begin();
-    // LFM dense (arch 11) follows same pure exclusions as Qwen; MoE status is not checked here.
-    assert!(elig(
+    // LFM (arch 11) has no servable batch path: the capability is false, so
+    // even a fully clean request is refused and no batch state is allocated.
+    assert!(!elig(
         11, 1, false, false, false, false, false, false, false, false, true, true, 4
     ));
-    assert!(elig(
+    assert!(!elig(
         11, 1, false, false, false, false, false, false, false, false, true, true, 2
     ));
     // Same pure exclusions as Qwen: B=1, pp!=1, ep, images, tools, stops, spec, adaptive, pflash, history, think.
@@ -190,7 +191,7 @@ fn batch_eligible_allows_dense_lfm11_and_preserves_qwen() {
     assert!(!elig(
         11, 1, false, true, false, false, false, false, false, false, true, true, 4
     ));
-    // Unknown arch beside 5/6/11 stays ineligible.
+    // Archs beside 5/6 stay ineligible (11 included, via the caps refusal above).
     assert!(!elig(
         12, 1, false, false, false, false, false, false, false, false, true, true, 4
     ));

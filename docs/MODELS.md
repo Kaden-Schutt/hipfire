@@ -113,7 +113,7 @@ MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Le
 | `qwen3.8:27b-draft-mq6` | `qwen38-27b-dflash-mq6.hfq` | 1.66 | 16 | `qwen3.8:27b*` (same-bit alt) |
 | `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` |
 
-Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLASH_DRAFT` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)). Default `dflash_mode` is **off**. Filename auto-match may wire a sibling draft when present; that is discovery, not an admission that DFlash wins on every prompt.
+Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — `auto` uses the sidecar when present (AR otherwise), `on` requires it (load fails without it), `off` never drafts. Default `dflash_mode` is **off**. `developer.dflash_draft` / `run --model-draft` override the sidecar. Watch for `DFlash draft loaded:` in load output.
 
 ### Qwen3 (non-3.5) dense HF4
 

@@ -39,6 +39,29 @@ fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result
     Ok(())
 }
 
+/// Generate-time refusal for the lowered/MoE path, shared with the load-time
+/// admission below so both name the same combination and remedy. The generate
+/// body is eager-dense-only; a lowered load must never reach it.
+pub const LOWERED_GENERATE_REFUSAL: &str = "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant";
+
+/// Admission decision for the lowered path, before any device allocation.
+/// Pure so the contract is unit-testable. Returns the refusal reason when the
+/// (model, option) combination would select `lowered` via [`gemma4_use_lowered`],
+/// which generate cannot serve — fail here instead of after a full weight/KV
+/// upload. `None` means the eager dense path serves the combination.
+pub fn gemma4_lowered_refusal(
+    enable_moe_block: bool,
+    want_batched: bool,
+    has_drafter: bool,
+    is_e_series: bool,
+) -> Option<&'static str> {
+    if gemma4_use_lowered(enable_moe_block, want_batched, has_drafter, is_e_series) {
+        Some(LOWERED_GENERATE_REFUSAL)
+    } else {
+        None
+    }
+}
+
 // ─── Bundle types ─────────────────────────────────────────────────────────
 
 pub struct Gemma4EagerBundle {
@@ -119,6 +142,22 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     } else {
         false
     };
+    // Admission: the lowered/MoE path has no generate arm (the generate body is
+    // eager-dense-only and refuses post-load). Fail here — after the host-side
+    // config/env parse but before `lowered::load_weights` (first device
+    // allocation) — instead of after a full weight/scratch/KV upload.
+    // The `if use_lowered` block below is retained for the future lowered serve
+    // path; it is unreachable while this refusal stands.
+    if let Some(lcfg) = &lowered_cfg {
+        if let Some(reason) = gemma4_lowered_refusal(
+            lcfg.enable_moe_block,
+            want_batched,
+            ctx.gemma4_drafter_path.is_some(),
+            is_e_series,
+        ) {
+            return Err(reason.to_string());
+        }
+    }
     if use_lowered {
         let lcfg = lowered_cfg.unwrap();
         let (n_sliding_layers, n_full_layers) = lowered_kv_layer_counts(&lcfg.layer_types);
@@ -199,5 +238,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(lowered_kv_layer_counts(&layer_types), (40, 8));
+    }
+
+    #[test]
+    fn lowered_admission_refuses_what_generate_cannot_serve() {
+        // MoE variant: refused with the combination and remedy named.
+        let err = gemma4_lowered_refusal(true, false, false, false)
+            .expect("MoE lowered must be refused at admission");
+        assert!(err.contains("lowered/MoE"), "reason names the state: {err}");
+        assert!(err.contains("eager dense only"), "reason: {err}");
+        // Dense with batched/WMMA prefill opt-in and no drafter: refused.
+        assert!(gemma4_lowered_refusal(false, true, false, false).is_some());
+        // Adjacent supported: eager dense (no opt-in), drafter-kept-eager,
+        // and E-series all admit.
+        assert_eq!(gemma4_lowered_refusal(false, false, false, false), None);
+        assert_eq!(gemma4_lowered_refusal(false, true, true, false), None);
+        assert_eq!(gemma4_lowered_refusal(false, true, false, true), None);
+        // MoE always selects lowered even with a drafter requested, so it is
+        // refused too (the drafter route only keeps *dense* eager).
+        assert!(gemma4_lowered_refusal(true, false, true, false).is_some());
     }
 }
