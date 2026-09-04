@@ -14,12 +14,10 @@ default = ["deltanet"]
 deltanet = [
     "hipfire-runtime/deltanet",
     "rdna-compute/deltanet",
-    "hipfire-dispatch/deltanet",
     "hipfire-pflash/deltanet",
 ]
 flash-attn-ck = [
     "rdna-compute/flash-attn-ck",
-    "hipfire-dispatch/flash-attn-ck",
     "hipfire-runtime/flash-attn-ck",
 ]
 serve-fault-inject = ["hipfire-runtime/serve-fault-inject", "hipfire-generate/serve-fault-inject"]
@@ -31,8 +29,6 @@ ep-fault-inject = ["hipfire-loader/ep-fault-inject", "hipfire-runtime/ep-fault-i
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
-saddle-core = { path = "../saddle-core" }
-hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-engine = { path = "../hipfire-engine" }
@@ -40,11 +36,10 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 
-# All arch crates — unconditional, no features.
+# Arches via loader/generate; qwen35 direct for slots.
 
 # Direct external deps used by daemon.rs
 base64 = "0.22"
-serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

@@ -26,39 +26,19 @@ serve-fault-inject = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
-saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
-hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
-hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
-hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
-hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
-hipfire-pflash = { path = "../hipfire-pflash" }
-hipfire-engine = { path = "../hipfire-engine" }
-hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
-hipfire-atlas = { path = "../hipfire-atlas" }
-memmap2 = "0.9"
-safetensors.workspace = true
-half.workspace = true
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-base64 = "0.22"
 libc = "0.2"
-rayon = "1"
-smallvec = "1"
-regex = "1"
-minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-tracing = "0.1"
 
 # ── Archived examples (relocated from hipfire-runtime) ───────────────────
 # Each entry was `[[example]]` in hipfire-runtime/Cargo.toml with an identical
@@ -273,3 +253,8 @@ required-features = []
 [[example]]
 name = "imatrix_collect"
 required-features = []
+
+[package.metadata.cargo-machete]
+# byteorder: deliberately kept (workspace from_le_bytes convention); never referenced by path in code.
+# hipfire-dispatch: no direct code reference, but [features].deltanet forwards hipfire-dispatch/deltanet.
+ignored = ["byteorder", "hipfire-dispatch"]

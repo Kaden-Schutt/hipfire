@@ -31,7 +31,6 @@ members = [
     "crates/redline",
     "crates/redline-rocr",
     "crates/redline-dispatch",
-    "crates/radiowave",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
     "crates/hipfire-tui",

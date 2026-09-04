@@ -16,7 +16,6 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 libm = "0.2"
