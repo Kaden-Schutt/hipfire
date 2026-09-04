@@ -46,6 +46,7 @@ use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_batched_for;
+use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
 use hipfire_runtime::llama::rotate_x_mq_batched_for;
 use hipfire_runtime::llama::weight_gemv_prerotated;
@@ -4064,6 +4065,24 @@ pub(crate) fn batch_chunk_upload_positions(
     Ok(())
 }
 
+/// S3-f16-projection-inputs: exact-route gate for the FP16 projection-input
+/// fast path (all four `batch_chunk_*` projection hooks below).
+///
+/// All predicates are cheap field reads — no env/lock/JIT in the cycle (the
+/// kill switch resolves once at `FeatureFlags` init). Every failed predicate
+/// runs the pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
+#[inline]
+fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
+    matches!(fusion, DflashFusionCtx::ChainVerify)
+        && gpu.arch_caps.is_gfx1100()
+        && !gpu.flags.mq_f16_projection_off
+        && n >= 1
+        && n <= 16
+        && dim % 256 == 0
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording()
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 /// Prescaffold (behavior-only) extraction for S3-f16-projection-inputs.
@@ -4082,6 +4101,46 @@ fn batch_chunk_delta_net_input_projection(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    // S3-f16-projection-inputs fast path: emit exact FP16 directly from the
+    // RMSNorm+FWHT producer into `x_rot_f16_batch` and consume it with the
+    // F16-direct qkvza GEMM. Saves the `convert_f32_to_f16` launch with
+    // bit-identical projection outputs. All four weights must share the
+    // exact MQ4G256V2 stride (the fused kernel reads them as same-stride
+    // byte arrays); anything else stays on the pre-change path.
+    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && layer.wqkv.gpu_dtype == DType::MQ4G256V2
+        && layer.wz.gpu_dtype == DType::MQ4G256V2
+        && layer.w_beta.gpu_dtype == DType::MQ4G256V2
+        && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+    {
+        fused_rmsnorm_rotate_mq_f16_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wqkv,
+            &pbs.x_rot_f16_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        return gpu.gemm_qkvza_mq4g256v2_wmma_f16(
+            &layer.wqkv.buf,
+            &layer.wz.buf,
+            &layer.w_beta.buf,
+            &layer.w_alpha.buf,
+            &pbs.x_rot_f16_batch,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_beta_batch,
+            &pbs.dn_alpha_batch,
+            layer.wqkv.m,
+            layer.wz.m,
+            layer.w_beta.m,
+            layer.w_alpha.m,
+            layer.wqkv.k,
+            n,
+        );
+    }
     let is_mq = matches!(
         layer.wqkv.gpu_dtype,
         DType::MQ4G256
@@ -4809,6 +4868,34 @@ fn batch_chunk_delta_net_ffn_gate_up(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
+    // gate/up share the pre-rotation input, so both must be MQ4G256V2.
+    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && layer.w_gate.gpu_dtype == DType::MQ4G256V2
+        && layer.w_up.gpu_dtype == DType::MQ4G256V2
+    {
+        fused_rmsnorm_rotate_mq_f16_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &pbs.x_rot_f16_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        return gpu.gemm_gate_up_mq4g256v2_wmma_f16(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &pbs.x_rot_f16_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        );
+    }
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
         layer.w_gate.gpu_dtype,
@@ -5085,6 +5172,39 @@ fn batch_chunk_full_attn_input_projection(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    // S3-f16-projection-inputs fast path: exact-FP16 FA qkv inputs. The
+    // fused QKV kernel requires all three weights to share the MQ4G256V2
+    // stride (same gate as `qkv_same_dtype` below, restricted to MQ4V2).
+    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && layer.wq.gpu_dtype == DType::MQ4G256V2
+        && layer.wk.gpu_dtype == DType::MQ4G256V2
+        && layer.wv.gpu_dtype == DType::MQ4G256V2
+    {
+        fused_rmsnorm_rotate_mq_f16_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wq,
+            &pbs.x_rot_f16_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        return gpu.gemm_qkv_mq4g256v2_wmma_f16(
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            &pbs.x_rot_f16_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        );
+    }
     let qkv_is_mq = matches!(
         layer.wq.gpu_dtype,
         DType::MQ4G256
@@ -5648,6 +5768,33 @@ fn batch_chunk_full_attn_ffn_gate_up(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
+    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && layer.w_gate.gpu_dtype == DType::MQ4G256V2
+        && layer.w_up.gpu_dtype == DType::MQ4G256V2
+    {
+        fused_rmsnorm_rotate_mq_f16_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &pbs.x_rot_f16_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        return gpu.gemm_gate_up_mq4g256v2_wmma_f16(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &pbs.x_rot_f16_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        );
+    }
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
     let fa_ffn_is_mq = matches!(
