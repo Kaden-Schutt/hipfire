@@ -2044,6 +2044,35 @@ impl HiddenStateRingBuffer {
         if let Some(stream) = gpu.active_stream.as_ref() {
             gpu.hip.stream_synchronize(stream)?;
         }
+        // S2 launch fusion: exact gfx1100 commit5 kernel. Copies
+        // staging[ext][r, :] -> layer_bufs[ext][(head + r) % max_pos, :] for
+        // all five extracts in one launch (bit-identical: one writer per
+        // destination element, no FP arithmetic on the data). The launch
+        // also ensures the scatter5 symbol, which the same-cycle scatter
+        // reuses without its own `&mut` ensure. Any failed predicate
+        // (non-gfx1100, kill switch, capture/recording, non-5-extract or
+        // non-F32 shapes, n > max_pos) falls through to today's loop.
+        // Head/written advance only after successful enqueue, preserving the
+        // existing stream synchronization boundary above.
+        if gpu.dflash_hidden_commit5_applicable(
+            &self.staging_bufs,
+            &self.layer_bufs,
+            n,
+            self.hidden_dim,
+            max_pos,
+        ) {
+            gpu.dflash_hidden_commit5_launch(
+                &self.staging_bufs,
+                &self.layer_bufs,
+                head,
+                n,
+                self.hidden_dim,
+                max_pos,
+            )?;
+            self.head = (head + n) % max_pos;
+            self.written += n;
+            return Ok(());
+        }
 
         for ei in 0..self.layer_bufs.len() {
             if head + n <= max_pos {
@@ -3597,6 +3626,29 @@ pub fn scatter_hidden_block_to_interleaved(
     // block_size <= max_pos ⇒ r_skip = 0, identical behaviour.
     let r_skip = block_size.saturating_sub(max_pos);
     let start_slot = (head + max_pos - (block_size - r_skip)) % max_pos;
+    // S2 launch fusion: exact gfx1100 scatter5 kernel. Copies the retained
+    // block rows into dst[((dst_row_offset + r) % dst_modulus), ext, :] in
+    // one launch (bit-identical: one writer per destination element, no FP
+    // arithmetic on the data; usize::MAX keeps absolute addressing). The
+    // symbol is ensured by the same-cycle fused commit, which strictly
+    // precedes every fused scatter; without it (seed paths, non-gfx1100,
+    // kill switch, capture/recording, funny shapes) the launcher reports
+    // false and the loop below runs byte-for-byte as before. Never mutates
+    // head/written or the source ring.
+    if gpu.dflash_hidden_scatter5_try(
+        &hidden_rb.layer_bufs,
+        dst,
+        start_slot,
+        n_rows.saturating_sub(r_skip),
+        r_skip,
+        hidden,
+        max_pos,
+        dst_row_offset,
+        dst_modulus,
+        num_extract,
+    )? {
+        return Ok(());
+    }
 
     for r in r_skip..n_rows {
         let slot = (start_slot + (r - r_skip)) % max_pos;
