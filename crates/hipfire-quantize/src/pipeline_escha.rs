@@ -130,6 +130,36 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
         .collect();
+
+    // MTP lives in a SUBDIRECTORY on the dense export, inline in the main
+    // shards on the MoE one. `read_dir` is not recursive, so the 35B's
+    // `mtp.*` tensors rode along as passthrough while the 27B's `mtp/` was
+    // invisible — a converted 27B silently came out with no MTP head at all
+    // (verified: 0 mtp tensors in the output). Silent is the wrong failure:
+    // nobody notices a missing speculative-decode head until they wonder why
+    // it is slow.
+    //
+    // Names inside the subdirectory are already `mtp.`-prefixed in the
+    // checkpoint, so no rewriting is needed — they land in the same flat
+    // namespace the 35B produces.
+    let mtp_dir = src_dir.join("mtp");
+    if mtp_dir.is_dir() {
+        let mut mtp_paths: Vec<_> = std::fs::read_dir(&mtp_dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        mtp_paths.sort();
+        if mtp_paths.is_empty() {
+            return Err(format!(
+                "{}: mtp/ exists but holds no .safetensors — refusing to convert a \
+                 model whose MTP head would be silently dropped",
+                mtp_dir.display()
+            ));
+        }
+        paths.extend(mtp_paths);
+    }
     paths.sort();
     for p in &paths {
         shards.push(SafetensorsFile::open(p).map_err(|e| e.to_string())?);
