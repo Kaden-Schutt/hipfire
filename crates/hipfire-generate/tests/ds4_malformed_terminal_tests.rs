@@ -671,6 +671,7 @@ use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
                 eos: 7,
                 im_end: None,
                 tools: None,
+                grammar: true,
                 stop: Vec::new(),
                 max_think: 0,
                 max_tokens: 16,

@@ -501,6 +501,7 @@ pub fn generate_deepseek4_spec(
         SpecEmitRequest {
             im_end: None,
             tools: tools.map(|t| t.to_vec()),
+            grammar: true,
             stop: Vec::new(),
             max_think: 0,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,

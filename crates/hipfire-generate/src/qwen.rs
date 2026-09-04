@@ -2280,11 +2280,9 @@ pub fn generate_dflash(
         std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
         &m.model_path,
     );
-    let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
-        tools.map(|t| t.to_vec())
-    } else {
-        None
-    };
+    // Tools always reach the emitter: they arm the tool-call PARSER. Whether the
+    // grammar matcher is armed rides on `grammar_enabled` alone.
+    let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
 
     // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
     // the arch-generic `generate_spec`. This wrapper owns the qwen35/llama-specific
@@ -2337,6 +2335,7 @@ pub fn generate_dflash(
         SpecEmitRequest {
             im_end: im_end_token,
             tools: emit_tools,
+            grammar: grammar_enabled,
             stop: stop.to_vec(),
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
@@ -3100,6 +3099,7 @@ pub fn generate_spec(
         eos: slot.eos_token(),
         im_end: emit_req.im_end,
         tools: emit_req.tools.as_deref(),
+        grammar: emit_req.grammar,
         stop: emit_req.stop,
         max_think: emit_req.max_think,
         max_tokens,

@@ -1255,6 +1255,7 @@ pub struct SpecEmitRequest {
     pub im_end: Option<u32>,
     /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
     pub tools: Option<Vec<serde_json::Value>>,
+    pub grammar: bool,
     pub stop: Vec<String>,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
