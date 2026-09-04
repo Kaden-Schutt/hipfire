@@ -30,12 +30,11 @@
 // with (K/256) % KW == 0, KTOP in 1..=8, M arbitrary (clamped tail rows are
 // discarded).
 //
-// Grid:  [WG_COUNT, 1, 1] — host-computed as min(m_tiles, 1344) and
-//        statically proven resident: __launch_bounds__(32, 14) is met by the
-//        compiler (amdgpu-waves-per-eu check; 78 VGPRs, phase-2 LDS promoted
-//        to registers — zero group segment); 96 CU * 14 = 1344 >= WG_COUNT.
-//        The phase-2 generation barrier would hang on a non-resident grid;
-//        the launcher never emits one.
+// Grid:  [WG_COUNT, 1, 1] — host-computed as min(m_tiles, 768) and statically
+//        proven resident: __launch_bounds__(32, 8) bounds VGPRs so 8 one-wave
+//        blocks co-reside per CU (<= 512 VGPR budget, zero LDS); 96 CU * 8 =
+//        768 >= WG_COUNT. The phase-2 generation barrier would hang on a
+//        non-resident grid; the launcher never emits one.
 // Block: [32, 1, 1] — one wave32 per workgroup, the oracle's tile shape.
 //
 // Phase 1: static strided task map row_tile = wg + epoch * WG_COUNT (pure
@@ -84,10 +83,10 @@ typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 
 #define TDK_MAX_K 8
-#define TDK_WG_MAX 1344  // 96 CU x 14 resident 1-wave blocks (proven by amdgpu-waves-per-eu)
+#define TDK_WG_MAX 768   // 96 CU x 8 resident 1-wave blocks (static bound)
 #define TDK_N_MAX 16
 
-extern "C" __launch_bounds__(32, 14) __global__ void
+extern "C" __launch_bounds__(32, 8) __global__ void
 mq4v2_lmhead_topk_direct_gfx1100(
     const char* __restrict__ A,        // [M, K] MQ4G256V2 packed (136 B / 256-K group)
     const _Float16* __restrict__ X,    // [N, K] fp16 rotated hidden
