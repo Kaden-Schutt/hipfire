@@ -421,7 +421,7 @@ relatively less of the damage. "Codebooks are for the sub-4-bit tier" is defensi
 | **qt=45** batched prefill WMMA GEMM + batched lm_head GEMM | **gfx12-only** (`HasWmmaGfx12`); **not** admitted on gfx11 |
 | Unsupported batched prefill | **per-token decode fallback** (does not dispatch a foreign-arch WMMA kernel) |
 | FusedQkv / FusedGateUp decode registrations | remain **cross-arch** (not narrowed to gfx12) |
-| Prefill LA admission (qt=44) | gfx1100/1101/1102/1150/1151 + gfx1200/1201; gfx11 opt-out `HIPFIRE_MQV2_GFX11_WMMA=0` |
+| Prefill LA admission (qt=44) | **qwen35 only**: gfx1100/1101/1102/1150/1151 + gfx1200/1201; gfx11 opt-out `HIPFIRE_MQV2_GFX11_WMMA=0`. Plain-Llama dense (`llama::is_batchable_la`) **refuses V2 on every arch** (per-token decode) until `forward_prefill_chunk` grows V2 arms |
 | Exact parity examples | `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4v2_fused_parity`, `mq4v2_residual_parity`, `mq4c_parity`; BT screens `test_mq4v2_*_bt_gfx{1100,1151,1201}.rs` |
 | Qwen3.8 fixture-bound KLD | qt=44 `ctl` WT2 0.039033 / v6 0.544517; `ctl2` WT2 0.032495; `attn` WT2 0.025437 (§ 5) |
 | gfx1010 | scalar fused decode TUs compile; batched prefill falls back as above |
