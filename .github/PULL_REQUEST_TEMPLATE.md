@@ -57,7 +57,7 @@ Two model seats, one human owner. Every decision is announced on the PR.
 4. **Fable investigates and decides**: with a shell in a sandboxed checkout of your head on the hardware (all five hiptrx GPUs, base branch built for A/B), Fable runs whatever proves your change — multi-GPU loads, refusal sequences, parity, A/B — and returns `merge-staging` / `hold` / `block` with an investigation table and every evidence file. It may veto a greenlight or override a needs-human, and says why. On `merge-staging` Fable merges your head into **`beta`** (staging); `master` is promoted by the maintainer. Neither seat can override the hard floor: a failed fixture, an attractor, a policy-file change, or an unlabelled `RATCHET-RAISE`.
 5. **The `hw-gate` status** is green only on `merge-staging`; `hold` turns green when a maintainer applies `human-reviewed`; `block` clears only with a new commit.
 
-The seats act as `hipfire-sol[bot]` and `hipfire-fable[bot]`. Route policy: [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate. `python3 -m tools.change_gate` is optional local planning and is **not** CI evidence; the retired `scripts/coherence-gate*.sh` batteries no longer exist.
+The seats act as `hipfire-sol[bot]` and `hipfire-fable[bot]`. Route policy: [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate — request coverage with the `<!-- hw-gate-request -->` block above; no local planning tool is CI evidence. The retired `scripts/coherence-gate*.sh` batteries no longer exist.
 
 ## Architecture-trait change?
 

@@ -142,8 +142,6 @@ docs/investigations/*/sources/
 *.rocpd
 *.pftrace
 
-# Agentic review local provider overrides (per-developer, not checked in)
-.github/agentic-review/providers.local.json
 # Harvested corpus index — regenerable from autoresearch/corpus/*.jsonl
 # via scripts/harvest_ledgers.py --ingest
 autoresearch/db/ar.db
