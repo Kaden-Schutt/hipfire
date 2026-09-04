@@ -301,7 +301,7 @@ impl WeightLoadTransaction {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.store.as_ref().map_or(true, WeightStore::is_empty)
+        self.store.as_ref().is_none_or(WeightStore::is_empty)
     }
 
     pub fn contains(&self, name: &str, layer: Option<usize>, device: usize) -> bool {

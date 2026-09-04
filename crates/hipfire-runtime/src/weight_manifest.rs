@@ -386,7 +386,7 @@ fn validate_shape(entry: &WeightEntry) -> Result<(), String> {
     if entry.name.is_empty() {
         return Err("manifest entry has an empty name".to_string());
     }
-    if entry.logical_shape.is_empty() || entry.logical_shape.iter().any(|&d| d == 0) {
+    if entry.logical_shape.is_empty() || entry.logical_shape.contains(&0) {
         return Err(format!(
             "{}[layer {:?}]: logical_shape {:?} must be non-empty",
             entry.name, entry.layer, entry.logical_shape
