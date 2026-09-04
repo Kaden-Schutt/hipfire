@@ -170,22 +170,22 @@ impl Gpu {
 
     /// Fused scatter attempt on a shared `&Gpu`.
     ///
-    /// Copies the `rows` retained block rows (`r_skip <= r < r_skip + rows`,
-    /// ring slot `(start_slot + (r - r_skip)) % max_pos`) into
+    /// Copies the retained block rows (`r_skip <= r < n_rows`, ring slot
+    /// `(start_slot + (r - r_skip)) % max_pos`) into
     /// `dst[((dst_row_offset + r) % dst_modulus), ext, :]`, preserving the
     /// loop's `usize::MAX` absolute-addressing branch. Returns `Ok(true)`
-    /// when the kernel launched — or when `rows == 0`, which is a no-op in
-    /// both paths. Returns `Ok(false)` when the caller must run the loop
-    /// (wrong arch, kill switch, capture/recording, non-5-extract or non-F32
-    /// shapes, undersized buffers, or symbol not yet ensured by a fused
-    /// commit).
+    /// when the kernel launched — or when there are no retained rows
+    /// (`r_skip >= n_rows`), a no-op in both paths. Returns `Ok(false)`
+    /// when the caller must run the loop (wrong arch, kill switch,
+    /// capture/recording, non-5-extract or non-F32 shapes, undersized
+    /// buffers, or symbol not yet ensured by a fused commit).
     #[allow(clippy::too_many_arguments)]
     pub fn dflash_hidden_scatter5_try(
         &self,
         src: &[GpuTensor],
         dst: &GpuTensor,
         start_slot: usize,
-        rows: usize,
+        n_rows: usize,
         r_skip: usize,
         hidden: usize,
         max_pos: usize,
@@ -193,6 +193,7 @@ impl Gpu {
         dst_modulus: usize,
         num_extract: usize,
     ) -> HipResult<bool> {
+        let rows = n_rows.saturating_sub(r_skip);
         if rows == 0 {
             return Ok(true);
         }
@@ -233,8 +234,11 @@ impl Gpu {
         let Some(stride) = (num_extract as u64).checked_mul(hidden as u64) else {
             return Ok(false);
         };
+        // Bound by the loop's maximum row: r ranges over r_skip..n_rows, so
+        // the top row the loop can touch is dst_row_offset + n_rows - 1
+        // (absolute) or dst_modulus - 1 (windowed).
         let need_rows: Option<u64> = if dst_modulus == usize::MAX {
-            (dst_row_offset as u64).checked_add(rows as u64)
+            (dst_row_offset as u64).checked_add(n_rows as u64)
         } else {
             Some(dst_modulus as u64)
         };

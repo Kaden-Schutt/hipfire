@@ -3909,7 +3909,7 @@ pub fn scatter_hidden_block_to_interleaved(
         &hidden_rb.layer_bufs,
         dst,
         start_slot,
-        n_rows.saturating_sub(r_skip),
+        n_rows,
         r_skip,
         hidden,
         max_pos,

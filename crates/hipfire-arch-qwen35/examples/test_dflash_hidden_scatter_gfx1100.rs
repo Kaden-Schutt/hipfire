@@ -369,7 +369,7 @@ fn direct_launcher_arm(gpu: &mut Gpu, flags_off: &Arc<rdna_compute::FeatureFlags
     let start_slot = (rb_k.head + MP - (BLK - r_skip)) % MP;
     let launched = gpu
         .dflash_hidden_scatter5_try(
-            &rb_k.layer_bufs, &dst_k, start_slot, N - r_skip, r_skip, H, MP, OFF, MOD, N_EXTRACT,
+            &rb_k.layer_bufs, &dst_k, start_slot, N, r_skip, H, MP, OFF, MOD, N_EXTRACT,
         )
         .map_err(|e| format!("direct: scatter5 try: {e}"))?;
     assert!(launched, "direct: scatter5_try reported false after ensure");
