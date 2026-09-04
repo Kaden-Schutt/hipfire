@@ -1481,7 +1481,12 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
-            supports_continuous_batch: true,
+            // Continuous batching is NOT servable: the generate-side eligibility
+            // (`is_batch_request_eligible`) returns false unconditionally for
+            // LFM, so staging a batch state only spends VRAM on state that is
+            // never driven. Declare false so the route never admits it and the
+            // state is never allocated. Single-stream LFM is unaffected.
+            supports_continuous_batch: false,
             supports_ep_batch: false,
             dflash: None,
             supports_mtp: false,

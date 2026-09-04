@@ -99,7 +99,18 @@ jobs:
       - name: No committed expectation was loosened
         # PR-only: on a push there is no proposed base to compare against.
         if: github.event_name == 'pull_request'
-        run: bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          labels_json=$(gh pr view "${{ github.event.pull_request.number }}" --json labels)
+          if echo "$labels_json" | jq -e '.labels[] | select(.name=="ratchet-raise")' >/dev/null; then
+            export RATCHET_RAISE_LABEL_PRESENT=1
+          else
+            export RATCHET_RAISE_LABEL_PRESENT=0
+          fi
+          export RATCHET_RAISE_REQUIRE_LABEL=1
+          bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
 
   supply-chain:
     name: cargo-deny (${{ matrix.checks }})

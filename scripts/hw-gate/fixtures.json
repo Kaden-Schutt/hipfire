@@ -1,0 +1,77 @@
+{
+  "schema": "hipfire.hw-gate.fixtures",
+  "version": 2,
+  "_comment": "Every fixture is a registry tag pinned by sha256 (registry/v1.json is the source of truth). A missing or mismatched fixture FAILS the gate. Every fixture runs in every selected bucket; the bucket decides which serve_harness modes run (union across buckets). battery = varied prompts with expect-substrings and attractor/runaway/empty detection; chain = related multi-turn prompts through the prefix cache. No fixture is ever exercised with a single `hipfire run`: one request against a fresh daemon proves nothing about turn-to-turn state.",
+  "models_dir": "~/.hipfire/models",
+  "harness": {
+    "battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json",
+    "max_tokens": 256
+  },
+  "fixtures": [
+    {
+      "tag": "qwen3.6:27b",
+      "file": "qwen3.6-27b.mq4",
+      "sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
+      "size_bytes": 14984158208,
+      "arch_id": 5,
+      "why": "Canonical dense trunk (AGENTS.md pinned fixture); Qwen3.5-family text artifact whose embedded config carries vision_config with no vision tower."
+    },
+    {
+      "tag": "ornith-1.5:35b-a3b-mq4r",
+      "file": "ornith-1.5-35b-a3b.mq4r",
+      "sha256": "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6",
+      "size_bytes": 18700570368,
+      "arch_id": 6,
+      "why": "MoE A3B (arch 6), MQ4V2 uniform recipe with the MoE gate-routing fix from PR #664 (the registry's `ornith-1.5:35b-a3b` is the older plain MQ4 and benches ~140 tok/s AR vs ~206 for this one on gfx1201)."
+    },
+    {
+      "tag": "lfm2.5:1.2b",
+      "file": "lfm2.5-1.2b.mq4",
+      "sha256": "a7aeba879560e90f19a92479d5fbc578fa7ba99fc3de343b9f0d189738d56533",
+      "size_bytes": 698641072,
+      "arch_id": 11,
+      "why": "LFM2 (arch 11) \u2014 the second family with a config-vs-tower vision classifier; small and fast."
+    },
+    {
+      "tag": "qwen3.8:27b-mq4-xt",
+      "file": "qwen3.8-27b.mq4-xt",
+      "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
+      "size_bytes": 14980361216,
+      "arch_id": 5,
+      "why": "MQ4V2 xt tier \u2014 the neutral-header v2 quant family (537a292df) that the device-mesh series refused."
+    }
+  ],
+  "buckets": {
+    "load": {
+      "why": "Loader / daemon / runtime load path / arch load changed.",
+      "modes": [
+        "battery"
+      ]
+    },
+    "serve": {
+      "why": "Engine / generate / daemon serve semantics changed: add the multi-turn chain so reset, prefix cache, and terminal semantics are exercised.",
+      "modes": [
+        "battery",
+        "chain"
+      ]
+    },
+    "kernel": {
+      "why": "kernels/ / rdna-compute / hipfire-dispatch / hip-bridge changed: docs/VALIDATION.md route is redline_daemon_harness capture + multi-position HIP/PM4 parity, on top of the battery.",
+      "modes": [
+        "battery"
+      ],
+      "redline": {
+        "model_tag": "qwen3.6:27b",
+        "harness_args": [
+          "--pm4",
+          "--capture-repeats",
+          "2",
+          "--measure-repeats",
+          "2",
+          "--decode-iterations",
+          "16"
+        ]
+      }
+    }
+  }
+}

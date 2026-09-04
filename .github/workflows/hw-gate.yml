@@ -1,0 +1,519 @@
+# hw-gate — hipfire's autonomous review rung, two model seats, one human owner.
+#
+#   select       diff -> buckets; parse the author's hw-gate-request block
+#   sol-prelim   Sol reads the diff and DECIDES whether the code runs on the
+#                maintainer's hardware, and which routes run. Nothing else
+#                gates hardware except a maintainer's `hw-run` label, which
+#                only ever forces a run.
+#   hw-run       build the PR, drive every route through serve_harness on
+#                the self-hosted gfx1201 runner, post every decoded turn
+#   sol-verdict  Sol reads diff + evidence: greenlight / needs-human / block.
+#                Sol never merges.
+#   fable-decide Fable reads everything including Sol's verdict, then runs
+#                whatever routes it judges necessary in a sandboxed PR
+#                worktree on the hardware (all hiptrx GPUs reserved, base
+#                branch built for A/B), and decides: merge-staging / hold /
+#                block. May veto or override Sol with a stated reason. During probation "merge" means the `beta`
+#                staging branch; `master` stays human-owned.
+#   hw-gate      the required status: green only on merge-staging.
+#
+# The hard floor (scripts/hw-gate/review.py) is the workflow's own rule and
+# no seat overrides it: a failed fixture/harness, an attractor, a policy-file
+# change, or an unlabelled RATCHET-RAISE cannot reach staging unattended.
+#
+# Trust boundary. `pull_request_target`: this workflow and every script under
+# scripts/hw-gate come from the BASE branch, so a PR cannot edit its own gate.
+# The PR head is checked out by explicit SHA into a separate directory. The
+# reviewer seats use read-only tools. Each seat acts under its own GitHub App
+# identity when the secrets exist (hipfire-sol[bot], hipfire-fable[bot]) and
+# falls back to github-actions[bot] otherwise.
+
+name: hw-gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  statuses: write
+  actions: read
+
+concurrency:
+  # Code events and the `hw-run` label share one group so a new push cancels a
+  # stale hardware run. Every other label event (including the labels the
+  # seats apply mid-run) lives in a separate group so it can never cancel the
+  # run that is producing the verdict.
+  group: hw-gate-${{ github.event.pull_request.number || inputs.pr }}-${{ (github.event.action == 'labeled' && github.event.label.name != 'hw-run') && 'label' || 'run' }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+  HW_GATE_STAGING: beta
+
+jobs:
+  select:
+    name: select
+    runs-on: ubuntu-latest
+    outputs:
+      needs_hw: ${{ steps.sel.outputs.needs_hw }}
+      buckets: ${{ steps.sel.outputs.buckets }}
+      policy: ${{ steps.sel.outputs.policy }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      forced: ${{ steps.pr.outputs.forced }}
+      human_reviewed: ${{ steps.pr.outputs.human_reviewed }}
+      draft: ${{ steps.pr.outputs.draft }}
+      # true when this event should (re)run the seats and hardware: every code
+      # event, plus the `hw-run` label. Other label events only re-evaluate
+      # the recorded decision.
+      run_hw: ${{ steps.pr.outputs.run_hw }}
+    steps:
+      - name: Base checkout (gate scripts come from the base branch)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Clear per-commit labels on new commits
+        # A push invalidates every human and seat signature on the previous commit.
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for l in hw-run human-reviewed agent-approved needs-human hw-gate-blocked merged-staging; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$l" >/dev/null 2>&1 || true
+          done
+      - name: Resolve PR head, labels, body
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefOid,headRefOid,labels,isDraft,body)
+          echo "base_sha=$(jq -r .baseRefOid <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r .headRefOid <<<"$json")" >> "$GITHUB_OUTPUT"
+          has() { jq -e --arg n "$1" '.labels[] | select(.name==$n)' <<<"$json" >/dev/null; }
+          echo "forced=$(has hw-run && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "human_reviewed=$(has human-reviewed && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "draft=$(jq -r .isDraft <<<"$json")" >> "$GITHUB_OUTPUT"
+          jq -r .body <<<"$json" > pr-body.md
+          action='${{ github.event.action }}'
+          label='${{ github.event.label.name }}'
+          if [ "$action" = "labeled" ] && [ "$label" != "hw-run" ]; then
+            echo "run_hw=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_hw=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch PR head
+        run: git fetch --no-tags origin "${{ steps.pr.outputs.head_sha }}"
+      - name: Select buckets and parse the author's request
+        id: sel
+        run: |
+          set -euo pipefail
+          git diff --name-only "${{ steps.pr.outputs.base_sha }}...${{ steps.pr.outputs.head_sha }}" \
+            | python3 scripts/hw-gate/select.py --pr-body pr-body.md --github-output "$GITHUB_OUTPUT" --json select.json
+          cat select.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hw-gate-select
+          path: select.json
+
+  sol-prelim:
+    name: sol · prelim (decides hardware)
+    needs: select
+    if: needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && needs.select.outputs.draft != 'true'
+    runs-on: [self-hosted, hiptrx, gfx1201]
+    timeout-minutes: 20
+    outputs:
+      run_hardware: ${{ steps.out.outputs.run_hardware }}
+      reason: ${{ steps.out.outputs.reason }}
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: token
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HW_GATE_SOL_APP_ID }}
+          private-key: ${{ secrets.HW_GATE_SOL_PRIVATE_KEY }}
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+          fetch-depth: 0
+      - name: PR head checkout (read-only for the reviewer)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-select
+          path: evidence
+      - name: Sol reads the diff
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
+          HIPFIRE_MODELS_DIR: /home/kaden/.hipfire/models
+        run: |
+          set -euo pipefail
+          python3 base/scripts/hw-gate/review.py --phase prelim --seat sol \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --checkout pr \
+            --select evidence/select.json \
+            --fixtures base/scripts/hw-gate/fixtures.json \
+            --system-prompt base/scripts/hw-gate/sol.md \
+            --out prelim.json --routes routes.json
+      - name: Publish decision
+        id: out
+        if: always()
+        run: |
+          echo "run_hardware=$(jq -r '.run_hardware // false' prelim.json 2>/dev/null || echo false)" >> "$GITHUB_OUTPUT"
+          echo "reason=$(jq -r '(.prelim.run_hardware_reasons // ["sol prelim unavailable"]) | join("; ")' prelim.json 2>/dev/null || echo 'sol prelim unavailable')" >> "$GITHUB_OUTPUT"
+          echo "sol: run_hardware=$(jq -r '.run_hardware // false' prelim.json 2>/dev/null)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-prelim
+          path: |
+            prelim.json
+            routes.json
+
+  hw-run:
+    # One lane per architecture. Every lane runs the same routes; the seats read
+    # the merged evidence. A lane whose runner is offline produces no artifact,
+    # and merge_evidence.py treats that as a failure, never as a pass.
+    name: hardware (${{ matrix.lane.gfx }} on ${{ matrix.lane.name }})
+    needs: [select, sol-prelim]
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && (needs.sol-prelim.outputs.run_hardware == 'true' || needs.select.outputs.forced == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          # hiptrx: 5x R9700; device 3 is the gate's, the other four stay interactive.
+          - {name: hiptrx, gfx: gfx1201, labels: [self-hosted, hiptrx, gfx1201], device: "3"}
+          # hipx: RX 7900 XTX is HIP device 0 (gfx1100); the 6950/5700/8060S are not gate lanes yet.
+          - {name: hipx, gfx: gfx1100, labels: [self-hosted, gfx1100], device: "0"}
+    runs-on: ${{ matrix.lane.labels }}
+    timeout-minutes: 60
+    env:
+      HIPFIRE_HOME: ${{ github.workspace }}/.hw-gate-home
+      HIPFIRE_MODELS_DIR: /home/kaden/.hipfire/models
+      HW_GATE_DEVICE: ${{ matrix.lane.device }}
+      CARGO_TARGET_DIR: /home/kaden/actions-runner/_cache/hw-gate-target
+    steps:
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+      - name: PR head checkout (code under test, by SHA)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hw-gate-prelim
+          path: prelim
+      - name: Login-shell toolchain (the runner service PATH has neither cargo nor ROCm)
+        # Both runners are systemd services: PATH is the distro default, so
+        # `cargo` and `hipcc` are not found (run 33849478193 failed both lanes in
+        # 40 s with "[Errno 2] No such file or directory: 'cargo'"). The runner
+        # user's login shell has the toolchain; import it for the steps below.
+        run: |
+          set -euo pipefail
+          bash -lc 'echo "$PATH"' | tr ':' '\n' >> "$GITHUB_PATH"
+          bash -lc 'env' | grep -E '^(ROCM_PATH|HIP_PATH|HSA_PATH|HIP_PLATFORM|LD_LIBRARY_PATH)=' >> "$GITHUB_ENV" || true
+      - name: "Run routes (shared GPU lock: coexists with other lanes, excludes a Fable session)"
+        run: |
+          set -euo pipefail
+          routes=""
+          [ -f prelim/routes.json ] && routes="--routes prelim/routes.json"
+          exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
+          flock --shared --timeout 3600 9
+          python3 base/scripts/hw-gate/run.py \
+            --repo pr \
+            --fixtures base/scripts/hw-gate/fixtures.json \
+            --registry base/registry/v1.json \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --buckets "${{ needs.select.outputs.buckets }}" \
+            $routes \
+            --device "$HW_GATE_DEVICE" \
+            --out hw-gate.json --md hw-gate.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-evidence-${{ matrix.lane.name }}
+          path: |
+            hw-gate.json
+            hw-gate.md
+            hw-gate-logs/
+
+  sol-verdict:
+    name: sol · verdict
+    needs: [select, sol-prelim, hw-run]
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && (needs.sol-prelim.outputs.run_hardware == 'true' || needs.select.outputs.forced == 'true')
+    runs-on: [self-hosted, hiptrx, gfx1201]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: token
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HW_GATE_SOL_APP_ID }}
+          private-key: ${{ secrets.HW_GATE_SOL_PRIVATE_KEY }}
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+          fetch-depth: 0
+      - name: PR head checkout (read-only for the reviewer)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: hw-gate-evidence-*
+          path: lanes
+      - name: Merge lane evidence
+        run: |
+          mkdir -p evidence
+          python3 base/scripts/hw-gate/merge_evidence.py \
+            --lane hiptrx=lanes/hw-gate-evidence-hiptrx \
+            --lane hipx=lanes/hw-gate-evidence-hipx \
+            --out evidence/hw-gate.json --md evidence/hw-gate.md || true
+      - uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-select
+          path: evidence
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hw-gate-prelim
+          path: evidence
+      - name: Sol reads the evidence
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
+        run: |
+          set -euo pipefail
+          python3 base/scripts/hw-gate/review.py --phase verdict --seat sol \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --checkout pr \
+            --select evidence/select.json \
+            --prelim evidence/prelim.json \
+            --evidence evidence/hw-gate.json \
+            --hw-run-result "${{ needs.hw-run.result }}" \
+            --system-prompt base/scripts/hw-gate/sol.md \
+            --out verdict.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-verdict
+          path: verdict.json
+
+  fable-decide:
+    # Fable investigates on the hardware host with a real shell in a sandboxed
+    # PR worktree: every hiptrx GPU is reserved for it (a host-level lock
+    # serializes Fable sessions), the base branch is built alongside for A/B,
+    # and everything it writes to $HW_GATE_EVIDENCE is uploaded. It cannot
+    # reach GitHub or credentials from inside the session; review.py posts.
+    name: fable · investigate + decide
+    needs: [select, sol-prelim, hw-run, sol-verdict]
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && (needs.sol-prelim.outputs.run_hardware == 'true' || needs.select.outputs.forced == 'true')
+    runs-on: [self-hosted, hiptrx, gfx1201]
+    timeout-minutes: 75
+    env:
+      HIPFIRE_MODELS_DIR: /home/kaden/.hipfire/models
+      CARGO_TARGET_DIR: /home/kaden/actions-runner/_cache/hw-gate-target
+      CARGO_TARGET_DIR_BASE: /home/kaden/actions-runner/_cache/hw-gate-target-base
+      HW_GATE_DEVICES: "0,1,2,3,4"
+      HW_GATE_MAX_MINUTES: "45"
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: token
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HW_GATE_FABLE_APP_ID }}
+          private-key: ${{ secrets.HW_GATE_FABLE_PRIVATE_KEY }}
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+          fetch-depth: 0
+      - name: PR head checkout (Fable's sandbox)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - name: Login-shell toolchain (the runner service PATH has neither cargo nor ROCm)
+        run: |
+          set -euo pipefail
+          bash -lc 'echo "$PATH"' | tr ':' '\n' >> "$GITHUB_PATH"
+          bash -lc 'env' | grep -E '^(ROCM_PATH|HIP_PATH|HSA_PATH|HIP_PLATFORM|LD_LIBRARY_PATH)=' >> "$GITHUB_ENV" || true
+      - name: Build PR head and base branch
+        run: |
+          set -euo pipefail
+          (cd pr && cargo build --release 2>&1 | tail -2)
+          (cd base && CARGO_TARGET_DIR="$CARGO_TARGET_DIR_BASE" cargo build --release 2>&1 | tail -2)
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: hw-gate-evidence-*
+          path: lanes
+      - name: Merge lane evidence
+        run: |
+          mkdir -p evidence
+          python3 base/scripts/hw-gate/merge_evidence.py \
+            --lane hiptrx=lanes/hw-gate-evidence-hiptrx \
+            --lane hipx=lanes/hw-gate-evidence-hipx \
+            --out evidence/hw-gate.json --md evidence/hw-gate.md || true
+      - uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-select
+          path: evidence
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hw-gate-prelim
+          path: evidence
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hw-gate-verdict
+          path: evidence
+      - name: "Fable investigates and decides (exclusive GPU lock: all five devices)"
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
+        run: |
+          set -euo pipefail
+          # The runner reuses its workspace: without the rm, Fable inherits the
+          # previous PR's evidence files and home (run 33866758629 on #702
+          # carried #700's fable-summary.md and #686's route outputs) and can
+          # cite them as its own. Every session starts empty.
+          rm -rf fable-evidence fable-home
+          mkdir -p fable-evidence fable-home
+          exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
+          flock --exclusive --timeout 3600 9
+          python3 base/scripts/hw-gate/review.py --phase decide --seat fable --investigate \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --checkout pr \
+            --select evidence/select.json \
+            --prelim evidence/prelim.json \
+            --evidence evidence/hw-gate.json \
+            --verdict evidence/verdict.json \
+            --hw-run-result "${{ needs.hw-run.result }}" \
+            --staging "$HW_GATE_STAGING" \
+            --devices "$HW_GATE_DEVICES" \
+            --home "$PWD/fable-home" \
+            --evidence-dir "$PWD/fable-evidence" \
+            --bin "$CARGO_TARGET_DIR/release" \
+            --base-bin "$CARGO_TARGET_DIR_BASE/release" \
+            --system-prompt base/scripts/hw-gate/fable.md \
+            --out decision.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-decision
+          path: |
+            decision.json
+            fable-evidence/
+
+  hw-gate:
+    # The required status. Deterministic: it reads the recorded decision for
+    # this head SHA, never a model.
+    #   merge-staging -> green (Fable merged the head into the staging branch)
+    #   hold          -> red until a maintainer applies `human-reviewed`
+    #   block         -> red; only a new commit clears it
+    name: hw-gate
+    needs: [select, sol-prelim, hw-run, sol-verdict, fable-decide]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Preconditions
+        run: |
+          set -euo pipefail
+          echo "needs_hw=${{ needs.select.outputs.needs_hw }} run_hw=${{ needs.select.outputs.run_hw }} forced=${{ needs.select.outputs.forced }} human_reviewed=${{ needs.select.outputs.human_reviewed }}"
+          echo "sol.run_hardware=${{ needs.sol-prelim.outputs.run_hardware }} hw-run=${{ needs.hw-run.result }} sol-verdict=${{ needs.sol-verdict.result }} fable=${{ needs.fable-decide.result }}"
+          if [ "${{ needs.select.result }}" != "success" ]; then
+            echo "::error::bucket selection failed"; exit 1
+          fi
+          if [ "${{ needs.select.outputs.needs_hw }}" != "true" ]; then
+            echo "no hardware-relevant surface touched"; echo "skip=true" >> "$GITHUB_ENV"; exit 0
+          fi
+          if [ "${{ needs.select.outputs.run_hw }}" = "true" ]; then
+            if [ "${{ needs.sol-prelim.outputs.run_hardware }}" != "true" ] && [ "${{ needs.select.outputs.forced }}" != "true" ]; then
+              echo "::error::Sol did not authorize hardware: ${{ needs.sol-prelim.outputs.reason }} — a maintainer may force it with the 'hw-run' label"; exit 1
+            fi
+            if [ "${{ needs.hw-run.result }}" != "success" ]; then
+              echo "::error::hardware run did not pass"; exit 1
+            fi
+            if [ "${{ needs.fable-decide.result }}" != "success" ]; then
+              echo "::error::decider did not complete"; exit 1
+            fi
+            echo "decision_source=this-run" >> "$GITHUB_ENV"
+          else
+            echo "decision_source=recorded" >> "$GITHUB_ENV"
+          fi
+      - name: Decision from this run
+        if: env.skip != 'true' && env.decision_source == 'this-run'
+        uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-decision
+          path: decision
+      - name: Decision recorded for this commit
+        if: env.skip != 'true' && env.decision_source == 'recorded'
+        run: |
+          set -euo pipefail
+          head='${{ needs.select.outputs.head_sha }}'
+          mkdir -p decision
+          for attempt in $(seq 1 15); do
+            ids=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow hw-gate.yml --commit "$head" --limit 20 --json databaseId -q '.[].databaseId')
+            for id in $ids; do
+              [ "$id" = "$GITHUB_RUN_ID" ] && continue
+              if gh run download "$id" --repo "$GITHUB_REPOSITORY" -n hw-gate-decision -D decision >/dev/null 2>&1 && [ -f decision/decision.json ]; then
+                echo "reusing decision from run $id"; exit 0
+              fi
+            done
+            sleep 20
+          done
+          echo "::error::no decision recorded for $head"; exit 1
+      - name: Status
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          # review.py writes the seat's full object under `.decision` and the
+          # floor-applied verdict under `.decision_final`; `.decision` is a JSON
+          # object, so the old jq yielded "[object]" and every run — including
+          # a successful merge-staging (#689, run 33889229683) — went red.
+          decision=$(jq -r '.decision_final // .decision.decision // "hold"' decision/decision.json)
+          hard=$(jq -r '(.floor.hard // []) | join(", ")' decision/decision.json)
+          echo "decision=$decision hard_floor=[$hard] human_reviewed=${{ needs.select.outputs.human_reviewed }}"
+          case "$decision" in
+            merge-staging) echo "merged to staging by fable; promote $HW_GATE_STAGING -> master is the maintainer's"; exit 0 ;;
+            hold)
+              if [ "${{ needs.select.outputs.human_reviewed }}" = "true" ]; then
+                echo "hold cleared by a maintainer's 'human-reviewed' label"; exit 0
+              fi
+              echo "::error::hold: read the seats' comments, then apply 'human-reviewed' or push a fix ($hard)"; exit 1 ;;
+            *) echo "::error::blocked ($hard); only a new commit clears a block"; exit 1 ;;
+          esac

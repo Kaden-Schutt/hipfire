@@ -1107,9 +1107,7 @@ impl ServeRuntime {
         meta: &Mutex<ServeMeta>,
         minimum_max_seq: Option<u64>,
     ) -> Result<hipfire_config::ResolvedConfig> {
-        let (tag, entry) = self
-            .registry
-            .model(model)
+        let (tag, entry) = crate::registry_entry_for_path(&self.paths, &self.registry, model)
             .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
             .unwrap_or((None, None));
         let mut path = find_model_path(&self.paths, &self.registry, model);
@@ -1143,10 +1141,13 @@ impl ServeRuntime {
             let mut params = load_params(
                 &resolved,
                 entry,
+                &self.paths.models,
                 &path,
                 max_tokens,
                 self.kv_override.as_deref(),
                 self.kv_backend_override.as_deref(),
+                tag.as_deref(),
+                false,
             )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
@@ -1207,9 +1208,19 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
+            // Report the model the way it was requested. A path-form
+            // request now resolves its registry entry (for sidecars and
+            // tag policy), but clients — serve_harness's warm probe among
+            // them — compare `/health.model` against the path they asked
+            // for; a tag only stands in when the request was a tag.
+            let served_name = if Path::new(model).is_absolute() || model.contains('/') {
+                model.to_owned()
+            } else {
+                tag.unwrap_or_else(|| model.to_owned())
+            };
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .current_model = Some(tag.unwrap_or_else(|| model.to_owned()));
+                .current_model = Some(served_name);
         }
         Ok(resolved)
     }

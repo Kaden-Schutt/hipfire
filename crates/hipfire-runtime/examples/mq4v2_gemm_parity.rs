@@ -1,4 +1,5 @@
-//! v1-vs-v2 cross-check for the **WMMA GEMM** path (qt=13 vs qt=44).
+//! v1-vs-v2 cross-check for the **WMMA GEMM** path (qt=13 vs qt=44),
+//! plus a discriminating disjoint-halves arm for the v2 residual path.
 //!
 //! `mq4v2_parity` verifies the decode GEMV against a host oracle. It does NOT
 //! cover the WMMA prefill GEMMs, which are what `--scoring-mode prefill` actually
@@ -6,7 +7,27 @@
 //! executing (8 v2 modules compiled), WT2 KLD came back 16.705139 against a
 //! 0.043776 baseline.
 //!
-//! ## Why cross-check instead of a host reference
+//! ## Arm 1: Gaussian v1-vs-v2 agreement — CANNOT catch a half-select bug
+//!
+//! Realistic post-FWHT weights (Gaussian, sigma ~0.011) give the two halves of
+//! every group near-identical `(scale, zero)` headers, so a wrong half-select
+//! predicate lands inside 4-bit quantization noise. This arm detects gross v2
+//! decode errors (agreement far above the quantization floor) but a wrong
+//! predicate passes it silently. See arm 2 for the discriminating fixture.
+//!
+//! ## Arm 2: disjoint halves + negative control — CATCHES a half-select bug
+//!
+//! Same construction as `mq4v2_residual_parity.rs`: half 0 in `[-1, 1]`, half 1
+//! in `[96, 160]`, packed through the same fp16 round-trip. A kernel that
+//! decodes half 1 with half 0's header reconstructs `~0` instead of `~128`,
+//! so the v2 output is asserted against an exact-dequant f32 reference within
+//! a tight tolerance (rel-RMS below 5%). The negative control — a reference
+//! computed with the halves' headers swapped — must DISAGREE by an order of
+//! magnitude more; if it ever agrees, the fixture has stopped separating the
+//! halves and the arm is vacuous (same control as
+//! `rdna-compute/examples/mq4v2_moe_parity.rs`).
+//!
+//! ## Why cross-check instead of a host reference (arm 1)
 //!
 //! Replicating a WMMA kernel on the host means reproducing fp16 activation
 //! conversion, 16x16 tiling, and accumulation order — a reference that is itself
@@ -16,10 +37,11 @@
 //! Both paths then share every stage except the 8 header bytes and their decode.
 //! v1 quantizes with one affine grid per 256 weights; v2 with one per 128. v2 is
 //! therefore slightly MORE accurate, so agreement should sit at the scale of
-//! 4-bit quantization noise. A systematic blow-up isolates the v2 header decode —
-//! in practice the half-select predicate, which the spec calls out as "the single
-//! highest-risk detail in the port" because a wrong one "compiles, runs, and
-//! silently applies the wrong scale to half of every tensor."
+//! 4-bit quantization noise. A systematic blow-up isolates a gross v2 header
+//! decode error — but NOT the half-select predicate, which the spec calls out as
+//! "the single highest-risk detail in the port" because a wrong one "compiles,
+//! runs, and silently applies the wrong scale to half of every tensor." Only
+//! arm 2's disjoint fixture can see that failure.
 //!
 //! ## Why sweep batch size
 //!
@@ -27,7 +49,7 @@
 //! body by batch size and flags. Scoring compiled `_bt8` and `_bt12`, so the BT
 //! bodies are live — and BT is b-transposed, which changes the nibble addressing
 //! the half-select must be derived from. Sweeping batch size tells us WHICH body
-//! is wrong rather than just that something is.
+//! is wrong rather than just that something is. Both arms sweep.
 //!
 //! Run: `cargo run --release -p hipfire-runtime --example mq4v2_gemm_parity`
 
@@ -51,6 +73,7 @@ fn prng(i: usize, salt: u32) -> f32 {
 /// Realistic post-FWHT weights: roughly Gaussian, sigma ~0.011 as measured on the
 /// Qwen3.8-27B parent. Deliberately NOT the disjoint-halves fixture -- here both
 /// containers must be individually reasonable so their outputs are comparable.
+/// (The discriminating fixture is `build_disjoint_halves` below, used by arm 2.)
 fn build_weights(m: usize, k: usize) -> Vec<f32> {
     let mut w = vec![0.0f32; m * k];
     for (i, v) in w.iter_mut().enumerate() {
@@ -60,6 +83,43 @@ fn build_weights(m: usize, k: usize) -> Vec<f32> {
         *v = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.011;
     }
     w
+}
+
+/// Discriminating fixture (same construction as `mq4v2_residual_parity.rs`):
+/// half 0 in `[-1, 1]`, half 1 in `[96, 160]`. The two halves occupy disjoint
+/// ranges, so a kernel that decodes half 1 with half 0's header reconstructs
+/// `~0` instead of `~128` and fails by >100% relative error instead of hiding
+/// inside quantization noise.
+fn build_disjoint_halves(m: usize, k: usize) -> Vec<f32> {
+    let mut w = vec![0.0f32; m * k];
+    for r in 0..m {
+        for c in 0..k {
+            let gi = c % GROUP;
+            let idx = r * k + c;
+            if gi < HALF {
+                // [-1, 1]
+                w[idx] = prng(idx, 0xA5A5_0001) * 2.0 - 1.0;
+            } else {
+                // [96, 160] — disjoint from half0 by two orders of magnitude
+                w[idx] = 96.0 + prng(idx, 0x5A5A_0002) * 64.0;
+            }
+        }
+    }
+    w
+}
+
+/// Swap the two 4-byte half-headers of every group in a packed v2 blob. The
+/// result decodes each half with the OTHER half's grid — the negative control:
+/// a reference built from this blob must DISAGREE with the correct reference.
+fn swap_v2_half_headers(blob: &[u8]) -> Vec<u8> {
+    let mut out = blob.to_vec();
+    for chunk in out.chunks_exact_mut(GROUP_BYTES) {
+        let mut tmp = [0u8; 8];
+        tmp.copy_from_slice(&chunk[0..8]);
+        chunk[0..4].copy_from_slice(&tmp[4..8]);
+        chunk[4..8].copy_from_slice(&tmp[0..4]);
+    }
+    out
 }
 
 /// qt=13 / HFQ4 container: `[0..4) f32 scale, [4..8) f32 zero` over all 256.
@@ -250,6 +310,57 @@ fn main() {
         }
     }
 
+    // ── Arm 2: disjoint halves + negative control (residual path) ──────────
+    //
+    // Arm 1's Gaussian weights cannot discriminate a wrong half-select; this
+    // arm can. Same batch-size sweep, same v2 residual WMMA kernel, but the
+    // weights put half 0 in [-1, 1] and half 1 in [96, 160], so decoding half
+    // 1 with half 0's header is a ~100x scale error. The v2 output must match
+    // the exact-dequant f32 reference within a tight tolerance, AND the
+    // swapped-headers reference must DISAGREE — otherwise the fixture is
+    // vacuous and the arm proves nothing.
+    {
+        let wd = build_disjoint_halves(m, k);
+        let bd = pack_v2(&wd, m, k);
+        let bd_swapped = swap_v2_half_headers(&bd);
+        for &batch in &[1usize, 8, 12, 16, 32] {
+            let x: Vec<f32> = (0..batch * k)
+                .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
+                .collect();
+            let want = ref_gemm(&bd, &x, m, k, batch, true);
+            let want_bug = ref_gemm(&bd_swapped, &x, m, k, batch, true);
+            let bug_rel = {
+                let bug_f32: Vec<f32> = want_bug.iter().map(|&v| v as f32).collect();
+                rel_rms(&bug_f32, &want)
+            };
+            // Host-side negative control: the swapped grid must be badly wrong
+            // before any GPU result is scored against it.
+            assert!(
+                bug_rel > 0.5,
+                "disjoint fixture not discriminating at batch {batch}: bug_rel {bug_rel:.3e} — halves overlap"
+            );
+            let d_a = gpu.upload_raw(&bd, &[bd.len()]).unwrap();
+            let d_x = gpu.upload_f32(&x, &[batch * k]).unwrap();
+            let d_y = gpu.zeros(&[batch * m], rdna_compute::DType::F32).unwrap();
+            gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(&d_a, &d_x, &d_y, m, k, batch)
+                .expect("v2 disjoint residual wmma launch");
+            gpu.hip.device_synchronize().unwrap();
+            let got = gpu.download_f32(&d_y).unwrap();
+            let e = rel_rms(&got, &want);
+            let verdict = if e < 0.05 && e < bug_rel * 0.1 {
+                "ok"
+            } else {
+                "FAIL"
+            };
+            eprintln!(
+                "disjoint batch {batch:>3}: v2 rel-rms {e:.4e}   bug {bug_rel:.3e}   {verdict}"
+            );
+            if verdict == "FAIL" {
+                failures.push((3000 + batch, e, bug_rel));
+            }
+        }
+    }
+
     // ── The fused multi-output GEMMs ────────────────────────────────────────
     //
     // These are the rest of the live v2 set. `gemm_qkvza` carries NINETEEN header
@@ -356,19 +467,63 @@ fn main() {
 
     if failures.is_empty() {
         eprintln!(
-            "\nmq4v2_gemm_parity: PASS — every live v2 WMMA GEMM matches its own exact dequant"
+            "\nmq4v2_gemm_parity: PASS — every live v2 WMMA GEMM matches its own exact dequant, and the disjoint-halves residual arm is half-select correct"
         );
     } else {
         eprintln!(
             "\nmq4v2_gemm_parity: FAIL — codes {:?}",
             failures.iter().map(|f| f.0).collect::<Vec<_>>()
         );
-        eprintln!("(1000 = gate_up, 2000 = qkvza, otherwise the residual batch size)");
+        eprintln!("(1000 = gate_up, 2000 = qkvza, 3000+batch = disjoint-halves residual, otherwise the Gaussian residual batch size)");
         eprintln!("The v1 row is the WMMA fp16 error floor; a v2 row far above it means that");
-        eprintln!("kernel mis-decodes its own header. Each body has its OWN nibble addressing,");
-        eprintln!(
-            "so its half-select predicate must be derived from that addressing, never copied."
-        );
+        eprintln!("kernel mis-decodes its own header. Only the disjoint arm (3000+batch) can");
+        eprintln!("see a half-select bug — the Gaussian arm hides one inside quantization noise.");
+        eprintln!("Each body has its OWN nibble addressing, so its half-select predicate must");
+        eprintln!("be derived from that addressing, never copied.");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disjoint_fixture_discriminates_half_select() {
+        // Host-side proof that arm 2's negative control is load-bearing: the
+        // halves occupy disjoint ranges, header-swapping is an involution,
+        // and a swapped-headers reference DISAGREES with the correct one.
+        // Runs with no GPU.
+        let (m, k, batch) = (16usize, 256usize, 4usize);
+        let w = build_disjoint_halves(m, k);
+        for r in 0..m {
+            for c in 0..k {
+                let v = w[r * k + c];
+                if (c % GROUP) < HALF {
+                    assert!((-1.0..=1.0).contains(&v), "half0 out of range: {v}");
+                } else {
+                    assert!((96.0..=160.0).contains(&v), "half1 out of range: {v}");
+                }
+            }
+        }
+        let blob = pack_v2(&w, m, k);
+        let swapped = swap_v2_half_headers(&blob);
+        assert_ne!(swapped, blob, "swapping identical headers would be vacuous");
+        assert_eq!(
+            swap_v2_half_headers(&swapped),
+            blob,
+            "header swap must be an involution"
+        );
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
+            .collect();
+        let want = ref_gemm(&blob, &x, m, k, batch, true);
+        let want_bug = ref_gemm(&swapped, &x, m, k, batch, true);
+        let bug_f32: Vec<f32> = want_bug.iter().map(|&v| v as f32).collect();
+        let bug_rel = rel_rms(&bug_f32, &want);
+        assert!(
+            bug_rel > 0.5,
+            "swapped-headers reference must DISAGREE: bug_rel {bug_rel:.3e}"
+        );
     }
 }
