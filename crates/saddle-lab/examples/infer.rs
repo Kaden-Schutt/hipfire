@@ -37,7 +37,7 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: infer <model.hfq> [--image <image.png>] [--no-think] [prompt...]");
+        eprintln!("Usage: infer <model.hfq> [--image <image.png>] [--no-think] [--kv-seq N] [--max-tokens N] [prompt...]");
         std::process::exit(1);
     }
 
@@ -49,10 +49,23 @@ fn main() {
         .position(|a| a == "--max-tokens")
         .and_then(|i| args.get(i + 1).and_then(|v| v.parse().ok()))
         .unwrap_or(2048);
+    // KV capacity. Was hardwired to 4096; a longer prompt then ran off the end
+    // of the cache and surfaced as `hipMemcpy H2D: illegal memory access` from
+    // deep inside the prefill loop, with nothing pointing at the real cause.
+    let kv_seq: usize = args
+        .iter()
+        .position(|a| a == "--kv-seq")
+        .and_then(|i| args.get(i + 1).and_then(|v| v.parse().ok()))
+        .unwrap_or(4096);
+    // `--kv-full` keeps K/V unquantised. The 10 full-attention layers are what
+    // carry long-range retrieval, so KV precision is the thing to vary when
+    // deep-context recall fails.
     let kv_mode: &str = if args.iter().any(|a| a == "--givens4") {
         "givens4"
     } else if args.iter().any(|a| a == "--givens2") {
         "givens2"
+    } else if args.iter().any(|a| a == "--kv-full") {
+        "full"
     } else {
         "q8"
     };
@@ -69,17 +82,29 @@ fn main() {
             skip_next = false;
             continue;
         }
-        if a == "--no-think" || a == "--debug-compare" || a == "--givens4" || a == "--givens2" {
+        if a == "--no-think"
+            || a == "--debug-compare"
+            || a == "--givens4"
+            || a == "--givens2"
+            || a == "--kv-full"
+            || a == "--no-ngram-block"
+        {
             continue;
         }
-        if a == "--image" || a == "--max-tokens" {
+        if a == "--image"
+            || a == "--max-tokens"
+            || a == "--kv-seq"
+            || a == "--repeat-penalty"
+            || a == "--dn-state"
+            || a == "--temp"
+        {
             skip_next = true;
             continue;
         }
         positional.push(a.as_str());
     }
     let model_path = positional.first().unwrap_or_else(|| {
-        eprintln!("Usage: infer <model.hfq> [--image <image.png>] [--no-think] [prompt...]");
+        eprintln!("Usage: infer <model.hfq> [--image <image.png>] [--no-think] [--kv-seq N] [--max-tokens N] [prompt...]");
         std::process::exit(1);
     });
     let prompt_text = if positional.len() > 1 {
@@ -222,8 +247,7 @@ fn main() {
     }
     .expect("failed to load text weights");
 
-    let kv_seq = 4096usize;
-    eprintln!("KV cache: {kv_mode}");
+    eprintln!("KV cache: {kv_mode} (capacity {kv_seq} tokens)");
     let mut kv_cache = match kv_mode {
         "givens4" => llama::KvCache::new_gpu_asym3(
             &mut gpu,
@@ -241,6 +265,14 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "full" => llama::KvCache::new_gpu(
+            &mut gpu,
+            text_config.n_layers,
+            text_config.n_kv_heads,
+            text_config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
         _ => llama::KvCache::new_gpu_q8(
             &mut gpu,
             text_config.n_layers,
@@ -250,7 +282,22 @@ fn main() {
         )
         .unwrap(),
     };
-    let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
+    // DeltaNet's recurrent S matrix defaults to Q8. 30 of this model's 40 layers
+    // are recurrent, so at long context that state is requantised thousands of
+    // times in sequence and the noise compounds — the suspected cause of the
+    // ~8k degeneracy. `--dn-state fp32` is the ground-truth comparison.
+    let dn_quant = match args
+        .iter()
+        .position(|a| a == "--dn-state")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+    {
+        Some("fp32") => qwen35::StateQuant::FP32,
+        Some("q4") => qwen35::StateQuant::Q4,
+        _ => qwen35::StateQuant::Q8,
+    };
+    eprintln!("DeltaNet state: {dn_quant:?}");
+    let mut dn_state = DeltaNetState::new_with_quant(&mut gpu, &text_config, dn_quant).unwrap();
 
     if debug_cmp {
         let mut kv2 = llama::KvCache::new_gpu(
@@ -366,9 +413,54 @@ fn main() {
         }
     );
 
-    let sc = llama::SamplingConfig::text_thinking();
+    // Refuse to start rather than fault the GPU partway through prefill.
+    let needed = prompt_tokens.len() + max_tokens;
+    if needed > kv_seq {
+        eprintln!(
+            "error: prompt ({} tokens) + --max-tokens ({}) = {} exceeds KV \
+             capacity ({}). Re-run with --kv-seq {}.",
+            prompt_tokens.len(),
+            max_tokens,
+            needed,
+            kv_seq,
+            needed.next_power_of_two(),
+        );
+        std::process::exit(2);
+    }
+
+    // Verbatim-recall tasks are hostile to a repetition penalty: re-emitting a
+    // proper noun you just wrote is exactly what it suppresses. Overridable so
+    // that effect can be measured rather than assumed.
+    let mut sc = llama::SamplingConfig::text_thinking();
+    if let Some(v) = args
+        .iter()
+        .position(|a| a == "--repeat-penalty")
+        .and_then(|i| args.get(i + 1).and_then(|v| v.parse::<f32>().ok()))
+    {
+        sc.repeat_penalty = v;
+    }
+    // Default temp is 0.3, i.e. NOT greedy. Comparing one sample per config
+    // across that is comparing noise; `--temp 0` makes an A/B mean something.
+    if let Some(v) = args
+        .iter()
+        .position(|a| a == "--temp")
+        .and_then(|i| args.get(i + 1).and_then(|v| v.parse::<f32>().ok()))
+    {
+        sc.think_temp = v;
+        sc.answer_temp = v;
+    }
+    eprintln!(
+        "Sampling: think_temp {} answer_temp {} top_p {} repeat_penalty {} window {}",
+        sc.think_temp, sc.answer_temp, sc.top_p, sc.repeat_penalty, sc.repeat_window
+    );
     let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, sc.repeat_window)
         .expect("failed to create scratch");
+
+    let no_ngram_block = args.iter().any(|a| a == "--no-ngram-block");
+    let logit_probe: Option<usize> = std::env::var("HIPFIRE_LOGIT_PROBE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0);
 
     // Prefill (zero-alloc scratch path)
     let t_pf = Instant::now();
@@ -401,6 +493,38 @@ fn main() {
                 &scratch,
             )
             .expect("forward_scratch failed");
+
+            // HIPFIRE_LOGIT_PROBE=N: every N prefill positions, report the
+            // shape of the next-token distribution. The question this answers
+            // is whether long-context collapse is a SAMPLING problem or a
+            // LOGIT problem: if greedy stays coherent while temp-1.0 sampling
+            // derails, the argmax is fine and the tail has grown — which shows
+            // up here as top-1 mass falling and top-20 mass falling with it.
+            if let Some(every) = logit_probe {
+                if pos % every == 0 {
+                    let lg = gpu.download_f32(&scratch.logits).unwrap();
+                    let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut ex: Vec<f32> = lg.iter().map(|&v| (v - mx).exp()).collect();
+                    let sum: f32 = ex.iter().sum();
+                    for v in ex.iter_mut() {
+                        *v /= sum;
+                    }
+                    let ent: f32 = -ex
+                        .iter()
+                        .filter(|&&p| p > 0.0)
+                        .map(|&p| p * p.ln())
+                        .sum::<f32>();
+                    let mut srt = ex.clone();
+                    srt.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                    let top1 = srt[0];
+                    let top20: f32 = srt.iter().take(20).sum();
+                    let top100: f32 = srt.iter().take(100).sum();
+                    println!(
+                        "PROBE pos={pos} top1={top1:.4} top20={top20:.4} \
+                         top100={top100:.4} entropy={ent:.3} max_logit={mx:.2}"
+                    );
+                }
+            }
         }
     }
     let prefill_len = prompt_tokens.len();
@@ -434,7 +558,18 @@ fn main() {
     let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
 
     let t_gen = Instant::now();
-    let mut token_history: Vec<u32> = prompt_tokens.clone();
+    // Anti-repeat state covers ONLY the model's own output, never the prompt.
+    //
+    // This used to be seeded with `prompt_tokens.clone()`, which fed the whole
+    // prompt to `apply_ngram_block`. That routine hard-blocks (-INF) whatever
+    // token followed any repeated 3/4/5/6-gram, so the instant the model emitted
+    // a 3-gram occurring in the prompt — unavoidable when quoting the prompt —
+    // the next token of the quote was banned. Verbatim quotation was impossible
+    // by construction: `VIOLET-ANVIL-62` came back as `VIOLETANVIL62`, and the
+    // model then noticed the mangling and retried forever, which read as
+    // long-context "degeneracy". `test_long_ctx.rs` already documents this
+    // hazard and slices both corrections to the current turn; this file did not.
+    let mut token_history: Vec<u32> = Vec::new();
     let mut generated = Vec::new();
     let mut think_count = 0usize;
 
@@ -495,7 +630,41 @@ fn main() {
         )
         .expect("forward_scratch failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        if !in_thinking {
+        // Generation-time distribution shape. The prefill probe showed the
+        // representation is healthy out to 8k, so if collapse is real it must
+        // appear HERE — either bad from the first generated token (a state
+        // problem) or degrading over the first few (a feedback spiral).
+        // Sampled BEFORE ngram-block / repeat-penalty so it reflects the raw
+        // model distribution, not the harness's corrections.
+        if let Some(_) = logit_probe {
+            if generated.len() < 40 || generated.len() % 50 == 0 {
+                let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut ex: Vec<f32> = logits.iter().map(|&v| (v - mx).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                for v in ex.iter_mut() {
+                    *v /= sum;
+                }
+                let ent: f32 = -ex
+                    .iter()
+                    .filter(|&&p| p > 0.0)
+                    .map(|&p| p * p.ln())
+                    .sum::<f32>();
+                let mut srt = ex.clone();
+                srt.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let top20: f32 = srt.iter().take(20).sum();
+                println!(
+                    "GPROBE step={} top1={:.4} top20={:.4} entropy={:.3} max_logit={:.2}",
+                    generated.len(),
+                    srt[0],
+                    top20,
+                    ent,
+                    mx
+                );
+            }
+        }
+        // `token_history` holds generated tokens only, so this can only block
+        // the model repeating ITSELF — never block it quoting the prompt.
+        if !in_thinking && !no_ngram_block {
             llama::apply_ngram_block(&mut logits, &token_history);
         }
         llama::apply_repeat_penalty(

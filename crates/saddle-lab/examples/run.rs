@@ -273,7 +273,7 @@ fn main() {
         }
         let input_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(input);
         let input: &str = &input_norm;
-    if hipfire_runtime::config::get().prompt_token_heat {
+        if hipfire_runtime::config::get().prompt_token_heat {
             tokenizer.dump_prompt_heat(input);
         }
 
@@ -482,10 +482,18 @@ fn main() {
                 target_slot.forward(&mut gpu, next_token, pos).unwrap();
                 logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
                 if !no_penalty {
-                    llama::apply_ngram_block(&mut logits, &conversation_tokens);
+                    // Scope both corrections to THIS turn's own output. Passing
+                    // the whole conversation lets `apply_ngram_block` hard-block
+                    // (-INF) any token that followed a repeated 3/4/5/6-gram in
+                    // the user's text, so the model cannot quote back what it
+                    // was just given — it emits a mangled version, notices, and
+                    // retries. Same hazard `test_long_ctx.rs` documents.
+                    let turn_start = conversation_tokens.len() - generated;
+                    let turn = &conversation_tokens[turn_start..];
+                    llama::apply_ngram_block(&mut logits, turn);
                     llama::apply_repeat_penalty(
                         &mut logits,
-                        &conversation_tokens,
+                        turn,
                         sc.repeat_window,
                         sc.repeat_penalty,
                     );
