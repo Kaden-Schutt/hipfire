@@ -553,6 +553,95 @@ pub struct EschaDenseLinear {
     pub ptr0: Option<GpuTensor>,
 }
 
+/// Per-projection escha runtime data for ONE dense linear, held alongside the
+/// `WeightTensor` rather than replacing it.
+///
+/// The weight itself stays a `WeightTensor` (dtype `Escha2T16`/`Escha3T16`,
+/// buffer = verbatim trellis code) so every existing `layer.wqkv.gpu_dtype`
+/// check keeps working. What a trellis weight needs BEYOND that — the two
+/// rotation vectors and the one-element pointer table the indexed GEMV wants —
+/// lives here.
+pub struct EschaProj {
+    pub rin: GpuTensor,
+    pub rout: GpuTensor,
+    pub ptr0: GpuTensor,
+}
+
+impl EschaProj {
+    /// Run this projection: H128 in -> trellis GEMV -> H128 out.
+    ///
+    /// Bias is NOT applied here — it is added by the existing per-op bias
+    /// path, so there is exactly one place that knows bias ordering.
+    ///
+    /// `slots` is the token count: 1 for decode, n for batched prefill. The
+    /// indexed GEMV serves a dense linear as `slots` copies of expert 0, so
+    /// `ids` must be a slots-long run of zeros.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        gpu: &mut Gpu,
+        w: &WeightTensor,
+        ids: &GpuTensor,
+        x: &GpuTensor,
+        xh: &GpuTensor,
+        mid: &GpuTensor,
+        y: &GpuTensor,
+        slots: usize,
+    ) -> HipResult<()> {
+        let (ic, oc) = (w.k, w.m);
+        let tk = match w.gpu_dtype {
+            DType::Escha2T16 => 2u32,
+            DType::Escha3T16 => 3u32,
+            other => {
+                return Err(HipError::new(
+                    0,
+                    &format!("EschaProj::forward: dtype {other:?} is not a trellis code"),
+                ))
+            }
+        };
+        let xg = if slots == 1 {
+            rdna_compute::EschaXGroup::Broadcast
+        } else {
+            rdna_compute::EschaXGroup::PerSlot
+        };
+        gpu.escha_h128_batched("escha_h128_in_batched", x, &self.rin, ids, xh, ic, slots, xg)?;
+        gpu.escha_gemv_native_moe_k8_indexed_batched(&self.ptr0, ids, xh, mid, oc, ic, slots, tk)?;
+        gpu.escha_h128_batched(
+            "escha_h128_out_batched",
+            mid,
+            &self.rout,
+            ids,
+            y,
+            oc,
+            slots,
+            rdna_compute::EschaXGroup::PerSlot,
+        )?;
+        Ok(())
+    }
+}
+
+/// Load the escha runtime data for a projection whose weight is a trellis
+/// code. `None` when the weight is any other dtype — that is the signal a
+/// layer is not escha and should take its ordinary path.
+pub fn load_escha_proj(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    proj: &str,
+    w: &WeightTensor,
+    resolve: NameResolver,
+) -> HipResult<Option<EschaProj>> {
+    if !matches!(w.gpu_dtype, DType::Escha2T16 | DType::Escha3T16) {
+        return Ok(None);
+    }
+    let (ic, oc) = (w.k, w.m);
+    let rin = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rin_eff"), ic, resolve)?;
+    let rout = read_f32_tensor(hfq, gpu, &escha_dense_leaf(p, proj, "rout_eff"), oc, resolve)?;
+    let addr = w.buf.buf.as_ptr() as u64;
+    let ptr0 = gpu.upload_raw(&addr.to_le_bytes(), &[1])?;
+    Ok(Some(EschaProj { rin, rout, ptr0 }))
+}
+
 /// Load one dense escha linear: `{p}.{proj}` with `[ic, oc]`.
 ///
 /// `proj` is the full path below the layer (`linear_attn.in_proj_qkv`,

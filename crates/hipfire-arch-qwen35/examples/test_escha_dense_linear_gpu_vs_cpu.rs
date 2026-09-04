@@ -20,7 +20,7 @@
 //! `proj` defaults to `mlp.gate_proj` on layer 0; pass e.g.
 //! `linear_attn.in_proj_qkv` to check another.
 
-use hipfire_arch_qwen35::qwen35::escha::{
+use hipfire_arch_qwen35::qwen35::escha::{EschaProj,
     escha_dense_leaf, escha_dense_linear_forward, load_escha_dense_linear, EschaWeightStore,
 };
 use hipfire_runtime::hfq::HfqFile;
@@ -97,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|&b| hipfire_runtime::llama::f16_to_f32(b))
         .collect();
 
+    let mut bias_ref: Vec<f32> = vec![0.0; oc];
     // Bias AFTER the output transform, matching `ref.py::dense_linear`.
     let bias_name = format!("{p}.{proj}.bias");
     if let Some((info, d)) = find(&hfq, &bias_name) {
@@ -114,6 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (yi, bi) in y_ref.iter_mut().zip(b.iter()) {
             *yi += bi;
         }
+        bias_ref = b;
         println!("bias: present ({oc} elements), applied after the output transform");
     } else {
         println!("bias: absent (optional leaf)");
@@ -273,6 +275,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "F16 store: rel_rms {rel_rms:.3e} exceeds 2e-3 — the dense forward disagrees \
                  with escha_ref by more than fp16 accumulation explains"
             );
+        }
+    }
+    // BATCHED: the indexed GEMV must serve a dense linear as `slots` copies
+    // of expert 0. Verified before wiring it into the batched prefill path,
+    // because a wrong slot stride there is per-token garbage that only shows
+    // up as a bad PPL much later.
+    {
+        let lin = load_escha_dense_linear(
+            &hfq, &mut gpu, p, &proj, ic, oc, EschaWeightStore::Native, candidates)?;
+        let ep = EschaProj {
+            rin: lin.rin, rout: lin.rout, ptr0: lin.ptr0.expect("native has ptr0"),
+        };
+        for slots in [1usize, 4] {
+            let mut xb = Vec::with_capacity(slots * ic);
+            for _ in 0..slots { xb.extend_from_slice(&x); }
+            let xg = gpu.upload_f32(&xb, &[slots * ic])?;
+            let ids = gpu.upload_f32(&vec![f32::from_bits(0); slots], &[slots])?;
+            let xh = gpu.alloc_tensor(&[slots * ic], DType::F32)?;
+            let mid = gpu.alloc_tensor(&[slots * oc], DType::F32)?;
+            let yg = gpu.alloc_tensor(&[slots * oc], DType::F32)?;
+            ep.forward(&mut gpu, &lin.w, &ids, &xg, &xh, &mid, &yg, slots)?;
+            let y = gpu.download_f32(&yg)?;
+            // Every slot fed the same x, so every slot must equal y_ref
+            // (minus the bias, which EschaProj deliberately does not add).
+            let mut worst = 0.0f64;
+            for sl in 0..slots {
+                for o in 0..oc {
+                    let got = y[sl * oc + o] as f64;
+                    let want = y_ref[o] as f64 - bias_ref[o] as f64;
+                    let d = (got - want).abs() / (want.abs().max(1e-3));
+                    if d > worst { worst = d; }
+                }
+            }
+            println!("  BATCHED slots={slots}: worst_rel {worst:.3e}");
+            assert!(worst < 5e-2, "batched slots={slots} worst_rel {worst:.3e}");
         }
     }
     println!("PASS");
