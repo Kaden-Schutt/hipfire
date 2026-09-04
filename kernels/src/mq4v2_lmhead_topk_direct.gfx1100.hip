@@ -114,11 +114,7 @@ mq4v2_lmhead_topk_direct_gfx1100(
     float run_max = -INFINITY;
     float run_se = 0.0f;
 
-    // Clamped X row for dead lanes (ml >= N): the WMMA is warp-collective so
-    // every lane must issue its loads; their tile cells are discarded via
-    // col_live. Mirrors the oracle's safe_batch clamp.
-    const int safe_col = col_live ? ml : 0;
-    const _Float16* x_base = X + (long long)safe_col * K;
+    const _Float16* x_base = X + (long long)ml * K;
 
     for (int tile = wg; tile < m_tiles; tile += nwg) {
         const int row0 = tile << 4;
