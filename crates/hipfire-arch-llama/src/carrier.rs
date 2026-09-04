@@ -1238,4 +1238,263 @@ mod tests {
         assert_eq!(cache.physical_cap, 4);
         let _ = cache.free_gpu(&mut gpu);
     }
+
+    /// #666 G3 pinned-fixture parity oracle.
+    ///
+    /// Runs on the tracker fixture `qwen3:0.6b` (plain LLaMA-family HFQ,
+    /// canonical local file `~/.hipfire/models/qwen3-0.6b-llama.mq4`). The
+    /// path is taken from `HIPFIRE_G3_FIXTURE` when set, else the canonical
+    /// `~/.hipfire/models` location. Skips silently when the file or a GPU is
+    /// absent (no-GPU / no-fixture batteries stay green); fails loudly on a
+    /// size or route-class mismatch so a substituted artifact cannot pass as
+    /// the pinned fixture.
+    ///
+    /// Two routes are loaded from equivalent cloned state:
+    ///   * production manifest route — `load_bundle` classifies this plain
+    ///     file as `ManifestPlainLlama` and publishes through manifest
+    ///     planning, transactional fulfillment, and typed assembly;
+    ///   * validation-only reference — the legacy loader entry the manifest
+    ///     route replaces (`hfq::load_weights_hfq` plus the same scratch and
+    ///     KV constructors).
+    ///
+    /// Both then decode the same committed prompt greedily (argmax), and at
+    /// every committed position the oracle records and asserts: token IDs,
+    /// logits (max absolute difference), KV geometry / byte extents, the
+    /// position counter, alias identity, and route identity. The evidence
+    /// block is printed for the evidence run.
+    #[test]
+    fn pinned_fixture_manifest_legacy_parity_oracle() {
+        let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/.hipfire/models/qwen3-0.6b-llama.mq4")
+        });
+        // Fixture lock: the tracker artifact identity. A substituted file of
+        // the wrong size cannot pass; route classification below additionally
+        // refuses non-plain / mis-tagged artifacts.
+        const PINNED_SIZE: u64 = 495_181_824;
+        const PINNED_MD5: &str = "2579e10ba3a988818386f2b07632ee01";
+        let Ok(meta) = std::fs::metadata(&fixture) else {
+            eprintln!("g3-oracle: fixture absent ({fixture}); skipping");
+            return;
+        };
+        assert_eq!(
+            meta.len(),
+            PINNED_SIZE,
+            "g3-oracle: fixture size mismatch — not the pinned qwen3:0.6b artifact (md5 {PINNED_MD5})"
+        );
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("g3-oracle: no GPU; skipping");
+            return;
+        };
+        let prompt = "The capital of France is located in";
+        let max_seq = 64usize;
+        eprintln!(
+            "g3-oracle: fixture={fixture} size={} md5={PINNED_MD5}",
+            meta.len()
+        );
+        eprintln!("g3-oracle: prompt={prompt:?} (prompt md5 recorded by the evidence run)");
+
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
+        assert_eq!(
+            classify_hfq_route(&hfq),
+            HfqLoadRoute::ManifestPlainLlama,
+            "pinned fixture must take the production manifest route"
+        );
+        assert!(
+            !hfq.has_awq_sidecars(),
+            "pinned fixture must be a plain (sidecar-free) LLaMA-family HFQ"
+        );
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .expect("pinned fixture tokenizer");
+        let prompt_tokens = tokenizer.encode(prompt);
+        eprintln!(
+            "g3-oracle: prompt tokens = {prompt_tokens:?} ({} incl. BOS)",
+            prompt_tokens.len()
+        );
+        let has_separate_lm_head = hfq_has_separate_lm_head(&hfq);
+        eprintln!("g3-oracle: separate lm_head in fixture = {has_separate_lm_head}");
+
+        let cask = CaskConfig::default();
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = max_seq;
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("production load");
+        assert_eq!(
+            ctx.kv_mode_override,
+            Some("q8"),
+            "oracle runs both routes in the same Q8 KV mode"
+        );
+        assert!(bundle.weight_store.is_some(), "production store attached");
+        drop(ctx);
+
+        // Validation-only reference: the legacy loader entry, same scratch/KV.
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen pinned fixture");
+        let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("reference config");
+        let legacy = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+            .expect("legacy reference load");
+        let scratch = ForwardScratch::new_with_max_seq(&mut gpu, &config, max_seq)
+            .expect("reference forward scratch");
+        let dims = llama_kv_dims(&config, max_seq, None);
+        let mut legacy_kv =
+            <KvCache as KvCacheExt>::from_mode(KvMode::Q8, KvTarget::Single(&mut gpu), &dims)
+                .expect("reference KV cache");
+
+        eprintln!(
+            "g3-oracle: route identity — production=ManifestPlainLlama, reference=legacy load_weights_hfq"
+        );
+
+        // Alias identity parity.
+        assert_eq!(
+            bundle.weights.lm_head_aliases_embd, legacy.lm_head_aliases_embd,
+            "alias identity must match between routes"
+        );
+        eprintln!(
+            "g3-oracle: lm_head aliases embed_tokens = {} (both routes)",
+            legacy.lm_head_aliases_embd
+        );
+
+        // KV geometry parity (mode flags, dims, byte extents per layer).
+        {
+            let pkv = &bundle.kv;
+            eprintln!(
+                "g3-oracle: kv geometry — prod q8={} qint8={} kv_dim={} max_seq={} cap={} n_heads={} head_dim={}",
+                pkv.quant_q8, pkv.quant_int8, pkv.kv_dim, pkv.max_seq, pkv.physical_cap,
+                pkv.n_kv_heads, pkv.head_dim
+            );
+            assert_eq!(pkv.quant_q8, legacy_kv.quant_q8);
+            assert_eq!(pkv.quant_int8, legacy_kv.quant_int8);
+            assert_eq!(pkv.kv_dim, legacy_kv.kv_dim);
+            assert_eq!(pkv.max_seq, legacy_kv.max_seq);
+            assert_eq!(pkv.physical_cap, legacy_kv.physical_cap);
+            assert_eq!(pkv.n_kv_heads, legacy_kv.n_kv_heads);
+            assert_eq!(pkv.head_dim, legacy_kv.head_dim);
+            assert_eq!(pkv.k_gpu.len(), legacy_kv.k_gpu.len());
+            for layer in 0..pkv.k_gpu.len() {
+                assert_eq!(
+                    pkv.k_gpu[layer].byte_size(),
+                    legacy_kv.k_gpu[layer].byte_size(),
+                    "layer {layer} K byte extent parity"
+                );
+                assert_eq!(
+                    pkv.v_gpu[layer].byte_size(),
+                    legacy_kv.v_gpu[layer].byte_size(),
+                    "layer {layer} V byte extent parity"
+                );
+            }
+        }
+
+        // Greedy decode in lockstep; compare at every committed position.
+        let mut next_token: u32 = 0;
+        let mut worst_logit_diff: f32 = 0.0;
+        let mut tokens: Vec<u32> = Vec::new();
+        let generated = 12usize;
+        let total = prompt_tokens.len() + generated;
+        assert!(total <= max_seq, "position budget vs KV max_seq");
+        for pos in 0..total {
+            let token = if pos < prompt_tokens.len() {
+                prompt_tokens[pos]
+            } else {
+                next_token
+            };
+            forward_scratch_embed(
+                &mut gpu,
+                &bundle.weights,
+                &bundle.config,
+                token,
+                pos,
+                &bundle.scratch,
+            )
+            .expect("production embed");
+            forward_scratch_compute(
+                &mut gpu,
+                &bundle.weights,
+                &bundle.config,
+                0,
+                &mut bundle.kv,
+                &bundle.scratch,
+            )
+            .expect("production compute");
+            let prod_logits = gpu
+                .download_f32(&bundle.scratch.logits)
+                .expect("production logits");
+            forward_scratch_embed(&mut gpu, &legacy, &config, token, pos, &scratch)
+                .expect("reference embed");
+            forward_scratch_compute(&mut gpu, &legacy, &config, 0, &mut legacy_kv, &scratch)
+                .expect("reference compute");
+            let legacy_logits = gpu.download_f32(&scratch.logits).expect("reference logits");
+            assert_eq!(
+                prod_logits.len(),
+                legacy_logits.len(),
+                "logit width parity at position {pos}"
+            );
+            let mut diff: f32 = 0.0;
+            for (p, l) in prod_logits.iter().zip(&legacy_logits) {
+                diff = diff.max((p - l).abs());
+            }
+            worst_logit_diff = worst_logit_diff.max(diff);
+            assert!(
+                diff <= 1e-5,
+                "logit mismatch at committed position {pos}: max abs diff {diff}"
+            );
+            let prod_choice = argmax_index(&prod_logits) as u32;
+            let legacy_choice = argmax_index(&legacy_logits) as u32;
+            assert_eq!(
+                prod_choice, legacy_choice,
+                "token-id mismatch at committed position {pos}"
+            );
+            next_token = prod_choice;
+            tokens.push(token);
+            eprintln!(
+                "g3-oracle: pos {pos:>2} token {token:>6} max-logit-diff {diff:.3e} (choice {prod_choice})"
+            );
+        }
+
+        // End-state KV payload parity on layer 0 (full written extent).
+        let mut prod_k = vec![0u8; bundle.kv.k_gpu[0].byte_size()];
+        let mut ref_k = vec![0u8; legacy_kv.k_gpu[0].byte_size()];
+        gpu.hip
+            .memcpy_dtoh(&mut prod_k, &bundle.kv.k_gpu[0].buf)
+            .expect("download prod K");
+        gpu.hip
+            .memcpy_dtoh(&mut ref_k, &legacy_kv.k_gpu[0].buf)
+            .expect("download ref K");
+        let k_diffs = prod_k.iter().zip(&ref_k).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "g3-oracle: layer-0 K payload — {} bytes compared, {k_diffs} byte diffs",
+            prod_k.len()
+        );
+        assert_eq!(prod_k, ref_k, "layer-0 K payload must be byte-identical");
+        let mut prod_v = vec![0u8; bundle.kv.v_gpu[0].byte_size()];
+        let mut ref_v = vec![0u8; legacy_kv.v_gpu[0].byte_size()];
+        gpu.hip
+            .memcpy_dtoh(&mut prod_v, &bundle.kv.v_gpu[0].buf)
+            .expect("download prod V");
+        gpu.hip
+            .memcpy_dtoh(&mut ref_v, &legacy_kv.v_gpu[0].buf)
+            .expect("download ref V");
+        let v_diffs = prod_v.iter().zip(&ref_v).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "g3-oracle: layer-0 V payload — {} bytes compared, {v_diffs} byte diffs",
+            prod_v.len()
+        );
+        assert_eq!(prod_v, ref_v, "layer-0 V payload must be byte-identical");
+
+        eprintln!(
+            "g3-oracle: PASS — {total} committed positions, worst logit diff {worst_logit_diff:.3e}, tokens {tokens:?}"
+        );
+        Box::new(bundle).free_gpu(&mut gpu);
+        scratch.free_gpu(&mut gpu);
+        let _ = legacy_kv.free_gpu(&mut gpu);
+        legacy.free_gpu(&mut gpu);
+    }
+
+    fn argmax_index(logits: &[f32]) -> usize {
+        let mut best = 0usize;
+        for (index, value) in logits.iter().enumerate() {
+            if value > &logits[best] {
+                best = index;
+            }
+        }
+        best
+    }
 }
