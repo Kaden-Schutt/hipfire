@@ -3076,6 +3076,32 @@ pub fn preflight_weights_dense_tp(
     let conv = config.conv_kernel_dim;
 
     let validate_proj = |bare: &str, m: usize, k: usize| -> Result<(), String> {
+        // An escha-coded DENSE projection (Qwen3.8-27B) has no `.weight` at
+        // all — it ships `escha_code` + `escha_rin` + `escha_rout`. Validate
+        // the trio that the leaf contract makes REQUIRED (§1.4) and return;
+        // the shape lives in the code tensor's own dims and is checked when
+        // it is decoded, not here.
+        if let Some(stem) = bare.strip_suffix(".weight") {
+            let code = format!("{stem}.escha_code");
+            if let Some((info, _)) = find_qwen35_tensor(hfq, &code) {
+                if info.quant_type == 42 || info.quant_type == 43 {
+                    for leaf in ["escha_rin_eff", "escha_rout_eff"] {
+                        let n = format!("{stem}.{leaf}");
+                        if find_qwen35_tensor(hfq, &n).is_none() {
+                            return Err(format!(
+                                "preflight: {code} is escha-coded but {n} is missing — an \
+                                 incomplete escha linear must fail loudly at load, not \
+                                 decode into noise"
+                            ));
+                        }
+                    }
+                    if k % 256 != 0 {
+                        return Err(format!("preflight: {bare} K={k} not G256 aligned"));
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let (info, cand) = find_qwen35_tensor(hfq, bare)
             .ok_or_else(|| format!("preflight: missing tensor {bare}"))?;
         validate_mq4_proj_info(info, m, k, bare)?;
