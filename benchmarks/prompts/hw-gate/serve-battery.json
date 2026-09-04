@@ -1,0 +1,43 @@
+[
+  {
+    "genre": "code",
+    "prompt": "Write a Python function that returns the longest substring of a string without repeating characters. Reply with only the code.",
+    "expect": [
+      "def "
+    ]
+  },
+  {
+    "genre": "prose",
+    "prompt": "In three sentences, explain why the sky is blue during the day and red at sunset.",
+    "expect": [
+      "scatter"
+    ]
+  },
+  {
+    "genre": "factual",
+    "prompt": "What is the capital of France, and which river runs through it? Answer in one sentence.",
+    "expect": [
+      "Paris",
+      "Seine"
+    ]
+  },
+  {
+    "genre": "format",
+    "prompt": "Convert this to a JSON object with keys \"name\", \"age\", and \"city\", and reply with only the JSON: Alice is 34 and lives in Lisbon.",
+    "expect": [
+      "\"name\"",
+      "Alice",
+      "\"age\"",
+      "34",
+      "\"city\"",
+      "Lisbon"
+    ]
+  },
+  {
+    "genre": "reason",
+    "prompt": "What is 17 + 26? Think briefly if you need to, then give the final answer on its own line in exactly the form 'Answer: N'.",
+    "expect": [
+      "Answer: 43"
+    ]
+  }
+]

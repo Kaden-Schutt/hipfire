@@ -22,10 +22,19 @@
 # and a fourth that hides the evidence:
 #   4. stop emitting a metric that used to be asserted
 #
+# and a fifth that guards declared raises:
+#   5. declared RATCHET-RAISE without the 'ratchet-raise' label when
+#      RATCHET_RAISE_REQUIRE_LABEL=1 (CI enforces; local runs with the
+#      env unset keep the old behavior)
+#
 # A weakening is not forbidden. It must be declared, in a commit message on the
 # branch:
 #
 #     RATCHET-RAISE: <metric> <old> -> <new>, traded for <reason>
+#
+# When RATCHET_RAISE_REQUIRE_LABEL=1, a declared raise is accepted only if
+# RATCHET_RAISE_LABEL_PRESENT=1; otherwise it is a violation:
+#   declared RATCHET-RAISE for <metric> but the PR does not carry the 'ratchet-raise' label
 #
 # Lowering a ceiling, adding a threshold, or adding a metric always passes.
 #
@@ -87,7 +96,12 @@ while read -r name op val; do
 
   if [ -z "$head_line" ]; then
     if echo "$DECLARED" | grep -qx "$name"; then
-      note "$name" "threshold REMOVED (declared)"
+      if [ "${RATCHET_RAISE_REQUIRE_LABEL:-0}" = "1" ] && [ "${RATCHET_RAISE_LABEL_PRESENT:-0}" != "1" ]; then
+        note "$name" "declared RATCHET-RAISE for $name but the PR does not carry the 'ratchet-raise' label"
+        violations=$((violations + 1))
+      else
+        note "$name" "threshold REMOVED (declared)"
+      fi
     else
       note "$name" "threshold REMOVED  <-- was '$op $val'"
       violations=$((violations + 1))
@@ -109,7 +123,12 @@ while read -r name op val; do
 
   if [ "$weakened" -eq 1 ]; then
     if echo "$DECLARED" | grep -qx "$name"; then
-      note "$name" "$op $val  ->  $head_op $head_val   RAISED (declared)"
+      if [ "${RATCHET_RAISE_REQUIRE_LABEL:-0}" = "1" ] && [ "${RATCHET_RAISE_LABEL_PRESENT:-0}" != "1" ]; then
+        note "$name" "declared RATCHET-RAISE for $name but the PR does not carry the 'ratchet-raise' label"
+        violations=$((violations + 1))
+      else
+        note "$name" "$op $val  ->  $head_op $head_val   RAISED (declared)"
+      fi
     else
       note "$name" "$op $val  ->  $head_op $head_val   <-- WEAKENED"
       violations=$((violations + 1))

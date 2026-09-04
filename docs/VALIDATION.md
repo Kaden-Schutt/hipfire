@@ -1,9 +1,12 @@
 # Validation routes
 
-Sole human **route selector** for hipfire validation evidence.
-Executable behavior lives in the scripts and workflows named below — this
-file only maps claim class → route. Methodology numbers and Redline
-certification prose live in their owners ([`INDEX.md`](INDEX.md)).
+Maps claim class → validation route. **CI merge authority for hardware-relevant
+diffs is [`hw-gate`](../.github/workflows/hw-gate.yml)** (see below). Executable
+behavior lives in the scripts and workflows named in each route. Methodology
+numbers and Redline certification prose live in their owners
+([`INDEX.md`](INDEX.md)). Local `python3 -m tools.change_gate` remains available
+as optional offline route planning; it is **not** CI evidence and is superseded
+by hw-gate for the required check.
 
 | Field | Value |
 |---|---|
@@ -24,21 +27,154 @@ certification prose live in their owners ([`INDEX.md`](INDEX.md)).
 6. **Admissions** are recorded only in [`admissions.yml`](admissions.yml).
    A passing route does not create an admission row.
 
+## hw-gate (CI, required)
+
+[`hw-gate`](../.github/workflows/hw-gate.yml) is the **required** CI check for
+every PR and the repository's autonomous review rung: two model seats decide,
+one human owns `master`. Diffs that touch no hardware-relevant surface pass
+immediately. Every decision is announced on the PR under the seat's own
+identity (`hipfire-sol[bot]`, `hipfire-fable[bot]`).
+
+### Bucket selection (`scripts/hw-gate/select.py`)
+
+Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path;
+`serve` and `kernel` also imply `load`):
+
+| Bucket | Path rules (summary) |
+|---|---|
+| **kernel** | `kernels/**`, `crates/rdna-compute/**`, `crates/hipfire-dispatch/**`, `crates/hip-bridge/**`, `crates/saddle-core/**` |
+| **serve** | `crates/hipfire-engine/**`, `crates/hipfire-generate/**`, daemon `slots.rs` / `serve*.rs`, runtime emit/eos/dflash/spec/reset/triattn surfaces, arch `serve`/`generate`/`spec` sources |
+| **load** | loader/daemon/runtime load+config surfaces, arch `load*`/`weights*`/`carrier.rs`, `crates/hipfire-config/**`, `crates/hipfire-registry/**`, `registry/**`, workspace/`crates/*/Cargo.toml` and lockfile |
+| **none** | everything else (docs, benchmarks, most scripts, tests, markdown, …) |
+
+Touching **policy** paths (`.github/workflows/**`, `.github/CODEOWNERS`,
+`scripts/hw-gate/**`, leanup/ratchet scripts, `registry/**`) is part of the
+hard floor: no seat can merge those; a human does. Exec-sensitive paths (build
+scripts, manifests, toolchain, CI, shell/python) are reported to Sol as input
+to its execution-risk judgment; they are not a gate by themselves.
+
+### The author's request (`<!-- hw-gate-request -->`)
+
+A PR body may carry a fenced JSON block after the marker:
+`{"routes":[{"mode":"battery"|"chain","tag":"registry:tag"}],"claim":"..."}`.
+Sol treats the claim as a claim, runs the requested routes when the tag exists
+on the runner, reports unknown or absent tags as unavailable (not failed), and
+states in its verdict whether the claim was proven, disproven, or not
+exercised. The PR template ships the skeleton.
+
+### Seat 1 — Sol decides hardware and delivers the verdict
+
+Sol (`openai-codex/gpt-5.6-sol`, read-only tools in a PR checkout) reads the
+diff before anything runs and decides `run_hardware`: the hardware job builds
+the PR and runs its daemon as the maintainer's user on their workstation, so
+Sol refuses diffs that reach outside the process (network, filesystem beyond
+model/cache/temp, env or credential reads, process spawning, unexplained build
+or dependency changes, obfuscated blobs, unexplained `unsafe`). Nothing else
+gates hardware; a maintainer's **`hw-run`** label only ever forces a run and
+is removed after each run and on every push. Sol also composes the route list:
+the mandatory fixtures for the touched buckets, the author's requested routes,
+and its own additions.
+
+After hardware, Sol reads every decoded turn and returns `greenlight` /
+`needs-human` / `block` with regressions cited by `file:line` and fixture. Sol
+never merges and never approves; its review is a comment.
+
+### Fixtures and harnesses
+
+Every fixture runs through [`scripts/serve_harness.py`](../scripts/serve_harness.py)
+— never a single `hipfire run`, which is one request against a fresh daemon
+and proves nothing about turn-to-turn state — with reasoning off. Mandatory
+fixtures are registry tags pinned by sha256 in
+[`scripts/hw-gate/fixtures.json`](../scripts/hw-gate/fixtures.json); a
+missing or mismatched pinned fixture **fails the gate**. Requested extra tags
+resolve through `registry/v1.json`; one absent from the runner is reported as
+unavailable.
+
+- **`load` bucket** — `battery` on every fixture (varied prompts, expect
+  substrings, attractor / runaway / empty detection).
+- **`serve` bucket** — `battery` + `chain` (related turns through the prefix
+  cache: reset, cache, and terminal semantics).
+- **`kernel` bucket** — `battery` plus
+  [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py)
+  capture + HIP/PM4 parity on the dense trunk.
+
+Decoded assistant text is posted **verbatim** in the evidence comment. Reading
+it is part of review. The per-turn prefill/decode rates in that table are
+harness-side timings (HTTP streaming, sampling) and run well under
+`hipfire bench`; they are context, never a performance claim. Perf claims go
+through [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
+
+### Seat 2 — Fable investigates and decides the merge
+
+Fable (`anthropic/claude-fable-5-1`, thinking `xhigh`) reads the diff, the
+evidence, and Sol's verdict — and then, when that evidence does not prove the
+change, goes and gets the evidence itself. It runs with a real shell in a
+sandboxed checkout of the PR head on the hardware host: every hiptrx GPU is
+reserved for the session (a host-level lock serializes Fable sessions and
+excludes the lane runs), the PR and the base branch are both built for A/B,
+every registry artifact on the host is available read-only, and everything
+Fable writes to `$HW_GATE_EVIDENCE` is uploaded with its decision. There is
+no fixed route vocabulary: Fable chooses what proves the change — a
+multi-GPU load for new topology code, a refused-load-then-generate sequence
+for a moved refusal, Redline parity for a kernel, a base-vs-PR A/B for a
+"no behavior change" refactor. The sandbox bounds reach, not judgment: no
+network, no writes outside its home/evidence/build tree, no other GPUs, no
+credentials, no `gh` (the script posts), a wall-clock budget
+(`HW_GATE_MAX_MINUTES`, default 45), and only registry artifacts.
+
+Fable returns `merge-staging` / `hold` / `block` with an `investigation`
+table (question → route run → evidence file → result), an `unproven` list for
+what this host could not exercise, and an announcement written for the
+author. It may veto Sol's greenlight or override Sol's needs-human — expected
+when it closed the gap itself — and must say why; overrides are recorded so
+the maintainer can audit both seats against outcomes.
+
+**Probation.** While the two-seat rung is on probation, `merge-staging` means
+Fable merges the PR head into **`beta`** (the staging branch) under its own
+identity and announces the merge SHA on the PR. `master` is promoted from
+`beta` by the maintainer; GitHub marks the staged PRs merged when that
+happens. The record of prelims, verdicts, decisions, and overrides is the
+dataset for lifting probation.
+
+### The floor (`scripts/hw-gate/review.py`)
+
+The floor is the workflow's own rule, split in two:
+
+| Tier | Fires on | Who can override |
+|---|---|---|
+| **hard** | a failed fixture or harness, an attractor, a policy-file change, a `RATCHET-RAISE:` commit without the `ratchet-raise` label | nobody — `block` (evidence) or `hold` (policy/ratchet) regardless of either seat |
+| **soft** | coverage gaps, confidence < 0.8, Sol's `needs-human`, an unparseable verdict | Fable, with a stated reason |
+
+### The `hw-gate` status
+
+- `merge-staging` — green.
+- `hold` — red until a maintainer who has read the seats' comments applies
+  **`human-reviewed`** (a logged signature, cleared on every push; a label
+  event re-evaluates the recorded decision without re-running hardware).
+- `block` — red; only a new commit clears it.
+
+Branch protection binds every maintainer except repository admins
+(`enforce_admins` is off on purpose: the admin's judgment is the emergency
+path). An admin merging past a red status is expected to have read the
+comments first.
+
 ## Automatic checks vs manual evidence
 
 | Class | When it runs | Authority |
 |---|---|---|
+| **Automatic (hw-gate, required)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml); hardware run after `hw-run` label when buckets need it | **Required** CI check for every PR. Select may pass with no HW surface; otherwise load/serve/kernel evidence + bounded reviewer floor. |
 | **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, native control-plane/unit tests, CPU tests, and env/docs reference coverage. **Not** model coherence, serve semantics, or perf admission. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
-| **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Required for kernel, dispatch, forward, quant, serve-behavior, Redline, and perf claims. |
+| **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Still required for claim classes hw-gate does not cover (parity oracles, perf protocol, Redline promotion ladder, admissions). |
 
-Automatic CI green never substitutes for a required manual route. Running the no-GPU script locally is convenient parity with CI, not an automatic check.
+No-GPU CI green never substitutes for hw-gate or for a required manual route. hw-gate green does not create an admission or skip claim-specific oracles named below.
 
 ### Automatic entrypoints
 
 | Route | Path | Role |
 |---|---|---|
+| **hw-gate (required)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Automatic** required CI: path → buckets, pinned fixtures, hardware run, reviewer floor. See [§ hw-gate](#hw-gate-ci-required). |
 | No-GPU CI workflow | [`.github/workflows/no-gpu-ci.yml`](../.github/workflows/no-gpu-ci.yml) | **Automatic** CI entry that invokes the no-GPU script on PR/push. |
 | Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |

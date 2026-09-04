@@ -2034,11 +2034,20 @@ def gram3(toks):
     from collections import Counter
     c = Counter(g); return sum(v for v in c.values() if v > 1) / len(g)
 
+# An attractor is *repetition*: the frequency tests below are meaningless on a
+# window too short to repeat in. A one-"word" answer (`Paris`, compact JSON
+# `{"name":"Alice","age":34}`, a bare number) has maxfreq == 1.0 by
+# construction and used to fail every short-answer battery turn at random —
+# the gate hard-floors on it (hw-gate run 33862054891, qwen3.8 format turn,
+# recall 6/6). Runaway/empty cover the degenerate short cases.
+ATTRACTOR_MIN_WINDOW = 8
+
 def _token_attractor(toks):
     first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
+    short = len(toks) < ATTRACTOR_MIN_WINDOW
     return (
-        (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50))
-        or (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50))
+        (not short and (uniq(first) < 0.15 or maxfreq(first) > 0.50))
+        or (not short and (uniq(last) < 0.30 or maxfreq(last) > 0.50))
         or gram3(half) > 0.50
     )
 
@@ -2059,6 +2068,12 @@ def _self_test_attractor_channels():
     assert _token_attractor(combined), "fixture must reproduce the old false positive"
     assert not _response_has_attractor(reasoning, visible)
     assert _response_has_attractor("loop " * 200, "")
+    # Short answers cannot repeat enough to be attractors: one token, a
+    # compact JSON object, a bare number, a two-word echo.
+    for short in ('{"name":"Alice","age":34,"city":"Lisbon"}', "Paris", "43", "yes yes"):
+        assert not _response_has_attractor("", short), f"false positive on short answer {short!r}"
+    # ...but a genuinely degenerate short window still trips once it can repeat.
+    assert _response_has_attractor("", " ".join(["the"] * ATTRACTOR_MIN_WINDOW))
     print("serve_harness: attractor-channel self-test OK", flush=True)
 
 def _project_mtp_ngram_timings(timings):

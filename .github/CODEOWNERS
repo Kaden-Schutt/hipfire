@@ -1,0 +1,33 @@
+# Surfaces where a static-only review has already shipped a regression once.
+# Each of these owes a hardware run (scripts/hw-gate) and a code-owner review.
+
+# The gate itself and every policy file it reads are never bot-approvable.
+/.github/workflows/                     @Kaden-Schutt
+/.github/CODEOWNERS                     @Kaden-Schutt
+/scripts/hw-gate/                       @Kaden-Schutt
+/scripts/leanup-thresholds.txt          @Kaden-Schutt
+/scripts/layering.txt                   @Kaden-Schutt
+/scripts/ratchet-diff.sh                @Kaden-Schutt
+/scripts/leanup-ratchets.sh             @Kaden-Schutt
+/registry/                              @Kaden-Schutt
+
+# Load path: what gets admitted, classified, and uploaded to the GPU.
+/crates/hipfire-loader/                 @Kaden-Schutt
+/crates/hipfire-daemon/                 @Kaden-Schutt
+/crates/hipfire-runtime/src/model_load.rs        @Kaden-Schutt
+/crates/hipfire-runtime/src/hfq.rs               @Kaden-Schutt
+/crates/hipfire-runtime/src/loader_api.rs        @Kaden-Schutt
+/crates/hipfire-runtime/src/config.rs            @Kaden-Schutt
+/crates/hipfire-runtime/src/safetensors_source.rs @Kaden-Schutt
+/crates/hipfire-runtime/src/weight_backend.rs    @Kaden-Schutt
+/crates/hipfire-runtime/src/multi_gpu.rs         @Kaden-Schutt
+
+# Serve path: engine scheduler, terminal protocol, generation loops.
+/crates/hipfire-engine/                 @Kaden-Schutt
+/crates/hipfire-generate/               @Kaden-Schutt
+
+# Kernel path: bytes on the GPU.
+/kernels/                               @Kaden-Schutt
+/crates/rdna-compute/                   @Kaden-Schutt
+/crates/hipfire-dispatch/               @Kaden-Schutt
+/crates/hip-bridge/                     @Kaden-Schutt

@@ -79,8 +79,10 @@ downloads:
 ```
 
 It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
-CPU Python tests, and the env/docs drift check. GPU coherence and speed gates remain required
-for kernel, dispatch, quant, forward-pass, and spec-decode changes.
+CPU Python tests, and the env/docs drift check. Hardware-relevant changes
+(kernel, dispatch, quant, forward-pass, load, serve, spec-decode) must pass
+the required **hw-gate** CI check — see
+[docs/VALIDATION.md](docs/VALIDATION.md) § hw-gate.
 
 ### GPU kernel correctness check
 
@@ -96,9 +98,13 @@ arch port; if it fails on your hardware we want to hear about it
 ### Runtime and performance validation
 
 Any change to kernels, dispatch, fusion, rotation, rmsnorm, sampling,
-the spec-decode path, or the forward pass MUST validate the actual path under
-test. The fixed `coherence-gate*.sh` batteries are retired and must not be
-used as acceptance evidence.
+the spec-decode path, loader/daemon, or the forward pass MUST validate the
+actual path under test. **CI acceptance is hw-gate**
+([`.github/workflows/hw-gate.yml`](.github/workflows/hw-gate.yml),
+[`scripts/hw-gate/`](scripts/hw-gate/)); a maintainer applies the `hw-run`
+label to authorize the hardware run. The fixed `coherence-gate*.sh` batteries
+are retired and must not be used as acceptance evidence. Optional local
+`python3 -m tools.change_gate` is not CI evidence.
 
 ```bash
 python3 scripts/redline_daemon_harness.py --model /path/to/model --pm4
