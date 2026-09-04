@@ -4988,6 +4988,152 @@ fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
 }
 
+/// Run one projection op for a layer whose weights are escha trellis codes.
+///
+/// Returns `Ok(false)` when the layer is not escha, so the caller falls
+/// through to its ordinary dispatch untouched.
+///
+/// WHY THIS BYPASSES THE FUSED PATHS ENTIRELY: every escha projection rotates
+/// the SAME normed input with its OWN `rin` before its GEMV. FusedQkv /
+/// FusedQkvza / gate_up exist precisely to share one rotated activation across
+/// several weights, so there is nothing for them to share here — and they
+/// cannot read a trellis code in any case. A layer is all-escha or none
+/// (`need_eproj` enforces that at load), so the bypass is wholesale.
+///
+/// `in_proj_a` / `in_proj_b` are NOT coded — escha's `ignore` list keeps them
+/// plain — so PROJ_QKVZA runs those two through the normal GEMV.
+fn escha_run_proj(
+    gpu: &mut Gpu,
+    op: &OpBinding,
+    layer: &LayerWeights,
+    s: &Qwen35Scratch,
+    config: &Qwen35Config,
+) -> Result<bool, DispatchError> {
+    let hip = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    match (op_code(op), layer) {
+        (q35_op::PROJ_QKVZA, LayerWeights::DeltaNet(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            // Plain RMSNorm, NOT the fused rmsnorm+rotate: escha applies its
+            // own H128 per projection and a pre-rotated input would be
+            // rotated twice.
+            gpu.rmsnorm_f32(&s.x, &l.attn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.qkv.forward(gpu, &l.wqkv, &e.ids, &s.tmp, &s.escha_xh, &s.dn_qkv, &s.dn_qkv, 1)
+                .map_err(hip)?;
+            e.z.forward(gpu, &l.wz, &e.ids, &s.tmp, &s.escha_xh, &s.dn_z, &s.dn_z, 1)
+                .map_err(hip)?;
+            hipfire_runtime::llama::weight_gemv(gpu, &l.w_beta, &s.tmp, &s.dn_beta).map_err(hip)?;
+            hipfire_runtime::llama::weight_gemv(gpu, &l.w_alpha, &s.tmp, &s.dn_alpha)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        (q35_op::PROJ_QKV, LayerWeights::FullAttn(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            gpu.rmsnorm_f32(&s.x, &l.attn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.q.forward(gpu, &l.wq, &e.ids, &s.tmp, &s.escha_xh, &s.fa_q_full, &s.fa_q_full, 1)
+                .map_err(hip)?;
+            e.k.forward(gpu, &l.wk, &e.ids, &s.tmp, &s.escha_xh, &s.fa_k, &s.fa_k, 1)
+                .map_err(hip)?;
+            e.v.forward(gpu, &l.wv, &e.ids, &s.tmp, &s.escha_xh, &s.fa_v, &s.fa_v, 1)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::DeltaNet(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            gpu.rmsnorm_f32(&s.x, &l.ffn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1)
+                .map_err(hip)?;
+            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::FullAttn(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            gpu.rmsnorm_f32(&s.x, &l.ffn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1)
+                .map_err(hip)?;
+            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Escha counterpart of the residual ops. `out_proj` and `down_proj` write
+/// into the residual stream, which the fused epilogue normally does in one
+/// launch; here the projection and the accumulate are separate because the
+/// trellis GEMV has no residual variant.
+///
+/// Adding into `s.x` afterwards is exact, not an approximation — both the
+/// residual and the projection output are plain f32 adds.
+fn escha_run_resid(
+    gpu: &mut Gpu,
+    op: &OpBinding,
+    layer: &LayerWeights,
+    s: &Qwen35Scratch,
+) -> Result<bool, DispatchError> {
+    let hip = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    let (esch, wo, w_down, dn_in) = match layer {
+        LayerWeights::DeltaNet(l) => match l.escha.as_ref() {
+            None => return Ok(false),
+            Some(e) => (
+                (&e.o, &e.down),
+                &l.wo,
+                &l.w_down,
+                &s.dn_normed,
+            ),
+        },
+        LayerWeights::FullAttn(l) => match l.escha.as_ref() {
+            None => return Ok(false),
+            Some(e) => ((&e.o, &e.down), &l.wo, &l.w_down, &s.fa_attn_out),
+        },
+        _ => return Ok(false),
+    };
+    match op_code(op) {
+        q35_op::RESID_WO => {
+            esch.0
+                .forward(gpu, wo, escha_ids(layer), dn_in, &s.escha_xh, &s.o, &s.o, 1)
+                .map_err(hip)?;
+            gpu.add_inplace_f32(&s.x, &s.o).map_err(hip)?;
+            Ok(true)
+        }
+        q35_op::RESID_DOWN_SWIGLU => {
+            // SwiGLU first — the fused `weight_gemv_swiglu_residual` folds it
+            // in, but that kernel cannot read a trellis code.
+            gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)
+                .map_err(hip)?;
+            esch.1
+                .forward(
+                    gpu,
+                    w_down,
+                    escha_ids(layer),
+                    &s.ffn_hidden,
+                    &s.escha_xh,
+                    &s.ffn_out,
+                    &s.ffn_out,
+                    1,
+                )
+                .map_err(hip)?;
+            gpu.add_inplace_f32(&s.x, &s.ffn_out).map_err(hip)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The layer's shared zero `ids` table. Only called where `escha` is `Some`.
+fn escha_ids(layer: &LayerWeights) -> &GpuTensor {
+    match layer {
+        LayerWeights::DeltaNet(l) => &l.escha.as_ref().expect("escha layer").ids,
+        LayerWeights::FullAttn(l) => &l.escha.as_ref().expect("escha layer").ids,
+        _ => unreachable!("escha_ids on a non-escha layer kind"),
+    }
+}
+
 /// Add the escha dense export's additive output biases.
 ///
 /// Applied here, at the ONE exit of `run_proj`, rather than inside each
@@ -5056,6 +5202,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     ) -> Result<(), DispatchError> {
         let s = self.s;
         let config = self.config;
+        if escha_run_proj(gpu, op, self.layer, s, config)? {
+            return apply_proj_biases(gpu, op, self.layer, s);
+        }
         let res: HipResult<()> = match op_code(op) {
             q35_op::PROJ_QKV => match self.layer {
                 LayerWeights::FullAttn(l) => {
@@ -5268,6 +5417,26 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         let s = self.s;
+        if escha_run_resid(gpu, op, self.layer, s)? {
+            let bias = match self.layer {
+                LayerWeights::DeltaNet(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+                LayerWeights::FullAttn(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+                _ => None,
+            };
+            if let Some((bo, bdown)) = bias {
+                let which = match op_code(op) {
+                    q35_op::RESID_WO => Some(bo),
+                    q35_op::RESID_DOWN_SWIGLU => Some(bdown),
+                    _ => None,
+                };
+                if let Some(b) = which {
+                    let n = b.numel();
+                    gpu.bias_add_f32(&s.x, b, 1, n)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
+            }
+            return Ok(());
+        }
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::RESID_WO => {
                 let (wo, input) = match self.layer {

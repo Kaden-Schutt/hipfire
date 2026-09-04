@@ -13991,11 +13991,18 @@ impl Gpu {
                 ),
             ));
         }
-        if out.numel() != slots * n {
+        // `>=`, not `==`: the kernel writes exactly `slots * n` elements and
+        // never reads `out`, so an oversized destination is safe. The dense
+        // path relies on this — its `xh` scratch is sized to the LARGEST `ic`
+        // any projection uses so one buffer serves them all, and an exact
+        // check would reject every projection but the widest.
+        //
+        // Undersized is still fatal: that is a real out-of-bounds write.
+        if out.numel() < slots * n {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "escha_h128_batched: out has {} elements, need {}",
+                    "escha_h128_batched: out has {} elements, need at least {}",
                     out.numel(),
                     slots * n
                 ),

@@ -91,6 +91,26 @@ pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
         push(format!("model.{name}"));
         push(name.to_string());
     }
+
+    // Escha alias. A trellis-coded projection has NO `.weight` — it ships
+    // `escha_code` + `escha_rin` + `escha_rout`. Offering the code under the
+    // same lookup lets the ordinary `b.proj(...)` path find it and build a
+    // `WeightTensor` with dtype Escha2T16/3T16; `escha_sidecars` then attaches
+    // the rotation vectors.
+    //
+    // Ordered LAST on purpose: a checkpoint carrying both a real `.weight` and
+    // a stale `escha_code` must resolve to the weight, not silently prefer a
+    // code the runtime would then decode against the wrong activation.
+    if let Some(stem) = name.strip_suffix(".weight") {
+        let alias = format!("{stem}.escha_code");
+        if alias.starts_with("model.") {
+            push(alias);
+        } else {
+            push(format!("model.language_model.{alias}"));
+            push(format!("model.{alias}"));
+            push(alias);
+        }
+    }
     out
 }
 
