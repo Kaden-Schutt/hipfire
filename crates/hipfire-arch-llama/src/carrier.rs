@@ -1626,6 +1626,186 @@ mod tests {
         );
     }
 
+    /// AWQ-sidecar HFQ retains the legacy loader end to end on GPU: the
+    /// source is classified `LegacyAwq`, no manifest store is attached, and
+    /// decode works through the same weights path the manifest route replaces.
+    #[test]
+    fn production_awq_sidecar_loads_and_decodes_on_gpu_through_legacy_route() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        let (path, hfq) = fixture_hfq(true, false, false, false);
+        assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
+        let cask = CaskConfig::default();
+        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy GPU load");
+        drop(ctx);
+        assert!(
+            bundle.weight_store.is_none(),
+            "AWQ-sidecar sources must not attach a manifest store"
+        );
+        forward_scratch_embed(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            0,
+            0,
+            &bundle.scratch,
+        )
+        .expect("AWQ legacy embed");
+        forward_scratch_compute(
+            &mut gpu,
+            &bundle.weights,
+            &bundle.config,
+            0,
+            &mut bundle.kv,
+            &bundle.scratch,
+        )
+        .expect("AWQ legacy compute");
+        let logits = gpu
+            .download_f32(&bundle.scratch.logits)
+            .expect("AWQ legacy logits");
+        assert_eq!(logits.len(), 2, "fixture vocab width");
+        Box::new(bundle).free_gpu(&mut gpu);
+        std::fs::remove_file(path).expect("remove AWQ fixture");
+    }
+
+    /// Repeated production load/unload cycles on the pinned fixture must not
+    /// leak: every cycle publishes exactly the warm baseline (no growth in the
+    /// store's resident accounting), decodes identically, and returns free
+    /// VRAM to within a bounded floor of the stabilized level after unload, so
+    /// a manifest-specific retention cannot accumulate across reloads on one
+    /// context. The floor is deliberately generous (1 GiB/cycle beyond a
+    /// one-time 256 MiB context allowance) because gfx1151 UMA pooling means
+    /// hipMemGetInfo does not credit driver-pooled frees in-cycle — the
+    /// legacy-route cycle test documents that identical behaviour.
+    #[test]
+    fn pinned_fixture_repeated_load_unload_cycles_leak_nothing() {
+        let Some(fixture) = pinned_fixture_path() else {
+            return;
+        };
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("g3-cycles: no GPU; skipping");
+            return;
+        };
+        const SLACK: usize = 256 * 1024 * 1024;
+        const PER_CYCLE_ALLOWANCE: usize = 1024 * 1024 * 1024;
+        let prompt = "The capital of France is located in";
+        let max_seq = 64usize;
+        let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .expect("pinned fixture tokenizer");
+        let prompt_tokens = tokenizer.encode(prompt);
+        let cask = CaskConfig::default();
+        test_support::reset();
+        let mut baseline_tokens: Option<Vec<u32>> = None;
+        let mut published = 0usize;
+        let mut stabilized_free: usize = 0;
+        for cycle in 0..4 {
+            let (free_before, _) = gpu.hip.get_vram_info().expect("vram before cycle");
+            let alloc_before = test_support::resident_allocations();
+            let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+            ctx.max_seq = max_seq;
+            let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for cycle");
+            let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
+                .unwrap_or_else(|e| panic!("cycle {cycle} production load: {e}"));
+            drop(ctx);
+            let delta = test_support::resident_allocations() - alloc_before;
+            if cycle == 0 {
+                published = delta;
+                assert!(published > 0, "cycle must publish resident allocations");
+            } else {
+                assert_eq!(
+                    delta, published,
+                    "cycle {cycle} must publish exactly the warm baseline ({published})"
+                );
+            }
+            let tokens = greedy_decode(
+                &mut gpu,
+                &bundle.weights,
+                &bundle.config,
+                &mut bundle.kv,
+                &bundle.scratch,
+                &prompt_tokens,
+                8,
+            );
+            match &baseline_tokens {
+                None => baseline_tokens = Some(tokens.clone()),
+                Some(baseline) => assert_eq!(&tokens, baseline, "cycle {cycle} decode parity"),
+            }
+            Box::new(bundle).free_gpu(&mut gpu);
+            let (free_after, _) = gpu.hip.get_vram_info().expect("vram after unload");
+            eprintln!(
+                "g3-cycles: cycle {cycle} — published {delta} residents, free VRAM {free_before} -> {free_after}"
+            );
+            // Cycle 0 pays one-time context cost (kernel modules, stream and
+            // driver-side arena growth); later cycles must stay within the
+            // bounded floor of the stabilized post-cycle-0 level.
+            if cycle == 0 {
+                stabilized_free = free_after;
+            } else {
+                assert!(
+                    free_after + SLACK + (cycle as usize) * PER_CYCLE_ALLOWANCE >= stabilized_free,
+                    "cycle {cycle} exceeded VRAM floor: {stabilized_free} -> {free_after}"
+                );
+            }
+        }
+        assert!(baseline_tokens.is_some());
+        eprintln!(
+            "g3-cycles: PASS — 4 load/unload cycles, per-cycle baseline {published} residents, decode identical, VRAM within floor"
+        );
+    }
+
+    /// Legacy-route load/unload cycles on the pinned fixture, measured with
+    /// the same VRAM floor as the manifest-route cycle test. gfx1151 UMA
+    /// pooling means hipMemGetInfo does not credit driver-pooled frees
+    /// in-cycle on either route; this test pins that the manifest route
+    /// behaves no worse than the legacy loader it replaces.
+    #[test]
+    fn pinned_fixture_legacy_route_cycles_vram_bounded() {
+        let Some(fixture) = pinned_fixture_path() else {
+            return;
+        };
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("g3-legacy-vram: no GPU; skipping");
+            return;
+        };
+        const SLACK: usize = 256 * 1024 * 1024;
+        const PER_CYCLE_ALLOWANCE: usize = 1024 * 1024 * 1024;
+        let mut stabilized_free: usize = 0;
+        for cycle in 0..3 {
+            let (free0, _) = gpu.hip.get_vram_info().expect("vram before cycle");
+            let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
+            let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("fixture config");
+            let legacy = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+                .expect("legacy load");
+            let scratch =
+                ForwardScratch::new_with_max_seq(&mut gpu, &config, 64).expect("legacy scratch");
+            let dims = llama_kv_dims(&config, 64, None);
+            let mut kv =
+                <KvCache as KvCacheExt>::from_mode(KvMode::Q8, KvTarget::Single(&mut gpu), &dims)
+                    .expect("legacy KV");
+            let (free1, _) = gpu.hip.get_vram_info().expect("vram after load");
+            scratch.free_gpu(&mut gpu);
+            let _ = kv.free_gpu(&mut gpu);
+            legacy.free_gpu(&mut gpu);
+            let (free2, _) = gpu.hip.get_vram_info().expect("vram after unload");
+            eprintln!(
+                "g3-legacy-vram: cycle {cycle} free {free0} -> loaded {free1} -> unloaded {free2}"
+            );
+            if cycle == 0 {
+                stabilized_free = free2;
+            } else {
+                assert!(
+                    free2 + SLACK + (cycle as usize) * PER_CYCLE_ALLOWANCE >= stabilized_free,
+                    "legacy cycle {cycle} exceeded VRAM floor: {stabilized_free} -> {free2}"
+                );
+            }
+        }
+        eprintln!("g3-legacy-vram: PASS — legacy-route cycles within the same VRAM floor");
+    }
+
     fn pinned_fixture_path() -> Option<String> {
         let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1634,7 +1814,7 @@ mod tests {
         const PINNED_SIZE: u64 = 495_181_824;
         const PINNED_MD5: &str = "2579e10ba3a988818386f2b07632ee01";
         let Ok(meta) = std::fs::metadata(&fixture) else {
-            eprintln!("g3-lifecycle: fixture absent ({fixture}); skipping");
+            eprintln!("g3: fixture absent ({fixture}); skipping");
             return None;
         };
         assert_eq!(
@@ -1643,10 +1823,6 @@ mod tests {
             "fixture size mismatch — not the pinned qwen3:0.6b artifact (md5 {PINNED_MD5})"
         );
         Some(fixture)
-    }
-
-    fn hfq_clone(path: &str) -> HfqFile {
-        HfqFile::open(std::path::Path::new(path)).expect("reopen pinned fixture")
     }
 
     /// Greedy argmax decode over `prompt_tokens` followed by `generated`
