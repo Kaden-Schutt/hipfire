@@ -1,5 +1,6 @@
 //! Shared model-format helpers used by the quantizer binaries.
 
+pub mod escha_fold;
 pub mod escha_ref;
 pub mod float16;
 pub mod gptq;
