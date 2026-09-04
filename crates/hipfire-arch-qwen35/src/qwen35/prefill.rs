@@ -48,6 +48,7 @@ use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_batched_for;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
+use hipfire_runtime::llama::fused_silu_mul_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::rotate_x_mq_batched_for;
 use hipfire_runtime::llama::weight_gemv_prerotated;
 use hipfire_runtime::llama::weight_gemv_swiglu_residual;
@@ -4609,6 +4610,28 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// S4-f16-residual-inputs: shared fast-route predicate for the four
+/// post-attention/down hooks.
+///
+/// True only for the frozen fixture route: chain (non-tree) verify on exact
+/// gfx1100, the slice kill switch clear, an MQ4G256V2 residual consumer, a
+/// `Residual` epilogue, and a verify-block batch `1 <= n <= 16`. Every false
+/// keeps the pre-change path byte-for-byte.
+fn s4_residual_fast(
+    gpu: &Gpu,
+    fusion: DflashFusionCtx,
+    w_dtype: DType,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+) -> bool {
+    fusion == DflashFusionCtx::ChainVerify
+        && !gpu.flags.mq_f16_residual_off
+        && gpu.arch_caps.is_gfx1100()
+        && w_dtype == DType::MQ4G256V2
+        && matches!(epilogue, BatchEpilogue::Residual)
+        && (1..=16).contains(&n)
+}
+
 /// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
 ///
 /// Same statements, same order, same launches as the inlined block.
@@ -4626,7 +4649,62 @@ fn batch_chunk_delta_net_output_projection(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    let _ = fusion;
+    // S4: one gated_norm+FWHT+F16 producer + direct-F16 residual GEMM
+    // instead of gated_norm_f32 + mq_rotate_x + convert.
+    if s4_residual_fast(gpu, fusion, layer.wo.gpu_dtype, &epilogue, n)
+        && config.linear_value_head_dim == 128
+    {
+        let k = layer.wo.k;
+        let m = layer.wo.m;
+        if k > 0 && k % 256 == 0 {
+            if let Some(awq) = layer.wo.awq_scale.as_ref() {
+                if awq.numel() >= k {
+                    gpu.gated_norm_rotate_mq_awq_f16_batched(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        awq,
+                        &pbs.dn_normed_rot_f16_batch,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
+                        n,
+                    )?;
+                    let x_f16 = pbs.dn_normed_rot_f16_batch.sub_offset(0, n * k);
+                    gpu.gemm_mq4g256v2_residual_wmma_f16(
+                        &layer.wo.buf,
+                        &x_f16,
+                        &pbs.x_batch,
+                        m,
+                        k,
+                        n,
+                    )?;
+                    return Ok(());
+                }
+            } else {
+                gpu.gated_norm_rotate_mq_f16_batched(
+                    &pbs.dn_attn_out_batch,
+                    &pbs.dn_z_batch,
+                    &layer.norm_weight,
+                    &pbs.dn_normed_rot_f16_batch,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                    n,
+                )?;
+                let x_f16 = pbs.dn_normed_rot_f16_batch.sub_offset(0, n * k);
+                gpu.gemm_mq4g256v2_residual_wmma_f16(
+                    &layer.wo.buf,
+                    &x_f16,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                )?;
+                return Ok(());
+            }
+        }
+    }
     // Batched gated output norm.
     gpu.gated_norm_f32_batched(
         &pbs.dn_attn_out_batch,
@@ -5131,7 +5209,33 @@ fn batch_chunk_delta_net_ffn_down(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    let _ = fusion;
+    // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
+    // of fused_silu_mul_rotate_mq_batched + convert.
+    if s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) {
+        let k = layer.w_down.k;
+        let m = layer.w_down.m;
+        if k > 0 && k % 256 == 0 && k == hidden_dim {
+            fused_silu_mul_rotate_mq_f16_batched_for(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_f16_batch,
+                hidden_dim,
+                n,
+            )?;
+            let x_f16 = pbs.ffn_hidden_f16_batch.sub_offset(0, n * hidden_dim);
+            gpu.gemm_mq4g256v2_residual_wmma_f16(
+                &layer.w_down.buf,
+                &x_f16,
+                &pbs.x_batch,
+                m,
+                hidden_dim,
+                n,
+            )?;
+            return Ok(());
+        }
+    }
     // SwiGLU activation feeding w_down. For MQ, we need the
     // output FWHT-rotated so it matches the pre-rotated w_down
     // weights. For HFQ, plain silu_mul is enough. silu_mul_f32
@@ -5714,7 +5818,55 @@ fn batch_chunk_full_attn_output_projection(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    let _ = fusion;
+    // S4: one sigmoid*attn+FWHT+F16 producer + direct-F16 residual GEMM
+    // instead of sigmoid_mul_f32 + mq_rotate_x + convert. The F32 attn
+    // input is left unmutated (the old in-place sigmoid write is skipped).
+    if s4_residual_fast(gpu, fusion, layer.wo.gpu_dtype, &epilogue, n) {
+        let k = layer.wo.k;
+        let m = layer.wo.m;
+        if k > 0 && k % 256 == 0 {
+            if let Some(awq) = layer.wo.awq_scale.as_ref() {
+                if awq.numel() >= k {
+                    gpu.sigmoid_mul_rotate_mq_awq_f16_batched(
+                        &pbs.fa_attn_out_batch,
+                        &pbs.fa_gate_batch,
+                        awq,
+                        &pbs.fa_attn_out_rot_f16_batch,
+                        k,
+                        n,
+                    )?;
+                    let x_f16 = pbs.fa_attn_out_rot_f16_batch.sub_offset(0, n * k);
+                    gpu.gemm_mq4g256v2_residual_wmma_f16(
+                        &layer.wo.buf,
+                        &x_f16,
+                        &pbs.x_batch,
+                        m,
+                        k,
+                        n,
+                    )?;
+                    return Ok(());
+                }
+            } else {
+                gpu.sigmoid_mul_rotate_mq_f16_batched(
+                    &pbs.fa_attn_out_batch,
+                    &pbs.fa_gate_batch,
+                    &pbs.fa_attn_out_rot_f16_batch,
+                    k,
+                    n,
+                )?;
+                let x_f16 = pbs.fa_attn_out_rot_f16_batch.sub_offset(0, n * k);
+                gpu.gemm_mq4g256v2_residual_wmma_f16(
+                    &layer.wo.buf,
+                    &x_f16,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                )?;
+                return Ok(());
+            }
+        }
+    }
     // 8. Fused sigmoid(gate) * attn_out, element-wise over the
     // full [N × q_dim] tensor.
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
@@ -6027,7 +6179,33 @@ fn batch_chunk_full_attn_ffn_down(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    let _ = fusion;
+    // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
+    // of fused_silu_mul_rotate_mq_batched + convert.
+    if s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) {
+        let k = layer.w_down.k;
+        let m = layer.w_down.m;
+        if k > 0 && k % 256 == 0 && k == hidden_dim {
+            fused_silu_mul_rotate_mq_f16_batched_for(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_f16_batch,
+                hidden_dim,
+                n,
+            )?;
+            let x_f16 = pbs.ffn_hidden_f16_batch.sub_offset(0, n * hidden_dim);
+            gpu.gemm_mq4g256v2_residual_wmma_f16(
+                &layer.w_down.buf,
+                &x_f16,
+                &pbs.x_batch,
+                m,
+                hidden_dim,
+                n,
+            )?;
+            return Ok(());
+        }
+    }
     let fa_w_down_is_mq = matches!(
         layer.w_down.gpu_dtype,
         DType::MQ4G256
