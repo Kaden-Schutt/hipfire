@@ -53,7 +53,16 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+anyhow = "1"
+clap = "4.6"
 half = "2.7"
 libloading = "0.9"
+memmap2 = "0.9"
+minijinja = "2"
+minijinja-contrib = "2"
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 safetensors = "0.8"
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"

@@ -40,7 +40,7 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 
 # Direct external deps used by daemon.rs
 base64 = "0.22"
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 libc = "0.2"

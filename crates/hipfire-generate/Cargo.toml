@@ -43,7 +43,7 @@ hipfire-arch-maple = { path = "../hipfire-arch-maple" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 base64 = "0.22"
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 
 [features]

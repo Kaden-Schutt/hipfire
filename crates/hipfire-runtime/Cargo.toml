@@ -55,17 +55,17 @@ hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
-memmap2 = "0.9"
+memmap2.workspace = true
 safetensors.workspace = true
 half.workspace = true
 byteorder = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
 # default BTreeMap alphabetic sort. Required so request tool-definition key order
 # survives parse → render → `| tojson`, byte-matching the model's trained
 # chat_template (HF apply_chat_template preserves insertion order). Feature-
 # unifies across the workspace build.
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 libc = "0.2"
 rayon = "1"
 # Inline-small token buffer for `spec::SpecStep::emit` — keeps the
@@ -88,12 +88,12 @@ regex = "1"
 # branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
 # inside the system block; without it, tool-using turns die at render time
 # (caught by jinja_smoke scenario C, 2026-05-09).
-minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
+minijinja = { workspace = true, features = ["loop_controls", "json", "preserve_order"] }
 # `pycompat` ships an unknown-method callback that makes Python
 # str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
 # work on plain Jinja values — required by the Qwen3 family
 # template which uses these throughout.
-minijinja-contrib = { version = "2", features = ["pycompat"] }
+minijinja-contrib = { workspace = true, features = ["pycompat"] }
 tracing = "0.1"
 
 # Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)

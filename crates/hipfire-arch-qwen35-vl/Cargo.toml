@@ -19,7 +19,7 @@ hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
-serde_json = "1"
+serde_json.workspace = true
 # image preprocessing (PNG/JPEG decode + resize) for the vision encoder
 # input pipeline lives in this crate (`crate::image`). Same default-feature
 # gating as runtime had pre-PR-9.
