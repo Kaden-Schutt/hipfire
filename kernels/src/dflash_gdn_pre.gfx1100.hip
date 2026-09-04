@@ -291,11 +291,11 @@ __global__ void dflash_gdn_pre_replay_gfx1100(
         return;
     }
 
-    if (bx == n_key_heads) {
-        // V region: one block loops 256-wide stripes when v_dim > 256 would
-        // need more blocks — except the launcher sizes v_blocks; every V
-        // block runs this same striped loop over its own stripe set. To keep
-        // the two cooperating, V block j handles stripes j, j+v_blocks, ...
+    if (bx < n_key_heads + v_blocks) {
+        // V region: every V block runs this striped loop over its own stripe
+        // set. V block j (0-based past the Q/K blocks) handles stripes
+        // j, j+v_blocks, ...; the vi guard breaks the loop once past v_dim.
+        // Union over blocks covers every V channel exactly once.
         for (int t = 0; t < n_steps; ++t) {
             const long long in_row = (long long)t * qkv_dim;
             for (int stripe = bx - n_key_heads; ; stripe += v_blocks) {
