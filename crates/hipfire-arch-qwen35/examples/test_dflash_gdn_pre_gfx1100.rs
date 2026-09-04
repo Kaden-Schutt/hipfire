@@ -124,12 +124,14 @@ impl Arm {
     fn alloc(gpu: &mut Gpu, s_dtype_size_note: bool) -> Self {
         let _ = s_dtype_size_note;
         // Q8 S state is raw bytes (s_size); mirror weights.rs allocation.
+        // Tagged DType::Raw (not F32) so byte_size() matches the S_SIZE-byte
+        // buffer and download() works; kernels only see the raw pointer.
         let s_buf = gpu.hip.malloc(S_SIZE).expect("s alloc");
         gpu.hip.memset(&s_buf, 0, S_SIZE).expect("s zero");
         let s = GpuTensor {
             buf: s_buf,
             shape: vec![S_SIZE],
-            dtype: DType::F32,
+            dtype: DType::Raw,
         };
         Self {
             beta: gpu.alloc_tensor(&[MAX_N * N_V], DType::F32).expect("beta"),
