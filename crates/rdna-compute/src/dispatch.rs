@@ -1112,6 +1112,12 @@ impl Gpu {
         // `gfx10-1-generic` (covers Navi 10/12/14) without per-arch JIT
         // cache fragmentation. Empty / unset preserves prior behavior.
         let detected_arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
+        // Record the DETECTED (not compile-target-overridden) arch for
+        // config-time policy that runs without a Gpu handle in hand — the
+        // kv_slots memory preflight resolves its auto mode (unified-memory
+        // APU vs discrete GPU) from physical topology, which a
+        // HIPFIRE_TARGET_ARCH override does not change.
+        crate::arch_caps::note_process_gpu_arch(&detected_arch);
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())

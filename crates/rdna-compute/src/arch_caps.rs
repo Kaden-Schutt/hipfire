@@ -78,6 +78,25 @@ pub struct ArchCaps {
     flags: std::sync::Arc<FeatureFlags>,
 }
 
+// Process-wide GPU arch, recorded at `Gpu::init[_with_device]` so config-time
+// policy that runs without a `Gpu` handle in hand (the `kv_slots` memory
+// preflight) can still classify the deployment as unified-memory APU vs
+// discrete GPU. First init wins: a mixed APU + dGPU process is not a
+// supported topology, and re-inits (device swaps in harnesses) must not
+// silently change which class the OOM guard applies to.
+static PROCESS_GPU_ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the arch this process initialized its primary GPU with. First call
+/// wins; later calls are no-ops.
+pub fn note_process_gpu_arch(arch: &str) {
+    let _ = PROCESS_GPU_ARCH.set(arch.to_string());
+}
+
+/// The arch recorded at GPU init, if any GPU has been initialized.
+pub fn process_gpu_arch() -> Option<&'static str> {
+    PROCESS_GPU_ARCH.get().map(|s| s.as_str())
+}
+
 impl ArchCaps {
     pub fn new(arch: &str, flags: std::sync::Arc<FeatureFlags>) -> Self {
         // Atoms

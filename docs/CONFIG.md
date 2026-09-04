@@ -109,6 +109,7 @@ Stable/default-on and safety controls:
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
+| `memory.oom_guard` | `auto` | Memory preflight OOM guard (`kv_slots::preflight_alloc` and the bench-sweep headroom check). Refuses oversized allocations before they are made. `auto` decides by deployment class: on for unified-memory APU archs (gfx1035/1036/1103/1150/1151/1152 — GPU allocations come out of system RAM, so an overshoot is a global OOM that kills the desktop), off for discrete GPUs (an overshoot is a plain failed hipMalloc), and for GPU-less processes by host swap state (no swap → on). `true`/`false` force the decision. |
 
 The following default-off keys are experimental kernel-route overrides. They
 are typed booleans, process-scoped, and visible in `hipfire config list` with

@@ -3877,7 +3877,17 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 /// a leaked first model would show up: if the slots engine did not actually
 /// release its weights, `MemAvailable` is still depressed here and this stops
 /// the sweep instead of taking the box down.
+///
+/// `memory.oom_guard` (default `auto`) opts out or forces the check on: this
+/// process never initializes a GPU, so `auto` falls back to host swap state —
+/// with swap an overcommit degrades rather than kills and the check stands
+/// down; without swap it stays up. A discrete-GPU box that wants the check
+/// anyway pins `memory.oom_guard=true`.
 fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    if !hipfire_config::oom_guard_effective(None) {
+        eprintln!("memory headroom guard inactive (memory.oom_guard); continuing sweep");
+        return Ok(());
+    }
     let registry = load_registry(&paths.registry).registry;
     let Some(path) = find_model_path(paths, &registry, model) else {
         return Ok(());

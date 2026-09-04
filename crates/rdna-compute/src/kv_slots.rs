@@ -258,6 +258,16 @@ pub fn build_tiles(slot_query_counts: &[usize], br: usize) -> (Vec<i32>, Vec<i32
 // us). This function is the first line of defence: refuse cheaply and clearly
 // BEFORE allocating, so a bad configuration reports itself instead of dying
 // half-way through and leaving the GPU in an unknown state.
+//
+// The defence is Strix-shaped, so it is configurable — `memory.oom_guard`
+// (compat `HIPFIRE_OOM_GUARD`), default `auto`:
+//   - unified-memory APU arch (gfx1151 etc.) → guard ON: GPU allocations come
+//     out of system RAM, so the refusal protects the desktop;
+//   - discrete-GPU arch (gfx1100 etc.) → guard OFF: an overshoot is a plain
+//     failed hipMalloc, failing one request, not the box;
+//   - no GPU arch known (e.g. the CLI supervising a daemon) → decided by host
+//     swap state: with swap an overcommit degrades rather than kills;
+//   - explicit `true`/`false` overrides the decision either way.
 
 /// Default deployment-target budget: the R9700 has 32 GB. A configuration that
 /// does not fit here cannot ship, regardless of what this 125 GiB dev box can
@@ -282,6 +292,12 @@ pub fn mem_available_bytes() -> Option<u64> {
 /// Refuse a planned allocation that would either exceed the deployment target's
 /// VRAM or leave this box without enough headroom to stay responsive.
 ///
+/// Gated by `memory.oom_guard` (compat `HIPFIRE_OOM_GUARD`), default `auto`:
+/// the deployment-target ceiling and the headroom check both assume GPU
+/// memory comes from system RAM, so `auto` keeps them on only for
+/// unified-memory APU architectures (and, when no GPU arch is known in this
+/// process, for hosts without swap). See `hipfire_config::oom_guard_effective`.
+///
 /// `planned_bytes` must be the TOTAL the caller is about to hold live at once,
 /// not a single buffer. Returns `Err` with an actionable message; callers should
 /// skip the configuration rather than proceed.
@@ -293,6 +309,25 @@ pub fn mem_available_bytes() -> Option<u64> {
 /// forbidden by scripts/check-env-docs.py. Harnesses live in `examples/`,
 /// which is exempt, so they read any override there and pass it in.
 pub fn preflight_alloc(planned_bytes: u64, budget_bytes: u64, what: &str) -> Result<(), String> {
+    // Gpu::init records the detected arch; until it runs (or in GPU-less
+    // processes) the resolver falls back to host swap state.
+    if !hipfire_config::oom_guard_effective(crate::arch_caps::process_gpu_arch()) {
+        static INACTIVE_NOTE: std::sync::Once = std::sync::Once::new();
+        INACTIVE_NOTE.call_once(|| {
+            eprintln!(
+                "[kv_slots] memory preflight guard inactive (memory.oom_guard); \
+                 allocations will not be refused before allocate"
+            );
+        });
+        return Ok(());
+    }
+    preflight_checks(planned_bytes, budget_bytes, what)
+}
+
+/// The guard's actual checks, with no config gating — deterministic on every
+/// machine so the unit tests below assert refusal behavior rather than this
+/// box's config. [`preflight_alloc`] is the config-gated production entry.
+pub(crate) fn preflight_checks(planned_bytes: u64, budget_bytes: u64, what: &str) -> Result<(), String> {
     let budget = budget_bytes;
 
     let gib = |b: u64| b as f64 / 1073741824.0;
@@ -341,15 +376,19 @@ mod tests {
     #[test]
     fn preflight_refuses_over_target_budget() {
         // 64 GiB against the 32 GiB R9700 target: must refuse even though this
-        // dev box has 125 GiB.
-        let e = preflight_alloc(64 * 1024 * 1024 * 1024, R9700_VRAM_BYTES, "test").unwrap_err();
+        // dev box has 125 GiB. The pure checks, not the config-gated entry —
+        // this test must refuse identically whether this box is an APU or a
+        // dGPU.
+        let e = preflight_checks(64 * 1024 * 1024 * 1024, R9700_VRAM_BYTES, "test").unwrap_err();
         assert!(e.contains("deployment target"), "unexpected message: {e}");
     }
 
     #[test]
     fn preflight_allows_a_small_allocation() {
-        // 64 MiB is under budget and under any plausible MemAvailable.
-        assert!(preflight_alloc(64 * 1024 * 1024, R9700_VRAM_BYTES, "test").is_ok());
+        // 64 MiB is under budget and under any plausible MemAvailable. Pure
+        // checks: this test must pass regardless of this box's oom_guard
+        // setting.
+        assert!(preflight_checks(64 * 1024 * 1024, R9700_VRAM_BYTES, "test").is_ok());
     }
 
     #[test]
