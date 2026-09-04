@@ -59,7 +59,9 @@ fn fill_lcg(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 33) as f64) / (u32::MAX as f64) - 0.5;
             (u as f32) * scale
         })
@@ -136,8 +138,12 @@ impl Arm {
         Self {
             beta: gpu.alloc_tensor(&[MAX_N * N_V], DType::F32).expect("beta"),
             alpha: gpu.alloc_tensor(&[MAX_N * N_V], DType::F32).expect("alpha"),
-            q_raw: gpu.alloc_tensor(&[MAX_N * K_DIM], DType::F32).expect("q_raw"),
-            k_raw: gpu.alloc_tensor(&[MAX_N * K_DIM], DType::F32).expect("k_raw"),
+            q_raw: gpu
+                .alloc_tensor(&[MAX_N * K_DIM], DType::F32)
+                .expect("q_raw"),
+            k_raw: gpu
+                .alloc_tensor(&[MAX_N * K_DIM], DType::F32)
+                .expect("k_raw"),
             v: gpu.alloc_tensor(&[MAX_N * V_DIM], DType::F32).expect("v"),
             q: gpu.alloc_tensor(&[MAX_N * V_DIM], DType::F32).expect("q"),
             k: gpu.alloc_tensor(&[MAX_N * V_DIM], DType::F32).expect("k"),
@@ -153,11 +159,11 @@ impl Arm {
             tape_beta: gpu
                 .alloc_tensor(&[MAX_N * N_V], DType::F32)
                 .expect("tape_beta"),
-            attn: gpu.alloc_tensor(&[MAX_N * V_DIM], DType::F32).expect("attn"),
+            attn: gpu
+                .alloc_tensor(&[MAX_N * V_DIM], DType::F32)
+                .expect("attn"),
             s,
-            scales: gpu
-                .zeros(&[N_V * HD], DType::F32)
-                .expect("scales"),
+            scales: gpu.zeros(&[N_V * HD], DType::F32).expect("scales"),
             ef: gpu.zeros(&[S_SIZE], DType::F16).expect("ef"),
         }
     }
@@ -192,9 +198,7 @@ fn main() {
         .expect("qkv_in");
     let dt_bias = gpu.alloc_tensor(&[N_V], DType::F32).expect("dt_bias");
     let a_log = gpu.alloc_tensor(&[N_V], DType::F32).expect("a_log");
-    let conv_w = gpu
-        .alloc_tensor(&[N_CH * 4], DType::F32)
-        .expect("conv_w");
+    let conv_w = gpu.alloc_tensor(&[N_CH * 4], DType::F32).expect("conv_w");
     upload(&gpu, &qkv_in, &fill_lcg(MAX_N * QKV_DIM, 0x1234, 0.6));
     upload(&gpu, &dt_bias, &fill_lcg(N_V, 0xB1A5, 1.0));
     upload(&gpu, &a_log, &fill_lcg(N_V, 0xA106, 0.5));
@@ -251,8 +255,15 @@ fn main() {
             )
             .expect("old tape beta");
             gpu.conv1d_silu_split_f32_n(
-                &old.q_raw, &old.k_raw, &old.v, &qkv_in, &conv_w, &old.conv_state,
-                K_DIM, V_DIM, n,
+                &old.q_raw,
+                &old.k_raw,
+                &old.v,
+                &qkv_in,
+                &conv_w,
+                &old.conv_state,
+                K_DIM,
+                V_DIM,
+                n,
             )
             .expect("old conv");
             gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
@@ -263,10 +274,31 @@ fn main() {
             // New path: single launch.
             let fused = gpu
                 .dflash_gdn_pre_capture_gfx1100(
-                    &new.beta, &new.alpha, &dt_bias, &a_log, &qkv_in, &conv_w,
-                    &new.conv_state, &new.q_raw, &new.k_raw, &new.v, &new.q, &new.k,
-                    &new.tape_qkv, &new.tape_alpha, &new.tape_beta, N_V, N_KEY, HD,
-                    K_DIM, V_DIM, QKV_DIM, n, tape_offset, q_scale, EPS,
+                    &new.beta,
+                    &new.alpha,
+                    &dt_bias,
+                    &a_log,
+                    &qkv_in,
+                    &conv_w,
+                    &new.conv_state,
+                    &new.q_raw,
+                    &new.k_raw,
+                    &new.v,
+                    &new.q,
+                    &new.k,
+                    &new.tape_qkv,
+                    &new.tape_alpha,
+                    &new.tape_beta,
+                    N_V,
+                    N_KEY,
+                    HD,
+                    K_DIM,
+                    V_DIM,
+                    QKV_DIM,
+                    n,
+                    tape_offset,
+                    q_scale,
+                    EPS,
                 )
                 .expect("new capture");
             assert!(fused, "capture must take the fused route on gfx1100");
@@ -290,8 +322,18 @@ fn main() {
             // End-to-end through the untouched Q8 recurrence owner.
             for arm in [&old, &new] {
                 gpu.gated_delta_net_q8_batch_seq(
-                    &arm.q, &arm.k, &arm.v, &arm.alpha, &arm.beta, &arm.s,
-                    &arm.scales, &arm.attn, n, N_V, HD, Some(&arm.ef),
+                    &arm.q,
+                    &arm.k,
+                    &arm.v,
+                    &arm.alpha,
+                    &arm.beta,
+                    &arm.s,
+                    &arm.scales,
+                    &arm.attn,
+                    n,
+                    N_V,
+                    HD,
+                    Some(&arm.ef),
                 )
                 .expect("gdn q8");
             }
@@ -329,8 +371,15 @@ fn main() {
                     }
                     // Old replay path, verbatim replay_gdn_inner steps 1-3.
                     gpu.conv1d_silu_split_f32_n(
-                        &old.q_raw, &old.k_raw, &old.v, &old.tape_qkv, &conv_w,
-                        &old.conv_state, K_DIM, V_DIM, n_steps,
+                        &old.q_raw,
+                        &old.k_raw,
+                        &old.v,
+                        &old.tape_qkv,
+                        &conv_w,
+                        &old.conv_state,
+                        K_DIM,
+                        V_DIM,
+                        n_steps,
                     )
                     .expect("old replay conv");
                     gpu.fused_qk_l2_norm_scale_f32_batched(
@@ -338,8 +387,7 @@ fn main() {
                     )
                     .expect("old replay norm");
                     gpu.repeat_interleave_qk_f32_batched(
-                        &old.q_raw, &old.k_raw, &old.q, &old.k, N_KEY, RATIO, HD,
-                        n_steps,
+                        &old.q_raw, &old.k_raw, &old.q, &old.k, N_KEY, RATIO, HD, n_steps,
                     )
                     .expect("old replay repeat");
 
@@ -347,9 +395,23 @@ fn main() {
                     // through untouched — GDN reads tape directly).
                     let fused = gpu
                         .dflash_gdn_pre_replay_gfx1100(
-                            &new.tape_qkv, &conv_w, &new.conv_state, &new.q_raw,
-                            &new.k_raw, &new.v, &new.q, &new.k, N_V, N_KEY, HD,
-                            K_DIM, V_DIM, QKV_DIM, n_steps, q_scale, EPS,
+                            &new.tape_qkv,
+                            &conv_w,
+                            &new.conv_state,
+                            &new.q_raw,
+                            &new.k_raw,
+                            &new.v,
+                            &new.q,
+                            &new.k,
+                            N_V,
+                            N_KEY,
+                            HD,
+                            K_DIM,
+                            V_DIM,
+                            QKV_DIM,
+                            n_steps,
+                            q_scale,
+                            EPS,
                         )
                         .expect("new replay");
                     assert!(fused, "replay must take the fused route on gfx1100");
@@ -366,8 +428,17 @@ fn main() {
                     }
                     for arm in [&old, &new] {
                         gpu.gated_delta_net_q8_batch_seq(
-                            &arm.q, &arm.k, &arm.v, &arm.tape_alpha, &arm.tape_beta,
-                            &arm.s, &arm.scales, &arm.attn, n_steps, N_V, HD,
+                            &arm.q,
+                            &arm.k,
+                            &arm.v,
+                            &arm.tape_alpha,
+                            &arm.tape_beta,
+                            &arm.s,
+                            &arm.scales,
+                            &arm.attn,
+                            n_steps,
+                            N_V,
+                            HD,
                             Some(&arm.ef),
                         )
                         .expect("replay gdn q8");
@@ -407,8 +478,8 @@ fn main() {
     let scratch = gpu.alloc_tensor(&[8], DType::F32).expect("scratch");
     let ineligible = gpu
         .dflash_gdn_pre_replay_gfx1100(
-            &scratch, &scratch, &scratch, &scratch, &scratch, &scratch, &scratch,
-            &scratch, N_V, N_KEY, HD, K_DIM, V_DIM, QKV_DIM, 17, q_scale, EPS,
+            &scratch, &scratch, &scratch, &scratch, &scratch, &scratch, &scratch, &scratch, N_V,
+            N_KEY, HD, K_DIM, V_DIM, QKV_DIM, 17, q_scale, EPS,
         )
         .expect("ineligible call");
     assert!(!ineligible, "n_steps=17 must decline the fused route");

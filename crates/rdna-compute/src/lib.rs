@@ -8,11 +8,11 @@ pub mod arch_caps;
 pub mod attention;
 pub mod cdna;
 mod compiler;
-mod dispatch;
 pub mod dflash_draft_fusion;
+pub mod dflash_gdn_pre;
 pub mod dflash_hidden_scatter;
 pub mod dflash_state_copy;
-pub mod dflash_gdn_pre;
+mod dispatch;
 pub mod embedding;
 pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]

@@ -94,7 +94,9 @@ fn part_a_embedding(gpu: &mut Gpu) -> HipResult<()> {
     }
     let table_gpu = gpu.upload_raw(&table, &[table.len()])?;
 
-    let ids: Vec<u32> = (0..B).map(|_| (xorshift(&mut rng) % VOCAB as u64) as u32).collect();
+    let ids: Vec<u32> = (0..B)
+        .map(|_| (xorshift(&mut rng) % VOCAB as u64) as u32)
+        .collect();
 
     // Old path: 16 scalar lookups into rows of one [B*DIM] plane.
     let out_old = gpu.alloc_tensor(&[B * DIM], DType::F32)?;
@@ -107,7 +109,8 @@ fn part_a_embedding(gpu: &mut Gpu) -> HipResult<()> {
     // and run a single batched lookup.
     let ids_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
     let ids_gpu = gpu.alloc_tensor(&[B], DType::F32)?;
-    gpu.hip.memcpy_htod(&ids_gpu.buf, i32_slice_bytes(&ids_i32))?;
+    gpu.hip
+        .memcpy_htod(&ids_gpu.buf, i32_slice_bytes(&ids_i32))?;
     let out_new = gpu.alloc_tensor(&[B * DIM], DType::F32)?;
     gpu.embedding_lookup_q8_batched(&table_gpu, &out_new, &ids_gpu, B, DIM)?;
 
@@ -208,7 +211,8 @@ fn upload_inputs(
 ) -> HipResult<()> {
     use hip_bridge::HipResult;
     gpu.hip.memcpy_htod(&s.x.buf, f32_slice_bytes(noise))?;
-    gpu.hip.memcpy_htod(&s.target_hidden.buf, f32_slice_bytes(th))?;
+    gpu.hip
+        .memcpy_htod(&s.target_hidden.buf, f32_slice_bytes(th))?;
     gpu.hip
         .memcpy_htod(&s.positions_q.buf, i32_slice_bytes(pos_q))?;
     gpu.hip
@@ -237,9 +241,7 @@ fn dump_forward(
     let l = 64usize;
     eprintln!(
         "draft: n_layers={} hidden={h} inter={} b={b} l={l} collapse_off={}",
-        cfg.n_layers,
-        cfg.intermediate,
-        gpu.flags.draft_collapse_off,
+        cfg.n_layers, cfg.intermediate, gpu.flags.draft_collapse_off,
     );
 
     let mut s = if let Some(w) = cfg.declared_window {
@@ -303,11 +305,24 @@ fn dump_forward(
     }
     // NOTE: mq_x_rot (F32) vs mq_x_rot_f16 (F16) differ by design; their
     // consumers' outputs (all projections above) are the parity check.
-    manifest.push_str(&format!("thlog_proj_cached_rows {}\n", s.thlog.proj_cached_rows()));
-    manifest.push_str(&format!("thlog_uploaded_rows {}\n", s.thlog.uploaded_rows()));
-    manifest.push_str(&format!("thlog_full_cached_rows {}\n", s.thlog.full_cached_rows()));
+    manifest.push_str(&format!(
+        "thlog_proj_cached_rows {}\n",
+        s.thlog.proj_cached_rows()
+    ));
+    manifest.push_str(&format!(
+        "thlog_uploaded_rows {}\n",
+        s.thlog.uploaded_rows()
+    ));
+    manifest.push_str(&format!(
+        "thlog_full_cached_rows {}\n",
+        s.thlog.full_cached_rows()
+    ));
     std::fs::write(outdir.join("MANIFEST"), manifest).expect("write manifest");
-    eprintln!("dumped forward (collapse_off={}) to {}", gpu.flags.draft_collapse_off, outdir.display());
+    eprintln!(
+        "dumped forward (collapse_off={}) to {}",
+        gpu.flags.draft_collapse_off,
+        outdir.display()
+    );
     Ok(())
 }
 

@@ -126,12 +126,9 @@ fn self_test_conversion() {
         let want = expected;
         let got = f32_to_f16_bits(f32::from_bits(fb));
         assert_eq!(
-            got,
-            want,
+            got, want,
             "host f32->f16 mismatch for {:08x}: got {:04x} want {:04x}",
-            fb,
-            got,
-            want
+            fb, got, want
         );
     }
     // Exhaustive-ish sweep over small magnitudes incl. subnormal ties:
@@ -153,7 +150,11 @@ fn self_test_conversion() {
 fn f64_ref(x: f32) -> u16 {
     let v = x as f64;
     if v == 0.0 {
-        return if x.to_bits() & 0x8000_0000 == 0 { 0 } else { 0x8000 };
+        return if x.to_bits() & 0x8000_0000 == 0 {
+            0
+        } else {
+            0x8000
+        };
     }
     let sign = if v < 0.0 { 0x8000u16 } else { 0 };
     let a = v.abs();
@@ -166,7 +167,11 @@ fn f64_ref(x: f32) -> u16 {
     // use frexp-style scaling to an integer grid.
     let exp2 = a.log2().floor() as i32;
     // Normal f16 spacing at this binade: 2^(exp2-10); subnormal: 2^-24.
-    let ulp = if exp2 >= -14 { 2f64.powi(exp2 - 10) } else { 2f64.powi(-24) };
+    let ulp = if exp2 >= -14 {
+        2f64.powi(exp2 - 10)
+    } else {
+        2f64.powi(-24)
+    };
     let q = a / ulp;
     // RN-even to integer.
     let lo = q.floor();
@@ -326,7 +331,8 @@ fn run_p1(
         None
     };
     if let Some(ref a) = dawq {
-        gpu.rotate_x_mq_awq_batched(&d_norm, a, &d_rot, k, n).unwrap();
+        gpu.rotate_x_mq_awq_batched(&d_norm, a, &d_rot, k, n)
+            .unwrap();
     } else {
         gpu.rotate_x_mq_batched(&d_norm, &d_rot, k, n).unwrap();
     }
@@ -363,7 +369,8 @@ fn run_p2(gpu: &mut Gpu, rng: &mut Rng, n: usize, k: usize, awq: bool) -> bool {
         None
     };
     if let Some(ref a) = dawq {
-        gpu.rotate_x_mq_awq_batched(&d_sig, a, &d_rot, k, n).unwrap();
+        gpu.rotate_x_mq_awq_batched(&d_sig, a, &d_rot, k, n)
+            .unwrap();
     } else {
         gpu.rotate_x_mq_batched(&d_sig, &d_rot, k, n).unwrap();
     }

@@ -27,7 +27,9 @@ fn fill_lcg(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 33) as f64) / (65536.0 * 32768.0);
             (u as f32 - 1.0) * 2.0
         })
@@ -38,10 +40,11 @@ fn upload_pos(gpu: &mut Gpu, vals: &[i32]) -> rdna_compute::GpuTensor {
     let t = gpu
         .alloc_tensor(&[vals.len()], rdna_compute::DType::F32)
         .expect("alloc positions");
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4)
-    };
-    gpu.hip.memcpy_htod(&t.buf, bytes).expect("upload positions");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4) };
+    gpu.hip
+        .memcpy_htod(&t.buf, bytes)
+        .expect("upload positions");
     t
 }
 
@@ -64,23 +67,31 @@ fn test_prep(gpu: &mut Gpu, n: usize, nq: usize, nk: usize) {
     let kv_dim = nk * HD;
     let tag = format!("{nq}Q/{nk}K N={n}");
     // Noncontiguous physical slots; tree-depth-like gaps included.
-    let base: Vec<i32> = (0..n)
-        .map(|b| (5 + b * 3 + (b % 3) * 7) as i32)
-        .collect();
+    let base: Vec<i32> = (0..n).map(|b| (5 + b * 3 + (b % 3) * 7) as i32).collect();
     let pos = upload_pos(gpu, &base);
 
     let inter = gpu
         .upload_f32(&fill_lcg(n * q_dim * 2, 0x11 + n as u64), &[n * q_dim * 2])
         .expect("upload inter");
     let k_in = fill_lcg(n * kv_dim, 0x22 + n as u64);
-    let qw = fill_lcg(HD, 0x33).iter().map(|&v| 0.5 + 0.02 * v).collect::<Vec<_>>();
-    let kw = fill_lcg(HD, 0x44).iter().map(|&v| 0.5 + 0.02 * v).collect::<Vec<_>>();
+    let qw = fill_lcg(HD, 0x33)
+        .iter()
+        .map(|&v| 0.5 + 0.02 * v)
+        .collect::<Vec<_>>();
+    let kw = fill_lcg(HD, 0x44)
+        .iter()
+        .map(|&v| 0.5 + 0.02 * v)
+        .collect::<Vec<_>>();
     let qw_t = gpu.upload_f32(&qw, &[HD]).expect("upload qw");
     let kw_t = gpu.upload_f32(&kw, &[HD]).expect("upload kw");
 
     // Old path buffers.
-    let q_old = gpu.upload_f32(&vec![0.0; n * q_dim], &[n * q_dim]).expect("q_old");
-    let g_old = gpu.upload_f32(&vec![0.0; n * q_dim], &[n * q_dim]).expect("g_old");
+    let q_old = gpu
+        .upload_f32(&vec![0.0; n * q_dim], &[n * q_dim])
+        .expect("q_old");
+    let g_old = gpu
+        .upload_f32(&vec![0.0; n * q_dim], &[n * q_dim])
+        .expect("g_old");
     let k_old = gpu.upload_f32(&k_in, &[n * kv_dim]).expect("k_old");
     gpu.deinterleave_f32_batched(&inter, &q_old, &g_old, nq, HD, n)
         .expect("deinterleave");
@@ -94,8 +105,12 @@ fn test_prep(gpu: &mut Gpu, n: usize, nq: usize, nk: usize) {
     .expect("rope");
 
     // Fused path buffers.
-    let q_new = gpu.upload_f32(&vec![0.0; n * q_dim], &[n * q_dim]).expect("q_new");
-    let g_new = gpu.upload_f32(&vec![0.0; n * q_dim], &[n * q_dim]).expect("g_new");
+    let q_new = gpu
+        .upload_f32(&vec![0.0; n * q_dim], &[n * q_dim])
+        .expect("q_new");
+    let g_new = gpu
+        .upload_f32(&vec![0.0; n * q_dim], &[n * q_dim])
+        .expect("g_new");
     let k_new = gpu.upload_f32(&k_in, &[n * kv_dim]).expect("k_new");
     gpu.qwen35_fa_prep_batched_gfx1100(
         &inter, &q_new, &g_new, &k_new, &qw_t, &kw_t, &pos, EPS, THETA, POS_OFFSET, nq, nk, n,
@@ -115,12 +130,16 @@ fn test_prep(gpu: &mut Gpu, n: usize, nq: usize, nk: usize) {
     // could be no-ops and still agree).
     let inter_host = gpu.download_f32(&inter).expect("dl inter");
     assert!(
-        qo.iter().zip(inter_host.iter()).any(|(&a, &b)| a.to_bits() != b.to_bits()),
+        qo.iter()
+            .zip(inter_host.iter())
+            .any(|(&a, &b)| a.to_bits() != b.to_bits()),
         "prep {tag}: fused output looks untouched"
     );
     println!("  prep {tag}: q/gate/k bit-equal ({})", qo.len());
 
-    for t in [inter, q_old, g_old, k_old, q_new, g_new, k_new, qw_t, kw_t, pos] {
+    for t in [
+        inter, q_old, g_old, k_old, q_new, g_new, k_new, qw_t, kw_t, pos,
+    ] {
         gpu.free_tensor(t).expect("free");
     }
 }
@@ -176,12 +195,24 @@ fn test_kv_pair(gpu: &mut Gpu, n: usize, nk: usize) {
         let w0 = slot * per_pos_bytes / 4;
         let w1 = w0 + per_pos_bytes / 4;
         if written.contains(&slot) {
-            if kn[w0..w1].iter().zip(&canary[w0..w1]).any(|(&a, &b)| a.to_bits() != b.to_bits()) {
+            if kn[w0..w1]
+                .iter()
+                .zip(&canary[w0..w1])
+                .any(|(&a, &b)| a.to_bits() != b.to_bits())
+            {
                 touched += 1;
             }
         } else {
-            assert_bits_eq(&format!("kv K canary slot {slot} {tag}"), &kn[w0..w1], &canary[w0..w1]);
-            assert_bits_eq(&format!("kv V canary slot {slot} {tag}"), &vn[w0..w1], &canary[w0..w1]);
+            assert_bits_eq(
+                &format!("kv K canary slot {slot} {tag}"),
+                &kn[w0..w1],
+                &canary[w0..w1],
+            );
+            assert_bits_eq(
+                &format!("kv V canary slot {slot} {tag}"),
+                &vn[w0..w1],
+                &canary[w0..w1],
+            );
         }
     }
     assert_eq!(touched, written.len(), "kv {tag}: some slot unwritten");

@@ -133,15 +133,15 @@ impl Gpu {
                 "dflash_state_bulk_copy_gfx1100_on_stream: refusing capture without blob retention",
             ));
         }
-        let func =
-            self.functions
-                .get(DFLASH_STATE_BULK_COPY_GFX1100_SYMBOL)
-                .ok_or_else(|| {
-                    hip_bridge::HipError::new(
-                        0,
-                        "dflash_state_bulk_copy_gfx1100_on_stream: kernel not ensured",
-                    )
-                })?;
+        let func = self
+            .functions
+            .get(DFLASH_STATE_BULK_COPY_GFX1100_SYMBOL)
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "dflash_state_bulk_copy_gfx1100_on_stream: kernel not ensured",
+                )
+            })?;
         let mut blob = KernargBlob::new();
         blob.push_ptr(desc_ptr);
         blob.push_u32(n_items);
