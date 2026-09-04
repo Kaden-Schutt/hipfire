@@ -450,6 +450,11 @@ impl RecipeCatalog {
         q4_wave64_evidence.extend(hipx_wave64_rejection_evidence("q4_selected_dual"));
         let mut q6_wave64_evidence = promoted();
         q6_wave64_evidence.extend(hipx_wave64_rejection_evidence("q6_x8"));
+        let ks4residual_kernels = [
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds",
+        ];
         let wave64_kernels = [
             "dense_q8",
             "dense_q8_single",
@@ -476,6 +481,143 @@ impl RecipeCatalog {
             "dense_q8_single",
         ];
         Self::new(vec![
+            recipe(
+                "hipfire.ks4residual.buffer_w_b32",
+                "Lower ksplit residual weight-stream loads through AMDGPU buffer resources (KS4_W_LOADFORM=1). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([SourceLowering::BufferResourceB32]),
+                    defines: BTreeSet::from(["KS4_W_LOADFORM=1".to_owned()]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.buffer_x_b32",
+                "Lower ksplit residual activation-stream loads through temporal buffer VMEM (KS4_X_LOADFORM=1). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([SourceLowering::TemporalBufferB32]),
+                    defines: BTreeSet::from(["KS4_X_LOADFORM=1".to_owned()]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.buffer_wx_b32",
+                "Lower both ksplit residual streams through independent buffer descriptors (KS4_W_LOADFORM=1, KS4_X_LOADFORM=1). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([
+                        SourceLowering::BufferResourceB32,
+                        SourceLowering::TemporalBufferB32,
+                        SourceLowering::IndependentBufferB32,
+                    ]),
+                    defines: BTreeSet::from([
+                        "KS4_W_LOADFORM=1".to_owned(),
+                        "KS4_X_LOADFORM=1".to_owned(),
+                    ]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.aligned_w_b128",
+                "Load ksplit residual weight-stream groups as aligned B128 vectors (KS4_W_LOADFORM=2). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([SourceLowering::AlignedBufferB128]),
+                    defines: BTreeSet::from(["KS4_W_LOADFORM=2".to_owned()]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.aligned_x_b128",
+                "Load ksplit residual activation-stream groups as aligned B128 vectors (KS4_X_LOADFORM=2). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([SourceLowering::AlignedBufferB128]),
+                    defines: BTreeSet::from(["KS4_X_LOADFORM=2".to_owned()]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.aligned_wx_b128",
+                "Load both ksplit residual streams as aligned B128 vectors through independent descriptors (KS4_W_LOADFORM=2, KS4_X_LOADFORM=2). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([
+                        SourceLowering::AlignedBufferB128,
+                        SourceLowering::IndependentBufferB32,
+                    ]),
+                    defines: BTreeSet::from([
+                        "KS4_W_LOADFORM=2".to_owned(),
+                        "KS4_X_LOADFORM=2".to_owned(),
+                    ]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.vgpr_cap",
+                "Cap ksplit residual VGPR allocation via amdgpu_num_vgpr (KS4_VGPR_CAP=40; the sweep varies 48/40/32 through HIPFIRE_KS4_DEFINES). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    defines: BTreeSet::from(["KS4_VGPR_CAP=40".to_owned()]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.sched_profile",
+                "Compile the ksplit residual module under the max-memory-clause scheduler profile (the sweep varies all SchedulerProfile values through HIPFIRE_SCHED_PROFILE). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    scheduler_profile: Some(SchedulerProfile::MemoryClause),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
+            recipe(
+                "hipfire.ks4residual.unroll",
+                "Unroll the ksplit residual group loop twice (KS4_UNROLL=2; the sweep varies 1/2/4 through HIPFIRE_KS4_DEFINES). Unpromoted until the ks4-radiowave campaign ledger promotes it.",
+                exact_kernels(&ks4residual_kernels),
+                &[],
+                &[],
+                &[],
+                RecipeAction {
+                    lowerings: BTreeSet::from([SourceLowering::Unroll(2)]),
+                    defines: BTreeSet::from(["KS4_UNROLL=2".to_owned()]),
+                    ..RecipeAction::default()
+                },
+                Vec::new(),
+            ),
             recipe(
                 "hipfire.dispatch.live_lane_workgroup",
                 "Use one 32-lane workgroup when only lane zero is live.",
