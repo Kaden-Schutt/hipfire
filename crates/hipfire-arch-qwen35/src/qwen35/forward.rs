@@ -1150,19 +1150,7 @@ impl Qwen35Scratch {
             // Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
             // for users who prefer the non-flash kernel and don't intend
             // to use graph capture.
-            flash_mode: match hipfire_runtime::config::get().attention_flash_mode.as_str() {
-                "never" | "0" | "off" => 0,
-                "always" | "2" | "force" => 2,
-                _ => {
-                    let graph_capable_arch =
-                        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-                    if graph_capable_arch {
-                        2
-                    } else {
-                        1
-                    }
-                }
-            },
+            flash_mode: hipfire_runtime::llama::attention_flash_mode(&gpu.arch) as u8,
 
             moe_router_logits: None,
             moe_scalar_buf: None,
