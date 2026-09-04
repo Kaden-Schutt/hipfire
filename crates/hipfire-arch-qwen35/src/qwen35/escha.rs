@@ -541,6 +541,16 @@ pub struct EschaDenseLinear {
     /// `escha_dense_linear_forward` for why the batched form and not the
     /// single one.
     pub ids0: GpuTensor,
+    /// One-element expert-pointer table holding `w.buf`'s device address.
+    ///
+    /// Present only for `EschaWeightStore::Native`, where `w` IS the trellis
+    /// code and there is no decoded weight for a normal GEMV to read. Every
+    /// escha GEMV kernel is expert-INDEXED, so rather than write a second
+    /// near-identical kernel, a dense linear is served as the degenerate
+    /// one-expert case: `expert_ptrs = [&code]`, `ids = [0]`, `slots = 1`.
+    /// That reuses the kernel G2 already gates bit-exact against the oracle
+    /// instead of forking the trellis inner loop.
+    pub ptr0: Option<GpuTensor>,
 }
 
 /// Load one dense escha linear: `{p}.{proj}` with `[ic, oc]`.
@@ -615,6 +625,15 @@ pub fn load_escha_dense_linear(
     // reinterpretation `EschaMoeTables::ids` documents. A dense linear is
     // slot 0 of a one-entry table, so the bytes are four zeros.
     let ids0 = gpu.upload_f32(&[f32::from_bits(0)], &[1])?;
+    // Native store keeps the code verbatim, so the GEMV needs its address in
+    // a device-side table. Decoded stores (Q8_0/F16/F32) go through the
+    // ordinary GEMV and need none.
+    let ptr0 = if matches!(store, EschaWeightStore::Native) {
+        let addr = w.buf.buf.as_ptr() as u64;
+        Some(gpu.upload_raw(&addr.to_le_bytes(), &[1])?)
+    } else {
+        None
+    };
     Ok(EschaDenseLinear {
         w,
         rin,
@@ -622,6 +641,7 @@ pub fn load_escha_dense_linear(
         bias,
         owner,
         ids0,
+        ptr0,
     })
 }
 
@@ -673,11 +693,30 @@ pub fn escha_dense_linear_forward(
         1,
         rdna_compute::EschaXGroup::Broadcast,
     )?;
-    // Plain `weight_gemv`, NOT `weight_gemv_prerotated`. The escha stores
-    // decode to Q8_0/F16, neither of which wants an FWHT rotation, and `xh`
-    // is already H128-rotated — handing it to the prerotated path as well
-    // would rotate a rotated activation.
-    hipfire_runtime::llama::weight_gemv(gpu, &lin.w, xh, mid)?;
+    match lin.ptr0.as_ref() {
+        // NATIVE: the trellis code decoded inside the GEMV, served as the
+        // degenerate one-expert case of the indexed kernel.
+        Some(ptr0) => {
+            let tk = match lin.w.gpu_dtype {
+                DType::Escha2T16 => 2u32,
+                DType::Escha3T16 => 3u32,
+                other => {
+                    return Err(HipError::new(
+                        0,
+                        &format!("escha dense native: unexpected dtype {other:?}"),
+                    ))
+                }
+            };
+            gpu.escha_gemv_native_moe_k8_indexed_batched(
+                ptr0, &lin.ids0, xh, mid, oc, ic, 1, tk,
+            )?;
+        }
+        // Plain `weight_gemv`, NOT `weight_gemv_prerotated`. The decoded
+        // stores are Q8_0/F16, neither of which wants an FWHT rotation, and
+        // `xh` is already H128-rotated — the prerotated path would rotate a
+        // rotated activation.
+        None => hipfire_runtime::llama::weight_gemv(gpu, &lin.w, xh, mid)?,
+    }
     gpu.escha_h128_batched(
         "escha_h128_out_batched",
         mid,

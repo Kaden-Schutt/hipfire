@@ -199,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── GPU ──────────────────────────────────────────────────────────────
     // F16 store: the decode to fp16 is exact, so any difference is the
     // forward path rather than a re-quantisation. Q8_0 is reported after.
-    for store in [EschaWeightStore::F16, EschaWeightStore::Q8_0] {
+    for store in [EschaWeightStore::F16, EschaWeightStore::Native, EschaWeightStore::Q8_0] {
         let lin = load_escha_dense_linear(&hfq, &mut gpu, p, &proj, ic, oc, store, candidates)?;
         let xg = gpu.upload_f32(&x, &[ic])?;
         let xh = gpu.alloc_tensor(&[ic], DType::F32)?;
@@ -239,7 +239,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         // F16 must be tight; Q8_0 carries its own re-quantisation error and is
         // reported rather than gated, so the two are not held to one bar.
-        if matches!(store, EschaWeightStore::F16) {
+        // Native decodes the trellis INSIDE the GEMV, so it should track F16
+        // (both deliver exactly-decoded weights); only the accumulation order
+        // differs. Q8_0 carries its own re-quantisation and is reported, not
+        // gated.
+        if matches!(store, EschaWeightStore::F16 | EschaWeightStore::Native) {
             assert_eq!(nonfinite, 0, "non-finite output");
             assert!(
                 rel_rms < 2e-3,
