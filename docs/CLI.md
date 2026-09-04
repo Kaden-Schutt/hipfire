@@ -121,7 +121,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 
 | Command | Purpose |
 |---|---|
-| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). |
+| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--redline`). |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
