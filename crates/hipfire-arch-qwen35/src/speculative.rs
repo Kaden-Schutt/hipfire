@@ -29,6 +29,9 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::dflash_state_copy::{
+    DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1134,17 +1137,181 @@ pub struct SpecStepResult {
 /// all speculative cycles.
 ///
 /// Includes the default-on Q8 error-feedback residual (`s_ef_residual`) when
-/// present. Empty when EF is off (`HIPFIRE_DN_STATE_EF=0`) or non-Q8 quant —
-/// save/restore/free then no-op over that vector, matching the live state.
 pub struct DeltaNetSnapshot {
     s_matrix_bufs: Vec<DeviceBuffer>,
     s_scale_bufs: Vec<DeviceBuffer>,
     conv_state_bufs: Vec<DeviceBuffer>,
     /// F16 per-element EF residual backups; `len == state.s_ef_residual.len()`.
     s_ef_residual_bufs: Vec<DeviceBuffer>,
+    /// S1: persistent forward (live -> backup) descriptor table, device
+    /// resident, built once at `new_for`. `None` unless the gfx1100 bulk
+    /// route armed (non-gfx1100, kill switch, JIT failure, or bad alignment
+    /// all leave this `None` and every op uses the memcpy loops).
+    bulk_fwd: Option<DeviceBuffer>,
+    /// S1: persistent reverse (backup -> live) descriptor table. Same
+    /// arming rule as `bulk_fwd`; both are always armed together.
+    bulk_rev: Option<DeviceBuffer>,
+    /// S1: descriptor count shared by both tables (fixed per snapshot).
+    bulk_n_items: u32,
+    /// S1: live-state pointer/size fingerprint the tables were built
+    /// against. Save/restore re-fingerprint the passed state and fall back
+    /// to memcpy on any mismatch (never copy through stale descriptors).
+    bulk_fingerprint: u64,
 }
 
 impl DeltaNetSnapshot {
+    /// S1: chunk size for bulk-copy descriptor splitting. Chunk offsets stay
+    /// multiples of this, keeping every 16 B vector lane aligned.
+    const BULK_CHUNK: usize = 64 * 1024;
+
+    /// S1: FNV-1a fingerprint over the live state's family lengths plus every
+    /// tensor's (pointer, size) pair in family order. Tables built at
+    /// `new_for` are valid only while this matches; any mismatch routes to
+    /// the memcpy loops (never copy through stale descriptors).
+    fn bulk_fingerprint(state: &DeltaNetState) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        mix(state.s_matrices.len() as u64);
+        mix(state.s_scales.len() as u64);
+        mix(state.conv_states.len() as u64);
+        mix(state.s_ef_residual.len() as u64);
+        for t in state
+            .s_matrices
+            .iter()
+            .chain(state.s_scales.iter())
+            .chain(state.conv_states.iter())
+            .chain(state.s_ef_residual.iter())
+        {
+            mix(t.buf.as_ptr() as u64);
+            mix(t.buf.size() as u64);
+        }
+        h
+    }
+
+    /// S1: build + upload the forward/reverse descriptor tables. Returns
+    /// `None` — leaving the snapshot on the memcpy path — when the kernel
+    /// cannot be ensured, any live/backup pair is size-mismatched or
+    /// misaligned, or the item count does not fit the fixed grid. Never
+    /// fails the allocation. EF-off is an empty fourth family, not a fake
+    /// allocation: it contributes zero items.
+    fn build_bulk_tables(
+        gpu: &mut Gpu,
+        state: &DeltaNetState,
+        backs: [&[DeviceBuffer]; 4],
+    ) -> Option<(DeviceBuffer, DeviceBuffer, u32)> {
+        if gpu.ensure_dflash_state_bulk_copy_gfx1100().is_err() {
+            return None;
+        }
+        let lives: [&[GpuTensor]; 4] = [
+            &state.s_matrices,
+            &state.s_scales,
+            &state.conv_states,
+            &state.s_ef_residual,
+        ];
+        let mut fwd: Vec<DflashStateCopyDesc> = Vec::new();
+        let mut rev: Vec<DflashStateCopyDesc> = Vec::new();
+        for (live_fam, back_fam) in lives.iter().zip(backs.iter()) {
+            if live_fam.len() != back_fam.len() {
+                return None;
+            }
+            for (live, back) in live_fam.iter().zip(back_fam.iter()) {
+                let n = live.buf.size();
+                if n != back.size() || n == 0 {
+                    if n != back.size() {
+                        return None;
+                    }
+                    continue;
+                }
+                let s = live.buf.as_ptr() as u64;
+                let d = back.as_ptr() as u64;
+                // The vector body needs 16 B aligned bases; chunk offsets are
+                // 64-KiB multiples by construction.
+                if s % 16 != 0 || d % 16 != 0 {
+                    return None;
+                }
+                let mut off: usize = 0;
+                while off < n {
+                    let cnt = (n - off).min(Self::BULK_CHUNK);
+                    fwd.push(DflashStateCopyDesc {
+                        src: s,
+                        dst: d,
+                        off: off as u64,
+                        cnt: cnt as u64,
+                    });
+                    rev.push(DflashStateCopyDesc {
+                        src: d,
+                        dst: s,
+                        off: off as u64,
+                        cnt: cnt as u64,
+                    });
+                    off += cnt;
+                }
+            }
+        }
+        if fwd.is_empty() || fwd.len() > DFLASH_STATE_BULK_COPY_MAX_ITEMS as usize {
+            return None;
+        }
+        let n_items = fwd.len() as u32;
+        let bytes = std::mem::size_of::<DflashStateCopyDesc>();
+        let fwd_buf = gpu.hip.malloc(fwd.len() * bytes).ok()?;
+        if gpu
+            .hip
+            .memcpy_htod(&fwd_buf, DflashStateCopyDesc::as_bytes(&fwd))
+            .is_err()
+        {
+            let _ = gpu.hip.free(fwd_buf);
+            return None;
+        }
+        let rev_buf = gpu.hip.malloc(rev.len() * bytes).ok()?;
+        if gpu
+            .hip
+            .memcpy_htod(&rev_buf, DflashStateCopyDesc::as_bytes(&rev))
+            .is_err()
+        {
+            let _ = gpu.hip.free(fwd_buf);
+            let _ = gpu.hip.free(rev_buf);
+            return None;
+        }
+        Some((fwd_buf, rev_buf, n_items))
+    }
+
+    /// S1: shared fast-path gate. Returns the table + count to launch, or
+    /// `None` when the call must use the memcpy loops (kill switch, arch,
+    /// disarmed tables, or stale fingerprint).
+    fn bulk_table(
+        &self,
+        state: &DeltaNetState,
+        gpu: &Gpu,
+        forward: bool,
+    ) -> Option<(&DeviceBuffer, u32)> {
+        if gpu.flags.dn_snapshot_bulk_off || !gpu.arch_caps.is_gfx1100() {
+            return None;
+        }
+        if self.bulk_n_items == 0 || Self::bulk_fingerprint(state) != self.bulk_fingerprint {
+            return None;
+        }
+        match (forward, &self.bulk_fwd, &self.bulk_rev) {
+            (true, Some(t), _) => Some((t, self.bulk_n_items)),
+            (false, _, Some(t)) => Some((t, self.bulk_n_items)),
+            _ => None,
+        }
+    }
+
+    /// S1: host-visible completion barrier. `memcpy_dtod` blocks the host;
+    /// the kernel launch does not, so sync the launch stream to preserve the
+    /// exact synchronous contract (backup==L on save return, live==L on
+    /// restore return). The optimized route still never allocates, uploads
+    /// descriptors, reads host state, or JITs in a decode cycle.
+    fn bulk_sync(gpu: &Gpu) -> HipResult<()> {
+        match &gpu.active_stream {
+            Some(s) => gpu.hip.stream_synchronize(s),
+            None => gpu.hip.device_synchronize(),
+        }
+    }
+
     /// Allocate backup buffers matching `state`'s shapes (incl. EF residual).
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
         let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
@@ -1163,12 +1330,33 @@ impl DeltaNetSnapshot {
         for t in &state.s_ef_residual {
             s_ef_residual_bufs.push(gpu.hip.malloc(t.buf.size())?);
         }
-        Ok(Self {
+        let mut snap = Self {
             s_matrix_bufs,
             s_scale_bufs,
             conv_state_bufs,
             s_ef_residual_bufs,
-        })
+            bulk_fwd: None,
+            bulk_rev: None,
+            bulk_n_items: 0,
+            bulk_fingerprint: Self::bulk_fingerprint(state),
+        };
+        // Arm the gfx1100 bulk route: JIT + table upload happen here at
+        // setup, never in a decode cycle. Any failure leaves the snapshot on
+        // the legacy memcpy path.
+        if gpu.arch_caps.is_gfx1100() && !gpu.flags.dn_snapshot_bulk_off {
+            let backs = [
+                &snap.s_matrix_bufs[..],
+                &snap.s_scale_bufs[..],
+                &snap.conv_state_bufs[..],
+                &snap.s_ef_residual_bufs[..],
+            ];
+            if let Some((f, r, n)) = Self::build_bulk_tables(gpu, state, backs) {
+                snap.bulk_fwd = Some(f);
+                snap.bulk_rev = Some(r);
+                snap.bulk_n_items = n;
+            }
+        }
+        Ok(snap)
     }
 
     /// Number of EF residual backup buffers (0 when EF is off).
@@ -1177,8 +1365,29 @@ impl DeltaNetSnapshot {
         self.s_ef_residual_bufs.len()
     }
 
+    /// S1: armed descriptor count, or `None` when the snapshot rides the
+    /// legacy memcpy loops. Diagnostics only (the launch-count gate proves
+    /// engagement); always `None` off gfx1100 or under the kill switch.
+    #[inline]
+    pub fn bulk_n_items(&self) -> Option<u32> {
+        self.bulk_fwd
+            .as_ref()
+            .and(self.bulk_rev.as_ref())
+            .map(|_| self.bulk_n_items)
+    }
+
     /// Copy live state → backup (S/scale/conv + EF residual).
+    ///
+    /// S1: on gfx1100 with armed tables and a matching fingerprint this is a
+    /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
+    /// the forward table (plus a stream sync preserving the synchronous
+    /// contract); otherwise the legacy per-tensor memcpy loop below runs.
     pub fn save_from(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
+        if let Some((table, n)) = self.bulk_table(state, gpu, true) {
+            gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
+            Self::bulk_sync(gpu)?;
+            return Ok(());
+        }
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
             gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
         }
@@ -1202,12 +1411,23 @@ impl DeltaNetSnapshot {
     ///
     /// Caller owns cross-stream ordering. MTP trunk-spine uses this as an
     /// opt-in experiment to overlap DN snapshot copy with proposal work.
+    /// S1: with armed tables this launches the same forward table on the
+    /// supplied `stream` (no sync — caller owns ordering, exactly like the
+    /// async memcpy loop it replaces on launch failure or fallback).
     pub fn save_from_async_on(
         &mut self,
         state: &DeltaNetState,
         gpu: &Gpu,
         stream: &Stream,
     ) -> HipResult<()> {
+        if let Some((table, n)) = self.bulk_table(state, gpu, true) {
+            if gpu
+                .dflash_state_bulk_copy_gfx1100_on_stream(table.as_ptr() as *const _, n, stream)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
             gpu.hip
                 .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
@@ -1232,7 +1452,17 @@ impl DeltaNetSnapshot {
     }
 
     /// Copy backup → live state (rewinds recurrent + EF residual to the snapshot).
+    ///
+    /// S1: on gfx1100 with armed tables and a matching fingerprint this is a
+    /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
+    /// the reverse table (plus a stream sync preserving the synchronous
+    /// contract); otherwise the legacy per-tensor memcpy loop below runs.
     pub fn restore_to(&self, state: &mut DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
+        if let Some((table, n)) = self.bulk_table(state, gpu, false) {
+            gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
+            Self::bulk_sync(gpu)?;
+            return Ok(());
+        }
         for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
             gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
         }
@@ -1269,6 +1499,14 @@ impl DeltaNetSnapshot {
         }
         for b in self.s_ef_residual_bufs {
             let _ = gpu.hip.free(b);
+        }
+        // S1: descriptor tables are device allocations too — freeing them
+        // here keeps the checkpoint-ring accounting leak-free.
+        if let Some(t) = self.bulk_fwd {
+            let _ = gpu.hip.free(t);
+        }
+        if let Some(t) = self.bulk_rev {
+            let _ = gpu.hip.free(t);
         }
     }
 }
