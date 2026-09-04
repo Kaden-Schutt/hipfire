@@ -423,6 +423,26 @@ pub fn prefill_max_batch(gpu: &Gpu) -> usize {
     explicit_prefill_max_batch().unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str()))
 }
 
+/// Ceiling on the TP compensation below; beyond it the prefill kernels stop
+/// gaining and the per-chunk scratch keeps growing.
+const PREFILL_TP_BATCH_CAP: usize = 2048;
+
+/// Prefill chunk for one rank of a `tp`-way split.
+///
+/// The prefill attention grid is `local_heads x chunk / M_TILE`, and TP divides
+/// the heads, so a rank running the arch default launches `tp` times fewer
+/// workgroups than a single card and starves an already latency-bound kernel.
+/// Scaling the chunk by `tp` restores the single-card workgroup count.
+/// Measured on gfx1100, Qwen3.8-27B, 33k prompt, tp=2: 649 -> 773 tok/s with
+/// byte-identical output. An explicit `HIPFIRE_PREFILL_MAX_BATCH` wins.
+pub fn prefill_max_batch_tp(gpu: &Gpu, tp: usize) -> usize {
+    if let Some(explicit) = explicit_prefill_max_batch() {
+        return explicit;
+    }
+    let base = prefill_max_batch_for_arch(gpu.arch.as_str());
+    base.saturating_mul(tp.max(1)).min(PREFILL_TP_BATCH_CAP)
+}
+
 /// Effective per-chunk capacity for one prefill call.
 ///
 /// Never form a chunk larger than the configured/capped max, the PBS
