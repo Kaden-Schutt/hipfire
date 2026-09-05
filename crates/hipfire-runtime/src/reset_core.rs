@@ -254,6 +254,95 @@ pub fn fault_inject_eligible_routes(arch: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+/// Sticky GPU-fault poison latch (serve-hardening, complements the retry
+/// inventory above: retry eligibility assumes a *live* context; these codes
+/// mean the context itself is dead and no reset can revive it).
+///
+/// `hipErrorIllegalMemoryAccess` (700) and `hipErrorLaunchFailure` (719) are
+/// sticky: once reported, every subsequent device op on the context fails the
+/// same way until process (or device) teardown. The tree documents both
+/// behaviours in the wild — 700 surfacing late after freed-memory reads
+/// (`rdna-compute/src/graph.rs`), 719 from bound-violating launches
+/// (`rdna-compute/src/gemv.rs`) — and a gate run showed the same 719
+/// repeating across requests (`reset_recurrent` memsets on a dead context),
+/// each burning a full prefill that could not succeed.
+///
+/// Arch hooks call [`note_hip_error`] (or [`note_hip_result`]) on error paths
+/// that observe a device op result; the daemon checks [`gpu_poison`] before
+/// dispatching generate and fails fast ("unload/reload" cannot revive a
+/// sticky-dead primary context — only process restart does — so the latch is
+/// never cleared automatically; [`clear_gpu_poison`] exists for tests and
+/// explicit operator recovery paths).
+pub const STICKY_GPU_FAULT_ILLEGAL_ACCESS: u32 = 700;
+/// See [`STICKY_GPU_FAULT_ILLEGAL_ACCESS`]; 719 is `hipErrorLaunchFailure`.
+pub const STICKY_GPU_FAULT_LAUNCH_FAILURE: u32 = 719;
+
+/// A latched sticky fault: the device code and the arch call site that first
+/// observed it (first observation wins — later reports are knock-on effects
+/// of the same dead context, not independent faults).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuPoison {
+    /// Raw HIP error code ([`STICKY_GPU_FAULT_ILLEGAL_ACCESS`] / [`STICKY_GPU_FAULT_LAUNCH_FAILURE`]).
+    pub code: u32,
+    /// Arch call-site label that first observed the fault (e.g.
+    /// `"qwen35::DeltaNetState::reset"`).
+    pub site: &'static str,
+}
+
+static GPU_POISON: std::sync::Mutex<Option<GpuPoison>> = std::sync::Mutex::new(None);
+
+/// Whether a raw HIP error code is sticky (context-dead) as opposed to an
+/// ordinary per-call failure (OOM, invalid value, unsupported) that a reset
+/// or retry may legitimately recover from.
+#[inline]
+pub fn is_sticky_gpu_fault(code: u32) -> bool {
+    code == STICKY_GPU_FAULT_ILLEGAL_ACCESS || code == STICKY_GPU_FAULT_LAUNCH_FAILURE
+}
+
+/// Latch [`GpuPoison`] when `err` carries a sticky code. Returns true when
+/// latched. First observation wins; later sticky reports from the same dead
+/// context are ignored (but still returned to the caller for its own handling).
+pub fn note_hip_error(err: &hip_bridge::HipError, site: &'static str) -> bool {
+    if !is_sticky_gpu_fault(err.code) {
+        return false;
+    }
+    let mut guard = GPU_POISON.lock().unwrap_or_else(|error| error.into_inner());
+    if guard.is_none() {
+        *guard = Some(GpuPoison {
+            code: err.code,
+            site,
+        });
+    }
+    true
+}
+
+/// [`note_hip_error`] over a full result: passes `Ok` through untouched and
+/// latches-then-returns `Err` unchanged, so call sites wrap a single
+/// expression with no behaviour change on any path.
+pub fn note_hip_result<T>(
+    result: hip_bridge::HipResult<T>,
+    site: &'static str,
+) -> hip_bridge::HipResult<T> {
+    if let Err(err) = &result {
+        note_hip_error(err, site);
+    }
+    result
+}
+
+/// Copy out the latched sticky fault, if any. Does not clear: the context
+/// stays dead until process teardown, so clearing on read would let the next
+/// request burn another doomed prefill.
+pub fn gpu_poison() -> Option<GpuPoison> {
+    *GPU_POISON.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Clear the latch. Only for tests and explicit operator recovery paths that
+/// re-establish a live context out-of-band (model unload/reload does NOT:
+/// it frees buffers without resetting the primary context). Never called
+/// automatically.
+pub fn clear_gpu_poison() {
+    *GPU_POISON.lock().unwrap_or_else(|error| error.into_inner()) = None;
+}
 
 #[cfg(test)]
 mod tests {
@@ -483,5 +572,53 @@ mod tests {
         // Unknowns must stay ineligible (fail-closed).
         assert!(!is_retry_reset_eligible("unknown-arch"));
         assert!(reset_coverage_for("unknown-arch").is_none());
+    }
+
+    #[test]
+    fn sticky_poison_latch_lifecycle() {
+        // Single test (not one per case): the latch is process-global, so
+        // sequential steps here avoid cross-test races by construction.
+        clear_gpu_poison();
+        assert_eq!(gpu_poison(), None);
+        // Classification: only 700/719 latch.
+        assert!(is_sticky_gpu_fault(700));
+        assert!(is_sticky_gpu_fault(719));
+        for code in [0, 1, 2, 11, 200, 217, 999] {
+            assert!(!is_sticky_gpu_fault(code), "code {code} must not latch");
+        }
+        // Non-sticky errors never latch and pass through untouched.
+        let oom: hip_bridge::HipResult<()> = Err(hip_bridge::HipError::new(2, "hipOutOfMemory"));
+        let oom = note_hip_result(oom, "test::oom");
+        assert!(oom.is_err());
+        assert_eq!(gpu_poison(), None);
+        // First sticky observation wins and preserves the error value.
+        let first: hip_bridge::HipResult<()> =
+            Err(hip_bridge::HipError::new(719, "hipMemcpy H2D offset"));
+        let first = note_hip_result(first, "test::first");
+        assert!(first.is_err());
+        assert_eq!(
+            gpu_poison(),
+            Some(GpuPoison {
+                code: 719,
+                site: "test::first"
+            })
+        );
+        let second: hip_bridge::HipResult<()> =
+            Err(hip_bridge::HipError::new(700, "hipMemsetAsync"));
+        let second = note_hip_result(second, "test::second");
+        assert!(second.is_err());
+        assert_eq!(
+            gpu_poison(),
+            Some(GpuPoison {
+                code: 719,
+                site: "test::first"
+            }),
+            "knock-on reports must not overwrite the root-cause latch"
+        );
+        clear_gpu_poison();
+        let ok: hip_bridge::HipResult<u32> = Ok(7);
+        assert_eq!(note_hip_result(ok, "test::ok").unwrap(), 7);
+        assert_eq!(gpu_poison(), None);
+        clear_gpu_poison();
     }
 }
