@@ -30,7 +30,7 @@ daemon_lines                <= 4155
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
-# 28 of these are invoked by scripts or change_gate routes and are meant to stay.
+# 28 of these are invoked by scripts or CI gates and are meant to stay.
 ungated_examples            <= 48
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---

@@ -103,8 +103,8 @@ actual path under test. **CI acceptance is hw-gate**
 ([`.github/workflows/hw-gate.yml`](.github/workflows/hw-gate.yml),
 [`scripts/hw-gate/`](scripts/hw-gate/)); a maintainer applies the `hw-run`
 label to authorize the hardware run. The fixed `coherence-gate*.sh` batteries
-are retired and must not be used as acceptance evidence. Optional local
-`python3 -m tools.change_gate` is not CI evidence.
+are retired and must not be used as acceptance evidence. No local planning
+tool is CI evidence — only hw-gate acceptance counts.
 
 ```bash
 python3 scripts/redline_daemon_harness.py --model /path/to/model --pm4

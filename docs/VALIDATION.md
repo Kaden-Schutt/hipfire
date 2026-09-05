@@ -4,9 +4,9 @@ Maps claim class → validation route. **CI merge authority for hardware-relevan
 diffs is [`hw-gate`](../.github/workflows/hw-gate.yml)** (see below). Executable
 behavior lives in the scripts and workflows named in each route. Methodology
 numbers and Redline certification prose live in their owners
-([`INDEX.md`](INDEX.md)). Local `python3 -m tools.change_gate` remains available
-as optional offline route planning; it is **not** CI evidence and is superseded
-by hw-gate for the required check.
+([`INDEX.md`](INDEX.md)). Plan hardware coverage in the hw-gate section below
+(the author's `<!-- hw-gate-request -->` block selects routes); no local
+planning tool is CI evidence.
 
 | Field | Value |
 |---|---|
