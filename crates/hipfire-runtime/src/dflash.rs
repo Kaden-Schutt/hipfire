@@ -1387,7 +1387,40 @@ impl DflashScratch {
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
 
-        let mq_x_rot = if with_mq {
+        // Transactional construction: every `alloc_tensor` below goes through
+        // `at!`, which records the tensor in `live`; each index is taken
+        // exactly once when the struct is built. On failure the error arm
+        // frees everything recorded so far and returns — a bare `?` would
+        // leak (`GpuTensor`/`DeviceBuffer` have no `Drop`).
+        let mut live: Vec<Option<GpuTensor>> = Vec::new();
+        macro_rules! at {
+            ($shape:expr) => {{
+                at!($shape, DType::F32)
+            }};
+            ($shape:expr, $dtype:expr) => {{
+                match gpu.alloc_tensor($shape, $dtype) {
+                    Ok(t) => {
+                        live.push(Some(t));
+                        live.len() - 1
+                    }
+                    Err(e) => {
+                        for slot in live.iter_mut() {
+                            if let Some(t) = slot.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }};
+        }
+        macro_rules! take {
+            ($i:expr) => {
+                live[$i].take().expect("dflash scratch slot taken twice")
+            };
+        }
+
+        let i_mq_x_rot = if with_mq {
             // Sized for a CHUNK of the worst-case MQ rotation, not the whole
             // first-call prefix. The rotations called through `gemm_dispatch`
             // are:
@@ -1408,102 +1441,126 @@ impl DflashScratch {
             // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
             // 1K prefix tokens (negligible vs seconds-scale prefill).
             let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
-            Some(gpu.alloc_tensor(&[widest], DType::F32)?)
+            Some(at!(&[widest]))
         } else {
             None
         };
         // Prescaffold F16 twin: same element count as `mq_x_rot`.
-        let mq_x_rot_f16 = if with_mq {
+        // Joins the `at!` transaction (dtype arm): a bare `?` here would
+        // leak every earlier allocation (`GpuTensor` has no `Drop`).
+        let i_mq_x_rot_f16 = if with_mq {
             let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
-            Some(gpu.alloc_tensor(&[widest], DType::F16)?)
+            Some(at!(&[widest], DType::F16))
         } else {
             None
         };
 
         // DFlash2 optional buffers: allocated only when the config declares them.
-        let (conv_temp, conv_dynamic, selector_proj, topk_ids, topk_vals) = {
-            let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
-            let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
-            let ct = if need_conv {
-                Some(gpu.alloc_tensor(&[b * h], DType::F32)?)
-            } else {
-                None
-            };
-            let cd = if need_conv {
-                let k = cfg.conv_kernel_size.unwrap();
-                let g = cfg.conv_group_size.unwrap();
-                let groups = h / g;
-                let stride = 2 * k * groups;
-                Some(gpu.alloc_tensor(&[b * stride], DType::F32)?)
-            } else {
-                None
-            };
-            let sp = if need_selector {
-                let rank = cfg.selector_rank.unwrap();
-                Some(gpu.alloc_tensor(&[b * rank], DType::F32)?)
-            } else {
-                None
-            };
-            let (ti, tv) = if need_selector {
-                let kk = cfg.selector_top_k.unwrap();
-                // ids as i32 stored in F32 buffer (reinterprets), vals as f32
-                (
-                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
-                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
-                )
-            } else {
-                (None, None)
-            };
-            (ct, cd, sp, ti, tv)
+        // Slot indices (`take!`n at the build below).
+        let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
+        let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
+        let i_conv_temp = if need_conv { Some(at!(&[b * h])) } else { None };
+        let i_conv_dynamic = if need_conv {
+            let k = cfg.conv_kernel_size.unwrap();
+            let g = cfg.conv_group_size.unwrap();
+            let groups = h / g;
+            let stride = 2 * k * groups;
+            Some(at!(&[b * stride]))
+        } else {
+            None
+        };
+        let i_selector_proj = if need_selector {
+            let rank = cfg.selector_rank.unwrap();
+            Some(at!(&[b * rank]))
+        } else {
+            None
+        };
+        let (i_topk_ids, i_topk_vals) = if need_selector {
+            let kk = cfg.selector_top_k.unwrap();
+            // ids as i32 stored in F32 buffer (reinterprets), vals as f32
+            (Some(at!(&[b * kk])), Some(at!(&[b * kk])))
+        } else {
+            (None, None)
         };
 
         // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
         // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
         // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
         // = 128 MB. Trivial vs 24 GB VRAM.
-        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
-        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut kv_idx: Vec<(usize, usize)> = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_warmed_up = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
-            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            kv_idx.push((at!(&[l * kvd]), at!(&[l * kvd])));
             draft_ffn_graphs.push(HashMap::new());
             draft_ffn_warmed_up.push(HashSet::new());
         }
 
+        let i_x = at!(&[b * h]);
+        let i_x_norm = at!(&[b * h]);
+        let i_q = at!(&[b * qd]);
+        let i_k_noise = at!(&[b * kvd]);
+        let i_v_noise = at!(&[b * kvd]);
+        let i_gate = at!(&[b * inter]);
+        let i_up = at!(&[b * inter]);
+        let i_gate_up = at!(&[b * inter]);
+        let i_attn_out = at!(&[b * qd]);
+        let i_residual = at!(&[b * h]);
+
+        let i_target_hidden = at!(&[l * ne * h]);
+        let i_target_hidden_proj = at!(&[l * h]);
+
+        let i_k_cat = at!(&[tot * kvd]);
+        let i_v_cat = at!(&[tot * kvd]);
+
+        let i_positions_q = at!(&[b]);
+        let i_positions_k = at!(&[tot]);
+
+        // Launch-fusion prescaffold (S7): persistent noise-token-ID plane
+        // ([B] i32 IDs stored as F32, same cosmetic pattern as `positions_*`).
+        // Unconditional, as before; joins the transaction so any later `at!`
+        // failure frees it.
+        let i_noise_tokens = at!(&[b]);
+
+        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        for (ik, iv) in kv_idx {
+            k_ctx_cached.push(take!(ik));
+            v_ctx_cached.push(take!(iv));
+        }
+        debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
 
-            x: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            x_norm: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            q: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            k_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            v_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            gate: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            residual: gpu.alloc_tensor(&[b * h], DType::F32)?,
+            x: take!(i_x),
+            x_norm: take!(i_x_norm),
+            q: take!(i_q),
+            k_noise: take!(i_k_noise),
+            v_noise: take!(i_v_noise),
+            gate: take!(i_gate),
+            up: take!(i_up),
+            gate_up: take!(i_gate_up),
+            attn_out: take!(i_attn_out),
+            residual: take!(i_residual),
 
-            target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
-            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
+            target_hidden: take!(i_target_hidden),
+            target_hidden_proj: take!(i_target_hidden_proj),
 
-            k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
-            v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
+            k_cat: take!(i_k_cat),
+            v_cat: take!(i_v_cat),
 
-            positions_q: gpu.alloc_tensor(&[b], DType::F32)?,
-            positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
+            positions_q: take!(i_positions_q),
+            positions_k: take!(i_positions_k),
 
-            mq_x_rot,
-            mq_x_rot_f16,
-            noise_tokens: gpu.alloc_tensor(&[b], DType::F32)?,
-            conv_temp,
-            conv_dynamic,
-            selector_proj,
-            topk_ids,
-            topk_vals,
+            mq_x_rot: i_mq_x_rot.map(|j| take!(j)),
+            mq_x_rot_f16: i_mq_x_rot_f16.map(|j| take!(j)),
+            noise_tokens: take!(i_noise_tokens),
+            conv_temp: i_conv_temp.map(|j| take!(j)),
+            conv_dynamic: i_conv_dynamic.map(|j| take!(j)),
+            selector_proj: i_selector_proj.map(|j| take!(j)),
+            topk_ids: i_topk_ids.map(|j| take!(j)),
+            topk_vals: i_topk_vals.map(|j| take!(j)),
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,

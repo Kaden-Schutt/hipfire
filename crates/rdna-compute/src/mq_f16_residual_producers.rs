@@ -35,6 +35,7 @@
 use std::ffi::c_void;
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
+use crate::gemm::ResidualVerifyTier;
 use crate::kernels;
 use hip_bridge::HipResult;
 
@@ -44,22 +45,6 @@ const SIGMOID_MUL_F16_SRC: &str =
     include_str!("../../../kernels/src/sigmoid_mul_mq_rotate_f16.gfx1100.hip");
 const FUSED_SILU_F16_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_f16.gfx1100.hip");
-
-/// Split-K width for the exact-gfx1100 DFlash verify tier (N<=16).
-///
-/// Copy of the frozen perf table owned by `gemm.rs::residual_ksplit_kw`
-/// (the authority — keep in sync; do not retune here).
-fn residual_ksplit_kw(k: usize) -> Option<usize> {
-    if k % 256 != 0 || k == 0 {
-        return None;
-    }
-    let g = k / 256;
-    let want = if k <= 8192 { 4 } else { 8 };
-    [want, 4, 2]
-        .into_iter()
-        .filter(|&kw| kw <= want)
-        .find(|&kw| g >= kw && g % kw == 0)
-}
 
 fn check_f16_out(out: &GpuTensor, what: &str) -> HipResult<()> {
     if out.dtype != DType::F16 {
@@ -620,25 +605,28 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        // ldsstage opt-in mirror (same predicate as the F32 entry).
-        if self.flags.residual_ldsstage && k % 512 == 0 {
-            return self.gemm_residual_f16_one(
-                a_raw,
-                x_f16,
-                y,
-                m,
-                k,
-                batch_size,
-                "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC,
-                "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
-                [256, 1, 1],
-            );
-        }
-        // Split-K verify tier mirror (skipped under residual_ksplit_off,
-        // exactly like the F32 entry).
-        if !self.flags.residual_ksplit_off {
-            if let Some(kw) = residual_ksplit_kw(k) {
+        // Shared verify-tier pick (same helper as the F32 entry): the kill
+        // switch dominates both optimized tiers and restores base.
+        match Self::residual_verify_tier(
+            self.flags.residual_ksplit_off,
+            self.flags.residual_ldsstage,
+            k,
+        ) {
+            ResidualVerifyTier::LdsStage => {
+                return self.gemm_residual_f16_one(
+                    a_raw,
+                    x_f16,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC,
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
+                    [256, 1, 1],
+                );
+            }
+            ResidualVerifyTier::Ksplit { kw } => {
                 let func_name = match kw {
                     2 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
                     4 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
@@ -663,6 +651,7 @@ impl Gpu {
                     [(32 * kw) as u32, 1, 1],
                 );
             }
+            ResidualVerifyTier::Base => {}
         }
         // Base kernel mirror.
         self.gemm_residual_f16_one(

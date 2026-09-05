@@ -82,6 +82,21 @@ enum Mq4v2QkvVariant {
     K2048XBufferGfx1100,
 }
 
+/// Exact-gfx1100 MQ4V2 residual verify-tier pick (N<=16 DFlash tier).
+///
+/// Shared by the F32 entry below and the F16 entry in
+/// `mq_f16_residual_producers.rs` so both precisions route identically: the
+/// `residual_ksplit_off` kill switch dominates BOTH optimized tiers and
+/// restores the base kernel; otherwise the `residual_ldsstage` opt-in wins
+/// wherever `K % 512 == 0`, else the frozen split-K table, else base. Pure
+/// so CPU tests can pin the precedence without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidualVerifyTier {
+    LdsStage,
+    Ksplit { kw: usize },
+    Base,
+}
+
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
@@ -28058,14 +28073,22 @@ impl Gpu {
             && self.arch == "gfx1100"
             && batch_size <= 16
         {
-            if self.flags.residual_ldsstage && k % 512 == 0 && k > 0 {
-                return self
-                    .gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(a_raw, x, y, m, k, batch_size);
-            }
-            if let Some(kw) = Self::residual_ksplit_kw(k) {
-                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
-                    a_raw, x, y, m, k, batch_size, kw,
-                );
+            match Self::residual_verify_tier(
+                self.flags.residual_ksplit_off,
+                self.flags.residual_ldsstage,
+                k,
+            ) {
+                ResidualVerifyTier::LdsStage => {
+                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+                        a_raw, x, y, m, k, batch_size,
+                    );
+                }
+                ResidualVerifyTier::Ksplit { kw } => {
+                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                        a_raw, x, y, m, k, batch_size, kw,
+                    );
+                }
+                ResidualVerifyTier::Base => {}
             }
         }
         // Exact gfx1100 production multi-wave policy: MW4 for N 416..463
@@ -28356,6 +28379,27 @@ impl Gpu {
             .into_iter()
             .filter(|&kw| kw <= want)
             .find(|&kw| g >= kw && g % kw == 0)
+    }
+
+    /// Shared verify-tier pick for the exact-gfx1100 residual entries (see
+    /// `ResidualVerifyTier`): kill switch dominates both tiers, ldsstage
+    /// opt-in next, split-K table next, base fallback. Both the F32 entry
+    /// above and the F16 entry route through here.
+    #[inline]
+    pub(crate) fn residual_verify_tier(
+        ksplit_off: bool,
+        ldsstage: bool,
+        k: usize,
+    ) -> ResidualVerifyTier {
+        if !ksplit_off && ldsstage && k > 0 && k % 512 == 0 {
+            return ResidualVerifyTier::LdsStage;
+        }
+        if !ksplit_off {
+            if let Some(kw) = Self::residual_ksplit_kw(k) {
+                return ResidualVerifyTier::Ksplit { kw };
+            }
+        }
+        ResidualVerifyTier::Base
     }
 
     /// MQ4V2 gfx1100 split-K LDS residual (KS2/KS4/KS8) — DFlash verify tier.
@@ -36335,5 +36379,55 @@ impl Gpu {
             "qt=45 gemm_mq4cg256_batched_lmhead: scalar fallback has no mq4c source \
              (GEMM_MQ4CG256_SRC missing) — would mis-decode MQ4C fp16-header groups as v1 f32 header",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residual_kill_switch_dominates_ldsstage_and_ksplit() {
+        // K = 2048 admits both optimized tiers (K % 512 == 0, ks table -> kw=4).
+        // Kill switch restores base even with the ldsstage opt-in (the F16 bug).
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(true, true, 2048)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(true, false, 2048)
+        );
+        // Preserved opt-in/default routing with the kill switch off.
+        assert_eq!(
+            ResidualVerifyTier::LdsStage,
+            Gpu::residual_verify_tier(false, true, 2048)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Ksplit { kw: 4 },
+            Gpu::residual_verify_tier(false, false, 2048)
+        );
+        // Large-K split widths still route through the table (kw=8).
+        assert_eq!(
+            ResidualVerifyTier::Ksplit { kw: 8 },
+            Gpu::residual_verify_tier(false, false, 12288)
+        );
+        assert_eq!(
+            ResidualVerifyTier::LdsStage,
+            Gpu::residual_verify_tier(false, true, 12288)
+        );
+        // Unsupported K (K/256 odd, no kw divides it) restores base.
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(false, true, 768)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(false, false, 1000)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(false, true, 0)
+        );
     }
 }
