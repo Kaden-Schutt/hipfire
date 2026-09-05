@@ -241,8 +241,11 @@ Measured across the 11 ported kernels, three distinct forms occur:
 | `kt < 8` | 8 | WMMA GEMM main + BT bodies | nibbles at `gp + 8 + kt*8 + k_grp*4` with `k_grp = tid>>4 ∈ {0,1}`; `kt*8 + 4 < 64` ⇔ `kt < 8` for both `k_grp` |
 | `quarter_in_group < 2` | 2 | WMMA `ldsstage` bodies | nibbles at `gp + 8 + quarter*32 + {0,8,16,24} + k_grp*4`; max offset at `quarter=1` is 60 < 64 |
 
-In the WMMA main path the loop steps `kt += 4` over tiles `kt..kt+3`, so all four tiles in one
-body share a half (kt=0,4 → half 0; kt=8,12 → half 1) and one select per body suffices.
+The step varies by variant — gfx11 main bodies step `kt += 2` (K2 unroll; both tiles in a
+pair share a half), the gfx11 residual body steps `kt++` (per-tile select), gfx12 bodies
+step `kt += 4` over tiles `kt..kt+3` (all four tiles in one body share a half: kt=0,4 →
+half 0; kt=8,12 → half 1) — but every body selects with `kt < 8`, so one select per
+body suffices in all three forms.
 
 A wrong predicate here **compiles, runs, and silently applies the wrong scale to half of every
 tensor**. It is the single highest-risk detail in the port. For any kernel not in the 11, redo
@@ -418,7 +421,7 @@ relatively less of the damage. "Codebooks are for the sub-4-bit tier" is defensi
 | **qt=45** batched prefill WMMA GEMM + batched lm_head GEMM | **gfx12-only** (`HasWmmaGfx12`); **not** admitted on gfx11 |
 | Unsupported batched prefill | **per-token decode fallback** (does not dispatch a foreign-arch WMMA kernel) |
 | FusedQkv / FusedGateUp decode registrations | remain **cross-arch** (not narrowed to gfx12) |
-| Prefill LA admission (qt=44) | gfx1100/1101/1102/1150/1151 + gfx1200/1201; gfx11 opt-out `HIPFIRE_MQV2_GFX11_WMMA=0` |
+| Prefill LA admission (qt=44) | **qwen35 only**: gfx1100/1101/1102/1150/1151 + gfx1200/1201; gfx11 opt-out `HIPFIRE_MQV2_GFX11_WMMA=0`. Plain-Llama dense (`llama::is_batchable_la`) **refuses V2 on every arch** (per-token decode) until `forward_prefill_chunk` grows V2 arms |
 | Exact parity examples | `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4v2_fused_parity`, `mq4v2_residual_parity`, `mq4c_parity`; BT screens `test_mq4v2_*_bt_gfx{1100,1151,1201}.rs` |
 | Qwen3.8 fixture-bound KLD | qt=44 `ctl` WT2 0.039033 / v6 0.544517; `ctl2` WT2 0.032495; `attn` WT2 0.025437 (§ 5) |
 | gfx1010 | scalar fused decode TUs compile; batched prefill falls back as above |
@@ -429,10 +432,10 @@ relatively less of the damage. "Codebooks are for the sub-4-bit tier" is defensi
 ### Not claimed / out of scope
 
 - **wave64** half-split (§ 4) — not verified; wave64 remains unsupported for these formats.
-- **MoE** paths (`gemv_hfq4g256_moe_*`, `gemm_*_moe_grouped_*`) — out of scope / fail-closed for V2 product tiers.
+- **MoE** paths (`gemv_mq4g256v2_moe_*`, `gemm_mq4g256v2_moe_grouped_*`) — production-wired for qt=44 (decode + prefill, gfx11 + gfx12; loader → `MoeResolution.routed_indexable_mq4v2` at `families/moe.rs:244` → `pipeline/mod.rs:1244-1262`).
 - **qt=45 on gfx11** — no gfx11 WMMA sibling; do not promote.
 - **gfx1030 default-R decision** (§ 6) — still open if/when gfx1030 ships these dtypes; not a dense-WMMA blocker.
-- Research-only surfaces: `muse_*`, dp4a / cpol / `ldscoop` / `ldsx` / `.v1`–`.v5` / `XBATCH` single-row path. (gfx11 base/BT WMMA for **qt=44** is production, not research-only.)
+- Research-only surfaces: `muse_*`, dp4a / cpol / `ldscoop` / `ldsx` / `.v1`–`.v5`. (The `XBATCH` single-row path IS ported for qt=44 — `gemv_mq4g256v2.hip:295-361` — and gfx11 base/BT WMMA for **qt=44** is production, not research-only.)
 
 ### Port surface that landed for dense HasWmma (qt=44) / dense gfx12 (qt=45)
 

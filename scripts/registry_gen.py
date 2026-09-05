@@ -12,7 +12,7 @@ old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
   per-entry : sha256 (HF LFS oid), size_bytes, arch_id, quant
-  sidecars  : triattn/mtp gain sha256/size_bytes next to their `file`
+  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`
 
 Fail-closed: ANY problem — repo unreachable, file missing from the repo
 tree, file not LFS (no sha256), size_bytes disagreeing with curated
@@ -360,7 +360,7 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
-    """triattn/mtp sub-object: require existence, add sha256/size_bytes if LFS."""
+    """triattn/mtp/dflash sub-object: require existence, add sha256/size_bytes if LFS."""
     out = dict(sidecar)
     fname = sidecar.get("file", "")
     item = tree.get(fname)
@@ -482,7 +482,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
                                 f"update registry/models.json"
                             )
-            for kind in ("triattn", "mtp"):
+            for kind in ("triattn", "mtp", "dflash"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
         # repo probe already failed → error recorded above; entry still gets

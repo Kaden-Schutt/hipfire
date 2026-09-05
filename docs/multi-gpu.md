@@ -59,7 +59,6 @@ Source of truth: `Gpus` in `multi_gpu.rs`.
    - Escape hatch: `HIPFIRE_PP_LAYERS=a,b,…` → `Gpus::init_layers` (length must
      equal `pp`, sum must equal `n_layers`). Skips the uniform free-VRAM delta
      check; still enforces arch match unless overridden.
-   - `Gpus::init_vram_weighted` is **not implemented** (returns a scheduled-for-v1.1 error).
 3. **Placement convention (Variant 2)** — `output_device = last` device holds
    `output_norm + lm_head`. Device 0 holds the embedding side of the split.
 4. **Boundary traffic** — at each band edge, `boundary_copy` moves the residual
@@ -175,7 +174,7 @@ EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep`
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
-- No automatic VRAM-weighted split (`init_vram_weighted` stub).
+- No automatic VRAM-weighted split.
 - PP decode is sequential across bands (no async multi-band pipeline / per-band
   graph capture as a documented product path).
 - Experimental `HIPFIRE_PP_*` flags are **not** admissions and are not
@@ -438,7 +437,7 @@ Refused at load time:
 
 Architectural limits in v1:
 - Homogeneous arch only (`init_uniform` hard-fails on arch mismatch)
-- Uniform layer split — `init_layers(per_device)` is the manual escape hatch; `init_vram_weighted` stubbed
+- Uniform layer split — `init_layers(per_device)` is the manual escape hatch
 - Per-token decode (no async stream pipeline / per-band graph capture) — v1.1
 - Pipelined prefill (chunk N+1 on dev_0 while chunk N processes on dev_1) — v1.1
 

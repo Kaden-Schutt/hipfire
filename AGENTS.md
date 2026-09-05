@@ -220,27 +220,27 @@ works, what to measure, what counts as pass/fail.
 
 ### Pull the model + draft you want to test
 
-Targets and drafts are independent pulls — drafts auto-discover their
-target by filename when the daemon loads:
+`hipfire pull <tag>` fetches the target plus its registry-declared
+DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 
 ```bash
 # 27B Qwen 3.5 (the canonical perf-test target):
-hipfire pull qwen3.5:27b           # 15 GB target
-hipfire pull qwen3.5:27b-draft     # 0.92 GB DFlash draft
+hipfire pull qwen3.5:27b           # 15 GB target + 0.92 GB DFlash draft sidecar
 
 # 27B Qwen 3.6 (refresh):
-hipfire pull qwen3.6:27b           # 15 GB target
-hipfire pull qwen3.6:27b-draft     # 0.92 GB DFlash draft
+hipfire pull qwen3.6:27b           # 15 GB target + 0.92 GB DFlash draft sidecar
 
 # 9B Qwen 3.5 (smaller, faster sanity-check):
-hipfire pull qwen3.5:9b            # 5.3 GB target
-hipfire pull qwen3.5:9b-draft      # 0.55 GB DFlash draft
+hipfire pull qwen3.5:9b            # 5.3 GB target + 0.55 GB DFlash draft sidecar
 ```
 
-Files land at `~/.hipfire/models/<canonical-name>` matching the
-daemon's auto-discovery pattern (`qwen3{ver}-{size}-dflash-{quant}.hfq`).
-**Do not rename.** Renaming breaks the auto-discovery and DFlash falls
-back to AR silently.
+Standalone `*-draft` tags (`hipfire pull qwen3.5:27b-draft`) still work —
+they address the same file for anyone who wants the draft alone.
+
+Files land at `~/.hipfire/models/<canonical-name>`.
+**Do not rename.** Load resolves the draft by its registry-declared
+filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
+(one warning line), `on` fails the load.
 
 ### Verify md5s after pull (paranoid mode)
 
@@ -330,7 +330,8 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 - `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
   target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
 
-Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6:27b`.
+`hipfire pull <target>` fetches the target plus its draft sidecar;
+standalone drafts stay pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft`.
 
 ---
 
@@ -355,6 +356,7 @@ hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 | `--spec` | `off`/`dflash`/`mtp`/`ngram`/`dspark`/`auto` |
 | `--backend` | `noslots` (sequential daemon) / `slots` / `batch` / `both` |
 | `--workload` | `stateless` / `multiturn` / `both` |
+| `--prompt-file PATH` | verbatim prompt bytes for the run; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars` plus a `warnings` caveat below 256 tokens |
 | `--kv-mode`, `--kv-backend` | KV format and allocator |
 | `--reasoning-on` | off by default: a reasoning model cannot close `<think>` inside the token budget, and the daemon fails that turn closed |
 
@@ -429,17 +431,17 @@ reassurance.
 If you're testing an actual user UX flow:
 
 ```bash
-hipfire pull qwen3.5:9b
-hipfire pull qwen3.5:9b-draft
+hipfire pull qwen3.5:9b                # target + draft sidecar in one pull
 hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
 hipfire run qwen3.5:9b "Write a Python function to find the longest substring without repeating characters"
-# expected: daemon logs '[hipfire] DFlash draft detected: ...'
+# expected: loader logs 'DFlash draft loaded: ...'
 # response generates at ≥250 tok/s on a 9B target with a paired draft
 ```
 
 Without the `dflash_mode auto` config, `hipfire run` runs pure AR
-even when a paired draft is on disk — the daemon explicitly logs
-`[hipfire] DFlash disabled (dflash_mode=off).` This is the "I pulled
+even when a paired draft is on disk. `dflash_mode on` instead requires
+the sidecar and fails the load when it is missing; `developer.dflash_draft`
+or `run --model-draft` overrides the sidecar. This is the "I pulled
 the draft but DFlash isn't firing" pitfall.
 
 ---
@@ -584,8 +586,8 @@ against the A3B MoE DFlash perfmaxx line.
 | 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
-| daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
-| `[hipfire] DFlash disabled (dflash_mode=off)` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.5:9b set dflash_mode on` |
+| daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
+| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.5:9b set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always coherence-gate or eyeball under `HIPFIRE_GRAPH=1`. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
@@ -602,7 +604,7 @@ against the A3B MoE DFlash perfmaxx line.
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
 | `HIPFIRE_KV_MODE` | Override kv_cache config | (config) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
-|`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path. Empty string = explicit opt-out|(filename auto-match alongside target)|
+|`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
 |`HIPFIRE_DFLASH_CTX_CAP`|Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring). Bounds draft-side VRAM on large-`max_seq` serve loads; over-cap requests fall back to AR (identical output, slower). `0` = uncapped legacy.|8192|
 |`HIPFIRE_DFLASH_WINDOW`|Windowed draft context (NInfer pattern): SWA over the last W rows on draft layers 0..n-2 + full-attention last layer reaching min(physical_cap, 4W). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Refused with CASK eviction. `0`/unset = Legacy (cap + AR fallback).|0 (off)|
 | `HIPFIRE_LM_HEAD_F16` | `auto`/`native` keeps qt=1 lm_head as F16; `f32`/`legacy` expands to F32 | auto/native |
