@@ -105,6 +105,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Relicense / governance records | [`docs/governance/`](governance/) | historical | Legal/historical; do not rewrite. |
 | Design-time architecture drafts | [`docs/design/`](design/) | planned | Directory policy is planned intent. Member exceptions: some branch-implemented LFM/Redline designs and measured baseline notes may coexist; none are product defaults. Historical member bodies stay disposition-only. |
 | Implementation plans and PRDs | [`docs/plans/`](plans/) | planned | Directory policy is planned intent. Member exceptions: measured results ledgers may appear; recency ≠ authority. |
+| Codebase audit 2026-09-02 | [`docs/plans/audit-2026-09-02/`](plans/audit-2026-09-02/README.md) | planned | Point-in-time audit of master `8cd15a62b` (twelve read-only slices) with a ranked remediation plan. Findings cite `path:line` at that commit. |
 | Narrow specs | [`docs/specs/`](specs/) | planned | Intent/spec records; promote only via shipped owners. |
 | Investigations | [`docs/investigations/`](investigations/) | historical | Discovery trails including measured research; not product defaults. |
 | Reviews | [`docs/reviews/`](reviews/) | historical | Review archives. |
