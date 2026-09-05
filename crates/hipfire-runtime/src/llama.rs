@@ -680,18 +680,24 @@ pub struct LayerWeights {
 
 impl LlamaWeights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
+    /// Each weight goes through `WeightTensor::free_all` so the PARO rotation
+    /// and AWQ scale sidecars are released with their buffers.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
         if !self.lm_head_aliases_embd {
-            let _ = gpu.free_tensor(self.output.buf);
+            // free_all (not .buf) so the AWQ / PARO sidecars are released too.
+            // The tied-lm_head alias carries no sidecars by construction
+            // (`tied_lm_head_alias` sets paro/awq_scale to None), so skipping
+            // the whole output weight when aliased still frees exactly once.
+            self.output.free_all(gpu);
         }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
-            let _ = gpu.free_tensor(l.wk.buf);
-            let _ = gpu.free_tensor(l.wv.buf);
-            let _ = gpu.free_tensor(l.wo.buf);
+            l.wq.free_all(gpu);
+            l.wk.free_all(gpu);
+            l.wv.free_all(gpu);
+            l.wo.free_all(gpu);
             if let Some(t) = l.q_norm {
                 let _ = gpu.free_tensor(t);
             }
@@ -699,9 +705,9 @@ impl LlamaWeights {
                 let _ = gpu.free_tensor(t);
             }
             let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+            l.w_gate.free_all(gpu);
+            l.w_up.free_all(gpu);
+            l.w_down.free_all(gpu);
         }
     }
 }

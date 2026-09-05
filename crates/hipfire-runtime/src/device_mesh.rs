@@ -51,8 +51,6 @@ pub struct Axis {
 /// A collective or point-to-point operation implied by mesh placement.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum CollectiveHint {
-    /// Reduce values across the named axis group.
-    AllReduce { kind: DimKind },
     /// Transfer the residual from one pipeline stage to the next.
     ///
     /// `src` and `dst` are stage coordinates (not physical device IDs). Use

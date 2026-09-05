@@ -188,6 +188,8 @@ pub struct ModelEntry {
     #[serde(default)]
     pub dspark: Option<Sidecar>,
     #[serde(default)]
+    pub dflash: Option<Sidecar>,
+    #[serde(default)]
     pub default_tool_format: Option<String>,
     #[serde(default)]
     pub default_kv_mode: Option<String>,
@@ -364,7 +366,7 @@ impl RegistryV1 {
                 return Err(fail(format!("model '{tag}' has invalid size metadata")));
             }
             validate_digest(entry.sha256.as_deref(), tag).map_err(fail)?;
-            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark]
+            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark, &entry.dflash]
                 .into_iter()
                 .flatten()
             {
@@ -422,12 +424,29 @@ impl RegistryV1 {
         if self.models.contains_key(&qwen) {
             return qwen;
         }
+        // A bare file name matches its entry. A path never does: matching on
+        // `file_name()` let a lookalike file outside the models directory
+        // inherit the installed artifact's identity (sidecars, kv/max_seq
+        // policy, rm targets). Callers that know the models directory resolve
+        // paths with canonical comparison instead (`registry_entry_for_path`
+        // in hipfire-cli); a bare file name carries no directory to confuse.
         self.models
             .iter()
             .find_map(|(tag, entry)| {
                 (entry.file == normalized || entry.file == input).then(|| tag.clone())
             })
             .unwrap_or(normalized)
+    }
+
+    /// Exact `entry.file` match for callers that already established the input
+    /// is the installed artifact (e.g. via canonical path comparison against
+    /// the models directory). Unlike [`RegistryV1::model`], this never applies
+    /// tag/alias normalization: `file_name` must be the bare file as stored.
+    pub fn entry_for_file(&self, file_name: &str) -> Option<(&str, &ModelEntry)> {
+        self.models
+            .iter()
+            .find(|(_, entry)| entry.file == file_name)
+            .map(|(tag, entry)| (tag.as_str(), entry))
     }
 
     pub fn model(&self, input: &str) -> Option<(&str, &ModelEntry)> {
@@ -1028,6 +1047,33 @@ mod tests {
             "effort-native: absence means uncapped"
         );
     }
+    #[test]
+    fn bundled_dflash_sidecars_name_pullable_files() {
+        // Every `dflash.file` must name a file that some registry entry's
+        // `file` also names, so `hipfire pull <target>` fetching the sidecar
+        // always lands a file that `hipfire pull <tag>-draft` could fetch too.
+        let registry = bundled().unwrap();
+        let files: std::collections::BTreeSet<&str> = registry
+            .models
+            .values()
+            .map(|entry| entry.file.as_str())
+            .collect();
+        let mut paired = 0;
+        for (tag, entry) in &registry.models {
+            if let Some(sidecar) = entry.dflash.as_ref() {
+                assert!(
+                    files.contains(sidecar.file.as_str()),
+                    "model '{tag}' declares dflash sidecar '{}' with no matching entry file",
+                    sidecar.file
+                );
+                paired += 1;
+            }
+        }
+        assert!(
+            paired > 0,
+            "bundled registry should pair at least one dflash sidecar"
+        );
+    }
 
     #[test]
     fn aliases_and_filenames_resolve_to_canonical_tags() {
@@ -1043,6 +1089,21 @@ mod tests {
             "qwen3.8:27b-mq4-xt"
         );
         assert_eq!(registry.resolve_tag("qwen3.8:fast"), "qwen3.8:27b-mq4-xt");
+        // A path is not a tag: even a path into the models directory resolves
+        // to itself here. Callers that know the models directory establish
+        // identity with canonical path comparison (`registry_entry_for_path`
+        // in hipfire-cli), so `serve --model ~/.hipfire/models/<file>` still
+        // sees the entry's sidecars without letting a same-basename lookalike
+        // elsewhere inherit them (PR #686 hw-gate regression).
+        assert_eq!(
+            registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq5"),
+            "/home/u/.hipfire/models/qwen3.8-27b.mq5"
+        );
+        assert_eq!(
+            registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq4"),
+            "/home/u/.hipfire/models/qwen3.8-27b.mq4"
+        );
+        assert!(registry.model("/home/u/.hipfire/models/qwen3.8-27b.mq4").is_none());
 
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
@@ -1100,6 +1161,48 @@ mod tests {
             "effort-native: absence means uncapped"
         );
     }
+
+    #[test]
+    fn path_inputs_never_resolve_to_registry_tags() {
+        // PR #686 hw-gate regression: `hipfire rm /elsewhere/qwen3.6-27b.mq4`
+        // basename-matched the `qwen3.6:27b` entry and deleted the installed
+        // sidecars. A path — anywhere, including the models directory itself —
+        // is not a tag and resolves to itself.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        assert_eq!(
+            registry.resolve_tag("/elsewhere/qwen3.6-27b.mq4"),
+            "/elsewhere/qwen3.6-27b.mq4"
+        );
+        assert!(registry.model("/elsewhere/qwen3.6-27b.mq4").is_none());
+        // The bare file name still resolves: it carries no directory to confuse
+        // with the installed artifact.
+        assert_eq!(registry.resolve_tag("qwen3.6-27b.mq4"), "qwen3.6:27b");
+        assert!(registry.model("qwen3.6-27b.mq4").is_some());
+    }
+
+    #[test]
+    fn entry_for_file_matches_exact_bare_names_only() {
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{"qwen36":"qwen3.6:27b"}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, _) = registry.entry_for_file("qwen3.6-27b.mq4").unwrap();
+        assert_eq!(tag, "qwen3.6:27b");
+        assert!(registry.entry_for_file("/elsewhere/qwen3.6-27b.mq4").is_none());
+        assert!(registry.entry_for_file("qwen3.6:27b").is_none());
+        assert!(registry.entry_for_file("qwen36").is_none());
+        assert!(registry.entry_for_file("other.mq4").is_none());
+    }
+
 
     #[test]
     fn recommended_settings_lower_the_full_sampling_contract_to_config() {

@@ -224,15 +224,6 @@ impl Gpus {
         Self::from_parts(devices, per_device.to_vec(), n_layers)
     }
 
-    /// Reserved for v1.1 — automatic VRAM-weighted band assignment. For v1
-    /// use `init_layers(...)` with hand-computed counts.
-    pub fn init_vram_weighted(_n_devices: usize, _n_layers: usize) -> HipResult<Self> {
-        Err(HipError::new(
-            0,
-            "init_vram_weighted: scheduled for v1.1; use init_layers(per_device) instead",
-        ))
-    }
-
     /// PP=1 back-compat path: wrap an existing single `Gpu` into a `Gpus`
     /// with all layers on dev 0. `output_device = 0`.
     pub fn single(gpu: Gpu, n_layers: usize) -> Self {
@@ -298,6 +289,55 @@ impl Gpus {
             layer_to_device: vec![0u8; n_layers],
             band_starts,
             mesh: DeviceMesh::rect(&[(DimKind::Tp, tp_size)]).expect("tp mesh cannot overflow"),
+            peer_access_enabled: false,
+            output_device: 0,
+            givens_cos_per_dev: Vec::new(),
+            givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
+            host_ar_tmp: Vec::new(),
+            active_peer_lease: None,
+            peer_lease_buffers: Vec::new(),
+            peer_lease_next_id: 0,
+            peer_lease_quarantined: false,
+            rank_barrier_events: Vec::new(),
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
+        })
+    }
+
+    /// Expert-parallel constructor: bring up `ep_size` devices that each run
+    /// **every** layer (PP=1), with routed experts sharded across ranks per an
+    /// expert assignment (e.g. `ExpertAssign::Stride`).
+    ///
+    /// Layout-identical to [`Gpus::init_tp`]: same device set, streams,
+    /// pre-flight VRAM gate, and PP=1 layer-band map (`tp_band_starts` is
+    /// layout-generic despite the name). Only the recorded [`DeviceMesh`]
+    /// axis differs — `Ep` instead of `Tp` — so `mesh.size_of(Ep)` reports
+    /// the rank count after an EP load instead of collapsing to the
+    /// absent-axis default of 1.
+    pub fn init_ep(ep_size: usize, n_layers: usize) -> HipResult<Self> {
+        if ep_size == 0 {
+            return Err(HipError::new(0, "init_ep: ep_size must be >= 1"));
+        }
+        if n_layers == 0 {
+            return Err(HipError::new(0, "init_ep: n_layers must be >= 1"));
+        }
+        let device_ids = resolve_device_ids(ep_size)?;
+        let devices = construct_devices(&device_ids)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+        let band_starts = tp_band_starts(ep_size, n_layers);
+
+        // PP=1 EP topology: every device runs every layer. Encode the layer
+        // map exactly as init_tp does so PP helpers stay well-defined,
+        // while the EP forward path dispatches every layer on every rank.
+        Ok(Self {
+            rccl_comms: None,
+            devices,
+            layer_to_device: vec![0u8; n_layers],
+            band_starts,
+            mesh: DeviceMesh::rect(&[(DimKind::Ep, ep_size)]).expect("ep mesh cannot overflow"),
             peer_access_enabled: false,
             output_device: 0,
             givens_cos_per_dev: Vec::new(),
@@ -2137,5 +2177,22 @@ mod tests {
         let single = DeviceMesh::single().unwrap();
         assert_eq!(single.n_devices(), 1);
         assert!(single.axes().is_empty());
+    }
+
+    #[test]
+    fn device_mesh_ep_group_and_tp_absent() {
+        // EP=4: the mesh `Gpus::init_ep` records. The Ep axis groups all
+        // four devices; the absent Tp axis reads back as 1 (the `size_of`
+        // default), so an EP load is never mistaken for TP.
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 4)]).unwrap();
+        assert_eq!(ep.group_along(DimKind::Ep, &[0]).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(ep.n_devices(), 4);
+        assert_eq!(ep.size_of(DimKind::Ep), 4);
+        assert_eq!(ep.size_of(DimKind::Tp), 1);
+
+        // Symmetric check on the mesh `Gpus::init_tp` records.
+        let tp = DeviceMesh::rect(&[(DimKind::Tp, 4)]).unwrap();
+        assert_eq!(tp.size_of(DimKind::Tp), 4);
+        assert_eq!(tp.size_of(DimKind::Ep), 1);
     }
 }
