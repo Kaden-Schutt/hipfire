@@ -1160,13 +1160,11 @@ pub fn generate(
             // eager dense (ModelState::Gemma4) and lowered/MoE
             // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
             // lowered load must fail loudly here rather than silently run eager
-            // against lowered weights.
+            // against lowered weights. Admission now refuses lowered loads
+            // before any device allocation; this arm stays as the fail-closed
+            // net. Message is shared with the admission refusal by construction.
             if m.gemma4_lowered_mut().is_some() {
-                emit_error_with_id(
-                stdout,
-                id,
-                "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant",
-            );
+                emit_error_with_id(stdout, id, hipfire_arch_gemma4::LOWERED_GENERATE_REFUSAL);
                 return;
             }
             let _ = (
@@ -2382,11 +2380,12 @@ pub fn generate(
             // model's trained template, splicing each cached assistant turn's
             // VERBATIM tokens in place of its content (sentinel substitution).
             // The store side (`asst_turn_cache`) holds the GENERATED body only
-            // (post-primer); the template renders a history assistant turn as
-            // `<|im_start|>assistant\n{content}` with NO generation primer, so
-            // we prepend the assistant-opener primer (e.g. `<think>\n`) that
-            // THIS turn's cold render emitted — making the spliced stream
-            // byte-match `conversation_tokens` for a clean forward extension.
+            // (post-primer). Whether the template re-emits the generation
+            // primer (e.g. `<think>\n\n</think>\n\n`) on a HISTORY assistant
+            // turn is template-specific: Qwen3.5 renders history turns bare,
+            // Qwen3.8 re-emits the empty-think block. Prepend the primer THIS
+            // turn's cold render emitted only when the template does not, so
+            // the spliced stream byte-matches `conversation_tokens`.
             let primer: Vec<u32> = {
                 let im_start = tokenizer.special_token_id("<|im_start|>");
                 let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
@@ -2408,6 +2407,12 @@ pub fn generate(
                 reasoning_strength: None,
                 reasoning_effort,
             };
+            let primer: Vec<u32> =
+                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
+                    Vec::new()
+                } else {
+                    primer
+                };
             let cache_ref = &mut m.asst_turn_cache;
             let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,

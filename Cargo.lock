@@ -1316,6 +1316,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "md5",
  "saddle-core",
  "serde",
  "serde_json",

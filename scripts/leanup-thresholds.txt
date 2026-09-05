@@ -25,8 +25,9 @@ required_features_daemon    == 0
 # Reconciled to the measured f2ea5136 master baseline on 2026-08-28. This
 # branch adds no semantic debt; rustfmt makes one existing Qwen35 call visible.
 # hipfire-daemon/src/main.rs. Was 43,696 as hipfire-runtime/examples/daemon.rs
-# on master; the saddle layering moved it into a crate.
-daemon_lines                <= 4155
+# on master; the saddle layering moved it into a crate. Raised 4155 -> 4176 on
+# 2026-09-02 for the G2 source-aware admission block (see commit message).
+daemon_lines                <= 4176
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

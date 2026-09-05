@@ -4,6 +4,7 @@
 //! Top-of-DAG model loader. Owns `LoadedModel`, the carrier registry,
 //! and `load_model` — the single arch-dispatch point for the daemon.
 
+pub mod admission;
 pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
@@ -26,6 +27,7 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
+use hipfire_runtime::device_mesh::DimKind;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode;
@@ -53,6 +55,28 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+    /// Read-only admission refusal for a topology/shape combination this
+    /// carrier cannot serve. Runs before any allocation or collective so a
+    /// refusal leaves no side effect (device-mesh G2 admission). Default:
+    /// pipeline-parallel (pp>1) is unsupported; HFQ and Dir get distinct
+    /// messages matching each carrier's load-time refusal. Qwen3.5 overrides —
+    /// it is the only carrier with a pp>1 path (`load_qwen35_pp`).
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err(if is_dir {
+                format!("{}: safetensors + pp>1 unsupported", self.name())
+            } else {
+                format!("{}: pipeline-parallel (pp>1) unsupported", self.name())
+            });
+        }
+        Ok(())
+    }
 
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
@@ -188,12 +212,14 @@ pub enum ContinuousBatchRoute {
     Qwen35,
     Lfm2Moe,
 }
-/// Exact arch_id -> continuous-batch route. Mirrors the two batch-capable
-/// families (qwen35 5|6, lfm2moe 11). No carrier probing — pure id match.
+/// Exact arch_id -> continuous-batch route. Only qwen35 5|6 admits: LFM2 (11)
+/// has no servable batch path (see the lfm2moe carrier caps), so the route
+/// refuses it and no batch state is ever allocated. No carrier probing — pure
+/// id match. `ContinuousBatchRoute::Lfm2Moe` stays for the staging body, which
+/// is now unreachable.
 pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
     match arch_id {
         5 | 6 => Some(ContinuousBatchRoute::Qwen35),
-        11 => Some(ContinuousBatchRoute::Lfm2Moe),
         _ => None,
     }
 }
@@ -1676,6 +1702,14 @@ pub(crate) fn parse_state_quant(
 // ─── Core arch carrier load ─────────────────────────────────────────────
 
 /// Hard-error free for unfinished qwen35 finish path: bundle + optional VL.
+///
+/// `free_qwen35_bundle` returns every buffer to the GPU pool; only a drain
+/// hands the VRAM back to the driver, and `unload_model` is normally the
+/// one that drains. A load that fails here never reaches `unload_model`,
+/// so without the drain the whole target (~15 GB on a 27B) stayed pooled —
+/// the hw-gate Fable seat measured ~5 GB retained after a refused
+/// `dflash_mode=on` load on top of the next resident model, compounding on
+/// every lazy serve retry. Mirror `unload_model`: invalidate graphs, drain.
 fn rollback_unfinished_qwen35(
     err: String,
     bundle: Qwen35Bundle,
@@ -1689,6 +1723,8 @@ fn rollback_unfinished_qwen35(
     if let Some(vw) = vision_weights {
         vw.free_gpu(gpu);
     }
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
     if notes.is_empty() {
         err
     } else {
@@ -1965,6 +2001,16 @@ fn finish_qwen35_load(
                 Some(s)
             }
             Err(e) => {
+                if ctx.spec.dflash == Some(true) {
+                    return Err(rollback_unfinished_qwen35(
+                        format!(
+                            "DFlash draft required (dflash_mode=on) but failed to load ({dp}): {e}"
+                        ),
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
                 eprintln!(
                     "  DFlash draft load failed ({}): {} — falling back to AR only",
                     dp, e
@@ -2373,37 +2419,69 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
+    // Classify once and admit before any side effect (source-aware admission).
+    let admission = crate::admission::admit_source(
+        path,
+        1, // this entry serves tp<=1
+        pp,
+        kv_backend_override,
+        draft_path,
+        gpu.arch.as_str(),
+    )?;
+    load_admitted_with_gemma4_drafter(
+        admission,
+        path,
+        max_seq,
+        deepseek4_experts_per_token,
+        deepseek4_compute_placement,
+        draft_path,
+        gemma4_drafter_path,
+        gemma4_draft_len,
+        kv_mode_override,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        spec,
+        gpu,
+    )
+}
+
+/// Consume an already-admitted source: the retained [`SourceAdmission`] handle
+/// plus its resolved carrier. Destructive work — VMM readiness, carrier load
+/// with its allocations and collectives — begins here, only after admission has
+/// succeeded.
+#[allow(clippy::too_many_arguments)]
+pub fn load_admitted_with_gemma4_drafter(
+    admission: crate::admission::SourceAdmission,
+    path: &str,
+    max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    draft_path: Option<&str>,
+    gemma4_drafter_path: Option<&str>,
+    gemma4_draft_len: usize,
+    kv_mode_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
+    let crate::admission::SourceAdmission {
+        source,
+        kv_backend,
+        carrier,
+        ..
+    } = admission;
+    let carrier =
+        carrier.ok_or_else(|| "single/pp admission must resolve a carrier".to_string())?;
     ensure_vmm_ready_for_load(gpu)?;
-    let src = ModelSource::from_path(path)?;
-    let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
-    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
-    let rec_sampling = match &src {
+    let rec_sampling = match &source {
         ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
         _ => None,
     };
-    // Reuse DFlash quant checks for draft_path (unchanged)
-    if draft_path.is_some() {
-        if let ModelSource::Hfq(ref hfq) = src {
-            let lm_qt = hfq
-                .tensor_data("lm_head.weight")
-                .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
-                .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
-                .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
-                .map(|(info, _)| info.quant_type);
-            let supported = dflash_lm_head_quant_supported(lm_qt, gpu.arch.as_str());
-            if !supported {
-                let qt_desc = match lm_qt {
-                    Some(qt) => format!("quant_type={qt}"),
-                    None => "no lm_head/embed_tokens tensor found".to_string(),
-                };
-                return Err(format!(
-                    "DFlash draft requested but target lm_head {} is not supported \
-                     on gfx11+gfx12 WMMA ({}).",
-                    qt_desc, gpu.arch
-                ));
-            }
-        }
-    }
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -2421,40 +2499,7 @@ pub fn load_model_with_gemma4_drafter(
         gemma4_drafter_path,
         gemma4_draft_len,
     };
-    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
-    let carrier = matches
-        .next()
-        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
-    if let Some(other) = matches.next() {
-        return Err(format!(
-            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
-            src.describe(),
-            carrier.name(),
-            other.name()
-        ));
-    }
-    if kv_backend == KvBackend::Vmm
-        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
-    {
-        return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
-            carrier.name()
-        ));
-    }
-    // The allowlist above gates on CARRIER, which let `vmm` + `pp>1` through:
-    // qwen35 is allowlisted, so a pipeline-parallel Qwen3.5 load passed it. But
-    // VMM is strictly per-device — `ensure_vmm_ready_for_load` takes a single
-    // `&mut Gpu`, `multi_gpu.rs` has no VMM path at all, and the pp>1 load tail
-    // never mentions it. Refusing here, BEFORE any allocation, beats letting a
-    // single-device KV backend be half-applied to a model spread across devices.
-    if kv_backend == KvBackend::Vmm && ctx.pp > 1 {
-        return Err(
-            "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
-             use a different kv_cache backend or load with pp=1"
-                .to_string(),
-        );
-    }
-    let mut result = carrier.load(src, &mut ctx)?;
+    let mut result = carrier.load(source, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
@@ -2841,8 +2886,46 @@ impl Drop for Qwen35DenseTpStaging {
     }
 }
 
+/// Admission refusal for Qwen3.5-MoE under expert-parallel load (#683 family).
+/// Pure so the contract is unit-testable: any Qwen3.5 config with routed
+/// experts (`num_experts > 0`, i.e. arch 6 and any mis-stamped arch 5) has no
+/// EP serve path — `generate_ep` routes arch 6 at the dense-TP server, which
+/// only accepts `EpArch::Qwen35DenseTp`. Refuse here, before `Gpus::init_tp`
+/// and the per-rank weight upload, instead of after a full 4-rank load.
+/// Dense Qwen3.5 (`num_experts == 0`) is unaffected and keeps its EP path.
+pub fn qwen35_ep_moe_refusal(arch_id: u32, num_experts: usize) -> Option<String> {
+    if num_experts > 0 {
+        Some(format!(
+            "Qwen3.5-MoE (arch_id={arch_id}) has no EP serve path; use TP or single-GPU"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Message constructor shared by [`ep_admission`] and the per-entry match
+/// backstops so the refusal text cannot drift between the two.
+fn ep_unsupported_arch_message(arch_id: u32) -> String {
+    format!(
+        "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+    )
+}
+
+/// EP load admission by arch_id. Only archs with an `EpArch` variant may enter
+/// expert-parallel load (9/DeepSeek4, 10/MiniMax, 5|6/Qwen3.5); LFM2 (11),
+/// Cohere2 (12) and anything else must fail here — right after the host-side
+/// HFQ probe, before any device init — otherwise they would reach
+/// `generate_ep` with no correct server. Pure so the contract is
+/// unit-testable; both `load_model_ep_*` entries call it before dispatching.
+pub fn ep_admission(arch_id: u32) -> Result<(), String> {
+    match arch_id {
+        5 | 6 | 9 | 10 => Ok(()),
+        id => Err(ep_unsupported_arch_message(id)),
+    }
+}
+
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
-/// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
+/// (`Gpus::init_ep` + per-arch sharded weight load), wrapped in a staging guard so
 /// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
 /// at the call site left intact). ds4 (arch_id 9) and MiniMax (arch_id 10) only.
 ///
@@ -2908,27 +2991,49 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let kv_backend_raw = kv_backend.unwrap_or("contiguous");
-    let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
-    match hfq.arch_id {
+    // Classify once and admit before any side effect. EP is HFQ-only and
+    // dispatches on arch_id, so the admission retains the arch_id decision and
+    // the per-rank file re-open happens inside the EP load (unchanged).
+    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "")?;
+    load_model_ep_admitted(
+        admission,
+        path,
+        max_seq,
+        tp,
+        kv_mode,
+        kv_backend,
+        state_quant,
+    )
+}
+
+/// Dispatch an already-admitted expert-parallel source on its `arch_id` —
+/// admission's classification is not repeated. Unlike the single/pp route,
+/// the per-arch EP loaders still re-open `path` per rank, so the retained
+/// `SourceAdmission.source` is dropped here rather than consumed. Destructive
+/// (per-rank allocation + collectives) begins inside the per-arch loaders.
+pub fn load_model_ep_admitted(
+    admission: crate::admission::SourceAdmission,
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
+    match admission.arch_id {
         9 => load_model_ep_ds4(
             path,
             max_seq,
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
-        10 if kv_backend_kind == KvBackend::Vmm => {
-            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
-        }
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 if kv_backend_kind == KvBackend::Vmm => {
-            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
-        }
         5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
+        // Backstop: `admit_source` above already refused every other arch_id.
+        // Route through the shared constructor (not `unreachable!`) so the
+        // refusal survives a future edit that drops the early classification,
+        // and so this message never drifts from `ep_admission`'s.
+        id => Err(ep_unsupported_arch_message(id)),
     }
 }
 
@@ -2942,6 +3047,8 @@ pub fn load_model_ep_with_compressor_cache(
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    // Admission: refuse archs with no `EpArch` before any per-arch device init.
+    ep_admission(hfq.arch_id)?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache),
         10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
@@ -2951,10 +3058,13 @@ pub fn load_model_ep_with_compressor_cache(
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
             load_model_ep_qwen35(path, max_seq, tp, None, None, None)
         }
-        5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
+        5 | 6 => {
+            Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
+        }
+        // Backstop: `ep_admission` above already refused these; route through the
+        // shared constructor (not `unreachable!`) so the refusal survives a
+        // future edit that drops the early call.
+        id => Err(ep_unsupported_arch_message(id)),
     }
 }
 
@@ -2991,11 +3101,22 @@ fn load_model_ep_ds4(
     let rec = hfq.recommended_sampling();
 
     let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+        Gpus::init_ep(tp, config.num_hidden_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    // Bind the recorded mesh to the loaded topology: `init_ep` is the only
+    // thing distinguishing this `Gpus` from a TP one (identical devices,
+    // bands, and pre-flight), so fail loudly here — where both the mesh and
+    // the rank count are known — if a future constructor ever records the
+    // wrong axis instead of loading silently mislabeled.
+    let ep = gpus.mesh.size_of(DimKind::Ep);
+    if ep != n {
+        return Err(format!(
+            "init_ep mesh records Ep={ep} for {n} devices, expected tp={tp} (mesh axis out of sync with constructed ranks)"
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
@@ -3219,11 +3340,22 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let rec = hfq.recommended_sampling();
 
     let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+        Gpus::init_ep(tp, config.num_hidden_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    // Bind the recorded mesh to the loaded topology: `init_ep` is the only
+    // thing distinguishing this `Gpus` from a TP one (identical devices,
+    // bands, and pre-flight), so fail loudly here — where both the mesh and
+    // the rank count are known — if a future constructor ever records the
+    // wrong axis instead of loading silently mislabeled.
+    let ep = gpus.mesh.size_of(DimKind::Ep);
+    if ep != n {
+        return Err(format!(
+            "init_ep mesh records Ep={ep} for {n} devices, expected tp={tp} (mesh axis out of sync with constructed ranks)"
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
@@ -3343,6 +3475,11 @@ fn load_model_ep_qwen35(
     }
     // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
     let _ = (kv_mode, kv_backend, state_quant);
+    // Admission (#683): MoE has no EP serve path — refuse before `Gpus::init_tp`
+    // (first device init) and the per-rank weight upload, not after a full load.
+    if let Some(reason) = qwen35_ep_moe_refusal(hfq_probe.arch_id, config.num_experts) {
+        return Err(reason);
+    }
     if tp != 4 {
         return Err(format!(
             "EP qwen35 MoE requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
@@ -3358,11 +3495,22 @@ fn load_model_ep_qwen35(
     let n_exp = config.num_experts;
     let chat_template = resolve_chat_template(&hfq_probe, path);
     let rec = hfq_probe.recommended_sampling();
-    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus = Gpus::init_ep(tp, config.n_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    // Bind the recorded mesh to the loaded topology: `init_ep` is the only
+    // thing distinguishing this `Gpus` from a TP one (identical devices,
+    // bands, and pre-flight), so fail loudly here — where both the mesh and
+    // the rank count are known — if a future constructor ever records the
+    // wrong axis instead of loading silently mislabeled.
+    let ep = gpus.mesh.size_of(DimKind::Ep);
+    if ep != n {
+        return Err(format!(
+            "init_ep mesh records Ep={ep} for {n} devices, expected tp={tp} (mesh axis out of sync with constructed ranks)"
         ));
     }
     for (idx, dev) in gpus.devices.iter().enumerate() {
@@ -3870,6 +4018,72 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 }
 
 #[cfg(test)]
+mod ep_admission_tests {
+    use super::{ep_admission, qwen35_ep_moe_refusal};
+
+    #[test]
+    fn qwen35_moe_ep_refuses_before_load_but_dense_admits() {
+        // Arch 6 MoE under EP: refused with the combination named.
+        let err =
+            qwen35_ep_moe_refusal(6, 128).expect("arch-6 MoE + EP must be refused at admission");
+        assert!(err.contains("Qwen3.5-MoE"), "reason names the model: {err}");
+        assert!(err.contains("no EP serve path"), "reason: {err}");
+        assert!(err.contains('6'), "reason names the arch: {err}");
+        // Mis-stamped arch 5 with routed experts: same missing serve path.
+        assert!(qwen35_ep_moe_refusal(5, 128).is_some());
+        // Adjacent supported: dense Qwen3.5 (either arch id) keeps its EP path.
+        assert_eq!(qwen35_ep_moe_refusal(5, 0), None);
+        assert_eq!(qwen35_ep_moe_refusal(6, 0), None);
+    }
+
+    #[test]
+    fn ep_without_eparch_refuses_but_served_archs_admit() {
+        // LFM2 (11), Cohere2 (12) and anything else with no `EpArch` variant:
+        for arch in [11u32, 12, 13, 0, 99] {
+            let err = match ep_admission(arch) {
+                Ok(()) => panic!("arch {arch} + EP must refuse"),
+                Err(e) => e,
+            };
+            assert!(err.contains("EP not supported"), "reason: {err}");
+            assert!(
+                err.contains(&arch.to_string()),
+                "reason names the arch: {err}"
+            );
+        }
+        // Adjacent supported: DS4, MiniMax and Qwen3.5 keep their EP entries.
+        for arch in [5u32, 6, 9, 10] {
+            assert!(ep_admission(arch).is_ok(), "arch {arch} + EP must admit");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lfm2_batch_admission_tests {
+    #[test]
+    fn lfm2_continuous_batch_never_admits_but_qwen_still_does() {
+        use super::{carrier_for, continuous_batch_route};
+        // Arch 11: the route refuses, so staging takes the fallback arm and
+        // no Lfm2DecodeBatchState is ever allocated; the caps gate in
+        // `is_batch_request_eligible` (and the engine scheduler) agrees.
+        assert_eq!(continuous_batch_route(11), None);
+        let caps = carrier_for(11).expect("lfm2moe carrier").caps();
+        assert!(
+            !caps.supports_continuous_batch,
+            "lfm2moe caps must stay false while no batch path is servable"
+        );
+        // Adjacent supported: qwen35 5|6 still admit continuous batching.
+        assert!(continuous_batch_route(5).is_some());
+        assert!(continuous_batch_route(6).is_some());
+        assert!(
+            carrier_for(5)
+                .expect("qwen35 carrier")
+                .caps()
+                .supports_continuous_batch
+        );
+    }
+}
+
+#[cfg(test)]
 mod registry_tests {
     use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
 
@@ -4164,10 +4378,12 @@ mod registry_tests {
             }
         );
         assert_eq!(caps_of("minimax"), text_only);
+        // lfm2moe declares supports_continuous_batch: false — the batch state
+        // was allocated and never driven (eligibility always false), so the
+        // capability is truthful only when false. Single-stream LFM unaffected.
         assert_eq!(
             caps_of("lfm2moe"),
             ArchCaps {
-                supports_continuous_batch: true,
                 supports_images: true,
                 ..text_only
             }
@@ -4189,13 +4405,12 @@ mod registry_tests {
             }
         );
 
-        // ── continuous_batch_route: 5|6 -> Qwen35, 11 -> Lfm2Moe ──
+        // ── continuous_batch_route: 5|6 -> Qwen35 only (11/LFM2 refuses) ──
         // The Some/None half duplicates caps().supports_continuous_batch; the
         // variant picks between two distinct staging bodies in batch_staging.
         for id in 0u32..=14 {
             let want = match id {
                 5 | 6 => Some(ContinuousBatchRoute::Qwen35),
-                11 => Some(ContinuousBatchRoute::Lfm2Moe),
                 _ => None,
             };
             assert_eq!(
