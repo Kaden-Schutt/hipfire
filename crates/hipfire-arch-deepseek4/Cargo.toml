@@ -16,12 +16,11 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-ds4-parent = { path = "../hipfire-ds4-parent" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
-memmap2 = "0.9"
 
 [dev-dependencies]
 libloading.workspace = true

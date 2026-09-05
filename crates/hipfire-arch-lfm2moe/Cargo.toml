@@ -17,8 +17,8 @@ hipfire-reap = { path = "../hipfire-reap", default-features = false }
 # an lfm2_vl artifact was loaded with --include-vision. Acyclic — lfm2-vl
 # never depends back on this crate.
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [features]
 # Archived research probes; see the note by the [[example]] blocks.

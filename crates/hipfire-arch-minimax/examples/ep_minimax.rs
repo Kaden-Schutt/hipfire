@@ -134,7 +134,7 @@ fn main() {
     for step in 0..max {
         let next = argmax(&logits);
         gen.push(next);
-        if matches!(next, 200020 | 151643 | 151645 | 2) {
+        if matches!(next, 200020 | hipfire_runtime::chatml::ENDOFTEXT | hipfire_runtime::chatml::IM_END | 2) {
             break;
         }
         if step == 2 { steady_t = std::time::Instant::now(); steady = 0; }

@@ -60,13 +60,35 @@ fn boxed_empty() -> BoxBody {
 }
 
 pub(crate) fn json_response(value: serde_json::Value, status: u16) -> Response<BoxBody> {
-    let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
+    match json_response_result(&value, status) {
+        Ok(resp) => resp,
+        Err(message) => openai_error(&message, 500),
+    }
+}
+
+fn json_response_result(value: &serde_json::Value, status: u16) -> Result<Response<BoxBody>, String> {
+    let bytes = serde_json::to_vec(value).map_err(|err| format!("failed to encode JSON response: {err}"))?;
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(boxed_full(bytes))
-        .unwrap()
+        .map_err(|err| format!("failed to build HTTP response: {err}"))
+}
+
+/// Last-resort 500 body with no serde dependency, so error rendering always
+/// terminates even if JSON encoding itself is what failed.
+fn static_server_error() -> Response<BoxBody> {
+    Response::builder()
+        .status(500)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(boxed_full(
+            br#"{"error":{"message":"internal server error","type":"server_error"}}"#.to_vec(),
+        ))
+        // Static status, headers, and body: the builder cannot fail on these
+        // inputs, and there is no further fallback below this point.
+        .expect("static 500 response builds")
 }
 
 pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
@@ -75,20 +97,22 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
     } else {
         "server_error"
     };
-    json_response(
-        serde_json::json!({
+    json_response_result(
+        &serde_json::json!({
             "error": { "message": message, "type": error_type }
         }),
         status,
     )
+    .unwrap_or_else(|_| static_server_error())
 }
 
 pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
     let mut resp = openai_error(&error.message, 503);
-    resp.headers_mut().insert(
-        header::RETRY_AFTER,
-        header::HeaderValue::from_str(&error.retry_after_seconds.to_string()).unwrap(),
-    );
+    if let Ok(retry_after) =
+        header::HeaderValue::from_str(&error.retry_after_seconds.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
+    }
     resp
 }
 

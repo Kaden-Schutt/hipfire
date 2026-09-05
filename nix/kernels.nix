@@ -43,7 +43,7 @@ stdenv.mkDerivation {
 
   meta = with lib; {
     description = "Pre-compiled GPU kernels for hipfire";
-    license = licenses.mit;
+    license = [ licenses.asl20 licenses.mit ];
     platforms = [ "x86_64-linux" ];
   };
 }

@@ -214,12 +214,6 @@ impl KernelFamily for AttentionFamily {
     }
 }
 
-macro_rules! hip {
-    ($e:expr) => {
-        $e.map_err(|e| DispatchError::Hip(e.to_string()))
-    };
-}
-
 // ── Full attention dispatch (no KV cache — vision / DFlash) ──
 
 fn dispatch_full_attention(

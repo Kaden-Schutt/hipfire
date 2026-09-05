@@ -151,7 +151,7 @@ fn main() -> Result<(), String> {
         let mut gen: Vec<u32> = Vec::new();
         for _ in 0..gen_n {
             let next = am(&logits) as u32;
-            if matches!(next, 200020 | 151643 | 151645 | 2) {
+            if matches!(next, 200020 | hipfire_runtime::chatml::ENDOFTEXT | hipfire_runtime::chatml::IM_END | 2) {
                 break;
             }
             gen.push(next);

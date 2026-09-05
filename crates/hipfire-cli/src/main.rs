@@ -693,19 +693,21 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 let mut values = fields()
                     .iter()
                     .map(|field| {
-                        let resolved = resolved.get(field.key).expect("schema key resolved");
-                        (
+                        let item = resolved.get(field.key).ok_or_else(|| {
+                            anyhow!("configuration key '{}' is not set", field.key)
+                        })?;
+                        Ok::<_, anyhow::Error>((
                             field.key.to_owned(),
                             serde_json::json!({
                                 "legacy_key": field.legacy_key,
-                                "value": resolved.value,
+                                "value": item.value,
                                 "default": format_default(field),
-                                "source": resolved.source,
+                                "source": item.source,
                                 "overridden": loaded.layer.get(field.key).is_some(),
                             }),
-                        )
+                        ))
                     })
-                    .collect::<serde_json::Map<_, _>>();
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
                 for (key, item) in resolved
                     .values
                     .iter()
@@ -739,7 +741,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 println!();
                 for schema in fields() {
-                    let item = resolved.get(schema.key).expect("schema key resolved");
+                    let item = resolved.get(schema.key).ok_or_else(|| {
+                        anyhow!("configuration key '{}' is not set", schema.key)
+                    })?;
                     let marker = if loaded.layer.get(schema.key).is_some() {
                         "override"
                     } else {
@@ -804,8 +808,12 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             let mut loaded = load_global(&paths.config)?;
             loaded.layer.set_cli(&key, &value)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            let canonical = canonical_config_key(&key).expect("set_cli accepted key");
-            let value = loaded.layer.get(&canonical).expect("set value");
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = loaded
+                .layer
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             println!("{canonical} = {value}");
             if loaded.format == ConfigFormat::LegacyJson {
                 println!(
@@ -842,8 +850,8 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             if is_developer_key(&canonical) {
-                let env_compat =
-                    developer_env_for_key(&canonical).expect("validated developer key");
+                let env_compat = developer_env_for_key(&canonical)
+                    .ok_or_else(|| anyhow!("developer key '{canonical}' has no legacy env spelling"))?;
                 if output.json {
                     println!(
                         "{}",
@@ -888,7 +896,8 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 return Ok(());
             }
-            let schema = field(&canonical).expect("stable configuration key");
+            let schema = field(&canonical)
+                .ok_or_else(|| anyhow!("unknown configuration key '{canonical}'"))?;
             if output.json {
                 println!(
                     "{}",
@@ -1097,8 +1106,10 @@ fn model_config_command(
                 let values = fields()
                     .iter()
                     .map(|schema| {
-                        let item = resolved.get(schema.key).expect("schema key resolved");
-                        (
+                        let item = resolved.get(schema.key).ok_or_else(|| {
+                            anyhow!("configuration key '{}' is not set", schema.key)
+                        })?;
+                        Ok::<_, anyhow::Error>((
                             schema.key.to_owned(),
                             serde_json::json!({
                                 "legacy_key": schema.legacy_key,
@@ -1106,9 +1117,9 @@ fn model_config_command(
                                 "source": item.source,
                                 "overridden": overrides.get(schema.key).is_some(),
                             }),
-                        )
+                        ))
                     })
-                    .collect::<serde_json::Map<_, _>>();
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -1129,7 +1140,9 @@ fn model_config_command(
                     catalog.format
                 );
                 for schema in fields() {
-                    let item = resolved.get(schema.key).expect("schema key resolved");
+                    let item = resolved.get(schema.key).ok_or_else(|| {
+                        anyhow!("configuration key '{}' is not set", schema.key)
+                    })?;
                     let marker = if overrides.get(schema.key).is_some() {
                         "override"
                     } else {
@@ -1155,7 +1168,9 @@ fn model_config_command(
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).expect("schema key resolved");
+            let value = resolved.get(schema.key).ok_or_else(|| {
+                anyhow!("configuration key '{}' is not set", schema.key)
+            })?;
             if output.json {
                 println!(
                     "{}",
@@ -1183,7 +1198,7 @@ fn model_config_command(
                 .map(str::to_owned)
                 .unwrap_or_else(|| tag.clone().unwrap_or_else(|| model_name.to_owned()));
             let local_path = find_model_path(paths, &registry, model_name);
-            let saved = {
+            let (canonical, saved) = {
                 let record = loaded.catalog.models.entry(id.clone()).or_default();
                 if record.path.is_none() {
                     record.path = local_path;
@@ -1192,12 +1207,17 @@ fn model_config_command(
                     record.registry_tag = tag.clone();
                 }
                 record.overrides.set_cli(&key, &value)?;
-                let schema = field(&key).expect("set_cli accepted key");
-                record.overrides.get(schema.key).unwrap().clone()
+                let schema = field(&key)
+                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let saved = record
+                    .overrides
+                    .get(schema.key)
+                    .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?
+                    .clone();
+                (schema.key, saved)
             };
             write_catalog_toml(&paths.config, &loaded.catalog)?;
-            let schema = field(&key).expect("set_cli accepted key");
-            println!("{id} {} = {saved}", schema.key);
+            println!("{id} {canonical} = {saved}");
             if loaded.format == CatalogFormat::LegacyJson {
                 println!(
                     "migrated model catalog to {}; preserved legacy JSON as rollback copies",
@@ -1215,11 +1235,9 @@ fn model_config_command(
                 println!("{model_name} has no per-model overrides");
                 return Ok(());
             };
-            let record = loaded
-                .catalog
-                .models
-                .get_mut(&id)
-                .expect("resolved model id");
+            let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
+                anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
+            })?;
             if let Some(key) = key {
                 let schema =
                     field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
@@ -1242,7 +1260,9 @@ fn model_config_command(
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).expect("schema key resolved");
+            let value = resolved.get(schema.key).ok_or_else(|| {
+                anyhow!("configuration key '{}' is not set", schema.key)
+            })?;
             if output.json {
                 println!(
                     "{}",
@@ -4389,7 +4409,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
                     .unwrap_or("unknown"),
             );
         }
-        println!("\nFor phase-aware ISA fit evidence, run hipfire-atlas.");
+        println!("\nFor phase-aware ISA fit evidence, run python3 scripts/kernel_atlas.py render-fit --row <atlas-row.json>.");
     }
     Ok(())
 }

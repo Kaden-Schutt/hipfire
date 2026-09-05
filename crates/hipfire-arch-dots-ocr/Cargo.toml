@@ -21,7 +21,7 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
-serde_json = "1"
+serde_json.workspace = true
 # Used by `image.rs` for PNG/JPEG decode. Matches the version pin in
 # hipfire-arch-qwen35-vl/Cargo.toml; default-features off keeps the
 # build closure small (only PNG + JPEG are needed for dots.ocr's

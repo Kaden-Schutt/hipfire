@@ -104,7 +104,11 @@ hipfire run <tag-or-path> "…"
 Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
-    forced local when HIPFIRE_LOCAL=1, --kv-mode, --json, or --no-stream
+    forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
+    `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`,
+    `--draft-max`, `--dspark-conf-threshold` is passed (`force_local` in
+    `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream` ride the HTTP
+    route and do not force local)
     if HTTP fails while serve still live → abort (no local spawn; would collide)
   else → spawn one-shot daemon binary
         │

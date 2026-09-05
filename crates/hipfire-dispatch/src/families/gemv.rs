@@ -461,11 +461,6 @@ fn prepare_rotation_scratch(
 fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchError> {
     use KernelKey as K;
     let (w, x, y, m, k) = (p.w, p.x, p.y, p.w.m, p.w.k);
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     match key {
         K::GemvF32 => {
             // WeightRef is the source of truth for matrix shape. Some valid
@@ -544,11 +539,6 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
     let k = w.k;
     use DType::*;
 
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     match w.dtype {
         HFQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
@@ -587,12 +577,6 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
     let m = w.m;
     let k = w.k;
     use DType::*;
-
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
 
     // SwiGLU+Residual dispatch.
     //
