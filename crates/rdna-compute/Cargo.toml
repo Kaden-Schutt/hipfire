@@ -52,6 +52,14 @@ name = "bench_decode_attention"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_dflash_verify_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4v2_residual_ksplit_gfx1100"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_dispatch_floor"
 required-features = ["lab"]
 

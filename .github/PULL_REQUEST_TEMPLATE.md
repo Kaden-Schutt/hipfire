@@ -4,7 +4,7 @@
 
 ## Which surface(s) does this touch?
 
-hw-gate selects hardware routes from the diff (`scripts/hw-gate/select.py`); tick what applies so a reviewer can check the selection.
+Tick the surfaces this PR changes so a reviewer can match evidence to the claim map in `docs/VALIDATION.md`. Optional hw-gate automation uses the same buckets (`scripts/hw-gate/select.py`) when it runs.
 
 - [ ] **kernel** — `kernels/`, `crates/rdna-compute`, `crates/hipfire-dispatch`, `crates/hip-bridge`, `crates/saddle-core`
 - [ ] **load** — `crates/hipfire-loader`, `crates/hipfire-daemon`, runtime load path (`model_load`, `hfq`, `loader_api`, `config`, `safetensors_source`, `weight_backend`, `multi_gpu`), arch `load*`/`weights*`/`carrier.rs`, `hipfire-config`, `hipfire-registry`, `registry/`, Cargo manifests
@@ -13,7 +13,7 @@ hw-gate selects hardware routes from the diff (`scripts/hw-gate/select.py`); tic
 - [ ] `crates/hipfire-quantize` / quant formats (update `docs/quant-formats/qt-register.txt`)
 - [ ] control plane — `hipfire-cli`, `hipfire-client`, `hipfire-tui`
 - [ ] docs / CI / scripts only (no hardware route)
-- [ ] **policy files** — `.github/workflows/`, `CODEOWNERS`, `scripts/hw-gate/`, `leanup-thresholds.txt`, `layering.txt`, `registry/` (hard floor: no seat can merge these; a human does)
+- [ ] **policy files** — `.github/workflows/`, `CODEOWNERS`, `scripts/hw-gate/`, `leanup-thresholds.txt`, `layering.txt`, `registry/` (always human-owned; automation must not merge these)
 
 ## Test plan
 
@@ -34,7 +34,7 @@ paste the harness --out JSON here (per-turn rows with assistant_content, attract
 
 ## Hardware validation request (optional)
 
-Tell the gate which registry artifacts prove your change, and what you claim. Sol reads the claim as a claim and runs the routes you name (tags must exist on the runner; unknown or absent tags are reported, not failed). Leave the block out and the gate runs the mandatory fixtures for the surfaces you touched.
+Optional. Name registry artifacts and the claim they should prove. When hw-gate automation runs, Sol treats the claim as a claim and runs the routes you name (tags must exist on the runner; unknown or absent tags are reported, not failed). Leave the block out to rely on manual harness attachments and/or the automation's default fixtures for touched surfaces. Either path is evidence for direct review — not a required CI pass.
 
 <!-- hw-gate-request -->
 ```json
@@ -47,17 +47,15 @@ Tell the gate which registry artifacts prove your change, and what you claim. So
 }
 ```
 
-## How this merges (hw-gate)
+## How this merges (direct review)
 
-Two model seats, one human owner. Every decision is announced on the PR.
+Merge authority is **direct maintainer review** plus the required no-GPU CI checks. hw-gate automation is optional evidence delivery, not a prerequisite or substitute.
 
-1. **Sol reads the diff** (read-only) and decides whether your code runs on the maintainer's hardware and which routes run — the mandatory fixtures for the surfaces you touched, plus the routes you requested, plus any Sol adds. Only Sol decides this; a maintainer's `hw-run` label can force a run, nothing can silently block one. Skipped on drafts.
-2. **Hardware runs**: the PR is built and every route is driven through `serve_harness.py` on gfx1201. Every turn's decoded text is posted verbatim in the evidence comment. A missing or mismatched pinned fixture, an attractor, an empty turn, or a missed expect-substring is a failure.
-3. **Sol's verdict**: `greenlight` / `needs-human` / `block` on diff + evidence, with regressions cited by `file:line` and fixture. Sol never merges.
-4. **Fable investigates and decides**: with a shell in a sandboxed checkout of your head on the hardware (all five hiptrx GPUs, base branch built for A/B), Fable runs whatever proves your change — multi-GPU loads, refusal sequences, parity, A/B — and returns `merge-staging` / `hold` / `block` with an investigation table and every evidence file. It may veto a greenlight or override a needs-human, and says why. On `merge-staging` Fable merges your head into **`beta`** (staging); `master` is promoted by the maintainer. Neither seat can override the hard floor: a failed fixture, an attractor, a policy-file change, or an unlabelled `RATCHET-RAISE`.
-5. **The `hw-gate` status** is green only on `merge-staging`; `hold` turns green when a maintainer applies `human-reviewed`; `block` clears only with a new commit.
-
-The seats act as `hipfire-sol[bot]` and `hipfire-fable[bot]`. Route policy: [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate — request coverage with the `<!-- hw-gate-request -->` block above; no local planning tool is CI evidence. The retired `scripts/coherence-gate*.sh` batteries no longer exist.
+1. **Required CI** (must stay green): `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, `gates (ratchets, layering, registers)` from [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+2. **Required review**: one approving maintainer review. The reviewer judges claim-matched evidence for the surfaces you ticked — static read for docs/control-plane-only work; hardware/model proof when load/serve/kernel/runtime behavior changes.
+3. **Evidence you owe**: pick routes from [`docs/VALIDATION.md`](../docs/VALIDATION.md). Prefer attaching local harness output (`serve_harness.py`, `redline_daemon_harness.py`, `test_kernels`, etc.). A lone `hipfire run` transcript is not evidence.
+4. **Optional automation**: when hw-gate runs, Sol/Fable may post seat commentary and hardware fixtures under `hipfire-sol[bot]` / `hipfire-fable[bot]`. A maintainer's `hw-run` label can force a hardware pass. Seat output informs the human reviewer; it does **not** auto-approve, auto-merge, or promote `master`, and hw-gate is **not** a required status check.
+5. **Retired paths**: `scripts/coherence-gate*.sh` and `tools/change_gate` / agentic-review are historical only — never acceptance evidence. No local planning tool is merge evidence.
 
 ## Architecture-trait change?
 

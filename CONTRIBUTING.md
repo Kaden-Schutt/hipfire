@@ -80,10 +80,12 @@ downloads:
 ```
 
 It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
-CPU Python tests, and the env/docs drift check. Hardware-relevant changes
-(kernel, dispatch, quant, forward-pass, load, serve, spec-decode) must pass
-the required **hw-gate** CI check — see
-[docs/VALIDATION.md](docs/VALIDATION.md) § hw-gate.
+CPU Python tests, and the env/docs drift check. Required CI on `master` is
+`build (workspace, no GPU)`, `unit tests (lib, no GPU)`, and
+`gates (ratchets, layering, registers)`, plus one approving review — see
+[docs/VALIDATION.md](docs/VALIDATION.md) § Merge bar. Hardware-relevant
+changes still owe claim-matched GPU/model evidence for direct review; that
+evidence is not a separate required CI check.
 
 ### GPU kernel correctness check
 
@@ -100,12 +102,17 @@ arch port; if it fails on your hardware we want to hear about it
 
 Any change to kernels, dispatch, fusion, rotation, rmsnorm, sampling,
 the spec-decode path, loader/daemon, or the forward pass MUST validate the
-actual path under test. **CI acceptance is hw-gate**
+actual path under test and attach claim-matched evidence for **direct
+maintainer review**. Use the harnesses below (and the routes in
+[docs/VALIDATION.md](docs/VALIDATION.md)). Optional automation
 ([`.github/workflows/hw-gate.yml`](.github/workflows/hw-gate.yml),
-[`scripts/hw-gate/`](scripts/hw-gate/)); a maintainer applies the `hw-run`
-label to authorize the hardware run. The fixed `coherence-gate*.sh` batteries
-are retired and must not be used as acceptance evidence. No local planning
-tool is CI evidence — only hw-gate acceptance counts.
+[`scripts/hw-gate/`](scripts/hw-gate/)) may deliver the same class of
+evidence when it runs — a maintainer can apply `hw-run` to force a hardware
+pass — but hw-gate is **not** a required status check, not automatic
+acceptance, and not a substitute for the approving review. The fixed
+`coherence-gate*.sh` batteries and the retired `tools/change_gate` /
+agentic-review route are historical only and must not be used as acceptance
+evidence. No local planning tool is merge evidence.
 
 ```bash
 python3 scripts/redline_daemon_harness.py --model /path/to/model --pm4

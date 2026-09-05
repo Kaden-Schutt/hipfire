@@ -1948,10 +1948,15 @@ def spawn_serve(cfg, home, log):
         except OSError:
             pass
     _write_native_config(cfg, home)
+    # The requested config is written to <home>/.hipfire/config.toml, but
+    # ConfigPaths::discover prefers HIPFIRE_HOME over HOME/.hipfire — an inherited
+    # HIPFIRE_HOME would make the daemon read a stale parent/gate config instead
+    # (dflash off, wrong max_seq, MTP auto). Point the child's HIPFIRE_HOME at the
+    # harness-written root; the parent environment is untouched.
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
-    env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
+    env = dict(os.environ, HOME=home, HIPFIRE_HOME=os.path.join(home, ".hipfire"), HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
                HIPFIRE_DAEMON_BIN=os.environ.get(
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),

@@ -1,12 +1,18 @@
 # Validation routes
 
-Maps claim class → validation route. **CI merge authority for hardware-relevant
-diffs is [`hw-gate`](../.github/workflows/hw-gate.yml)** (see below). Executable
-behavior lives in the scripts and workflows named in each route. Methodology
-numbers and Redline certification prose live in their owners
-([`INDEX.md`](INDEX.md)). Plan hardware coverage in the hw-gate section below
-(the author's `<!-- hw-gate-request -->` block selects routes); no local
-planning tool is CI evidence.
+Maps claim class → validation route. **Merge authority is direct maintainer
+review backed by evidence selected for the changed behavior**, plus the
+required no-GPU CI checks named below. Executable behavior lives in the
+scripts and workflows named in each route. Methodology numbers and Redline
+certification prose live in their owners
+([`INDEX.md`](INDEX.md)).
+
+Automation — including [`hw-gate`](../.github/workflows/hw-gate.yml) when it
+runs — is **optional evidence delivery**. It is not a merge prerequisite, not
+a required status check, and not a substitute for the proof the claim needs
+or for an approving human review. Authors may request hardware routes with
+the PR template's `<!-- hw-gate-request -->` block when that automation is
+used; no local planning tool is merge evidence.
 
 | Field | Value |
 |---|---|
@@ -26,14 +32,42 @@ planning tool is CI evidence.
    (especially Redline route proof — see [`REDLINE.md`](REDLINE.md)).
 6. **Admissions** are recorded only in [`admissions.yml`](admissions.yml).
    A passing route does not create an admission row.
+7. **Static review ≠ hardware proof.** Required no-GPU CI and a clean static
+   read never substitute for GPU/model evidence the claim map requires.
+   Hardware harness output never substitutes for required CI or an approving
+   review.
 
-## hw-gate (CI, required)
+## Merge bar (required)
 
-[`hw-gate`](../.github/workflows/hw-gate.yml) is the **required** CI check for
-every PR and the repository's autonomous review rung: two model seats decide,
-one human owns `master`. Diffs that touch no hardware-relevant surface pass
-immediately. Every decision is announced on the PR under the seat's own
-identity (`hipfire-sol[bot]`, `hipfire-fable[bot]`).
+Branch protection on `master` requires these CI job names from
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
+
+- `build (workspace, no GPU)`
+- `unit tests (lib, no GPU)`
+- `gates (ratchets, layering, registers)`
+
+plus **one approving review**.
+
+Those three jobs stay required. Do not disable them. `hw-gate` is **not**
+among the required checks: a missing, skipped, or unsuccessful hw-gate run
+is not a merge blocker by itself, and a successful hw-gate run is not
+automatic acceptance, auto-promotion, or a substitute for the approving
+review.
+
+Every change still owes the evidence named by the [claim → route map](#claim--route-map)
+for the surfaces it touches. The author or reviewer may gather that evidence
+with the manual harnesses below and/or optional automation; the maintainer
+who approves judges that the evidence matches the claim.
+
+## hw-gate (optional evidence automation)
+
+[`hw-gate`](../.github/workflows/hw-gate.yml) is optional automation that can
+collect load/serve/kernel evidence and post seat commentary on a PR. It does
+not approve PRs, does not replace the [merge bar](#merge-bar-required), and
+does not own `master`. When it runs, two model seats may assist investigation
+under their own identities (`hipfire-sol[bot]`, `hipfire-fable[bot]`); a human
+still owns the approving review. Diffs that touch no hardware-relevant
+surface need no hardware route.
 
 ### Bucket selection (`scripts/hw-gate/select.py`)
 
@@ -48,36 +82,38 @@ Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path
 | **none** | everything else (docs, benchmarks, most scripts, tests, markdown, …) |
 
 Touching **policy** paths (`.github/workflows/**`, `.github/CODEOWNERS`,
-`scripts/hw-gate/**`, leanup/ratchet scripts, `registry/**`) is part of the
-hard floor: no seat can merge those; a human does. Exec-sensitive paths (build
-scripts, manifests, toolchain, CI, shell/python) are reported to Sol as input
-to its execution-risk judgment; they are not a gate by themselves.
+`scripts/hw-gate/**`, leanup/ratchet scripts, `registry/**`) always needs a
+human decision; automation must not merge those. Exec-sensitive paths (build
+scripts, manifests, toolchain, CI, shell/python) are useful context for
+execution-risk judgment; they are not a gate by themselves.
 
 ### The author's request (`<!-- hw-gate-request -->`)
 
 A PR body may carry a fenced JSON block after the marker:
 `{"routes":[{"mode":"battery"|"chain","tag":"registry:tag"}],"claim":"..."}`.
-Sol treats the claim as a claim, runs the requested routes when the tag exists
-on the runner, reports unknown or absent tags as unavailable (not failed), and
-states in its verdict whether the claim was proven, disproven, or not
-exercised. The PR template ships the skeleton.
+When hw-gate runs, Sol treats the claim as a claim, runs the requested routes
+when the tag exists on the runner, reports unknown or absent tags as
+unavailable (not failed), and states in its verdict whether the claim was
+proven, disproven, or not exercised. The PR template ships the skeleton.
+Authors may instead attach equivalent manual harness output; either path is
+evidence for direct review, not an acceptance pass by itself.
 
-### Seat 1 — Sol decides hardware and delivers the verdict
+### Seat 1 — Sol (when automation runs)
 
 Sol (`openai-codex/gpt-5.6-sol`, read-only tools in a PR checkout) reads the
 diff before anything runs and decides `run_hardware`: the hardware job builds
 the PR and runs its daemon as the maintainer's user on their workstation, so
 Sol refuses diffs that reach outside the process (network, filesystem beyond
 model/cache/temp, env or credential reads, process spawning, unexplained build
-or dependency changes, obfuscated blobs, unexplained `unsafe`). Nothing else
-gates hardware; a maintainer's **`hw-run`** label only ever forces a run and
-is removed after each run and on every push. Sol also composes the route list:
-the mandatory fixtures for the touched buckets, the author's requested routes,
-and its own additions.
+or dependency changes, obfuscated blobs, unexplained `unsafe`). A maintainer's
+**`hw-run`** label only ever forces a run and is removed after each run and on
+every push. Sol also composes the route list: the mandatory fixtures for the
+touched buckets, the author's requested routes, and its own additions.
 
 After hardware, Sol reads every decoded turn and returns `greenlight` /
 `needs-human` / `block` with regressions cited by `file:line` and fixture. Sol
-never merges and never approves; its review is a comment.
+never merges and never approves; its review is a comment that may inform the
+human reviewer.
 
 ### Fixtures and harnesses
 
@@ -86,9 +122,9 @@ Every fixture runs through [`scripts/serve_harness.py`](../scripts/serve_harness
 and proves nothing about turn-to-turn state — with reasoning off. Mandatory
 fixtures are registry tags pinned by sha256 in
 [`scripts/hw-gate/fixtures.json`](../scripts/hw-gate/fixtures.json); a
-missing or mismatched pinned fixture **fails the gate**. Requested extra tags
-resolve through `registry/v1.json`; one absent from the runner is reported as
-unavailable.
+missing or mismatched pinned fixture **fails that automation run**. Requested
+extra tags resolve through `registry/v1.json`; one absent from the runner is
+reported as unavailable.
 
 - **`load` bucket** — `battery` on every fixture (varied prompts, expect
   substrings, attractor / runaway / empty detection).
@@ -104,11 +140,14 @@ harness-side timings (HTTP streaming, sampling) and run well under
 `hipfire bench`; they are context, never a performance claim. Perf claims go
 through [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
 
-### Seat 2 — Fable investigates and decides the merge
+The same harnesses are the manual evidence path when automation is not used:
+run them locally, attach the artifacts, and let the maintainer review.
+
+### Seat 2 — Fable (when automation runs)
 
 Fable (`anthropic/claude-fable-5-1`, thinking `xhigh`) reads the diff, the
 evidence, and Sol's verdict — and then, when that evidence does not prove the
-change, goes and gets the evidence itself. It runs with a real shell in a
+change, may gather more evidence itself. It runs with a real shell in a
 sandboxed checkout of the PR head on the hardware host: every hiptrx GPU is
 reserved for the session (a host-level lock serializes Fable sessions and
 excludes the lane runs), the PR and the base branch are both built for A/B,
@@ -122,66 +161,46 @@ network, no writes outside its home/evidence/build tree, no other GPUs, no
 credentials, no `gh` (the script posts), a wall-clock budget
 (`HW_GATE_MAX_MINUTES`, default 45), and only registry artifacts.
 
-Fable returns `merge-staging` / `hold` / `block` with an `investigation`
-table (question → route run → evidence file → result), an `unproven` list for
-what this host could not exercise, and an announcement written for the
-author. It may veto Sol's greenlight or override Sol's needs-human — expected
-when it closed the gap itself — and must say why; overrides are recorded so
-the maintainer can audit both seats against outcomes.
-
-**Probation.** While the two-seat rung is on probation, `merge-staging` means
-Fable merges the PR head into **`beta`** (the staging branch) under its own
-identity and announces the merge SHA on the PR. `master` is promoted from
-`beta` by the maintainer; GitHub marks the staged PRs merged when that
-happens. The record of prelims, verdicts, decisions, and overrides is the
-dataset for lifting probation.
+Fable returns a decision comment with an `investigation` table
+(question → route run → evidence file → result), an `unproven` list for what
+this host could not exercise, and an announcement written for the author. It
+may disagree with Sol and must say why. **Fable does not replace the required
+approving review and does not promote `master`.** Seat commentary is input to
+the maintainer, not an acceptance pass or auto-merge contract.
 
 ### The floor (`scripts/hw-gate/review.py`)
 
-The floor is the workflow's own rule, split in two:
+When automation runs, the workflow's own rule is split in two:
 
 | Tier | Fires on | Who can override |
 |---|---|---|
-| **hard** | a failed fixture or harness, an attractor, a policy-file change, a `RATCHET-RAISE:` commit without the `ratchet-raise` label | nobody — `block` (evidence) or `hold` (policy/ratchet) regardless of either seat |
+| **hard** | a failed fixture or harness, an attractor, a policy-file change, a `RATCHET-RAISE:` commit without the `ratchet-raise` label | nobody within the automation — evidence stays failed / policy stays held |
 | **soft** | coverage gaps, confidence < 0.8, Sol's `needs-human`, an unparseable verdict | Fable, with a stated reason |
 
-### The `hw-gate` status
-
-- `merge-staging` — green.
-- `hold` — red until a maintainer who has read the seats' comments applies
-  **`human-reviewed`** (a logged signature, cleared on every push; a label
-  event re-evaluates the recorded decision without re-running hardware).
-- `block` — red; only a new commit clears it.
-
-Branch protection binds every maintainer except repository admins
-(`enforce_admins` is off on purpose: the admin's judgment is the emergency
-path). An admin merging past a red status is expected to have read the
-comments first.
+Hard-floor failures are strong signals for the human reviewer; they are still
+not a separate required GitHub check beyond the [merge bar](#merge-bar-required).
 
 ## Automatic checks vs manual evidence
 
 | Class | When it runs | Authority |
 |---|---|---|
-| **Automatic (hw-gate, required)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml); hardware run after `hw-run` label when buckets need it | **Required** CI check for every PR. Select may pass with no HW surface; otherwise load/serve/kernel evidence + bounded reviewer floor. |
-| **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, native control-plane/unit tests, CPU tests, and env/docs reference coverage. **Not** model coherence, serve semantics, or perf admission. |
+| **Automatic (no GPU CI, required)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | **Required** merge bar: `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, `gates (ratchets, layering, registers)`. **Not** model coherence, serve semantics, or perf admission. |
+| **Automatic (hw-gate, optional)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) when that automation runs; hardware run after `hw-run` when buckets need it | **Optional** evidence delivery. Not a required status check; not automatic acceptance or promotion. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
-| **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Still required for claim classes hw-gate does not cover (parity oracles, perf protocol, Redline promotion ladder, admissions). |
+| **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Required for claim classes that name GPU/model routes (parity oracles, serve semantics, perf protocol, Redline promotion ladder, admissions) when those surfaces change — whether or not hw-gate ran. |
+| **Direct maintainer review** | Human approval on the PR | **Required** (one approving review). Judges claim-matched evidence; automation comments are inputs, not substitutes. |
 
-No-GPU CI green never substitutes for hw-gate or for a required manual route. hw-gate green does not create an admission or skip claim-specific oracles named below.
-
-Branch protection requires the no-GPU workflow's checks by exact CI job
-name: `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, and
-`gates (ratchets, layering, registers)` (all in
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). `hw-gate` is
-the hardware rung — currently advisory, planned required.
+No-GPU CI green never substitutes for GPU/model evidence the claim map
+requires. hw-gate green (when present) does not create an admission, skip
+claim-specific oracles named below, or replace the approving review.
 
 ### Automatic entrypoints
 
 | Route | Path | Role |
 |---|---|---|
-| **hw-gate (required)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Automatic** required CI: path → buckets, pinned fixtures, hardware run, reviewer floor. See [§ hw-gate](#hw-gate-ci-required). |
-| No-GPU CI workflow | [`.github/workflows/no-gpu-ci.yml`](../.github/workflows/no-gpu-ci.yml) | **Automatic** CI entry that invokes the no-GPU script on PR/push. |
+| No-GPU CI (required jobs) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (+ [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) body) | **Required** automatic CI: workspace build, lib unit tests, ratchets/layering/registers gates. |
+| **hw-gate (optional)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Optional** evidence automation: path → buckets, pinned fixtures, hardware run, seat commentary. See [§ hw-gate](#hw-gate-optional-evidence-automation). |
 | Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |
 | Env/docs drift check | [`scripts/check-env-docs.py`](../scripts/check-env-docs.py) | **Automatic** through `scripts/no-gpu-ci.sh`; checks that referenced `HIPFIRE_*` names are documented and production reads are config-owned. |
@@ -251,15 +270,15 @@ Use only when the claim class below names them. They are not universal.
 | MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | **Only** current automatic runtime predicate. Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; case-insensitive `.mq4r` → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic (no `arch_id` gate). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
 | Unknown surface | **Blocked** until an owner adds a row here | Fail closed |
 
-## Retired coherence-gate scripts
+## Retired gates (historical only)
 
-The fixed `scripts/coherence-gate-*.sh` batteries are **retired as current
-acceptance evidence**. They must not be required for merge, promotion, or
-benchmark claims.
+The following are **retired as current acceptance evidence**. They must not
+be required for merge, promotion, or benchmark claims.
 
 | Pattern | Status |
 |---|---|
 | `scripts/coherence-gate-*.sh` (e.g. `coherence-gate-dflash.sh`, `coherence-gate-qwen35-dspark.sh`, `coherence-gate-minimax.sh`, `coherence-gate-cohere2moe.sh`, `coherence-gate-deepseek4-*.sh`, …) | **Historical reproduction only.** Never promotion or acceptance. |
+| `tools/change_gate/`, `.github/agentic-review/`, and the pre-hw-gate agentic static-review route | **Retired.** Superseded as a review path; historical references only. Not merge evidence. |
 | Other gate scripts **not named anywhere in this selector** | Do not treat as canonical acceptance unless a future INDEX/VALIDATION revision names them. Supporting tools already listed above stay in force. |
 
 Campaign-specific guidance (for example an LFM effort that omits coherence
@@ -276,6 +295,9 @@ blocked on purpose.
 | `serve_harness` success as Redline route proof | **Rejected** |
 | `redline_daemon_harness` fingerprint as installed product PM4/AQL route | **Rejected** without `REDLINE.md` ladder |
 | Coherence-gate pass as current acceptance | **Rejected** |
+| `change_gate` / agentic-review route as current acceptance | **Rejected** — retired; historical only |
+| hw-gate success as required merge gate, auto-approval, or auto-promotion | **Rejected** — optional evidence only; direct review + required no-GPU checks remain |
+| Missing/skipped hw-gate as a merge blocker by itself | **Rejected** — hw-gate is not a required status check |
 | Bench number without protocol + identity hashes | **Rejected** as promotion evidence |
 | Inferred or “signed” `admissions.yml` row without earned fixture evidence | **Rejected** — schema v2 forbids inferred/wildcard rows; only the exact admitted record applies |
 

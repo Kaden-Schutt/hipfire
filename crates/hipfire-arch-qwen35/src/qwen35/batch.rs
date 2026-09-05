@@ -5,6 +5,7 @@
 //! Qwen3.5 continuous-batch state: `PrefillBatchScratch`, `Qwen35DecodeBatchState`,
 //! lane-mask helpers, and the independent-lane batched decode entry points.
 
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
@@ -91,6 +92,19 @@ pub struct PrefillBatchScratch {
     pub fa_attn_out_batch: GpuTensor, // [N × n_heads × head_dim]
     // FWHT-rotated fa_attn_out for feeding MQ4 wo.
     pub fa_attn_out_rot_batch: GpuTensor, // [N × n_heads × head_dim]
+
+    // ── Launch-fusion prescaffold (S3/S4/S9): exact-FP16 producer sidecars ──
+    // Allocated/freed and byte-accounted, but never written or read yet.
+    // S3 fills the projection-input family with bit-identical
+    // `fused_rmsnorm_mq_rotate` F32 + `convert_f32_to_f16` bytes; S4 fills
+    // the residual family; S9 consumes them from persistent prologues.
+    // Shapes mirror the F32 counterparts at half the bytes per element.
+    pub x_rot_f16_batch: GpuTensor, // [N × dim] F16, mirrors x_rot_batch
+    pub dn_normed_rot_f16_batch: GpuTensor, // [N × v_dim] F16, mirrors dn_normed_rot_batch
+    pub ffn_hidden_f16_batch: GpuTensor, // [N × hidden_dim] F16, mirrors ffn_hidden_batch
+    pub fa_attn_out_rot_f16_batch: GpuTensor, // [N × q_dim] F16, mirrors fa_attn_out_rot_batch
+    // Small persistent prologue-control tensor for S9 (counters/generations).
+    pub mq_prologue_ctrl: GpuTensor, // [256] bytes, Raw
 
     // ── MoE batched intermediates (allocated only when num_experts > 0) ──
     // All outputs of the fused 4-way router + shared-gate GEMM, plus the
@@ -284,6 +298,13 @@ impl PrefillBatchScratch {
             fa_v_batch: alloc!(&[max_batch * kv_dim], DType::F32),
             fa_attn_out_batch: alloc!(&[max_batch * q_dim], DType::F32),
             fa_attn_out_rot_batch: alloc!(&[max_batch * q_dim], DType::F32),
+            x_rot_f16_batch: alloc!(&[max_batch * dim], DType::F16),
+            dn_normed_rot_f16_batch: alloc!(&[max_batch * v_dim], DType::F16),
+            ffn_hidden_f16_batch: alloc!(&[max_batch * hidden_dim], DType::F16),
+            fa_attn_out_rot_f16_batch: alloc!(&[max_batch * q_dim], DType::F16),
+            // S9 prologue control plane: 256 bytes of device-resident
+            // counters/generations. Raw dtype counts bytes.
+            mq_prologue_ctrl: alloc!(&[256], DType::Raw),
             moe_router_logits_batch: alloc_opt!(
                 config.num_experts > 0,
                 &[max_batch * config.num_experts],
@@ -435,6 +456,11 @@ impl PrefillBatchScratch {
             self.fa_v_batch,
             self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
+            self.x_rot_f16_batch,
+            self.dn_normed_rot_f16_batch,
+            self.ffn_hidden_f16_batch,
+            self.fa_attn_out_rot_f16_batch,
+            self.mq_prologue_ctrl,
         ] {
             note(gpu.free_tensor(t));
         }
@@ -1178,6 +1204,12 @@ impl PrefillBatchScratch {
         add(cm(n, kv_dim)?, 4)?;
         add(cm(n, q_dim)?, 4)?;
         add(cm(n, q_dim)?, 4)?;
+        // Prescaffold F16 sidecars (same order as `new_opt`): half bytes.
+        add(cm(n, dim)?, 2)?;
+        add(cm(n, v_dim)?, 2)?;
+        add(cm(n, hd)?, 2)?;
+        add(cm(n, q_dim)?, 2)?;
+        add(256, 1)?;
         if config.num_experts > 0 {
             add(cm(n, config.num_experts as u64)?, 4)?;
             add(n, 4)?;
@@ -1657,6 +1689,7 @@ pub fn forward_decode_batch_prepared(
             lane_capacity: state.lane_capacity,
             active_mask,
         },
+        DflashFusionCtx::Off,
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);

@@ -259,8 +259,15 @@ fn dispatch_full_attention(
         TileImpl::DflashN64 => {
             debug_assert_eq!(key, AttnFullF32);
             hip!(gpu.attention_dflash_wmma_n64_f32(
-                io.q, io.k, io.v, io.out, io.n, io.seq_len,
-                io.n_heads, io.n_kv_heads, io.head_dim,
+                io.q,
+                io.k,
+                io.v,
+                io.out,
+                io.n,
+                io.seq_len,
+                io.n_heads,
+                io.n_kv_heads,
+                io.head_dim,
             ))?;
             Ok(())
         }
@@ -598,24 +605,40 @@ fn dispatch_kv_write(
             ))
         }
         KernelKey::KvWriteQ8_0Batched => {
-            // Q8 batched write is called twice (K, then V) — not fused.
+            // S6-fa-prep-q8-pair: exact gfx1100 fold of the K+V pair into one
+            // launch. Bit-exact vs the two calls below (same per-block
+            // arithmetic and legacy single-arena addressing); every failed
+            // predicate and HIPFIRE_FA_BATCH_FUSE_OFF=1 keep the old path.
             let pos = io.positions();
-            hip!(gpu.kv_cache_write_q8_0_batched(
-                io.k_cache,
-                io.k,
-                pos,
-                io.n_kv_heads,
-                io.head_dim,
-                io.batch_size,
-            ))?;
-            hip!(gpu.kv_cache_write_q8_0_batched(
-                io.v_cache,
-                io.v,
-                pos,
-                io.n_kv_heads,
-                io.head_dim,
-                io.batch_size,
-            ))
+            if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
+                hip!(gpu.kv_cache_write_q8_0_pair_batched(
+                    io.k_cache,
+                    io.v_cache,
+                    io.k,
+                    io.v,
+                    pos,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.batch_size,
+                ))
+            } else {
+                hip!(gpu.kv_cache_write_q8_0_batched(
+                    io.k_cache,
+                    io.k,
+                    pos,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.batch_size,
+                ))?;
+                hip!(gpu.kv_cache_write_q8_0_batched(
+                    io.v_cache,
+                    io.v,
+                    pos,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.batch_size,
+                ))
+            }
         }
 
         // ── Llama legacy (decode only, no batched variants) ──
@@ -1683,9 +1706,14 @@ fn dispatch_attend(
                     // gate. The scalar variant keeps its measured break-even.
                     // It computes in f16 (relative L2 ~1e-3 vs the f32
                     // reference) — a real precision/speed trade, hence opt-in.
-                    let variant_override = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL").ok();
+                    let variant_override =
+                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL").ok();
                     let variant = variant_override.clone().unwrap_or_else(|| {
-                        if gpu.arch.starts_with("gfx11")
+                        // Default batched speculative verify is measured on
+                        // exact gfx1100 only. Sibling gfx11 atoms keep WMMA
+                        // until measured; explicit HIPFIRE_FLASH_PREFILL_KERNEL
+                        // still selects batched on any arch.
+                        if gpu.arch.as_str() == "gfx1100"
                             && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
                         {
                             "batched".to_owned()
@@ -1695,14 +1723,26 @@ fn dispatch_attend(
                     });
                     // Explicit A/B route for speculative verify. Batched
                     // flash keeps all query rows in one tiled launch and
-                    // avoids the slower query-tiled WMMA path on gfx11.
+                    // avoids the slower query-tiled WMMA path on the measured
+                    // gfx1100 verify workload.
                     if variant == "batched" {
                         let fp = io.flash_partials.unwrap();
                         return hip!(gpu.attention_flash_q8_0_batched_masked(
-                            io.q, io.k_cache, io.v_cache, io.output, io.positions(),
-                            io.n_heads, io.n_kv_heads, io.head_dim,
-                            io.physical_cap, io.max_ctx_len, io.batch_size, fp,
-                            io.tree_bias, io.block_start, io.block_cols,
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                            io.max_ctx_len,
+                            io.batch_size,
+                            fp,
+                            io.tree_bias,
+                            io.block_start,
+                            io.block_cols,
                         ));
                     }
                     // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags

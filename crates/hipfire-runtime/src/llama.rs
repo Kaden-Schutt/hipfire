@@ -1144,6 +1144,41 @@ pub fn rotate_x_mq_batched_for(
     }
 }
 
+/// S3-f16-projection-inputs: AWQ-aware batched RMSNorm+FWHT rotation writing
+/// exact FP16 directly into `x_rot_f16`.
+///
+/// Mirrors [`fused_rmsnorm_rotate_mq_batched_for`], but the producer stores
+/// `(_Float16)` (bit-identical to the F32 producer followed by
+/// `convert_f32_to_f16`) and the caller feeds the result to the
+/// `*_wmma_f16` GEMM entries, which validate `DType::F16` and never run
+/// `ensure_fp16_x`. AWQ routing is identical: `next_linear` is the FIRST
+/// linear after the rotation (e.g. `layer.wqkv`, `layer.w_gate`, `layer.wq`);
+/// gate/up and Q/K/V share the same input tensor hence the same scale.
+pub fn fused_rmsnorm_rotate_mq_f16_batched_for(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    next_linear: &WeightTensor,
+    x_rot_f16: &GpuTensor,
+    k: usize,
+    eps: f32,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = next_linear.awq_scale.as_ref() {
+        gpu.fused_rmsnorm_rotate_mq_awq_f16_batched(
+            x,
+            norm_weight,
+            awq,
+            x_rot_f16,
+            k,
+            eps,
+            batch_size,
+        )
+    } else {
+        gpu.fused_rmsnorm_rotate_mq_f16_batched(x, norm_weight, x_rot_f16, k, eps, batch_size)
+    }
+}
+
 /// Phase A Stage A — F2: standalone AWQ-aware variant of
 /// `fused_silu_mul_rotate_mq`. The `down_proj_weight` is the downstream
 /// linear consuming x_rot (e.g. `w_down` / `down_proj`). When its
@@ -1182,6 +1217,28 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
         gpu.fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, x_rot, k, batch_size)
     } else {
         gpu.fused_silu_mul_rotate_mq_batched(gate, up, x_rot, k, batch_size)
+    }
+}
+
+/// S4-f16-residual-inputs: batched AWQ-aware `fused_silu_mul_rotate_mq`
+/// writing the frozen F16 sidecar directly (no F32 `x_rot`, no convert).
+/// The `down_proj_weight` selects the plain vs AWQ kernel exactly like
+/// [`fused_silu_mul_rotate_mq_batched_for`]; `x_rot_f16` must be DType::F16.
+///
+/// Byte-identical to the F32 producer followed by `convert_f32_to_f16`.
+pub fn fused_silu_mul_rotate_mq_f16_batched_for(
+    gpu: &mut Gpu,
+    down_proj_weight: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot_f16: &GpuTensor,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
+        gpu.fused_silu_mul_rotate_mq_awq_f16_batched(gate, up, awq, x_rot_f16, k, batch_size)
+    } else {
+        gpu.fused_silu_mul_rotate_mq_f16_batched(gate, up, x_rot_f16, k, batch_size)
     }
 }
 
@@ -8311,8 +8368,8 @@ mod tests {
         // shared `mqv2_wmma_batchable` rule; see
         // `qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12` for the admit side.
         for arch in [
-            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-            "gfx1010", "gfx1030", "gfx942",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1010",
+            "gfx1030", "gfx942",
         ] {
             assert!(
                 !is_batchable_la(DType::MQ4G256V2, arch),
@@ -8332,13 +8389,25 @@ mod tests {
         // gfx11/gfx12). Mirrors `qwen35_is_batchable_la_v2_family_gfx11_and_gfx12`
         // on the admit side.
         for arch in [
-            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-            "gfx1010", "gfx1030", "gfx942",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1010",
+            "gfx1030", "gfx942",
         ] {
-            assert!(!is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 fallback on {arch}");
-            assert!(!is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 fallback on {arch}");
-            assert!(!is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 fallback on {arch}");
-            assert!(!is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 fallback on {arch}");
+            assert!(
+                !is_batchable_la(DType::MQ6G256V2, arch),
+                "MQ6V2 fallback on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ5G256V2, arch),
+                "MQ5V2 fallback on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ3G256V2, arch),
+                "MQ3V2 fallback on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ2G256V2, arch),
+                "MQ2V2 fallback on {arch}"
+            );
         }
         assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
         assert_ne!(DType::MQ3G256, DType::MQ3G256V2);

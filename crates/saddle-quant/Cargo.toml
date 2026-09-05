@@ -7,10 +7,10 @@ license.workspace = true
 # Quantization-quality toolkit: artifact formats, calibration corpora,
 # activation statistics, KLD reference construction/scoring, and reduction.
 #
-# The format layer is deliberately GPU-free and dependency-light so that CI,
-# Python bindings, and any tool can link it. Anything needing a forward pass
-# (teacher oracle, candidate scoring) sits behind the `eval` feature, which is
-# the only thing that pulls hipfire-runtime.
+# Deliberately GPU-free and dependency-light so CI, Python bindings, and any
+# tool can link it without hipfire-runtime or a ROCm toolchain. Format,
+# calibration, stats, and host-side eval math are unconditional public API —
+# there is no optional feature gate and no runtime dependency.
 
 [features]
 default = []
