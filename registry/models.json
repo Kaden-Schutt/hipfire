@@ -579,7 +579,7 @@
       "repo": "hipfire-models/qwen3.8-27b-escha",
       "file": "qwen3.8-27b.escha",
       "size_gb": 10.77,
-      "min_vram_gb": 13,
+      "min_vram_gb": 15,
       "desc": "EschaLabs Escha-W2 2-bit trellis, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.8-27B (dense, arch 5). Default: MQ6 dense tensors, PPL 9.6753, 119 tok/s prefill, 12.1 decode. Measured on gfx1151: PPL on a fixed wikitext-2 slice, 1020 scored tokens. Beats qwen3.8-27b.mq3 on quality while being smaller; slower to decode than the plain MQ quants because it also decodes the trellis (~127 GB/s against their ~198)."
     },
     "qwen3.8:27b-escha-pro": {
@@ -620,7 +620,7 @@
       "repo": "hipfire-models/qwen3.8-27b-escha",
       "file": "qwen3.8-27b.escha-pro",
       "size_gb": 11.16,
-      "min_vram_gb": 13,
+      "min_vram_gb": 15,
       "desc": "EschaLabs Escha-W2 2-bit trellis, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.8-27B (dense, arch 5). Q8_0 dense tensors, the most faithful build: PPL 9.6486, 113 tok/s prefill, 10.8 decode. Measured on gfx1151: PPL on a fixed wikitext-2 slice, 1020 scored tokens. Beats qwen3.8-27b.mq3 on quality while being smaller; slower to decode than the plain MQ quants because it also decodes the trellis (~127 GB/s against their ~198)."
     },
     "qwen3.8:27b-escha-xt": {
@@ -661,7 +661,7 @@
       "repo": "hipfire-models/qwen3.8-27b-escha",
       "file": "qwen3.8-27b.escha-xt",
       "size_gb": 10.45,
-      "min_vram_gb": 12,
+      "min_vram_gb": 14,
       "desc": "EschaLabs Escha-W2 2-bit trellis, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.8-27B (dense, arch 5). MQ4V2 dense tensors, smallest and fastest: PPL 9.7242, 122 tok/s prefill, 12.3 decode. Measured on gfx1151: PPL on a fixed wikitext-2 slice, 1020 scored tokens. Beats qwen3.8-27b.mq3 on quality while being smaller; slower to decode than the plain MQ quants because it also decodes the trellis (~127 GB/s against their ~198)."
     },
     "qwen3.6:35b-a3b-mq3p": {
