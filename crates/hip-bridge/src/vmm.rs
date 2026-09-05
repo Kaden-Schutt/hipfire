@@ -253,10 +253,22 @@ impl VmmArena {
         // 4 KiB offsets (for example base+16 KiB). Reapplying access from the
         // reservation base over the contiguous mapped prefix is accepted and
         // also ensures newly-added peer devices gain access to older segments.
-        if let Err(err) = take_fault(VmmFaultKind::AccessReset).map_or_else(
-            || unsafe { hip.mem_set_access(self.base, next_mapped, &access) },
+        let access_result = take_fault(VmmFaultKind::AccessReset).map_or_else(
+            || {
+                let mut ranges: Vec<_> = self
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.mapped)
+                    .map(|segment| (segment.offset, segment.size))
+                    .collect();
+                ranges.push((self.mapped_bytes, size));
+                set_access_compat(self.base, next_mapped, &ranges, |ptr, bytes| unsafe {
+                    hip.mem_set_access(ptr, bytes, &access)
+                })
+            },
             Err,
-        ) {
+        );
+        if let Err(err) = access_result {
             let err = HipError {
                 code: err.code,
                 message: format!(
@@ -423,6 +435,37 @@ fn offset_ptr(base: *mut c_void, offset: usize) -> *mut c_void {
     unsafe { (base as *mut u8).add(offset) as *mut c_void }
 }
 
+/// Set access on a growing VMM arena across HIP implementations with opposite
+/// range quirks. Linux ROCm 7.2 may reject a valid non-zero subrange, while the
+/// Windows HIP SDK may reject a range spanning multiple physical mappings.
+/// Prefer the contiguous prefix, then retry each physical mapping only when
+/// the prefix is rejected as an invalid argument.
+fn set_access_compat(
+    base: *mut c_void,
+    prefix_bytes: usize,
+    ranges: &[(usize, usize)],
+    mut set_access: impl FnMut(*mut c_void, usize) -> HipResult<()>,
+) -> HipResult<()> {
+    match set_access(base, prefix_bytes) {
+        Ok(()) => Ok(()),
+        Err(prefix_err) if prefix_err.code == 1 && ranges.len() > 1 => {
+            for &(offset, size) in ranges {
+                set_access(offset_ptr(base, offset), size).map_err(|segment_err| {
+                    HipError::new(
+                        segment_err.code,
+                        &format!(
+                            "{segment_err}; VMM access prefix was rejected ({prefix_err}); \
+                             per-mapping fallback failed at offset={offset} size={size}"
+                        ),
+                    )
+                })?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn round_up(value: usize, alignment: usize) -> HipResult<usize> {
     if alignment == 0 {
         return Err(HipError::new(0, "VMM alignment must be greater than zero"));
@@ -483,6 +526,44 @@ fn cleanup_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_falls_back_to_each_mapping_when_prefix_is_rejected() {
+        let base = 0x4408_0000_00usize as *mut c_void;
+        let ranges = [(0, 2 * 1024 * 1024), (2 * 1024 * 1024, 2 * 1024 * 1024)];
+        let mut calls = Vec::new();
+        set_access_compat(base, 4 * 1024 * 1024, &ranges, |ptr, size| {
+            calls.push((ptr as usize, size));
+            if calls.len() == 1 {
+                Err(HipError::new(1, "invalid argument"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            calls,
+            vec![
+                (base as usize, 4 * 1024 * 1024),
+                (base as usize, 2 * 1024 * 1024),
+                (base as usize + 2 * 1024 * 1024, 2 * 1024 * 1024),
+            ]
+        );
+    }
+
+    #[test]
+    fn access_does_not_mask_non_argument_failures() {
+        let base = 0x1000usize as *mut c_void;
+        let mut calls = 0;
+        let err = set_access_compat(base, 0x2000, &[(0, 0x1000), (0x1000, 0x1000)], |_, _| {
+            calls += 1;
+            Err(HipError::new(999, "driver failure"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(err.code, 999);
+    }
 
     fn segment(mapped: bool) -> VmmSegment {
         VmmSegment {
