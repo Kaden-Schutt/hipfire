@@ -325,6 +325,16 @@ pub enum DType {
     /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
     /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
     MQ3G256V2,
+    /// Escha-W2 trellis, K=2, 16x16 tile, cbA hash codebook (hfq qt=42, 2.00 bpw).
+    /// Weights are stored in the ROTATED domain — a 128-point unnormalised
+    /// Walsh-Hadamard is applied to activations on BOTH sides of the matmul
+    /// (see `RotationPlan::EschaH128`). Reaching an unrotated Plain GEMV with
+    /// this dtype produces fluent-looking but silently wrong output, not a
+    /// crash — see `dtype_rotation_plan` / `KernelKey::for_gemv`.
+    Escha2T16,
+    /// Escha-W2 trellis, K=3, 16x16 tile, cbA hash codebook (hfq qt=43, 3.00 bpw).
+    /// Same rotated-domain contract as `Escha2T16`.
+    Escha3T16,
     /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
     /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
@@ -431,6 +441,8 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL
             | DType::MQ3G256GL
+            | DType::Escha2T16
+            | DType::Escha3T16
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::MFP4G32Lloyd
@@ -1330,6 +1342,7 @@ impl Gpu {
                 mq_x_scales: None,
                 mq_rmsnorm_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                escha_prefill: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -3014,6 +3027,25 @@ impl Gpu {
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
 
+    /// Model-global Escha-W2 batched-prefill routed scratch, allocated on
+    /// first use and grown on demand. See
+    /// [`crate::scratch::EschaPrefillScratch`].
+    /// Returns VIEWS by value, not a borrow: the caller launches kernels
+    /// through `&mut Gpu` immediately afterwards, so a borrow of
+    /// `self.scratch` could not survive.
+    pub fn ensure_escha_prefill_scratch(
+        &mut self,
+        slots: usize,
+        hidden: usize,
+        mi: usize,
+    ) -> HipResult<crate::scratch::EschaPrefillViews> {
+        // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
+        Ok(self
+            .scratch
+            .ensure_escha_prefill(&self.hip, self.device_id, slots, hidden, mi)?
+            .views(slots))
+    }
+
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let numel: usize = shape.iter().product();
@@ -4352,6 +4384,27 @@ impl Gpu {
             _ => {}
         }
 
+        // Escha-W2 tile decode: standalone utility, not gated on weight_quant
+        // (it runs ahead of the normal GEMV dispatch to materialize bare fp16
+        // weights from the packed trellis code).
+        specs.push((
+            "escha_decode_tiles",
+            kernels::ESCHA_DECODE_TILES_SRC.to_string(),
+        ));
+        specs.push(("escha_h128", kernels::ESCHA_H128_SRC.to_string()));
+        specs.push((
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC.to_string(),
+        ));
+        specs.push((
+            "escha_moe_gemv_k8_indexed",
+            kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC.to_string(),
+        ));
+        specs.push((
+            "escha_moe_gemv_native",
+            kernels::ESCHA_MOE_GEMV_NATIVE_SRC.to_string(),
+        ));
+
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
         specs.push((
@@ -4680,6 +4733,36 @@ impl Gpu {
                     "sample_apply_repeat_penalty_fast65",
                     "sample_topk_partial_fast65",
                     "sample_topk_finalize_fast65",
+                ],
+                // Escha-W2 (Tasks 8/10): two multi-entry modules whose module
+                // name is NOT a symbol. Without these arms the `other =>
+                // vec![other]` default asks hipModuleGetFunction for a symbol
+                // named "escha_h128" / "escha_bare_to_outmajor", which does not
+                // exist, and the whole precompile batch fails.
+                "escha_h128" => vec![
+                    "escha_h128_in",
+                    "escha_h128_out",
+                    "escha_h128_in_batched",
+                    "escha_h128_out_batched",
+                    "escha_swiglu_batched",
+                ],
+                "escha_bare_to_outmajor" => vec![
+                    "escha_bare_to_q8_0",
+                    "escha_bare_to_f32",
+                    "escha_bare_to_f16",
+                ],
+                "escha_moe_gemv_k8_indexed" => vec![
+                    "escha_gemv_q8_0_moe_k8_indexed_batched",
+                    "escha_gemv_q8_0_wide_moe_k8_indexed_batched",
+                    "escha_round_weights_f16_rne",
+                ],
+                "escha_moe_gemv_native" => vec![
+                    "escha_gemv_native_k2_moe_k8_indexed_batched",
+                    "escha_gemv_native_k3_moe_k8_indexed_batched",
+                    "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
+                    "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
+                    "escha_gemv_f16_moe_k8_indexed_batched",
+                    "escha_gemv_f16_wide_moe_k8_indexed_batched",
                 ],
                 other => vec![other],
             };

@@ -88,6 +88,25 @@ pub struct MoeDtypes {
     pub per_expert_gate_up: Option<Vec<DType>>,
     /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
     pub per_expert_down: Option<Vec<DType>>,
+    /// This layer's routed experts came from an Escha-W2 checkpoint AND the
+    /// per-expert H128 transform tables are resident, so the escha routed
+    /// executor (`crate::pipeline::escha`) can run them.
+    ///
+    /// It is a separate flag rather than a dtype because the escha loader
+    /// decodes the trellis at load time and materialises the experts as
+    /// `Q8_0`: by the time dispatch sees the layer, NO routed dtype says
+    /// "escha" any more (that is exactly what `has_escha_experts` can no
+    /// longer see). The model sets it from `MoeFfnWeights.escha.is_some()` —
+    /// the same single source of truth that populates `MoeParams::escha`.
+    ///
+    /// It gates `routed_indexable_escha_q8`. Scoping the Q8_0 indexed arm to
+    /// escha, rather than admitting `Q8_0` routed experts in general, is
+    /// deliberate in BOTH directions: escha's indexed route is a different
+    /// executor (it wraps every GEMV in the H128 pair) that a plain-Q8_0 MoE
+    /// model must not be pulled onto, and a plain-Q8_0 MoE model must equally
+    /// not be pulled onto the generic indexed body on the strength of an arm
+    /// added for escha's benefit.
+    pub routed_escha_transforms: bool,
 }
 
 impl MoeDtypes {
@@ -103,6 +122,30 @@ impl MoeDtypes {
         // V1 (qt14) and V2 (qt47) are both 6-bit FWHT projections that trip
         // the gfx1151 MQ4-i8 grouped fence via `force_mq4_grouped_fp16`.
         .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
+    }
+
+    /// True iff this layer's routed experts carry an Escha-W2 dtype
+    /// (`Escha2T16` gate_up / `Escha3T16` down, today's only pairing —
+    /// checked on both `routed_*` and, defensively, any per-expert tier
+    /// table, in case a future graded-tier layer mixes escha in). Drives
+    /// the escha-only router-logits f16 round-trip in `run_moe_decode`
+    /// (see `kernels/src/router_logits_round_f16_rne.hip`): EschaLabs'
+    /// runtime rounds router logits to f16 before top-k, hipfire keeps them
+    /// F32 end-to-end everywhere else, and this flag scopes the rounding to
+    /// exactly the models that need to match Escha's f16 selection —
+    /// `qwen3.6:35b-a3b-*` and every other arch-6 SKU must stay bit-exact.
+    pub fn has_escha_experts(&self) -> bool {
+        let is_escha = |dt: DType| matches!(dt, DType::Escha2T16 | DType::Escha3T16);
+        is_escha(self.routed_gate_up)
+            || is_escha(self.routed_down)
+            || self
+                .per_expert_gate_up
+                .as_ref()
+                .is_some_and(|v| v.iter().copied().any(is_escha))
+            || self
+                .per_expert_down
+                .as_ref()
+                .is_some_and(|v| v.iter().copied().any(is_escha))
     }
 }
 
@@ -180,6 +223,27 @@ pub struct MoeResolution {
     /// gate_up and down. Binds the same indexed MQ2-Lloyd kernels as qt19 but
     /// consumes x in the natural basis (`needs_x_rot_local == false`).
     pub routed_indexable_mq2lloyd_u: bool,
+    /// Escha-W2 routed experts (Q8_0 on both projections, H128 transform
+    /// tables resident). Admits the layer to GPU-resident top-K ONLY — the
+    /// routed body it reaches is `pipeline::escha::escha_routed_decode_indexed`,
+    /// never the generic indexed body, which has no escha awareness. See the
+    /// arm in `resolve_arch` and `pipeline::check_moe_decode_supported`.
+    pub routed_indexable_escha_q8: bool,
+    /// Escha-W2 routed experts stored as the TRELLIS CODE (`Escha2T16` /
+    /// `Escha3T16` on either projection, H128 transform tables resident) — the
+    /// Phase-2 production shape. Admits the layer to exactly the same place
+    /// [`Self::routed_indexable_escha_q8`] does: GPU-resident top-K, reaching
+    /// `pipeline::escha::escha_routed_decode_indexed` and never the generic
+    /// indexed body.
+    ///
+    /// It is a SEPARATE flag rather than a widened `routed_indexable_escha_q8`
+    /// because the two select different GEMVs — the code arm dispatches
+    /// `escha_gemv_native_*` with a trellis order taken from each projection's
+    /// own dtype, the Q8_0 arm dispatches the block-decode kernels. A single
+    /// flag would leave the executor guessing from the dtype anyway, and the
+    /// fail-closed guard would no longer be able to say WHICH shape it
+    /// admitted.
+    pub routed_indexable_escha_native: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
     /// True when a per-expert tier table is `Some` AND contains >1 distinct
@@ -291,6 +355,44 @@ impl MoeResolution {
             && routed_gate_up_e8
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
+        // Escha-W2. The routed experts are the Q8_0 the trellis decoded into,
+        // BOTH projections, and the layer carries the H128 transform tables.
+        //
+        // This arm does NOT admit the layer to the generic indexed routed body
+        // below — escha weights are in a rotated domain and that body would
+        // omit both Hadamard transforms, producing finite, fluent, ~1e-1-wrong
+        // output. What it admits is GPU-resident top-K: `run_moe_decode`
+        // branches to `pipeline::escha::escha_routed_decode_indexed` (which
+        // keeps the H128 pair) before the generic body, and
+        // `check_moe_decode_supported` refuses any escha layer that arrives on
+        // the indexed path WITHOUT those tables.
+        //
+        // Q8_0 is required on both sides for the same reason every other
+        // uniform arm requires it: the indexed GEMV decodes a 34 B/32-element
+        // block layout, and handing it a different container is silent
+        // corruption, not a fault.
+        let routed_indexable_escha_q8 =
+            d.routed_escha_transforms && d.routed_gate_up == Q8_0 && d.routed_down == Q8_0;
+
+        // Escha-W2, Phase 2: the routed experts are the TRELLIS CODE itself and
+        // the fused GEMV decodes it in-register. Everything the Q8_0 arm above
+        // says applies unchanged — this admits GPU-resident top-K only, and the
+        // executor it reaches is still `escha_routed_decode_indexed` with its
+        // H128 pair, never the generic indexed body.
+        //
+        // Either escha dtype is accepted on either projection rather than
+        // hard-coding today's (K=2 gate_up, K=3 down) pairing: the trellis
+        // order is a per-projection property that the executor reads back off
+        // the SAME dtype to pick the kernel, so a file that allocated the bits
+        // the other way round is served correctly instead of being silently
+        // refused. What is NOT accepted is a mix with any other container —
+        // the fused kernel's bit geometry is the format's, and handing it
+        // anything else is silent corruption rather than a fault.
+        let is_escha_code = |dt: DType| matches!(dt, Escha2T16 | Escha3T16);
+        let routed_indexable_escha_native = d.routed_escha_transforms
+            && is_escha_code(d.routed_gate_up)
+            && is_escha_code(d.routed_down);
+
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq4v2
             || routed_indexable_mq5
@@ -303,7 +405,9 @@ impl MoeResolution {
             || routed_indexable_mq3lloyd
             || routed_indexable_mixed_lloyd
             || routed_indexable_paro
-            || routed_indexable_e8;
+            || routed_indexable_e8
+            || routed_indexable_escha_q8
+            || routed_indexable_escha_native;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
@@ -361,6 +465,8 @@ impl MoeResolution {
             routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
+            routed_indexable_escha_q8,
+            routed_indexable_escha_native,
             use_gpu_topk,
             needs_x_rot_local,
             mixed,
@@ -484,6 +590,32 @@ pub struct MoeParams<'a> {
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
     pub down_expanded: &'a GpuTensor,
+
+    /// Escha-W2 (Task 10): per-layer H128 transform tables + the phase
+    /// scratch the batched routed executor needs. `Some` only for layers
+    /// loaded from an Escha-W2 checkpoint; `None` leaves every other model
+    /// byte-identical.
+    ///
+    /// This is ALSO the escha marker `MoeDtypes::has_escha_experts` can no
+    /// longer be: the loader decodes the trellis at load time and stores the
+    /// experts as `Q8_0`, so by the time dispatch sees the layer no routed
+    /// dtype says "escha" any more. See [`MoeParams::has_escha`].
+    pub escha: Option<crate::pipeline::escha::EschaRoutedRefs<'a>>,
+}
+
+impl MoeParams<'_> {
+    /// True iff this layer must take escha semantics — the f16 router-logit
+    /// round-trip and the H128-wrapped routed executor.
+    ///
+    /// Two sources, deliberately OR-ed: `dtypes.has_escha_experts()` still
+    /// catches a layer whose routed dtype is literally `Escha2T16`/`Escha3T16`
+    /// (what a future on-the-fly-decode GEMV would present), and
+    /// `escha.is_some()` catches today's shape, where the loader has already
+    /// materialised the experts as `Q8_0` and only the transform tables
+    /// remain as evidence.
+    pub fn has_escha(&self) -> bool {
+        self.dtypes.has_escha_experts() || self.escha.is_some()
+    }
 }
 
 // ── DeepSeek-V4 bias-aware decode parameters ───────────
@@ -809,6 +941,37 @@ pub struct MoePrefillParams<'a> {
     /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
     /// byte-identical to pre-EP behavior.
     pub routed_out: Option<&'a GpuTensor>,
+    /// Escha-W2 transform tables for this layer. `Some` iff the layer's routed
+    /// experts are escha-coded AND the indexed route is enabled — the same
+    /// marker `MoePrefillDtypes::escha` gates admission on, so a layer cannot
+    /// be admitted to batched prefill and then arrive here without the tables
+    /// the executor needs. `None` for every other model: the escha branch in
+    /// [`crate::pipeline::run_moe_prefill`] is skipped entirely and Path 1 /
+    /// Path 2 run exactly as they do today.
+    ///
+    /// Only the FOUR `[E, ·]` transform tables are read — the `[k]`-sized
+    /// decode scratch fields of `EschaRoutedRefs` are ignored here, because
+    /// batched prefill uses the model-global `[n_tokens × k]` scratch from
+    /// `Gpu::ensure_escha_prefill_scratch` instead.
+    pub escha: Option<crate::pipeline::escha::EschaRoutedRefs<'a>>,
+    /// UNGATED marker: this layer's routed experts are escha-coded, full stop.
+    ///
+    /// Set from `ffn.escha.is_some()` alone — never ANDed with
+    /// `escha_indexed_route_enabled()` or any other env lever. That is the
+    /// whole point of the field: [`escha`](Self::escha) above IS gated, so
+    /// `escha.is_none()` cannot distinguish "not an escha layer" from "an
+    /// escha layer with the indexed route switched off", and the second of
+    /// those must never be allowed to run Path 1 / Path 2.
+    ///
+    /// Consumed by `pipeline::check_moe_prefill_supported`, which refuses
+    /// `layer_is_escha && escha.is_none()` before any GPU work. `false` for
+    /// every non-escha model, where the check is a no-op.
+    pub layer_is_escha: bool,
+    /// Model hidden size. Decode's `MoeParams` already carries this; prefill
+    /// did not need it until the escha branch, whose H128 transforms are sized
+    /// by it (`down_m` happens to equal it, but relying on that coincidence is
+    /// how a shape bug gets written).
+    pub hidden: usize,
 }
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
@@ -1053,6 +1216,7 @@ mod tests {
             has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
+            routed_escha_transforms: false,
         }
     }
 

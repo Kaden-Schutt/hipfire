@@ -14,6 +14,7 @@ use super::config::Qwen35Config;
 use super::config::TreeVerifyCtx;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
+use super::forward::forward_scratch_opts;
 use super::forward::forward_scratch_with_hidden;
 use super::forward::kv_cache_attention_dispatch;
 use super::forward::moe_ffn_has_mq3_experts_uniform;
@@ -100,7 +101,6 @@ fn dispatch_batched_gemm_epilogue(
     let is_mq3 = matches!(w.gpu_dtype, DType::MQ3G256);
     let is_fp4 = matches!(w.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let is_q8 = matches!(w.gpu_dtype, DType::Q8_0);
-    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     match epilogue {
         BatchEpilogue::Residual => {
             if is_6bit {
@@ -128,11 +128,11 @@ fn dispatch_batched_gemm_epilogue(
                     k,
                     n,
                 );
-            } else if is_q8 || is_lowbit {
+            } else if is_unfused_plain_gemm_dtype(w.gpu_dtype) {
                 let scratch = pbs.x_rot_batch.sub_offset(0, n * m);
                 run_plain_gemm_key(
                     gpu,
-                    plain_gemm_key_for(w.gpu_dtype),
+                    plain_gemm_key_for(w.gpu_dtype)?,
                     &w.buf,
                     w.gpu_dtype,
                     input,
@@ -221,10 +221,10 @@ fn dispatch_batched_gemm_epilogue(
                     k,
                     n,
                 );
-            } else if is_q8 || is_lowbit {
+            } else if is_unfused_plain_gemm_dtype(w.gpu_dtype) {
                 return run_plain_gemm_key(
                     gpu,
-                    plain_gemm_key_for(w.gpu_dtype),
+                    plain_gemm_key_for(w.gpu_dtype)?,
                     &w.buf,
                     w.gpu_dtype,
                     input,
@@ -349,6 +349,13 @@ const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
 /// Exact `gfx1201` only — not gfx1200 or other gfx12 variants.
 const PREFILL_DEFAULT_BATCH_GFX1201: usize = 384;
 
+/// gfx1151-measured default prefill chunk size (Strix Halo).
+///
+/// Measured on the native escha 27B at an 8k prompt: 256 -> 52 tok/s,
+/// **512 -> 73 tok/s**, 1024 -> 69 tok/s. gfx1151 had been falling through to
+/// the generic 256 and leaving 40% of prefill on the table.
+const PREFILL_DEFAULT_BATCH_GFX1151: usize = 512;
+
 /// Architecture default for prefill chunk size when
 /// `HIPFIRE_PREFILL_MAX_BATCH` is unset or invalid.
 #[inline]
@@ -357,6 +364,8 @@ fn prefill_max_batch_for_arch(arch: &str) -> usize {
         PREFILL_DEFAULT_BATCH_GFX1100
     } else if arch == "gfx1201" {
         PREFILL_DEFAULT_BATCH_GFX1201
+    } else if arch == "gfx1151" {
+        PREFILL_DEFAULT_BATCH_GFX1151
     } else {
         PREFILL_MAX_BATCH
     }
@@ -1188,7 +1197,16 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // One-shot: mark this forward AR-graph-eligible iff it's plain
                 // single-token decode (consumed inside forward_scratch).
                 gpu.graphs.ar_graph_eligible = plain_ar_graph_eligible;
-                forward_scratch(
+                // Only the LAST token's logits survive this loop — every
+                // earlier token's are overwritten by the next iteration and
+                // never read. Skipping the lm_head for them is not a
+                // shortcut, it deletes work that has no consumer: measured
+                // 2.32 ms of a 24.55 ms escha-35b prefill token (508 MB of
+                // weight traffic at vocab 248 320), 9.5 % of prefill, on
+                // every token but one. `scratch.tmp` (post-output-norm
+                // hidden) is still written, so the `per_token_hidden_out`
+                // copy below is unaffected.
+                forward_scratch_opts(
                     gpu,
                     weights,
                     config,
@@ -1197,6 +1215,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     kv_cache,
                     dn_state,
                     scratch,
+                    i + 1 == tokens.len(),
                 )?;
             }
             if let Some(dst) = per_token_hidden_out {
@@ -1343,14 +1362,99 @@ fn forward_prefill_batch_with_pbs_opts_inner(
 ///
 /// Q8 keeps the chunked kernel it already used, so this is behaviour-preserving
 /// for every existing model; the low-bit formats route to their tiled prefill
-/// GEMMs. They share the Q8 call sites deliberately: none of the three has a
-/// fused qkvza/gate_up/qkv kernel, so all three want the same unfused strategy.
-fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
+/// GEMMs. They share the Q8 call sites deliberately: none of the four has a
+/// fused qkvza/gate_up/qkv kernel, so all four want the same unfused strategy.
+///
+/// # Why this is an EXHAUSTIVE match that errors, not a `_ =>` guess
+///
+/// This used to end in `_ => GemmQ8_0BatchedChunked`. That default is a
+/// silent-corruption hazard, and it became reachable the moment
+/// [`is_batchable_la`] admitted `F16`: a Q8_0 GEMM walks 34-byte blocks of
+/// 32 int8 plus an f16 scale, so pointing it at a plain f16 weight matrix
+/// reads the wrong stride and produces finite, fluent, wrong output with
+/// nothing to catch it — the exact failure class this port keeps finding.
+/// An unrecognised dtype is now a hard error at the dispatch boundary, which
+/// surfaces as a refused batched prefill (the caller falls back per-token)
+/// rather than as bad tokens.
+///
+/// `F16 => GemmF16WmmaMb8` is the escha arm: `linear_attn.in_proj_a` /
+/// `in_proj_b` (`w_alpha` / `w_beta`) are stored at qt=1 = F16 and load
+/// native. `gemm_f16_wmma_mb8` takes an F16 weight against an F32 activation
+/// and was already the E8 shared-expert batched GEMM, so the kernel is
+/// shipped and exercised on gfx11.
+fn plain_gemm_key_for(dt: DType) -> HipResult<hipfire_dispatch::types::KernelKey> {
     use hipfire_dispatch::types::KernelKey as K;
     match dt {
-        DType::TQ2G128 => K::GemmTQ2G128Prefill,
-        DType::BQ1G128 => K::GemmBQ1G128Prefill,
-        _ => K::GemmQ8_0BatchedChunked,
+        DType::TQ2G128 => Ok(K::GemmTQ2G128Prefill),
+        DType::BQ1G128 => Ok(K::GemmBQ1G128Prefill),
+        DType::F16 => Ok(K::GemmF16WmmaMb8),
+        DType::Q8_0 => Ok(K::GemmQ8_0BatchedChunked),
+        other => Err(HipError::new(
+            0,
+            &format!(
+                "plain_gemm_key_for: no batched plain-GEMM kernel for {other:?}. \
+                 This dispatcher used to fall through to GemmQ8_0BatchedChunked for \
+                 any unknown dtype, which reads non-Q8_0 bytes at a Q8_0 stride — \
+                 add an explicit arm (and admit the dtype in is_batchable_la in the \
+                 SAME change) rather than restoring the default."
+            ),
+        )),
+    }
+}
+
+/// Weight dtypes the batched-prefill matchers serve with the UNFUSED,
+/// per-weight [`run_plain_gemm_key`] strategy — exactly the set
+/// [`plain_gemm_key_for`] resolves.
+///
+/// Keep the two in lockstep. A dtype admitted here with no arm there errors at
+/// the dispatch boundary (safe: the layer refuses and prefill falls back
+/// per-token). A dtype with an arm there but missing here falls through to a
+/// FUSED matcher instead, which assumes one shared stride across all of a
+/// layer's projections — that direction is silent corruption, so this predicate
+/// is the one that must be widened first.
+#[inline]
+pub(crate) fn is_unfused_plain_gemm_dtype(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::Q8_0 | DType::TQ2G128 | DType::BQ1G128 | DType::F16
+    )
+}
+
+/// Runtime precondition of the fused Q8_0 QKVZA / QKV / gate+up kernels: every
+/// weight the ONE launch reads must actually be Q8_0.
+///
+/// These matchers key their arm selection on a single representative weight
+/// (`wqkv`, `wq`, `w_gate`) and used to guard the rest with a `debug_assert!`,
+/// which is compiled out of a release build. That was unreachable only because
+/// `is_batchable_la` refused F16 up front; escha-35b stores `w_alpha` / `w_beta`
+/// as F16 beside a Q8_0 `wqkv`, so admitting F16 makes a Q8_0-strided read of
+/// F16 bytes reachable in release — finite, fluent, wrong. A false here sends
+/// the layer down the per-weight `run_plain_gemm_key` path instead, which reads
+/// each weight at its own stride.
+#[inline]
+pub(crate) fn all_q8_0(dtypes: &[DType]) -> bool {
+    dtypes.iter().all(|dt| matches!(dt, DType::Q8_0))
+}
+
+/// The same precondition as [`all_q8_0`], for the arms whose representative
+/// weight is an MQ-family container rather than Q8_0: every weight the ONE
+/// fused launch reads must share the container the arm was selected from.
+///
+/// `all_q8_0` was added because escha-35b stores `w_alpha` / `w_beta` as F16
+/// beside a Q8_0 `wqkv`. It fixed the Q8_0 arms and left the MQ arms — which
+/// select on `layer.wqkv.gpu_dtype` alone in exactly the same way — still able
+/// to read those F16 siblings at MQ stride.
+///
+/// Measured before this guard existed, down-quantising ONLY `in_proj_qkv` on
+/// escha-35b and scoring against the untouched build: KLD 12.63, PPL
+/// 2,375,141 against a 7.68 baseline. Identical under MQ6G256, MQ6G256V2 and
+/// MQ4G256V2, while `out_proj` — the one GDN projection not in the fused
+/// launch — was unaffected at KLD 0.0076. Finite, fluent and wrong, which is
+/// the signature this guard family exists to prevent.
+pub(crate) fn all_same_dtype(dtypes: &[DType]) -> bool {
+    match dtypes.split_first() {
+        Some((head, rest)) => rest.iter().all(|dt| dt == head),
+        None => true,
     }
 }
 
@@ -1395,8 +1499,56 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32
+        // Escha-W2 trellis codes. Admissible NOT because any batched GEMM can
+        // read them — none can — but because the escha arms added to the LA
+        // and FFN chunk functions intercept BEFORE those matchers and run
+        // `EschaProj::forward` for the whole batch instead. Refusing here
+        // would drop the layer to the per-token path, which is what made a
+        // native 27B prefill at 11.7 tok/s against a decode of 11.0: prefill
+        // was doing decode's work once per token.
+        | DType::Escha2T16 | DType::Escha3T16
     );
     if always_ok {
+        return true;
+    }
+
+    // F16 dense projections (Escha-W2 blocker 1), WMMA arches only.
+    //
+    // escha-35b stores `linear_attn.in_proj_a` / `in_proj_b` (w_alpha /
+    // w_beta) at qt=1 = F16 and the default `f16_lm_head_mode` is Native, so
+    // they load as DType::F16 beside a Q8_0 wqkv/wz/wo. Refusing F16 here
+    // refused 30 of escha's 40 layers BEFORE the MoE predicate was ever
+    // consulted, which is what pinned prefill to the per-token fallback.
+    //
+    // Admitting it is only safe because the SAME change (a) gave
+    // `plain_gemm_key_for` an explicit `F16 => GemmF16WmmaMb8` arm and turned
+    // its `_ =>` default from GemmQ8_0BatchedChunked into an error, and (b)
+    // converted the fused-QKVZA / QKV / gate+up `debug_assert!` stride guards
+    // into runtime `all_q8_0` predicates, so a layer that mixes Q8_0 and F16
+    // takes the per-weight unfused path instead of one fused launch at the
+    // wrong stride. See the all-together rule in
+    // docs/plans/mq-lloyd-batched-prefill-followup.md.
+    //
+    // Arch-gated rather than `always_ok` on purpose: the only batched F16 GEMM
+    // is `gemm_f16_wmma_mb8`, which hard-errors without wave32 WMMA. Admitting
+    // a layer whose dispatch then errors is NOT a graceful fallback — the
+    // chunk propagates the error out of `forward_prefill_batch` — so a
+    // non-WMMA arch must be refused HERE, where refusal means "keep taking the
+    // per-token path you take today". Same arch set as the MQ3/FP4 WMMA arms.
+    let f16_with_wmma = matches!(dt, DType::F16)
+        && matches!(
+            arch,
+            "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+                | "gfx1200"
+                | "gfx1201"
+        );
+    if f16_with_wmma {
         return true;
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
@@ -1837,7 +1989,24 @@ pub fn qwen35_layer_batch_admissible(
                 arch,
             );
             if !moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch) {
-                return Err(HipError::new(0, "DeltaNetMoe moe_ffn not batch-admissible"));
+                // Name the dtypes. "not batch-admissible" alone sends the
+                // reader to a 180-line predicate; the six dtypes it keys on
+                // identify the missing arm directly.
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "DeltaNetMoe moe_ffn not batch-admissible: router={:?} \
+                         shared_gate={:?} shared=({:?},{:?},{:?}) routed=({:?},{:?}) escha={}",
+                        l.ffn.router.gpu_dtype,
+                        l.ffn.shared_expert_gate.gpu_dtype,
+                        l.ffn.shared_expert.gate.gpu_dtype,
+                        l.ffn.shared_expert.up.gpu_dtype,
+                        l.ffn.shared_expert.down.gpu_dtype,
+                        l.ffn.experts.first().map(|e| e.gate_up.gpu_dtype),
+                        l.ffn.experts.first().map(|e| e.down.gpu_dtype),
+                        l.ffn.escha.is_some(),
+                    ),
+                ));
             }
             Ok(())
         }
@@ -1907,7 +2076,24 @@ pub fn qwen35_layer_batch_admissible(
                 arch,
             );
             if !moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch) {
-                return Err(HipError::new(0, "FullAttnMoe moe_ffn not batch-admissible"));
+                // Name the dtypes. "not batch-admissible" alone sends the
+                // reader to a 180-line predicate; the six dtypes it keys on
+                // identify the missing arm directly.
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "FullAttnMoe moe_ffn not batch-admissible: router={:?} \
+                         shared_gate={:?} shared=({:?},{:?},{:?}) routed=({:?},{:?}) escha={}",
+                        l.ffn.router.gpu_dtype,
+                        l.ffn.shared_expert_gate.gpu_dtype,
+                        l.ffn.shared_expert.gate.gpu_dtype,
+                        l.ffn.shared_expert.up.gpu_dtype,
+                        l.ffn.shared_expert.down.gpu_dtype,
+                        l.ffn.experts.first().map(|e| e.gate_up.gpu_dtype),
+                        l.ffn.experts.first().map(|e| e.down.gpu_dtype),
+                        l.ffn.escha.is_some(),
+                    ),
+                ));
             }
             Ok(())
         }
@@ -2021,6 +2207,17 @@ struct MoePrefillDtypes {
     /// fails admission and silently drops to the per-token prefill fallback (the
     /// merged kernel never fires — observed as ~decode-speed prefill).
     routed_mixed_merged: bool,
+    /// This layer's routed experts are Escha-W2 coded: the H128 transform
+    /// tables are resident (`MoeFfnWeights::escha`) AND the indexed
+    /// (device-resident top-K) route is enabled.
+    ///
+    /// Both halves matter. The tables are what make the H128 pair callable at
+    /// all; the indexed route is what the batched prefill executor mirrors —
+    /// there is no batched analogue of the CPU-top-K host route, so under
+    /// `HIPFIRE_ESCHA_INDEXED=0` this stays false and escha prefills per-token
+    /// exactly as it did before, keeping that env var a genuine A/B of two
+    /// working routes rather than a half-disabled state.
+    escha: bool,
 }
 
 impl MoePrefillDtypes {
@@ -2037,6 +2234,7 @@ impl MoePrefillDtypes {
             expert_gate_up_uniform: true,
             expert_down_uniform: true,
             routed_mixed_merged: false,
+            escha: false,
         }
     }
 
@@ -2058,6 +2256,7 @@ impl MoePrefillDtypes {
                 expert_gate_up_uniform: global.iter().all(|(g, _)| *g == first.0),
                 expert_down_uniform: global.iter().all(|(_, d)| *d == first.1),
                 routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
+                escha: ffn.escha.is_some() && super::escha::escha_indexed_route_enabled(),
             });
         }
         let first = ffn.experts.first()?;
@@ -2078,6 +2277,7 @@ impl MoePrefillDtypes {
                 .iter()
                 .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
             routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
+            escha: ffn.escha.is_some() && super::escha::escha_indexed_route_enabled(),
         })
     }
 }
@@ -2197,13 +2397,25 @@ fn moe_ffn_batched_admissible_for_dtypes(
     admit_e8: bool,
     admit_codebook: bool,
 ) -> bool {
+    // F16 (Escha-W2 blocker 2). `mlp.gate.weight` and
+    // `mlp.shared_expert_gate.weight` are F16 on escha-35b, and these are the
+    // FIRST two checks in this predicate — so the routed arms below were never
+    // even reached for an escha layer. Both are small ([n_exp, dim] and
+    // [1, dim]) and dispatch through `GemmF16WmmaMb8` against the UN-rotated
+    // `x_norm_batch`, matching the Q8_0 convention (F16 weights are dense and
+    // unrotated, so they are quantised against the unrotated activation).
+    //
+    // Every arm below is unchanged, so a model whose router / scalar gate is
+    // already MQ4 / MQ4V2 / Q8_0 / F32 keeps exactly the admission decision it
+    // has today. The only models this widens are ones REFUSED today, which by
+    // definition prefill per-token and cannot regress.
     let router_ok = matches!(
         dtypes.router,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32 | DType::F16
     );
     let shared_gate_ok = matches!(
         dtypes.shared_expert_scalar_gate,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32 | DType::F16
     );
     // Graded (mixed-dtype) routed experts are served by the merged grouped-WMMA
     // prefill kernel, so the per-expert *uniform* requirement is waived for the
@@ -2234,6 +2446,51 @@ fn moe_ffn_batched_admissible_for_dtypes(
             || (admit_mq6
                 && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
         return shared_gu_ok && shared_dn_ok;
+    }
+
+    // ── Escha-W2 routed experts (blocker 3) ──────────────────────────────
+    //
+    // The routed experts are the Q8_0 the trellis decoded into, on BOTH
+    // projections, and the layer carries the H128 transform tables. This is
+    // the prefill twin of `MoeResolution::routed_indexable_escha_q8`, and it
+    // admits the layer to ONE executor only: `escha_routed_prefill_indexed`,
+    // reached through the escha branch at the top of `run_moe_prefill`. It
+    // must never reach the generic Path 1 / Path 2 routed bodies, which know
+    // nothing about the Hadamard domain escha weights live in and would emit
+    // finite, fluent, ~1e-1-wrong output.
+    //
+    // The shared expert is required Q8_0 on all three projections because that
+    // is what the escha checkpoint ships and what the Q8 arm of the batched
+    // body above serves; a different shared dtype would be a different model
+    // and should get its own arm rather than silently borrow this one.
+    //
+    // The ROUTED side admits exactly the two containers the escha indexed
+    // executor has a GEMV for, and the pair must be uniform-in-kind:
+    //
+    //   * `Escha2T16` / `Escha3T16` — Phase 2 production. The routed experts
+    //     are the trellis CODE and `escha_gemv_native_*` decodes it inside the
+    //     GEMV. Either order on either projection (the shipped file is K=2
+    //     gate_up / K=3 down; the reverse allocation is equally valid), which
+    //     is exactly what `MoeResolution::routed_indexable_escha_native`
+    //     admits on the decode side — this is its prefill twin and the two
+    //     must agree or a layer batches in prefill and does not in decode.
+    //   * `Q8_0` on both — Phase 1, the A/B arm.
+    //
+    // The container is load-bearing for the same reason as every other uniform
+    // arm: each escha GEMV hard-codes one bit geometry (a 34 B/32-element Q8_0
+    // block, or a 16x16 trellis tile) and handing it the other reads different
+    // weights out of the same bytes — silent corruption, not a fault.
+    let escha_routed_ok = (dtypes.expert_gate_up == DType::Q8_0
+        && dtypes.expert_down == DType::Q8_0)
+        || (matches!(dtypes.expert_gate_up, DType::Escha2T16 | DType::Escha3T16)
+            && matches!(dtypes.expert_down, DType::Escha2T16 | DType::Escha3T16));
+    if dtypes.escha
+        && escha_routed_ok
+        && dtypes.shared_expert_gate == DType::Q8_0
+        && dtypes.shared_expert_up == DType::Q8_0
+        && dtypes.shared_expert_down == DType::Q8_0
+    {
+        return true;
     }
 
     // mfp4-E8 routed experts with Q8 shared expert (original arm):
@@ -2483,6 +2740,44 @@ pub fn prefill_batch_pbs_eligible(
         .as_deref()
         == Some("1")
     {
+        // Per-layer attention-projection dtypes. The refusal lines below name
+        // only the FIRST weight that failed, which is enough to know why a
+        // layer refused but not enough to know what the layer IS — and an
+        // ADMITTED layer printed nothing at all. Both questions come up every
+        // time a mixed-dtype checkpoint (escha: Q8_0 wqkv/wz/wo beside F16
+        // w_alpha/w_beta) picks a fused-vs-unfused arm.
+        for (i, lw) in weights.layers.iter().enumerate() {
+            let dts = match lw {
+                LayerWeights::DeltaNetMoe(l) => Some((
+                    "DeltaNetMoe",
+                    [
+                        l.wqkv.gpu_dtype,
+                        l.wz.gpu_dtype,
+                        l.w_beta.gpu_dtype,
+                        l.w_alpha.gpu_dtype,
+                        l.wo.gpu_dtype,
+                    ],
+                )),
+                LayerWeights::DeltaNet(l) => Some((
+                    "DeltaNet",
+                    [
+                        l.wqkv.gpu_dtype,
+                        l.wz.gpu_dtype,
+                        l.w_beta.gpu_dtype,
+                        l.w_alpha.gpu_dtype,
+                        l.wo.gpu_dtype,
+                    ],
+                )),
+                _ => None,
+            };
+            if let Some((kind, d)) = dts {
+                eprintln!(
+                    "[hipfire::batch_eligible]   L{i} {kind} wqkv={:?} wz={:?} \
+                     w_beta={:?} w_alpha={:?} wo={:?}",
+                    d[0], d[1], d[2], d[3], d[4]
+                );
+            }
+        }
         eprintln!(
             "[hipfire::batch_eligible] result={result} \
              arch={arch} n={n} n>={MIN_BATCH}={} \
@@ -2492,6 +2787,40 @@ pub fn prefill_batch_pbs_eligible(
              all_layers_ok={all_layers_ok}",
             n >= MIN_BATCH,
         );
+        // `all_layers_ok=false` on its own says a model prefills at decode
+        // speed but not WHY, and the reason is a string inside an `is_ok()`
+        // that nothing prints. Report each DISTINCT refusal once, with how
+        // many layers it covers, so a per-token prefill is diagnosable from
+        // one run instead of a source read. (Escha-W2 was diagnosed this way.)
+        if !all_layers_ok {
+            let mut seen: Vec<(String, Vec<usize>)> = Vec::new();
+            for (i, lw) in weights.layers.iter().enumerate() {
+                let reason = if matches!(
+                    lw,
+                    LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+                ) && !moe_router_logits_present
+                {
+                    Some("MoE layer with no batched router-logits buffer".to_string())
+                } else {
+                    qwen35_layer_batch_admissible(lw, config, arch)
+                        .err()
+                        .map(|e| e.message.clone())
+                };
+                if let Some(reason) = reason {
+                    match seen.iter_mut().find(|(r, _)| *r == reason) {
+                        Some((_, layers)) => layers.push(i),
+                        None => seen.push((reason, vec![i])),
+                    }
+                }
+            }
+            for (reason, layers) in &seen {
+                eprintln!(
+                    "[hipfire::batch_eligible]   REFUSED {} layer(s) (first is {}): {reason}",
+                    layers.len(),
+                    layers[0],
+                );
+            }
+        }
     }
     result
 }
@@ -3010,9 +3339,17 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     hipfire_dispatch::types::KernelKey::GemmF32Batched,
                     &pbs.x_norm_batch,
                 ),
+                // F16 (escha `mlp.gate.weight`). Dense and unrotated, so it
+                // reads `x_norm_batch` like Q8_0/F32 — feeding it the
+                // FWHT-rotated `x_rot_batch` would be the classic silent
+                // "rotated activation into an unrotated weight" failure.
+                DType::F16 => (
+                    hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                    &pbs.x_norm_batch,
+                ),
                 other => panic!(
                     "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_batched_admitted admits MQ4G256, Q8_0, F32"
+                         — moe_ffn_batched_admissible admits MQ4G256, MQ4G256V2, Q8_0, F32, F16"
                 ),
             };
         let w = WeightRef {
@@ -3047,9 +3384,12 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             DType::MQ4G256 => (KernelKey::GemmHfq4G256, &pbs.x_rot_batch),
             DType::MQ4G256V2 => (KernelKey::GemmMq4G256V2, &pbs.x_rot_batch),
             DType::F32 => (KernelKey::GemmF32Batched, &pbs.x_norm_batch),
+            // F16 (escha `mlp.shared_expert_gate.weight`), un-rotated — see
+            // the router arm above.
+            DType::F16 => (KernelKey::GemmF16WmmaMb8, &pbs.x_norm_batch),
             other => panic!(
                 "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
+                         — moe_ffn_batched_admissible admits MQ4G256, MQ4G256V2, Q8_0, F32, F16"
             ),
         };
         run_plain_gemm_key(
@@ -3260,6 +3600,31 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // so prefill activations match the CPU-reference softmax math
     // exactly. router_logits is allocated 1D as [n × n_exp]; alias it
     // into a 2D view so gpu.softmax_f32 takes rows = n.
+    // Escha-only router-logits f16 round-trip, the batched twin of the call in
+    // `run_moe_decode`. EschaLabs' runtime computes router logits as
+    // f16(x @ gate_w.T) and only widens to F32 to select top-k; hipfire keeps
+    // them F32 end to end, and escha's recovery fine-tune was trained against
+    // the rounding runtime.
+    //
+    // This is NOT optional polish for the batched path. Decode applies the
+    // rounding unconditionally, so omitting it here would make batched prefill
+    // select from UNROUNDED logits while decode selects from rounded ones —
+    // a systematic prefill-vs-decode route divergence on every token, on top
+    // of the residual divergence that genuinely straddles an f16 boundary
+    // (measured 2.96-3.13% per expert slot; design doc §10.5(b)).
+    // Applied to the shared `router_logits` buffer BEFORE the softmax, exactly
+    // where decode applies it, so both routes see identical inputs to top-k.
+    //
+    // Keyed on the layer's own transform tables (a load-time model-state
+    // property), never an env var, so every non-escha arch-6 model skips the
+    // launch entirely and keeps its selection bit-for-bit.
+    if ffn.escha.is_some() {
+        // `router_logits` is the [max_batch x n_exp] scratch; only the first
+        // n rows are live. Round exactly those — the kernel is numel-driven,
+        // so handing it the whole buffer would launch over stale tail rows.
+        let live = router_logits.sub_offset(0, n * n_exp);
+        gpu.router_logits_round_f16_rne(&live)?;
+    }
     let router_logits_2d = GpuTensor {
         buf: unsafe { router_logits.buf.alias() },
         shape: vec![n, n_exp],
@@ -3274,6 +3639,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         config.norm_topk_prob,
         n,
     )?;
+
+    // Selection capture, the batched twin of the call in `run_moe_decode`
+    // (off unless HIPFIRE_ESCHA_ROUTE_TRACE is set). Same point in the
+    // pipeline: after top-k, before any routed body.
+    if hipfire_dispatch::pipeline::route_trace::enabled() {
+        hipfire_dispatch::pipeline::route_trace::record(gpu, topk_indices, n, k_top);
+    }
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
@@ -3516,6 +3888,11 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
+        // Escha-W2. Same marker as the decode snapshot, and it must stay the
+        // same: the two routes resolving one layer differently is exactly the
+        // failure this field exists to prevent. It now also gates the escha
+        // branch at the top of `run_moe_prefill` (via `escha` below).
+        routed_escha_transforms: ffn.escha.is_some() && super::escha::escha_indexed_route_enabled(),
     };
 
     let paro_gate_up =
@@ -3580,6 +3957,27 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         paro_down,
         down_awq_scale,
         routed_out,
+        // Escha-W2 batched routed executor. `Some` publishes the layer's four
+        // `[E, ·]` transform tables to `run_moe_prefill`'s escha branch; the
+        // `[k]`-sized decode scratch inside `refs()` is unused there (batched
+        // prefill uses the model-global `[n × k]` scratch instead).
+        //
+        // Gated identically to `routed_escha_transforms` above and to the
+        // `escha` field of `MoePrefillDtypes` that admitted this layer, so
+        // "admitted" and "has the tables" cannot come apart.
+        escha: if ffn.escha.is_some() && super::escha::escha_indexed_route_enabled() {
+            ffn.escha.as_ref().map(|e| e.refs())
+        } else {
+            None
+        },
+        // UNGATED, deliberately — the one marker in this struct that is not
+        // ANDed with `escha_indexed_route_enabled()`. Keyed on the layer's own
+        // transform tables, exactly as the router f16 rounding above is. With
+        // the indexed route off, `escha` is `None` while this stays true, and
+        // `check_moe_prefill_supported` refuses the layer rather than letting
+        // it fall into a transform-free Path 1 / Path 2.
+        layer_is_escha: ffn.escha.is_some(),
+        hidden: dim,
     };
     hipfire_runtime::llama::moe_family()
         .run_prefill(ctx, gpu, &moe_prefill_params)
@@ -3625,6 +4023,46 @@ pub(crate) struct PrefillBandCtx<'a> {
 /// divergence by diffing `.batched` vs `.pertoken` per layer. Requires
 /// `HIPFIRE_GRAPH=0` (does a synchronous D2H readback, which is illegal under
 /// graph capture).
+/// Layer the `HIPFIRE_DUMP_HIDDEN` stage dumps (`q_b`/`k_b`/`v_b`/`alpha_b`/
+/// `beta_b`) fire on. `HIPFIRE_DUMP_HIDDEN_LAYER`, default 0.
+pub(crate) fn dump_diag_layer() -> usize {
+    static LAYER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LAYER.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `HIPFIRE_DUMP_HIDDEN`'s file prefix, resolved ONCE.
+///
+/// The call sites below are unconditional — every qwen35 model pays them, once
+/// per layer per chunk, not just the escha localisation runs they were written
+/// for. Read once behind a `OnceLock` (the pattern
+/// `escha::escha_indexed_route_enabled` and `route_trace` already use) so the
+/// steady-state cost is one relaxed atomic load rather than an environment
+/// lookup and a `String` allocation. Mid-run env mutation is not honoured, in
+/// common with every other developer var in this crate.
+fn dump_hidden_prefix() -> Option<&'static str> {
+    static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PREFIX
+        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").ok())
+        .as_deref()
+}
+
+/// `HIPFIRE_DUMP_HIDDEN_POS` (default 0), resolved once. See
+/// [`dump_hidden_prefix`].
+fn dump_hidden_pos() -> usize {
+    static POS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *POS.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 pub(crate) fn dump_hidden_localize(
     gpu: &Gpu,
     x: &GpuTensor,
@@ -3634,14 +4072,12 @@ pub(crate) fn dump_hidden_localize(
     layer_idx: usize,
     tag: &str,
 ) {
-    let prefix = match hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
-        Ok(p) => p,
-        Err(_) => return,
+    // One relaxed atomic load in the (overwhelmingly common) off case — this
+    // is called unconditionally, per layer per chunk, for EVERY qwen35 model.
+    let Some(prefix) = dump_hidden_prefix() else {
+        return;
     };
-    let target: usize = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let target: usize = dump_hidden_pos();
     if target < abs_pos_of_row0 {
         return;
     }
@@ -4105,11 +4541,6 @@ pub(crate) fn batch_chunk_delta_net_attn(
     let is_mq3_lloyd = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256Lloyd);
     let is_fp4 = matches!(layer.wqkv.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
 
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
@@ -4139,7 +4570,65 @@ pub(crate) fn batch_chunk_delta_net_attn(
     }
 
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-    if is_6bit {
+    //
+    // ESCHA FIRST: a trellis layer bypasses every fused arm below. Each
+    // projection rotates the same normed input with its OWN rin, so the fused
+    // kernels have nothing to share and cannot read a trellis code. `is_mq` is
+    // false for Escha2T16/3T16, so the rmsnorm above already left the normed
+    // (unrotated) activation in `x_rot_batch` — exactly what escha wants,
+    // since it applies its own H128 per projection.
+    //
+    // `in_proj_a`/`in_proj_b` stay on the ordinary batched GEMM: escha's
+    // `ignore` list leaves them uncoded.
+    if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
+        e.qkv.forward(
+            gpu,
+            &layer.wqkv,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_qkv_batch,
+            n,
+            grouped,
+        )?;
+        e.z.forward(
+            gpu,
+            &layer.wz,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_z_batch,
+            n,
+            grouped,
+        )?;
+        batched_gemm_single_weight(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
+        batched_gemm_single_weight(
+            gpu,
+            &layer.w_alpha,
+            &pbs.x_rot_batch,
+            &pbs.dn_alpha_batch,
+            n,
+        )?;
+    } else if is_6bit
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
@@ -4159,17 +4648,22 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 && q8_wmma_arch {
-        // `is_q8` only inspects `wqkv` (the routing anchor). The fused
-        // kernel assumes ALL four weights share the Q8_0 stride; a
-        // mixed-dtype layer would silently re-introduce the Tier-1
-        // kernel-vs-stride corruption mode.
-        debug_assert!(
-            matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
-            "LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
-        );
+    } else if is_q8
+        && q8_wmma_arch
+        && all_q8_0(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
+        // `is_q8` only inspects `wqkv` (the routing anchor). The fused kernel
+        // reads all FOUR weights in one launch at the Q8_0 stride, so the
+        // other three are checked HERE, at runtime — this used to be a
+        // `debug_assert!` (compiled out of release) and became reachable in
+        // release the moment `is_batchable_la` admitted F16. A mixed layer now
+        // falls through to the per-weight unfused arm below, which reads each
+        // weight at its own stride.
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaQ8_0,
@@ -4189,14 +4683,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 || is_lowbit {
+    } else if is_unfused_plain_gemm_dtype(layer.wqkv.gpu_dtype) {
         // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
         // (wqkv/wz/w_beta/w_alpha) → GemmFamily::run_key with the
         // GemmQ8_0BatchedChunked dispatcher-entry key → identical
         // gpu.gemm_q8_0_batched_chunked method, byte-for-byte.
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wqkv.gpu_dtype),
+            plain_gemm_key_for(layer.wqkv.gpu_dtype)?,
             &layer.wqkv.buf,
             layer.wqkv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4207,7 +4701,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wz.gpu_dtype),
+            plain_gemm_key_for(layer.wz.gpu_dtype)?,
             &layer.wz.buf,
             layer.wz.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4218,7 +4712,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_beta.gpu_dtype),
+            plain_gemm_key_for(layer.w_beta.gpu_dtype)?,
             &layer.w_beta.buf,
             layer.w_beta.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4229,7 +4723,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_alpha.gpu_dtype),
+            plain_gemm_key_for(layer.w_alpha.gpu_dtype)?,
             &layer.w_alpha.buf,
             layer.w_alpha.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4238,7 +4732,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.w_alpha.k,
             n,
         )?;
-    } else if is_mq3_lloyd {
+    } else if is_mq3_lloyd
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         // 112 B/group Lloyd-MQ3 stride; X is already FWHT-rotated.
         run_fused_qkvza_key(
             gpu,
@@ -4259,7 +4760,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_mq3 {
+    } else if is_mq3
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         // 104 B/group HFQ3-stride; X is already FWHT-rotated by
         // fused_rmsnorm_rotate_mq_batched above. The FusedQkvzaHfq3G256
         // run-arm replicates the call-site WMMA-vs-base arch split
@@ -4284,7 +4792,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_fp4 {
+    } else if is_fp4
+        && all_same_dtype(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
         // HFP4G32: 17-B blocks (vs HFQ4's 136-B groups), per-row 16-B header.
         // MFP4G32: same storage as HFP4 + offline-FWHT weights; X is already
         // rotated above when is_mq, so this branch handles both unrotated
@@ -4328,6 +4843,16 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
+    }
+
+    // Escha dense biases, applied at the ONE point the whole if/else chain
+    // above converges — five branches fill `dn_qkv_batch`/`dn_z_batch`, and a
+    // bias added in some but not others is a silent wrong answer. Must land
+    // before sigmoid/conv1d consume these. `in_proj_a`/`in_proj_b` (beta/
+    // alpha) have no bias: escha's `ignore` list keeps them plain weights.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.dn_qkv_batch, &b.qkv, n, b.qkv.numel())?;
+        gpu.bias_add_f32(&pbs.dn_z_batch, &b.z, n, b.z.numel())?;
     }
 
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
@@ -4688,16 +5213,52 @@ pub(crate) fn batch_chunk_delta_net_attn(
     } else {
         &pbs.dn_normed_batch
     };
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.wo,
-        wo_input,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+    if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
+        // Trellis wo: project into the ffn scratch, then accumulate into the
+        // residual. The fused epilogue folds those together but cannot read a
+        // trellis code; the split add is exact, both terms being plain f32.
+        // Input is the UNROTATED gated-norm output: escha applies its own
+        // H128, so `dn_normed_batch` and not the MQ-rotated variant.
+        e.o.forward(
+            gpu,
+            &layer.wo,
+            &e.ids,
+            &pbs.dn_normed_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+    } else {
+        dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            wo_input,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+        )?;
+    }
+
+    // out_proj's bias lands on the residual stream. After the residual add is
+    // the same value as before it — both additive.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
+    }
 
     Ok(())
 }
@@ -4715,6 +5276,76 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
+    // ── ESCHA TRELLIS FFN ───────────────────────────────────────────────
+    // Whole FFN in one branch: plain rmsnorm (escha applies its own H128, so a
+    // pre-rotated input would be rotated twice), gate and up as separate
+    // trellis GEMVs, SwiGLU, then down accumulated into the residual. The
+    // fused gate_up kernel cannot serve this — the two projections have
+    // different rin and it could not read a trellis code regardless.
+    if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &pbs.x_norm_batch,
+            n,
+            layer.w_gate.k,
+            config.norm_eps,
+        )?;
+        e.gate.forward(
+            gpu,
+            &layer.w_gate,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.gate_ffn_batch,
+            n,
+            grouped,
+        )?;
+        e.up.forward(
+            gpu,
+            &layer.w_up,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.up_batch,
+            &pbs.up_batch,
+            n,
+            grouped,
+        )?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+            gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+        }
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        e.down.forward(
+            gpu,
+            &layer.w_down,
+            &e.ids,
+            &pbs.ffn_hidden_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+        }
+        return Ok(());
+    }
+
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
         layer.w_gate.gpu_dtype,
@@ -4735,11 +5366,6 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
     let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     if ffn_is_mq {
         // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
         fused_rmsnorm_rotate_mq_batched_for(
@@ -4784,11 +5410,11 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             layer.w_gate.k,
             n,
         )?;
-    } else if ffn_is_q8 && q8_wmma_arch {
-        debug_assert!(
-            matches!(layer.w_up.gpu_dtype, DType::Q8_0),
-            "LA FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
-        );
+    } else if ffn_is_q8 && q8_wmma_arch && all_q8_0(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype])
+    {
+        // `ffn_is_q8` inspects w_gate only; the fused kernel reads BOTH
+        // weights in one launch at the Q8_0 stride. Runtime, not
+        // `debug_assert!` — see `all_q8_0`.
         run_fused_gate_up_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
@@ -4802,10 +5428,10 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             layer.w_gate.k,
             n,
         )?;
-    } else if ffn_is_q8 || ffn_is_lowbit {
+    } else if is_unfused_plain_gemm_dtype(layer.w_gate.gpu_dtype) {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_gate.gpu_dtype),
+            plain_gemm_key_for(layer.w_gate.gpu_dtype)?,
             &layer.w_gate.buf,
             layer.w_gate.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4816,7 +5442,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_up.gpu_dtype),
+            plain_gemm_key_for(layer.w_up.gpu_dtype)?,
             &layer.w_up.buf,
             layer.w_up.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4883,6 +5509,14 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         )?;
     }
 
+    // Escha dense biases on gate/up, at the point the branches converge and
+    // before SwiGLU consumes them — a bias applied after the activation would
+    // be a different function, not a rounding difference.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+        gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+    }
+
     // SwiGLU activation feeding w_down. For MQ, we need the
     // output FWHT-rotated so it matches the pre-rotated w_down
     // weights. For HFQ, plain silu_mul is enough. silu_mul_f32
@@ -4928,6 +5562,11 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+
+    // down_proj's bias, likewise onto the residual stream.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+    }
 
     Ok(())
 }
@@ -4977,11 +5616,6 @@ pub(crate) fn batch_chunk_full_attn_attn(
     let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
     let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     // Fused QKV kernels require all three weights to share a
     // dtype — they treat wq/wk/wv as same-stride byte arrays.
     // When kmap mode 2 promotes only `v_proj` (issue #249), the
@@ -5019,7 +5653,57 @@ pub(crate) fn batch_chunk_full_attn_attn(
     }
 
     // 2. Batched 3-way QKV projection (wq+wk+wv).
-    if qkv_is_6bit && qkv_same_dtype {
+    // ESCHA FIRST: a trellis layer takes none of the arms below — they cannot
+    // read a trellis code, and each projection needs its own rin-rotated
+    // activation so there is nothing for a fused q/k/v kernel to share.
+    // `qkv_is_mq` is false for Escha2T16/3T16, so the rmsnorm above left the
+    // normed (unrotated) activation in `x_rot_batch`, which is what escha
+    // wants.
+    if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
+        e.q.forward(
+            gpu,
+            &layer.wq,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_q_full_batch,
+            n,
+            grouped,
+        )?;
+        e.k.forward(
+            gpu,
+            &layer.wk,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_k_batch,
+            n,
+            grouped,
+        )?;
+        e.v.forward(
+            gpu,
+            &layer.wv,
+            &e.ids,
+            &pbs.x_rot_batch,
+            &pbs.escha_xh_batch,
+            &pbs.fa_v_batch,
+            &pbs.fa_v_batch,
+            n,
+            grouped,
+        )?;
+    } else if qkv_is_6bit && qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvHfq6G256,
@@ -5095,11 +5779,14 @@ pub(crate) fn batch_chunk_full_attn_attn(
             layer.wq.k,
             n,
         )?;
-    } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
-        debug_assert!(
-            matches!(layer.wk.gpu_dtype, DType::Q8_0) && matches!(layer.wv.gpu_dtype, DType::Q8_0),
-            "FA qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
-        );
+    } else if qkv_is_q8
+        && q8_wmma_arch
+        && all_q8_0(&[layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype])
+    {
+        // All three checked at runtime rather than by `qkv_same_dtype` plus a
+        // `debug_assert!`: the equality predicate and the Q8_0 anchor are two
+        // facts, and only their conjunction licenses one fused Q8_0-stride
+        // launch over three buffers.
         run_fused_qkv_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvQ8_0,
@@ -5116,10 +5803,10 @@ pub(crate) fn batch_chunk_full_attn_attn(
             layer.wq.k,
             n,
         )?;
-    } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
+    } else if is_unfused_plain_gemm_dtype(layer.wq.gpu_dtype) && qkv_same_dtype {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wq.gpu_dtype),
+            plain_gemm_key_for(layer.wq.gpu_dtype)?,
             &layer.wq.buf,
             layer.wq.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5130,7 +5817,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wk.gpu_dtype),
+            plain_gemm_key_for(layer.wk.gpu_dtype)?,
             &layer.wk.buf,
             layer.wk.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5141,7 +5828,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wv.gpu_dtype),
+            plain_gemm_key_for(layer.wv.gpu_dtype)?,
             &layer.wv.buf,
             layer.wv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5175,6 +5862,15 @@ pub(crate) fn batch_chunk_full_attn_attn(
         batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
         batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
         batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+    }
+
+    // Escha dense biases on q/k/v, where the branches converge and BEFORE the
+    // Q/gate deinterleave and q_norm consume them — after either would be a
+    // different function, not a rounding difference.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.fa_q_full_batch, &b.q, n, b.q.numel())?;
+        gpu.bias_add_f32(&pbs.fa_k_batch, &b.k, n, b.k.numel())?;
+        gpu.bias_add_f32(&pbs.fa_v_batch, &b.v, n, b.v.numel())?;
     }
 
     // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
@@ -5369,16 +6065,50 @@ pub(crate) fn batch_chunk_full_attn_attn(
     } else {
         &pbs.fa_attn_out_batch
     };
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.wo,
-        fa_wo_input,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+    if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
+        // Trellis o_proj from the UNROTATED attention output, then accumulate.
+        // The fused epilogue is SKIPPED, not supplemented: it writes into the
+        // residual itself, so running both would count this projection twice.
+        e.o.forward(
+            gpu,
+            &layer.wo,
+            &e.ids,
+            &pbs.fa_attn_out_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+    } else {
+        dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            fa_wo_input,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+        )?;
+    }
+
+    // o_proj's bias, onto the residual stream — additive, so after the
+    // residual add is the same value as before it.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
+    }
 
     Ok(())
 }
@@ -5396,6 +6126,76 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
+    // ── ESCHA TRELLIS FFN ───────────────────────────────────────────────
+    // Whole FFN in one branch: plain rmsnorm (escha applies its own H128, so a
+    // pre-rotated input would be rotated twice), gate and up as separate
+    // trellis GEMVs, SwiGLU, then down accumulated into the residual. The
+    // fused gate_up kernel cannot serve this — the two projections have
+    // different rin and it could not read a trellis code regardless.
+    if let Some(e) = layer.escha.as_ref() {
+        // One group holding every slot: `expert_offsets = [0, n]` and the
+        // identity permutation. Built here rather than per projection so the
+        // 2-int upload happens once per layer, not six times.
+        let off_bytes: Vec<u8> = [0i32, n as i32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+        let grouped = Some((&offsets, &e.iota));
+
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &pbs.x_norm_batch,
+            n,
+            layer.w_gate.k,
+            config.norm_eps,
+        )?;
+        e.gate.forward(
+            gpu,
+            &layer.w_gate,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.gate_ffn_batch,
+            n,
+            grouped,
+        )?;
+        e.up.forward(
+            gpu,
+            &layer.w_up,
+            &e.ids,
+            &pbs.x_norm_batch,
+            &pbs.escha_xh_batch,
+            &pbs.up_batch,
+            &pbs.up_batch,
+            n,
+            grouped,
+        )?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+            gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+        }
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        e.down.forward(
+            gpu,
+            &layer.w_down,
+            &e.ids,
+            &pbs.ffn_hidden_batch,
+            &pbs.escha_xh_batch,
+            &pbs.escha_y_batch,
+            &pbs.escha_y_batch,
+            n,
+            grouped,
+        )?;
+        gpu.add_inplace_f32(&pbs.x_batch, &pbs.escha_y_batch)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+        }
+        return Ok(());
+    }
+
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
     let fa_ffn_is_mq = matches!(
@@ -5417,11 +6217,6 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     let fa_ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
     let fa_ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     if fa_ffn_is_mq {
         // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
         fused_rmsnorm_rotate_mq_batched_for(
@@ -5462,11 +6257,13 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             layer.w_gate.k,
             n,
         )?;
-    } else if fa_ffn_is_q8 && q8_wmma_arch {
-        debug_assert!(
-            matches!(layer.w_up.gpu_dtype, DType::Q8_0),
-            "FA FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
-        );
+    } else if fa_ffn_is_q8
+        && q8_wmma_arch
+        && all_q8_0(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype])
+    {
+        // `fa_ffn_is_q8` inspects w_gate only; the fused kernel reads BOTH
+        // weights in one launch at the Q8_0 stride. Runtime, not
+        // `debug_assert!` — see `all_q8_0`.
         run_fused_gate_up_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
@@ -5480,10 +6277,10 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             layer.w_gate.k,
             n,
         )?;
-    } else if fa_ffn_is_q8 || fa_ffn_is_lowbit {
+    } else if is_unfused_plain_gemm_dtype(layer.w_gate.gpu_dtype) {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_gate.gpu_dtype),
+            plain_gemm_key_for(layer.w_gate.gpu_dtype)?,
             &layer.w_gate.buf,
             layer.w_gate.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5494,7 +6291,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_up.gpu_dtype),
+            plain_gemm_key_for(layer.w_up.gpu_dtype)?,
             &layer.w_up.buf,
             layer.w_up.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5560,6 +6357,11 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             n,
         )?;
     }
+    // Escha gate/up biases, before SwiGLU consumes them.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.gate_ffn_batch, &b.gate, n, b.gate.numel())?;
+        gpu.bias_add_f32(&pbs.up_batch, &b.up, n, b.up.numel())?;
+    }
     let fa_w_down_is_mq = matches!(
         layer.w_down.gpu_dtype,
         DType::MQ4G256
@@ -5597,6 +6399,11 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+
+    // down_proj's bias, onto the residual stream.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&pbs.x_batch, &b.down, n, b.down.numel())?;
+    }
 
     Ok(())
 }
@@ -5705,11 +6512,6 @@ fn batch_chunk_delta_net_moe(
     );
     let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
     // ParoQ4G128 (each with its own Givens rotation tables);
     // w_alpha/w_beta are F32 (no rotation, no quantization).
@@ -5855,18 +6657,21 @@ fn batch_chunk_delta_net_moe(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 && q8_wmma_arch {
-        // Fused Q8 QKVZA WMMA — assumes all 4 weights share Q8_0
-        // stride; mixed Q8/other layers within DNMoe are rejected
-        // upstream by `moe_ffn_batched_admissible` (router/gate Q8 OK, but
-        // shared_expert + experts must be MQ4) and would otherwise
-        // re-introduce Tier-1 stride corruption.
-        debug_assert!(
-            matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
-            "DNMoe LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
-        );
+    } else if is_q8
+        && q8_wmma_arch
+        && all_q8_0(&[
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ])
+    {
+        // Fused Q8 QKVZA WMMA — reads all four weights in ONE launch at the
+        // Q8_0 stride, so all four are checked at runtime here. This is the
+        // arm escha-35b would have hit: its wqkv/wz are Q8_0 but w_alpha /
+        // w_beta are F16, and the guard used to be a `debug_assert!` that a
+        // release build compiled out. It now falls through to the per-weight
+        // unfused arm below, which dispatches each weight by its own dtype.
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaQ8_0,
@@ -5886,12 +6691,12 @@ fn batch_chunk_delta_net_moe(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 || is_lowbit {
+    } else if is_unfused_plain_gemm_dtype(layer.wqkv.gpu_dtype) {
         // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
         // (wqkv/wz/w_beta/w_alpha), sibling DeltaNet QKVZA path.
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wqkv.gpu_dtype),
+            plain_gemm_key_for(layer.wqkv.gpu_dtype)?,
             &layer.wqkv.buf,
             layer.wqkv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5902,7 +6707,7 @@ fn batch_chunk_delta_net_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wz.gpu_dtype),
+            plain_gemm_key_for(layer.wz.gpu_dtype)?,
             &layer.wz.buf,
             layer.wz.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5913,7 +6718,7 @@ fn batch_chunk_delta_net_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_beta.gpu_dtype),
+            plain_gemm_key_for(layer.w_beta.gpu_dtype)?,
             &layer.w_beta.buf,
             layer.w_beta.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5924,7 +6729,7 @@ fn batch_chunk_delta_net_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_alpha.gpu_dtype),
+            plain_gemm_key_for(layer.w_alpha.gpu_dtype)?,
             &layer.w_alpha.buf,
             layer.w_alpha.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6072,8 +6877,13 @@ fn batch_chunk_delta_net_moe(
         gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
-    // DIAG: dump GDN inputs (batched, MoE branch)
-    if layer_idx == 0 {
+    // DIAG: dump GDN inputs (batched, MoE branch).
+    //
+    // The layer is selectable (`HIPFIRE_DUMP_HIDDEN_LAYER`, default 0) because
+    // a per-layer x_batch diff localises a divergence to ONE layer and the
+    // next question is always "what did that layer's GDN see?" — which was
+    // unanswerable while this was hard-wired to layer 0.
+    if layer_idx == dump_diag_layer() {
         let qk_dim = n_v_heads * hd;
         dump_hidden_localize(gpu, &pbs.dn_q_batch, n, start_pos, qk_dim, 0, "q_b");
         dump_hidden_localize(gpu, &pbs.dn_k_batch, n, start_pos, qk_dim, 0, "k_b");
@@ -6253,8 +7063,8 @@ fn batch_chunk_delta_net_moe(
                 config.linear_value_head_dim,
             )?,
         }
-        // DIAG: dump GDN attention output at layer 0
-        if layer_idx == 0 {
+        // DIAG: dump GDN attention output at the selected diag layer.
+        if layer_idx == dump_diag_layer() {
             dump_hidden_localize(
                 gpu,
                 &pbs.dn_attn_out_batch,
@@ -6276,6 +7086,26 @@ fn batch_chunk_delta_net_moe(
         config.norm_eps,
         n,
     )?;
+    if layer_idx == dump_diag_layer() {
+        let vd = n_v_heads * config.linear_value_head_dim;
+        dump_hidden_localize(gpu, &pbs.dn_normed_batch, n, start_pos, vd, 0, "dnnorm_b");
+        dump_hidden_localize(gpu, &pbs.dn_z_batch, n, start_pos, vd, 0, "dnz_b");
+    }
+    // DIAG: the two points that split a per-layer divergence inside the LA
+    // block. `prewo_b` is the residual stream just BEFORE the wo add, so
+    // `attn_b - prewo_b` isolates wo alone; `larot_b` is the layer's rmsnorm
+    // output, whose magnitude against `dnnorm_b` is what identifies wo reading
+    // the wrong activation buffer (a ~400x ratio, in the case this port hit).
+    dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "prewo_b");
+    dump_hidden_localize(
+        gpu,
+        &pbs.x_rot_batch,
+        n,
+        start_pos,
+        dim,
+        layer_idx,
+        "larot_b",
+    );
     // wo + residual. Q8 wo lands un-rotated (Q8 weights were
     // quantized against un-rotated activations); MQ4/MQ6 wo
     // require FWHT(awq_scale-adjusted) rotation. Mirrors the
@@ -6285,14 +7115,9 @@ fn batch_chunk_delta_net_moe(
     // stream when dispatched through the HFQ4 kernel against
     // 200 B/group MQ6-layout bytes.
     let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
-    let dn_wo_input = if dn_wo_is_q8 {
+    let dn_wo_input = if dn_wo_is_q8 || matches!(layer.wo.gpu_dtype, DType::F16) {
         &pbs.dn_normed_batch
     } else if dn_wo_is_paro {
         // PARO wo: rotate dn_normed by wo's own Givens tables
@@ -6349,14 +7174,14 @@ fn batch_chunk_delta_net_moe(
             layer.wo.k,
             n,
         )?;
-    } else if dn_wo_is_q8 || dn_wo_is_lowbit {
+    } else if is_unfused_plain_gemm_dtype(layer.wo.gpu_dtype) {
         // Non-WMMA Q8: gemm into a scratch then add into x_batch.
         // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
         // path didn't run here) as the GEMM scratch.
         let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
+            plain_gemm_key_for(layer.wo.gpu_dtype)?,
             &layer.wo.buf,
             layer.wo.gpu_dtype,
             dn_wo_input,
@@ -6404,6 +7229,10 @@ fn batch_chunk_delta_net_moe(
     // silu_mul + w_down) block. Takes pbs.x_batch as input AND
     // accumulates the FFN output residual back into it via the
     // batched indexed down kernel's atomicAdd path.
+    // DIAG: x_batch after the LA/attention residual, BEFORE the MoE FFN.
+    // Splits a per-layer divergence into "attention half" vs "FFN half"
+    // without another build.
+    dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "attn_b");
     prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
@@ -6472,11 +7301,6 @@ fn batch_chunk_full_attn_moe(
     );
     let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
     // (each with its own Givens rotation tables). The fused-QKV
     // kernels can't handle this — they assume one shared
@@ -6618,11 +7442,14 @@ fn batch_chunk_full_attn_moe(
             layer.wq.k,
             n,
         )?;
-    } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
-        debug_assert!(
-            matches!(layer.wk.gpu_dtype, DType::Q8_0) && matches!(layer.wv.gpu_dtype, DType::Q8_0),
-            "FAMoe qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
-        );
+    } else if qkv_is_q8
+        && q8_wmma_arch
+        && all_q8_0(&[layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype])
+    {
+        // All three checked at runtime rather than by `qkv_same_dtype` plus a
+        // `debug_assert!`: the equality predicate and the Q8_0 anchor are two
+        // facts, and only their conjunction licenses one fused Q8_0-stride
+        // launch over three buffers.
         run_fused_qkv_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvQ8_0,
@@ -6639,10 +7466,10 @@ fn batch_chunk_full_attn_moe(
             layer.wq.k,
             n,
         )?;
-    } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
+    } else if is_unfused_plain_gemm_dtype(layer.wq.gpu_dtype) && qkv_same_dtype {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wq.gpu_dtype),
+            plain_gemm_key_for(layer.wq.gpu_dtype)?,
             &layer.wq.buf,
             layer.wq.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6653,7 +7480,7 @@ fn batch_chunk_full_attn_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wk.gpu_dtype),
+            plain_gemm_key_for(layer.wk.gpu_dtype)?,
             &layer.wk.buf,
             layer.wk.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6664,7 +7491,7 @@ fn batch_chunk_full_attn_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wv.gpu_dtype),
+            plain_gemm_key_for(layer.wv.gpu_dtype)?,
             &layer.wv.buf,
             layer.wv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6851,18 +7678,13 @@ fn batch_chunk_full_attn_moe(
     // — catastrophic stride mismatch produces a single-token
     // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
     let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
     // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
     // paro into fa_attn_out_rot_batch, then HFQ4G128 GEMM into a
     // scratch, then add into x_batch.
     let fa_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
-    let fa_wo_input = if fa_wo_is_q8 {
+    let fa_wo_input = if fa_wo_is_q8 || matches!(layer.wo.gpu_dtype, DType::F16) {
         &pbs.fa_attn_out_batch
     } else if fa_wo_is_paro {
         let paro_wo = layer.wo.paro.as_ref().unwrap_or_else(|| {
@@ -6916,14 +7738,14 @@ fn batch_chunk_full_attn_moe(
             layer.wo.k,
             n,
         )?;
-    } else if fa_wo_is_q8 || fa_wo_is_lowbit {
+    } else if is_unfused_plain_gemm_dtype(layer.wo.gpu_dtype) {
         // Non-WMMA Q8: GEMM into a scratch then add into x_batch.
         // Reuse `fa_attn_out_rot_batch` (free since MQ4 rotate
         // didn't run here) as scratch.
         let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
+            plain_gemm_key_for(layer.wo.gpu_dtype)?,
             &layer.wo.buf,
             layer.wo.gpu_dtype,
             fa_wo_input,
@@ -6968,6 +7790,10 @@ fn batch_chunk_full_attn_moe(
     }
 
     // Batched MoE FFN.
+    // DIAG: x_batch after the LA/attention residual, BEFORE the MoE FFN.
+    // Splits a per-layer divergence into "attention half" vs "FFN half"
+    // without another build.
+    dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "attn_b");
     prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
@@ -7532,6 +8358,18 @@ fn run_fa_layer_body(
         weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
     }
 
+    // Escha q/k/v biases. THIS is the path the 27B's full-attention layers
+    // actually take: `fa_batched_ok` refuses MQ6 weights, so the batched arm
+    // never runs and `batch_chunk_full_attn_fallback` walks tokens through
+    // here instead. Adding them to `batch_chunk_full_attn_attn` alone moved
+    // PPL by exactly zero, which is how the wrong route was caught.
+    // Must precede the Q/gate deinterleave and q_norm.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.fa_q_full, &b.q, 1, b.q.numel())?;
+        gpu.bias_add_f32(&s.fa_k, &b.k, 1, b.k.numel())?;
+        gpu.bias_add_f32(&s.fa_v, &b.v, 1, b.v.numel())?;
+    }
+
     gpu.deinterleave_f32(
         &s.fa_q_full,
         &s.fa_q,
@@ -7636,6 +8474,12 @@ fn run_fa_layer_body(
             }],
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
+
+    // o_proj bias onto the residual stream (additive, so order with the
+    // residual add does not matter).
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.x, &b.o, 1, b.o.numel())?;
     }
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
@@ -7743,7 +8587,17 @@ fn run_fa_layer_body(
         weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
     }
+
+    // gate/up biases BEFORE the SwiGLU that `weight_gemv_swiglu_residual`
+    // applies; after it would be a different function.
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.gate_ffn, &b.gate, 1, b.gate.numel())?;
+        gpu.bias_add_f32(&s.up, &b.up, 1, b.up.numel())?;
+    }
     weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
+    if let Some(b) = layer.biases.as_ref() {
+        gpu.bias_add_f32(&s.x, &b.down, 1, b.down.numel())?;
+    }
 
     Ok(())
 }
@@ -7774,6 +8628,23 @@ fn batched_gemm_single_weight(
     n: usize,
 ) -> HipResult<()> {
     match w.gpu_dtype {
+        // F16: `linear_attn.in_proj_a`/`in_proj_b` on the escha exports, which
+        // escha's `ignore` list leaves uncoded while every sibling projection
+        // is a trellis code. `plain_gemm_key_for` already sanctions this exact
+        // mapping; this match simply had no arm for it, which surfaced as
+        // "weight dtype F16 has no single-weight batched dispatch yet" the
+        // moment escha layers were admitted to batched prefill.
+        DType::F16 => run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+        ),
         DType::MQ4G256 | DType::HFQ4G256 => run_plain_gemm_key(
             gpu,
             hipfire_dispatch::types::KernelKey::GemmHfq4G256,
@@ -8006,8 +8877,8 @@ mod tests {
 
     #[test]
     fn prefill_max_batch_arch_defaults() {
-        // Exact gfx1100 / gfx1201 alone get the measured defaults; every other
-        // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
+        // Exact gfx1100 / gfx1201 / gfx1151 get the measured defaults; every
+        // other string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
         // Pure helper — no process env mutation.
         assert_eq!(prefill_max_batch_for_arch("gfx1100"), 512);
         assert_eq!(
@@ -8019,7 +8890,14 @@ mod tests {
             prefill_max_batch_for_arch("gfx1201"),
             PREFILL_DEFAULT_BATCH_GFX1201
         );
-        for arch in ["gfx1200", "gfx1151", "gfx942", "unknown"] {
+        // gfx1151 measured on the native escha 27B at an 8k prompt:
+        // 256 -> 52 tok/s, 512 -> 73, 1024 -> 69.
+        assert_eq!(prefill_max_batch_for_arch("gfx1151"), 512);
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1151"),
+            PREFILL_DEFAULT_BATCH_GFX1151
+        );
+        for arch in ["gfx1200", "gfx1152", "gfx942", "unknown"] {
             assert_eq!(
                 prefill_max_batch_for_arch(arch),
                 PREFILL_MAX_BATCH,
@@ -9308,5 +10186,166 @@ mod tests {
 
         let full_chunk = moe_grouped_m_total_bound(2048, 256);
         assert_eq!(full_chunk, 5888);
+    }
+
+    // ── Escha-W2 batched prefill (task perf-3) ───────────────────────────
+
+    /// `is_batchable_la` admits F16 on WMMA arches only.
+    ///
+    /// The arch gate is not decoration. The only batched F16 GEMM is
+    /// `gemm_f16_wmma_mb8`, which hard-ERRORS without wave32 WMMA, and an
+    /// admitted-then-erroring layer is not a graceful fallback: the error
+    /// propagates out of `forward_prefill_batch`. Refusal here is what keeps a
+    /// non-WMMA arch on the per-token path it already takes.
+    #[test]
+    fn is_batchable_la_f16_is_wmma_arch_only() {
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            assert!(
+                is_batchable_la(DType::F16, arch),
+                "F16 must be batchable on {arch}"
+            );
+        }
+        for arch in [
+            "gfx906", "gfx908", "gfx942", "gfx1010", "gfx1030", "gfx1031",
+        ] {
+            assert!(
+                !is_batchable_la(DType::F16, arch),
+                "F16 must NOT be batchable on {arch} — gemm_f16_wmma_mb8 errors there"
+            );
+        }
+    }
+
+    /// `plain_gemm_key_for` resolves exactly the dtypes
+    /// `is_unfused_plain_gemm_dtype` admits, and ERRORS on everything else.
+    ///
+    /// The two must stay in lockstep. The dangerous direction is a dtype the
+    /// matchers route to the unfused path with no arm here: before this change
+    /// the `_ =>` default was `GemmQ8_0BatchedChunked`, so any such dtype was
+    /// read at a Q8_0 stride — 34-byte blocks of 32 int8 plus an f16 scale —
+    /// over bytes with a different layout. That is finite, fluent, wrong.
+    #[test]
+    fn plain_gemm_key_matches_the_unfused_dtype_set() {
+        use hipfire_dispatch::types::KernelKey as K;
+        // Behaviour-preserving for every dtype that reached this before.
+        assert_eq!(
+            plain_gemm_key_for(DType::Q8_0).unwrap(),
+            K::GemmQ8_0BatchedChunked
+        );
+        assert_eq!(
+            plain_gemm_key_for(DType::TQ2G128).unwrap(),
+            K::GemmTQ2G128Prefill
+        );
+        assert_eq!(
+            plain_gemm_key_for(DType::BQ1G128).unwrap(),
+            K::GemmBQ1G128Prefill
+        );
+        // New arm. NOT GemmF16 / GemmF16Tiled: those write Y as [M, N] while
+        // every batched-prefill consumer reads [N, M], so picking one of them
+        // would transpose the output silently.
+        assert_eq!(plain_gemm_key_for(DType::F16).unwrap(), K::GemmF16WmmaMb8);
+        for dt in [DType::Q8_0, DType::TQ2G128, DType::BQ1G128, DType::F16] {
+            assert!(
+                is_unfused_plain_gemm_dtype(dt),
+                "{dt:?} resolves a key but is not in the unfused set"
+            );
+        }
+        // Everything else must ERROR, not guess.
+        for dt in [
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::MQ3G256,
+            DType::F32,
+            DType::ParoQ4G128,
+            DType::MFP4G32E8,
+        ] {
+            assert!(
+                !is_unfused_plain_gemm_dtype(dt),
+                "{dt:?} must not be in the unfused set"
+            );
+            assert!(
+                plain_gemm_key_for(dt).is_err(),
+                "{dt:?} must error rather than fall through to a Q8_0-stride GEMM"
+            );
+        }
+    }
+
+    /// The fused Q8_0 QKVZA/QKV/gate+up kernels read several weights in ONE
+    /// launch at the Q8_0 stride, so the arm must check ALL of them.
+    ///
+    /// This was a `debug_assert!` — compiled out of release — and it was
+    /// unreachable only because `is_batchable_la` refused F16. escha-35b has
+    /// Q8_0 `wqkv`/`wz` beside F16 `w_alpha`/`w_beta`, so admitting F16 made a
+    /// Q8_0-strided read of F16 bytes reachable in a release build.
+    #[test]
+    fn all_q8_0_rejects_a_mixed_layer() {
+        assert!(all_q8_0(&[DType::Q8_0; 4]));
+        assert!(all_q8_0(&[]));
+        // The exact escha shape: the anchor weight is Q8_0, two others are not.
+        assert!(!all_q8_0(&[
+            DType::Q8_0,
+            DType::Q8_0,
+            DType::F16,
+            DType::F16
+        ]));
+        assert!(!all_q8_0(&[DType::Q8_0, DType::MQ4G256]));
+    }
+
+    /// The escha admission arm, and the proof that it is ADDITIVE.
+    ///
+    /// The same six dtypes without the escha marker must still be refused —
+    /// otherwise this arm would be admitting some other model's layer to an
+    /// executor that assumes escha's rotated weight domain and its H128 pair.
+    #[test]
+    fn moe_prefill_escha_arm_requires_the_escha_marker() {
+        let mut d = MoePrefillDtypes::uniform(DType::Q8_0);
+        d.router = DType::F16;
+        d.shared_expert_scalar_gate = DType::F16;
+        // shared expert + routed experts are Q8_0 from `uniform`.
+        assert!(
+            !moe_ffn_batched_admissible_for_dtypes(&d, false, false, false, false),
+            "Q8_0 routed + Q8_0 shared must stay refused WITHOUT the escha marker — no other \
+             arm serves that combination and the escha executor must not see a non-escha layer"
+        );
+        d.escha = true;
+        assert!(
+            moe_ffn_batched_admissible_for_dtypes(&d, false, false, false, false),
+            "the escha arm must admit F16 router + F16 scalar gate + Q8_0 shared + Q8_0 routed"
+        );
+        // The marker alone is not enough: the executor hard-codes the Q8_0
+        // block decode, so a non-Q8_0 routed projection must still refuse.
+        let mut mixed = d;
+        mixed.expert_down = DType::MQ4G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &mixed, false, false, false, false
+        ));
+    }
+
+    /// Widening `router_ok` / `shared_gate_ok` to F16 must not change any
+    /// decision for a model whose router and scalar gate were already
+    /// admissible — the additivity claim, checked rather than asserted.
+    #[test]
+    fn moe_prefill_f16_router_widening_is_additive() {
+        for base in [DType::MQ4G256, DType::MQ4G256V2] {
+            let d = MoePrefillDtypes::uniform(base);
+            // Admitted before and after; the F16 arms are simply not reached.
+            assert!(moe_ffn_batched_admissible_for_dtypes(
+                &d, false, false, false, false
+            ));
+        }
+        // A router dtype that is in NEITHER the old nor the new allowlist must
+        // still refuse — the widening added F16 and nothing else.
+        let mut d = MoePrefillDtypes::uniform(DType::MQ4G256);
+        d.router = DType::MQ6G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &d, true, false, false, false
+        ));
+        d.router = DType::MQ4G256;
+        d.shared_expert_scalar_gate = DType::MQ3G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &d, true, false, false, false
+        ));
     }
 }

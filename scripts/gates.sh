@@ -21,6 +21,11 @@ WORK_DIR="${HIPFIRE_GATE_WORK_DIR:-$ROOT/.redline-work/gates}"
 RUN_REDLINE=1
 RUN_SERVE=1
 RUN_PERF=1
+# Escha-W2 G1-G6. OFF by default: these are checkpoint-specific (they need the
+# escha .hfq and, for G1, the source safetensors tree), so running them against
+# whatever `--model` happens to be would either fail or, worse, pass vacuously.
+RUN_ESCHA=0
+ESCHA_SRC="${ESCHA_SRC:-/data/hipfire-models/escha-35b}"
 PM4=1
 PERF_BASE="HEAD~1"
 
@@ -36,6 +41,21 @@ Options:
   --perf REF         compare performance against REF (default HEAD~1)
   --aql              shadow the retained AQL path instead of one PM4 IB
   --work-dir PATH    artifact directory
+  --escha            ALSO run the Escha-W2 correctness battery G1-G6
+  --escha-only       run ONLY G1-G6 (--model must be the escha .hfq)
+  --escha-src PATH   source safetensors tree for G1 (or ESCHA_SRC)
+                     default /data/hipfire-models/escha-35b
+
+Escha-W2 gates (see docs/plans/escha-w2-port-design.md §10.6):
+  G1  verbatim repack: every escha_code tensor byte-identical to source
+  G2  GPU tile decode == escha_ref::reconstruct, bit-exact
+  G3  the H128 pair == escha_ref, bit-exact, every launch form
+  G4  the whole MoE block against escha's moeblk_out.f16 golden
+  G4b arch-6 router selects the same experts as escha
+  G5  KLD on a fixed teacher-forced corpus, with a negative control
+  G6  batched prefill vs the per-token route, whole model
+G5 and G6 load the model (37.6 GB resident) and take minutes; G1-G4b do not
+need a GPU-resident model beyond the checkpoint and the committed fixtures.
 EOF
 }
 
@@ -47,6 +67,9 @@ while [ $# -gt 0 ]; do
         --no-perf) RUN_PERF=0 ;;
         --perf) PERF_BASE="${2:?--perf requires a git ref}"; shift ;;
         --aql) PM4=0 ;;
+        --escha) RUN_ESCHA=1 ;;
+        --escha-only) RUN_ESCHA=1; RUN_REDLINE=0; RUN_SERVE=0; RUN_PERF=0 ;;
+        --escha-src) ESCHA_SRC="${2:?--escha-src requires a path}"; shift ;;
         --work-dir) WORK_DIR="${2:?--work-dir requires a path}"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "gates.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -95,6 +118,42 @@ if [ "$RUN_PERF" -eq 1 ]; then
     BASE_SHA="$(git rev-parse --verify "${PERF_BASE}^{commit}")"
     HEAD_SHA="$(git rev-parse HEAD)"
     BENCH_MODEL="$MODEL" scripts/probe_commits.sh "$BASE_SHA" "$HEAD_SHA"
+fi
+
+if [ "$RUN_ESCHA" -eq 1 ]; then
+    echo "== Escha-W2 correctness battery (G1-G6) =="
+    echo "   model:  $MODEL"
+    echo "   source: $ESCHA_SRC"
+    echo
+    # Built once; every gate below is a release example.
+    cargo build --release --workspace --all-targets --locked
+
+    echo "-- G1: verbatim repack (expect 80/80 byte-identical) --"
+    python3 scripts/escha-verify-roundtrip.py "$ESCHA_SRC" "$MODEL"
+
+    echo "-- G2: tile decode vs escha_ref (expect 0 mismatched) --"
+    cargo run --release -p rdna-compute --example test_escha_decode_gpu_vs_cpu
+
+    echo "-- G3: H128 pair vs escha_ref (expect 0 mismatched) --"
+    cargo run --release -p rdna-compute --example test_escha_h128_gpu_vs_cpu
+
+    echo "-- G4b: router contract (expect 0/8 differing sets) --"
+    cargo run --release -p hipfire-arch-qwen35 \
+        --example escha_router_contract -- "$MODEL"
+
+    echo "-- G4: MoE block vs golden (expect F32 1.828e-4/9.673e-6," \
+         "Q8_0 2.633e-4/3.027e-5, 0 differing floats on both routes) --"
+    cargo run --release -p hipfire-arch-qwen35 \
+        --example escha_moe_block_gate -- "$MODEL"
+
+    echo "-- G6: batched prefill vs per-token (expect a stable argmax) --"
+    cargo run --release -p hipfire-arch-qwen35 \
+        --example escha_prefill_batch_gate -- "$MODEL"
+
+    echo "-- G5: KLD (expect 0.0027576 nats, PPL 7.6585, control 0.000000) --"
+    scripts/escha-kld.sh "$MODEL"
+
+    echo "Escha-W2 G1-G6: all green."
 fi
 
 echo "runtime validation artifacts: $WORK_DIR"

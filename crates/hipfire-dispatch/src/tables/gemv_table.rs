@@ -62,11 +62,14 @@ fn register_plain(registry: &mut KernelRegistry) {
         let Ok(key) = KernelKey::for_gemv(dtype, GemvVariant::Plain, false) else {
             continue;
         };
+        let Ok(steps) = KernelKey::gemv_steps(dtype, GemvVariant::Plain) else {
+            continue;
+        };
         registry.register(KernelVariant {
             key,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
-            steps: KernelKey::gemv_steps(dtype, GemvVariant::Plain),
+            steps,
             has_awq: dtype == DType::MQ4G256,
             tile: TileImpl::None,
         });
@@ -100,11 +103,14 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         let Ok(key) = KernelKey::for_gemv_prerotated(dtype) else {
             continue;
         };
+        let Ok(steps) = KernelKey::gemv_steps(dtype, GemvVariant::Prerotated) else {
+            continue;
+        };
         registry.register(KernelVariant {
             key,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
-            steps: KernelKey::gemv_steps(dtype, GemvVariant::Prerotated),
+            steps,
             has_awq: dtype == DType::MQ4G256,
             tile: TileImpl::None,
         });
@@ -133,11 +139,14 @@ fn register_residual(registry: &mut KernelRegistry) {
         let Ok(key) = KernelKey::for_gemv_residual(dtype) else {
             continue;
         };
+        let Ok(steps) = KernelKey::gemv_steps(dtype, GemvVariant::WithResidual) else {
+            continue;
+        };
         registry.register(KernelVariant {
             key,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
-            steps: KernelKey::gemv_steps(dtype, GemvVariant::WithResidual),
+            steps,
             has_awq: dtype == DType::MQ4G256,
             tile: TileImpl::None,
         });
@@ -177,11 +186,14 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         let Ok(key) = KernelKey::for_gemv_swiglu_residual(dtype) else {
             continue;
         };
+        let Ok(steps) = KernelKey::gemv_steps(dtype, GemvVariant::WithSwiGLUResidual) else {
+            continue;
+        };
         registry.register(KernelVariant {
             key,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
-            steps: KernelKey::gemv_steps(dtype, GemvVariant::WithSwiGLUResidual),
+            steps,
             has_awq: dtype == DType::MQ4G256,
             tile: TileImpl::None,
         });

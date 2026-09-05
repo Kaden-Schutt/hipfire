@@ -1,0 +1,325 @@
+//! Gate: one escha-coded DENSE linear on GPU against the `escha_ref` oracle.
+//!
+//! This exists to be run BEFORE the dense path is wired into ten call sites in
+//! `forward.rs`/`prefill.rs`. Every failure mode of that wiring — a missing
+//! H128, the two H128s swapped, a bias applied before the output transform
+//! instead of after, rin/rout transposed — produces a full-rank, finite,
+//! plausible activation rather than a crash. Debugging that through a whole
+//! 64-layer model is far more expensive than pinning the single linear first.
+//!
+//! The oracle is `escha_ref::expert_linear`, which is the same
+//! input_transform -> matmul -> output_transform that `ref.py::dense_linear`
+//! specifies, and which G2/G3 already gate bit-exact at the decode and H128
+//! level. Bias is added on top here because the reference helper covers the
+//! coded linear only.
+//!
+//! Usage:
+//!   cargo run --release -p hipfire-arch-qwen35 \
+//!     --example test_escha_dense_linear_gpu_vs_cpu -- <model.hfq> [proj]
+//!
+//! `proj` defaults to `mlp.gate_proj` on layer 0; pass e.g.
+//! `linear_attn.in_proj_qkv` to check another.
+
+use hipfire_arch_qwen35::qwen35::escha::{EschaProj,
+    escha_dense_leaf, escha_dense_linear_forward, load_escha_dense_linear, EschaWeightStore,
+};
+use hipfire_runtime::hfq::HfqFile;
+use rdna_compute::{DType, Gpu};
+
+/// Same candidate expansion the loader uses, so a bare `layers.0.…` resolves
+/// against the `model.language_model.…` names actually in the file.
+fn candidates(name: &str) -> Vec<String> {
+    hipfire_arch_qwen35::qwen35::load::qwen35_tensor_name_candidates(name)
+}
+
+fn find(hfq: &HfqFile, name: &str) -> Option<(hipfire_runtime::hfq::HfqTensorInfo, Vec<u8>)> {
+    for c in candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data(&c) {
+            return Some((info.clone(), data.to_vec()));
+        }
+        if let Some((info, buf)) = hfq.tensor_data_pread(&c) {
+            return Some((info.clone(), buf.to_vec()));
+        }
+    }
+    None
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let path = args.next().expect("usage: <model.hfq> [proj]");
+    let proj = args.next().unwrap_or_else(|| "mlp.gate_proj".to_string());
+    let p = "layers.0";
+
+    let hfq = HfqFile::open(std::path::Path::new(&path))?;
+    let mut gpu = Gpu::init()?;
+
+    // Shape from the code tensor's own dims: escha stores [in/16, out/16, 16K].
+    let (code_info, code_bytes) =
+        find(&hfq, &escha_dense_leaf(p, &proj, "code")).expect("escha_code not found");
+    let k = match code_info.quant_type {
+        42 => 2usize,
+        43 => 3usize,
+        other => panic!("{proj}: quant_type {other} is not escha (42/43)"),
+    };
+    let dims: Vec<usize> = code_info.shape.iter().map(|&d| d as usize).collect();
+    assert_eq!(dims.len(), 3, "{proj}: escha_code should be 3-D, got {dims:?}");
+    let (ic, oc) = (dims[0] * 16, dims[1] * 16);
+    println!("{proj}: ic={ic} oc={oc} K={k}");
+
+    // ── CPU reference ────────────────────────────────────────────────────
+    let code_i16: Vec<i16> = code_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let w_bits = hipfire_quantize::escha_ref::reconstruct(&code_i16, ic, oc, k);
+
+    let read_f32 = |leaf: &str, want: usize| -> Vec<f32> {
+        let (_, d) = find(&hfq, &escha_dense_leaf(p, &proj, leaf))
+            .unwrap_or_else(|| panic!("{leaf} not found"));
+        let v: Vec<f32> = d
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(v.len(), want, "{leaf}: {} elements, want {want}", v.len());
+        v
+    };
+    let rin = read_f32("rin_eff", ic);
+    let rout = read_f32("rout_eff", oc);
+
+    // Deterministic input; no rand dependency and reproducible across runs.
+    let x: Vec<f32> = (0..ic)
+        .map(|i| (((i * 2654435761usize) % 1000) as f32 / 500.0) - 1.0)
+        .collect();
+
+    let y_ref_bits = hipfire_quantize::escha_ref::expert_linear(&x, &w_bits, &rin, &rout);
+    let mut y_ref: Vec<f32> = y_ref_bits
+        .iter()
+        .map(|&b| hipfire_runtime::llama::f16_to_f32(b))
+        .collect();
+
+    let mut bias_ref: Vec<f32> = vec![0.0; oc];
+    // Bias AFTER the output transform, matching `ref.py::dense_linear`.
+    let bias_name = format!("{p}.{proj}.bias");
+    if let Some((info, d)) = find(&hfq, &bias_name) {
+        let b: Vec<f32> = match info.quant_type {
+            1 => d
+                .chunks_exact(2)
+                .map(|c| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+            _ => d
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        };
+        assert_eq!(b.len(), oc, "bias length");
+        for (yi, bi) in y_ref.iter_mut().zip(b.iter()) {
+            *yi += bi;
+        }
+        bias_ref = b;
+        println!("bias: present ({oc} elements), applied after the output transform");
+    } else {
+        println!("bias: absent (optional leaf)");
+    }
+
+    // ── FOLD CHECK ───────────────────────────────────────────────────────
+    // Can the two H128s and both diagonals be folded into the weight, so an
+    // escha dense linear becomes an ORDINARY weight that every existing fused
+    // path can consume untouched? The algebra says yes:
+    //
+    //   mid = W^T xh,  xh = RS*H*diag(rin)*x,  y = RS*diag(rout)*H*mid
+    //   =>  W_eff[i][o] = RS^2 * rin_i * (H W H)[i][o] * rout_o
+    //
+    // The only deviation from the reference is that folding SKIPS the fp16
+    // rounding of xh, so it should land at or slightly better than the
+    // runtime path — not worse. If this holds, the 27B needs no forward-path
+    // changes at all.
+    {
+        const RS: f32 = 0.088_388_347_648;
+        let mut wf: Vec<f32> = w_bits
+            .iter()
+            .map(|&b| hipfire_runtime::llama::f16_to_f32(b))
+            .collect();
+        // H along the contiguous o-axis (each of the ic rows, length oc).
+        for row in wf.chunks_exact_mut(oc) {
+            hipfire_quantize::escha_ref::h128_inplace(row);
+        }
+        // H along the strided i-axis (each of the oc columns, stride oc).
+        let mut col = vec![0.0f32; ic];
+        for o in 0..oc {
+            for i in 0..ic {
+                col[i] = wf[i * oc + o];
+            }
+            hipfire_quantize::escha_ref::h128_inplace(&mut col);
+            for i in 0..ic {
+                wf[i * oc + o] = col[i];
+            }
+        }
+        // Both diagonals and RS^2.
+        for i in 0..ic {
+            let s = RS * RS * rin[i];
+            for o in 0..oc {
+                wf[i * oc + o] *= s * rout[o];
+            }
+        }
+        // Plain matmul, no transforms at all.
+        let mut y_fold = vec![0.0f32; oc];
+        for i in 0..ic {
+            let a = x[i];
+            let row = &wf[i * oc..(i + 1) * oc];
+            for (m, w) in y_fold.iter_mut().zip(row) {
+                *m += a * w;
+            }
+        }
+        if let Some((info, d)) = find(&hfq, &bias_name) {
+            let b: Vec<f32> = match info.quant_type {
+                1 => d
+                    .chunks_exact(2)
+                    .map(|c| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+                _ => d
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            };
+            for (yi, bi) in y_fold.iter_mut().zip(b.iter()) {
+                *yi += bi;
+            }
+        }
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in y_fold.iter().zip(y_ref.iter()) {
+            let d = (*a - *b) as f64;
+            num += d * d;
+            den += (*b as f64) * (*b as f64);
+        }
+        println!(
+            "  FOLDED (rotations baked into the weight, no runtime transform): rel_rms {:.3e}",
+            (num / den.max(1e-30)).sqrt()
+        );
+    }
+
+    // ── GPU ──────────────────────────────────────────────────────────────
+    // F16 store: the decode to fp16 is exact, so any difference is the
+    // forward path rather than a re-quantisation. Q8_0 is reported after.
+    for store in [EschaWeightStore::F16, EschaWeightStore::Native, EschaWeightStore::Q8_0] {
+        let lin = load_escha_dense_linear(&hfq, &mut gpu, p, &proj, ic, oc, store, candidates)?;
+        let xg = gpu.upload_f32(&x, &[ic])?;
+        let xh = gpu.alloc_tensor(&[ic], DType::F32)?;
+        let mid = gpu.alloc_tensor(&[oc], DType::F32)?;
+        let yg = gpu.alloc_tensor(&[oc], DType::F32)?;
+        escha_dense_linear_forward(&mut gpu, &lin, &xg, &xh, &mid, &yg)?;
+        let y = gpu.download_f32(&yg)?;
+
+        // Stage-by-stage norms: a zero at a known stage names the broken step.
+        let l2 = |v: &[f32]| (v.iter().map(|a| (*a as f64) * (*a as f64)).sum::<f64>()).sqrt();
+        let xh_h = gpu.download_f32(&xh)?;
+        let mid_h = gpu.download_f32(&mid)?;
+        println!(
+            "    |x|={:.4} |xh|={:.4} |mid|={:.4} |y|={:.4} |y_ref|={:.4}  w.dtype={:?} w.m={} w.k={}",
+            l2(&x), l2(&xh_h), l2(&mid_h), l2(&y), l2(&y_ref), lin.w.gpu_dtype, lin.w.m, lin.w.k
+        );
+
+        let mut worst = 0.0f32;
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        let mut nonfinite = 0usize;
+        for (a, b) in y.iter().zip(y_ref.iter()) {
+            let (a, b): (&f32, &f32) = (a, b);
+            if !a.is_finite() {
+                nonfinite += 1;
+            }
+            let d = (a - b).abs();
+            if d > worst {
+                worst = d;
+            }
+            num += (d as f64) * (d as f64);
+            den += (*b as f64) * (*b as f64);
+        }
+        let rel_rms = (num / den.max(1e-30)).sqrt();
+        // Timed: is the native trellis path fast enough to justify wiring it
+        // into the layer forward? Weight bytes differ per store, so report
+        // achieved bandwidth as well as raw time — the native store moves ~3x
+        // fewer bytes than Q8_0 for the same maths.
+        let iters = 200usize;
+        for _ in 0..10 {
+            escha_dense_linear_forward(&mut gpu, &lin, &xg, &xh, &mid, &yg)?;
+        }
+        gpu.hip.device_synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            escha_dense_linear_forward(&mut gpu, &lin, &xg, &xh, &mid, &yg)?;
+        }
+        gpu.hip.device_synchronize()?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let wbytes = match store {
+            EschaWeightStore::Native => (ic * oc * k) as f64 / 8.0,
+            EschaWeightStore::F16 => (ic * oc * 2) as f64,
+            EschaWeightStore::Q8_0 => (ic * oc) as f64 * 34.0 / 32.0,
+            EschaWeightStore::F32 => (ic * oc * 4) as f64,
+        };
+        println!(
+            "  store={store:?}: rel_rms {rel_rms:.3e}  worst_abs {worst:.3e}  non-finite {nonfinite}               {us:.1} us/call  {:.1} GB/s  weights {:.1} MB",
+            wbytes / us / 1e3,
+            wbytes / 1e6
+        );
+        // F16 must be tight; Q8_0 carries its own re-quantisation error and is
+        // reported rather than gated, so the two are not held to one bar.
+        // Native decodes the trellis INSIDE the GEMV, so it should track F16
+        // (both deliver exactly-decoded weights); only the accumulation order
+        // differs. Q8_0 carries its own re-quantisation and is reported, not
+        // gated.
+        if matches!(store, EschaWeightStore::F16 | EschaWeightStore::Native) {
+            assert_eq!(nonfinite, 0, "non-finite output");
+            assert!(
+                rel_rms < 2e-3,
+                "F16 store: rel_rms {rel_rms:.3e} exceeds 2e-3 — the dense forward disagrees \
+                 with escha_ref by more than fp16 accumulation explains"
+            );
+        }
+    }
+    // BATCHED: the indexed GEMV must serve a dense linear as `slots` copies
+    // of expert 0. Verified before wiring it into the batched prefill path,
+    // because a wrong slot stride there is per-token garbage that only shows
+    // up as a bad PPL much later.
+    {
+        let lin = load_escha_dense_linear(
+            &hfq, &mut gpu, p, &proj, ic, oc, EschaWeightStore::Native, candidates)?;
+        let ep = EschaProj {
+            rin: lin.rin, rout: lin.rout, ptr0: lin.ptr0.expect("native has ptr0"),
+        };
+        for slots in [1usize, 4] {
+            let mut xb = Vec::with_capacity(slots * ic);
+            for _ in 0..slots { xb.extend_from_slice(&x); }
+            let xg = gpu.upload_f32(&xb, &[slots * ic])?;
+            let ids = gpu.upload_f32(&vec![f32::from_bits(0); slots], &[slots])?;
+            let xh = gpu.alloc_tensor(&[slots * ic], DType::F32)?;
+            let mid = gpu.alloc_tensor(&[slots * oc], DType::F32)?;
+            let yg = gpu.alloc_tensor(&[slots * oc], DType::F32)?;
+            // Exercise BOTH shapes: the per-slot GEMV and, above 1 slot, the
+            // grouped WMMA GEMM that batched prefill uses.
+            let off_bytes: Vec<u8> = [0i32, slots as i32]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let offsets = gpu.upload_raw(&off_bytes, &[2])?;
+            let iota: Vec<f32> = (0..slots).map(|i| f32::from_bits(i as u32)).collect();
+            let iota = gpu.upload_f32(&iota, &[slots])?;
+            let grouped = if slots > 1 { Some((&offsets, &iota)) } else { None };
+            ep.forward(&mut gpu, &lin.w, &ids, &xg, &xh, &mid, &yg, slots, grouped)?;
+            let y = gpu.download_f32(&yg)?;
+            // Every slot fed the same x, so every slot must equal y_ref
+            // (minus the bias, which EschaProj deliberately does not add).
+            let mut worst = 0.0f64;
+            for sl in 0..slots {
+                for o in 0..oc {
+                    let got = y[sl * oc + o] as f64;
+                    let want = y_ref[o] as f64 - bias_ref[o] as f64;
+                    let d = (got - want).abs() / (want.abs().max(1e-3));
+                    if d > worst { worst = d; }
+                }
+            }
+            println!("  BATCHED slots={slots}: worst_rel {worst:.3e}");
+            assert!(worst < 5e-2, "batched slots={slots} worst_rel {worst:.3e}");
+        }
+    }
+    println!("PASS");
+    Ok(())
+}

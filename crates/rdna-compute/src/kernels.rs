@@ -4809,6 +4809,64 @@ pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 
+/// Escha-W2 one-shot tile decode: packed trellis code -> bare fp16 weights.
+/// No codebook LUT (65536 fp16 entries would be 128 KB, gfx1151 LDS is 64 KB);
+/// the codebook is computed inline per element. See the file for the G2 gate
+/// rationale (deliberately duplicates escha_ref.rs's lane maths in Rust).
+pub const ESCHA_DECODE_TILES_SRC: &str =
+    include_str!("../../../kernels/src/escha_decode_tiles.hip");
+
+/// Escha-W2 activation transforms: the 128-point Walsh-Hadamard applied to
+/// both sides of every escha matmul (`escha_h128_in`, `escha_h128_out`). Two
+/// entry points sharing one source file — see `ensure_kernel` call sites.
+pub const ESCHA_H128_SRC: &str = include_str!("../../../kernels/src/escha_h128.hip");
+
+/// Escha-W2 load-path transpose: `escha_decode_tiles` writes bare fp16
+/// IN-major `[ic, oc]` (escha's tile grid is in-major); hipfire's expert
+/// slots are OUT-major `[oc, ic]`. Two entry points — `escha_bare_to_q8_0`
+/// (production: transpose + Q8_0 re-quantise in one pass) and
+/// `escha_bare_to_f32` (the weight-exact control arm the G4 gate uses to
+/// separate wiring error from re-quantisation error).
+pub const ESCHA_BARE_TO_OUTMAJOR_SRC: &str =
+    include_str!("../../../kernels/src/escha_bare_to_outmajor.hip");
+
+/// Escha-W2 routed-expert GEMVs for the GPU-top-K (indexed) decode path, plus
+/// the device-side f16 round-trip of the combine weights. Three entry points:
+/// `escha_gemv_q8_0_moe_k8_indexed_batched`,
+/// `escha_gemv_q8_0_wide_moe_k8_indexed_batched` and
+/// `escha_round_weights_f16_rne`. The two GEMVs are per-slot-in/per-slot-out
+/// (both escha phases need that shape) verbatim transcriptions of `gemv_q8_0`
+/// / `gemv_q8_0_wide` — see the header of the .hip for why the pre-existing
+/// indexed Q8_0 MoE kernels cannot serve escha and why the accumulate order
+/// is copied rather than improved.
+pub const ESCHA_MOE_GEMV_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemv_k8_indexed.hip");
+
+/// Escha-W2 routed-expert GEMVs that read the TRELLIS CODE DIRECTLY — the
+/// Phase-2 fused kernels. Six entry points: the four
+/// `escha_gemv_native_k{2,3}[_wide]_moe_k8_indexed_batched` production kernels
+/// and the two `escha_gemv_f16[_wide]_moe_k8_indexed_batched` reference arms
+/// they are gated bit-exactly against. Same lane mapping, accumulator count
+/// and reduction as [`ESCHA_MOE_GEMV_K8_INDEXED_SRC`]; the only difference is
+/// that the weight is decoded in-register from the code instead of read from
+/// an expanded Q8_0 copy. See the .hip header for why a block has to own a
+/// whole 16-wide tile column to reach the format's 0.25 B/weight floor.
+pub const ESCHA_MOE_GEMV_NATIVE_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemv_native.hip");
+
+/// Escha-W2 routed-expert GROUPED GEMM — the Phase-3 batched-prefill kernel.
+/// Same trellis decode as [`ESCHA_MOE_GEMV_NATIVE_SRC`] and the same lane ->
+/// contraction map, but `blockIdx.y` is an EXPERT rather than a (token,
+/// expert) slot: the expert's code is decoded once and spent across every
+/// token that routed to it, and a block owns `CTILES` adjacent tile columns so
+/// the activation is read once for all of them. See the .hip header for the
+/// traffic arithmetic and for which projections stay bit-identical to the
+/// slot-parallel kernel (the narrow ones) and which do not (the wide ones).
+pub const ESCHA_MOE_GEMM_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemm_grouped_wmma.hip");
+pub const ESCHA_MOE_GEMM_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemm_grouped.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
@@ -5799,6 +5857,16 @@ pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f3
 /// vision encoder to match HF's bf16 forward path at residual-stream
 /// points. See `kernels/src/bf16_round_trip.hip`.
 pub const BF16_ROUND_TRIP_SRC: &str = include_str!("../../../kernels/src/bf16_round_trip.hip");
+
+/// In-place F32 router-logits round-trip through f16 (round-to-nearest-even).
+/// Escha-only: EschaLabs' runtime selects MoE top-k from f16-rounded router
+/// logits; hipfire keeps logits F32 end-to-end everywhere else. Applied to
+/// `router_logits` before top-k ONLY when the layer's routed experts are
+/// Escha2T16/Escha3T16 (see `MoeDtypes::has_escha_experts` in
+/// hipfire-dispatch and `run_moe_decode`'s call site). See
+/// `kernels/src/router_logits_round_f16_rne.hip`.
+pub const ROUTER_LOGITS_ROUND_F16_RNE_SRC: &str =
+    include_str!("../../../kernels/src/router_logits_round_f16_rne.hip");
 
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.

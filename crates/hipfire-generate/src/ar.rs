@@ -37,6 +37,29 @@ use std::any::Any;
 use std::io::Write;
 use std::time::Instant;
 
+/// Stage accounting for the AR decode loop, enabled by
+/// `HIPFIRE_DECODE_PROFILE=1`. Statics rather than locals because the
+/// detokenise calls sit inside closures handed to the semantic producer.
+pub(crate) mod decode_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static NS_FORWARD: AtomicU64 = AtomicU64::new(0);
+    pub static NS_SAMPLE: AtomicU64 = AtomicU64::new(0);
+    pub static NS_DETOK: AtomicU64 = AtomicU64::new(0);
+    pub static DETOK_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static DETOK_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("HIPFIRE_DECODE_PROFILE").as_deref() == Ok("1"))
+    }
+    pub fn add(c: &AtomicU64, ns: u128) {
+        c.fetch_add(ns as u64, Ordering::Relaxed);
+    }
+    pub fn get(c: &AtomicU64) -> u64 {
+        c.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(feature = "serve-fault-inject")]
 thread_local! {
     static FAULT_AFTER_PREFILL_ARMED: std::cell::Cell<bool> =
@@ -3514,7 +3537,32 @@ pub fn generate(
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
+        let dp_t0 = Instant::now();
         while generated < max_tokens {
+            if decode_prof::on() && generated > 0 && generated % 40 == 0 {
+                let tot = dp_t0.elapsed().as_nanos().max(1) as f64;
+                let f = decode_prof::get(&decode_prof::NS_FORWARD) as f64;
+                let sm = decode_prof::get(&decode_prof::NS_SAMPLE) as f64;
+                let dt = decode_prof::get(&decode_prof::NS_DETOK) as f64;
+                let calls = decode_prof::get(&decode_prof::DETOK_CALLS);
+                let dtoks = decode_prof::get(&decode_prof::DETOK_TOKENS);
+                eprintln!(
+                    "[ar-profile] n={generated} total={:.0}ms ({:.2} tok/s) | \
+                     forward {:.1}ms/tok ({:.0}%) | sample {:.1}ms/tok ({:.0}%) | \
+                     detok {:.1}ms/tok ({:.0}%) [{} calls, {} toks re-decoded] | other {:.0}%",
+                    tot / 1e6,
+                    generated as f64 / (tot / 1e9),
+                    f / 1e6 / generated as f64,
+                    100.0 * f / tot,
+                    sm / 1e6 / generated as f64,
+                    100.0 * sm / tot,
+                    dt / 1e6 / generated as f64,
+                    100.0 * dt / tot,
+                    calls,
+                    dtoks,
+                    100.0 * (tot - f - sm - dt).max(0.0) / tot,
+                );
+            }
             // Decode-side abort check. Client cancel (Pi 4-min idle
             // timeout firing while the CLI buffers tokens for tool-call
             // detection — wire shows zero output until `done`) sends
@@ -3577,7 +3625,19 @@ pub fn generate(
                         next_token,
                         QwenArRawCommitDisposition::ClassifiedVisible,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let all_bytes = {
+                        let _t = std::time::Instant::now();
+                        let r = tokenizer.decode_bytes(&streamed_tokens);
+                        if decode_prof::on() {
+                            decode_prof::add(&decode_prof::NS_DETOK, _t.elapsed().as_nanos());
+                            decode_prof::add(&decode_prof::DETOK_CALLS, 1);
+                            decode_prof::add(
+                                &decode_prof::DETOK_TOKENS,
+                                streamed_tokens.len() as u128,
+                            );
+                        }
+                        r
+                    };
                     let new_bytes = all_bytes[prev_fed..].to_vec();
                     bytes_fed_to_filter = all_bytes.len();
                     (pos, new_bytes)
@@ -3692,7 +3752,19 @@ pub fn generate(
                 || force_answer_latched
                 || max_total_think > 0
             {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_so_far = {
+                    let _t = std::time::Instant::now();
+                    let r = tokenizer.decode_bytes(&streamed_tokens);
+                    if decode_prof::on() {
+                        decode_prof::add(&decode_prof::NS_DETOK, _t.elapsed().as_nanos());
+                        decode_prof::add(&decode_prof::DETOK_CALLS, 1);
+                        decode_prof::add(
+                            &decode_prof::DETOK_TOKENS,
+                            streamed_tokens.len() as u128,
+                        );
+                    }
+                    r
+                };
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 // Total-think bound (re-arm-proof). Count every think token; at the
@@ -3806,7 +3878,19 @@ pub fn generate(
                                         m.seq_pos = new_phys;
                                     }
                                 }
-                                let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                                let all_bytes = {
+                        let _t = std::time::Instant::now();
+                        let r = tokenizer.decode_bytes(&streamed_tokens);
+                        if decode_prof::on() {
+                            decode_prof::add(&decode_prof::NS_DETOK, _t.elapsed().as_nanos());
+                            decode_prof::add(&decode_prof::DETOK_CALLS, 1);
+                            decode_prof::add(
+                                &decode_prof::DETOK_TOKENS,
+                                streamed_tokens.len() as u128,
+                            );
+                        }
+                        r
+                    };
                                 let new_bytes = all_bytes[prev_fed..].to_vec();
                                 bytes_fed_to_filter = all_bytes.len();
                                 (pos, new_bytes)
@@ -3874,7 +3958,19 @@ pub fn generate(
                 // answer with a system-alert string. Check the raw decoded
                 // text rather than token IDs since <think> tokenizes as a
                 // multi-token sequence in Qwen3.5's vocab.
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_so_far = {
+                    let _t = std::time::Instant::now();
+                    let r = tokenizer.decode_bytes(&streamed_tokens);
+                    if decode_prof::on() {
+                        decode_prof::add(&decode_prof::NS_DETOK, _t.elapsed().as_nanos());
+                        decode_prof::add(&decode_prof::DETOK_CALLS, 1);
+                        decode_prof::add(
+                            &decode_prof::DETOK_TOKENS,
+                            streamed_tokens.len() as u128,
+                        );
+                    }
+                    r
+                };
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 if !in_think {
@@ -3913,7 +4009,7 @@ pub fn generate(
                             &grammar_mask,
                             &mut logits,
                         );
-                        sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
+                        { let _t = std::time::Instant::now(); let r = sampler::sample_cpu(&mut logits, ngram_scope, &cfg); if decode_prof::on() { decode_prof::add(&decode_prof::NS_SAMPLE, _t.elapsed().as_nanos()); } r }
                     } else {
                         sampler::sample(
                             gpu,
@@ -4083,18 +4179,25 @@ pub fn generate(
                     &grammar_mask,
                     &mut logits,
                 );
-                sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
+                { let _t = std::time::Instant::now(); let r = sampler::sample_cpu(&mut logits, ngram_scope, &cfg); if decode_prof::on() { decode_prof::add(&decode_prof::NS_SAMPLE, _t.elapsed().as_nanos()); } r }
             } else {
-                sampler::sample(
-                    gpu,
-                    &scratch.logits,
-                    &scratch.sample_buf,
-                    &scratch.repeat_buf,
-                    vocab_size,
-                    ngram_scope,
-                    &cfg,
-                    &mut rng_state,
-                )
+                {
+                    let _t = std::time::Instant::now();
+                    let r = sampler::sample(
+                        gpu,
+                        &scratch.logits,
+                        &scratch.sample_buf,
+                        &scratch.repeat_buf,
+                        vocab_size,
+                        ngram_scope,
+                        &cfg,
+                        &mut rng_state,
+                    );
+                    if decode_prof::on() {
+                        decode_prof::add(&decode_prof::NS_SAMPLE, _t.elapsed().as_nanos());
+                    }
+                    r
+                }
             };
             if grammar_active {
                 let text = tokenizer.decode(&[next_token]);

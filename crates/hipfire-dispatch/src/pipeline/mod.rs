@@ -17,6 +17,11 @@ pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
 
+/// Escha-W2 routed-expert decode executor (Task 10). Replaces step 4 of the
+/// CPU-top-K fallback for escha layers; everything else stays arch-6 code.
+pub mod escha;
+pub mod route_trace;
+
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
 }
@@ -180,7 +185,7 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
     Ok(())
 }
 
-/// GPU-free pre-guard for MoE decode (#397 Ship 4c). Rejects the two
+/// GPU-free pre-guard for MoE decode (#397 Ship 4c). Rejects the
 /// truly-unsupported cases up front — *before* any GPU work — so the caller
 /// gets a clean [`DispatchError`] instead of a deep panic in the CPU-top-K
 /// fallback (`select_nth_unstable_by(k-1)` panics when `k == 0 || k > n_exp`)
@@ -198,14 +203,61 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
 ///   issue but experts are resident, the fallback runs it and its inner
 ///   `gemv.run_auto` surfaces any genuinely-unsupported dtype as its own clean
 ///   `DispatchError` — so we must NOT reject that case here.)
+/// - **(c)** an Escha-W2 layer on the indexed GPU-top-K path WITHOUT the escha
+///   indexed executor behind it. See below — this one is a silent-wrong-output
+///   guard, not a panic guard.
 ///
 /// `routed_experts_resident` mirrors `!MoeParams::routed_experts.is_empty()`
 /// (false under paged residency, where only the GPU-top-K path is available).
+///
+/// # (c) — why escha must fail closed on an UNSUPPORTED indexed path
+///
+/// Escha-W2 weights live in a ROTATED domain: only the escha routed executors
+/// in [`crate::pipeline::escha`] wrap the GEMVs in the H128 pair. The GENERIC
+/// indexed routed body in [`run_moe_decode`] knows nothing about escha;
+/// running an escha layer through it omits the transforms and emits finite,
+/// fluent output that is wrong by ~1e-1 — no crash, no NaN, no test fires.
+///
+/// Escha now has TWO supported indexed variants, and arm (c) is the assertion
+/// that the layer is one of them:
+///
+///  * `routed_indexable_escha_native` (Phase 2, production) — the routed
+///    experts are the trellis CODE (`Escha2T16` / `Escha3T16`) and the fused
+///    `escha_gemv_native_*` decodes it inside the GEMV;
+///  * `routed_indexable_escha_q8` (Phase 1, the A/B arm) — the experts are the
+///    Q8_0 the trellis decoded into at load.
+///
+/// Both additionally require the H128 transform tables to be resident, and
+/// both reach `escha::escha_routed_decode_indexed`, which `run_moe_decode`
+/// branches to before the generic body ever runs. `escha_indexed_supported` is
+/// the caller's assertion that a supported container AND the tables hold for
+/// this layer.
+///
+/// The arm was WIDENED for Phase 2 rather than removed, and it is still the
+/// specific-combination test it always was. What it catches is every way escha
+/// could arrive on the indexed path other than through those two arms:
+///
+///  * transform tables missing (`MoeParams::escha == None`) while the layer
+///    is still marked escha by dtype — the executor could not be called;
+///  * an escha layer that resolved indexable through some OTHER arm, e.g. a
+///    future graded/mixed escha file whose representative routed dtype is
+///    neither escha-coded nor Q8_0. Each escha GEMV hard-codes its container's
+///    bit geometry, so dispatching one on a different container is silent
+///    corruption too — this hazard is the mirror image of the original one,
+///    and both are refused here by requiring the *specific* supported
+///    combinations rather than merely "escha, somehow, on the indexed path".
+///
+/// It deliberately ERRORS rather than forcing `use_gpu_topk = false`. Forcing
+/// would keep escha correct while hiding the fact that a new indexed arm needs
+/// to be taught about escha (or explicitly excluded from it) — the whole point
+/// is that the next person has to make that decision consciously.
 pub fn check_moe_decode_supported(
     use_gpu_topk: bool,
     k: usize,
     n_exp: usize,
     routed_experts_resident: bool,
+    has_escha: bool,
+    escha_indexed_supported: bool,
 ) -> Result<(), DispatchError> {
     // (a) k-range — required by BOTH the GPU-top-K path and the CPU fallback's
     // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
@@ -224,6 +276,65 @@ pub fn check_moe_decode_supported(
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "decode-routed-dtype-unsupported-no-fallback",
+            arch: "",
+            quant: "",
+        });
+    }
+    // (c) escha on the indexed GPU-top-K path WITHOUT the escha indexed
+    // executor behind it: fail closed. The generic indexed body never applies
+    // the H128 pair, and each escha GEMV hard-codes one container's bit
+    // geometry — either mismatch is silently-wrong output rather than an
+    // error. See the module-level rationale on this function.
+    if has_escha && use_gpu_topk && !escha_indexed_supported {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-experts-on-indexed-gpu-topk-path",
+            arch: "",
+            quant: "",
+        });
+    }
+    Ok(())
+}
+
+/// The BATCHED-PREFILL mirror of [`check_moe_decode_supported`]'s arm (c).
+///
+/// [`run_moe_prefill`] branches to the escha routed executor on
+/// `MoePrefillParams::escha.is_some()`. If that is `None`, control falls
+/// through into Path 1 / Path 2, which apply NO Hadamard transform and raise
+/// no error — the same finite, fluent, ~1e-1-wrong output arm (c) exists to
+/// prevent on the decode side.
+///
+/// # Why the layer marker must be UNGATED
+///
+/// `MoePrefillParams::escha` is `Some` only when the layer is escha AND
+/// `escha_indexed_route_enabled()`. So `escha.is_none()` on its own cannot
+/// tell "this is a plain Q8_0 MoE layer" apart from "this is an escha layer
+/// with `HIPFIRE_ESCHA_INDEXED=0`". `layer_is_escha` is therefore taken
+/// straight from the layer's own transform tables (`ffn.escha.is_some()`, a
+/// load-time model-state property), never from an env var — exactly as the
+/// router f16 rounding in `qwen35::prefill` already does.
+///
+/// # Why this is not "safe today, therefore unnecessary"
+///
+/// It is safe today only because no admission arm outside escha's own admits
+/// Q8_0 routed experts to batched prefill — a property of a dtype table in
+/// another crate, 200 lines from the branch that depends on it. The next
+/// planned work is a Q8_0 grouped GEMM over sorted expert groups, which is
+/// precisely a generic Q8_0 routed arm; when it lands, an escha layer with the
+/// indexed route disabled becomes indistinguishable from a plain Q8_0 MoE
+/// layer inside `run_moe_prefill` and takes the transform-free path. This
+/// makes that a loud refusal at the point of danger instead.
+///
+/// Like arm (c), it ERRORS rather than silently rerouting: a new prefill arm
+/// has to be taught about escha, or explicitly excluded from it, consciously.
+pub fn check_moe_prefill_supported(
+    layer_is_escha: bool,
+    escha_tables_present: bool,
+) -> Result<(), DispatchError> {
+    if layer_is_escha && !escha_tables_present {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "escha-routed-experts-on-non-escha-prefill-path",
             arch: "",
             quant: "",
         });
@@ -582,6 +693,32 @@ pub fn run_uniform_moe_down_expanded(
     }
 }
 
+/// The exact arch predicate `run_moe_decode` uses to pick the fused
+/// exact-wave64 router kernel (`moe_router_softmax_topk_k8_wave64_exact`)
+/// over the reference two-launch (`softmax_f32` + `moe_topk_renorm_k8`)
+/// path. Extracted to a standalone function — rather than left inline —
+/// so any caller that needs to reproduce production's kernel choice (today:
+/// the escha router-contract test helper in hipfire-arch-qwen35) calls the
+/// real predicate instead of a hand-copied approximation that can silently
+/// drift from it.
+///
+/// `gfx1100_router_mode` is `HIPFIRE_GFX1100_ROUTER_W64`'s value (pass
+/// `hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok().as_deref()`
+/// to match production exactly): `"0"`/`"approx"` opt the gfx1100 production
+/// path back out to the reference two-launch kernel or the old
+/// non-bit-exact research kernel, respectively; anything else (including
+/// unset) keeps the fused exact kernel on gfx1100. gfx1151 always takes the
+/// fused exact kernel unconditionally.
+pub fn exact_wave64_router_predicate(
+    n_exp: usize,
+    arch: &rdna_compute::arch_caps::ArchCaps,
+    gfx1100_router_mode: Option<&str>,
+) -> bool {
+    n_exp == 256
+        && ((arch.is_gfx1100() && !matches!(gfx1100_router_mode, Some("0" | "approx")))
+            || arch.is_gfx1151())
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
@@ -621,7 +758,31 @@ pub fn run_moe_decode(
     // deep `select_nth_unstable_by` panic in the fallback into a clean error.
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
-    check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
+    //
+    // `p.has_escha()` feeds arm (c): an Escha-W2 layer on the indexed
+    // GPU-top-K path is refused HERE, before any GPU work, UNLESS it is one of
+    // the two supported shapes — resolved through
+    // `routed_indexable_escha_native` (Phase 2: the trellis code, fused GEMV)
+    // or `routed_indexable_escha_q8` (Phase 1: the decoded Q8_0) AND carrying
+    // the transform tables the escha indexed executor needs. Both arguments
+    // must stay wired to the real values; a constant re-opens exactly the hole
+    // they close.
+    //
+    // `escha_indexed_supported` is deliberately the AND of the resolver's
+    // escha arm and the tables' presence, and it is computed once here so the
+    // guard and the dispatch below cannot drift apart — the branch to
+    // `escha_routed_decode_indexed` re-reads THIS binding rather than
+    // recomputing the predicate.
+    let escha_indexed_supported =
+        (res.routed_indexable_escha_q8 || res.routed_indexable_escha_native) && p.escha.is_some();
+    check_moe_decode_supported(
+        res.use_gpu_topk,
+        p.k,
+        p.n_exp,
+        !p.routed_experts.is_empty(),
+        p.has_escha(),
+        escha_indexed_supported,
+    )?;
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
     // routed-combine accumulate into that zeroed partial (all-reduced by the EP
@@ -865,6 +1026,20 @@ pub fn run_moe_decode(
     // shared-expert down → generic per-expert routed loop, then returns. It
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // k=8 + an indexable routed dtype).
+    // Escha-only router-logits f16 round-trip. This is HOISTED ABOVE the
+    // CPU-fallback return on purpose (Task 10 fix): Task 9 placed it further
+    // down, on the GPU-top-K path only, but escha's routed experts are stored
+    // Q8_0 and Q8_0 is not an indexable routed dtype — so every real escha
+    // layer takes the `!use_gpu_topk` branch below and the rounding was
+    // unreachable on the one model family that needs it. The rationale for
+    // the rounding itself is unchanged; see the comment at the (now
+    // no-op-for-escha) second call site below and
+    // `MoeDtypes::has_escha_experts`. `p.has_escha()` also admits layers whose
+    // routed dtype has been rewritten to Q8_0 by the escha loader, which
+    // `has_escha_experts()` alone can no longer see.
+    if p.has_escha() {
+        hip!(gpu.router_logits_round_f16_rne(p.router_logits))?;
+    }
     if !res.use_gpu_topk {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
@@ -888,15 +1063,31 @@ pub fn run_moe_decode(
         }
     }
     let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
-    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
-    let exact_wave64_router = p.n_exp == 256
-        && ((ctx.arch.is_gfx1100()
-            // The exact fused router is the production gfx1100 path. `0` retains
-            // the two-launch reference path for A/B diagnosis; `approx` retains
-            // the old non-bit-exact research kernel without exposing it by
-            // accident through the former `1` opt-in.
-            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
-            || gfx1151_radiowave_fusions);
+    let exact_wave64_router =
+        exact_wave64_router_predicate(p.n_exp, &ctx.arch, gfx1100_router_mode.as_deref());
+    // Escha-only router-logits f16 round-trip (review Fix 1). EschaLabs'
+    // runtime computes router logits as f16(x @ gate_w.T) and only then
+    // widens to F32 to select top-k; hipfire keeps logits F32 end-to-end.
+    // The two selections differ whenever two experts' F32 logits round to
+    // the same f16 value AND straddle the top-k boundary (measured ~0.42%
+    // of router decisions across 11 layers). Escha's recovery fine-tune was
+    // trained against the f16-rounding runtime, so this model family must
+    // reproduce that rounding to avoid a silent, unexplained divergence
+    // from Escha's own expert choice.
+    //
+    // Gated on `MoeDtypes::has_escha_experts` — a model-state property fixed
+    // at load time by the routed-expert dtype actually on disk, never a
+    // global env var — so every `qwen3.6:35b-a3b-*` SKU and every other
+    // arch-6 model takes the branch below as a no-op and keeps its current
+    // selection bit-for-bit. Applied to the shared `router_logits` buffer
+    // BEFORE the kernel-selection `if`/`else` below, so both routes (the
+    // fused exact-wave64 kernel and the softmax_f32 + moe_topk_renorm_k8
+    // fallback pair) see identically-rounded logits.
+    // (The rounding itself was applied above, hoisted so the CPU-top-K
+    // fallback gets it too. Re-rounding here would be numerically a no-op —
+    // f16(f16(x)) == f16(x) — but the launch would not be free, so it is not
+    // repeated. This site keeps the rationale next to the selection kernels
+    // it protects.)
     static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
     let router_shared_fuse = exact_wave64_router
         && p.batch_size == 1
@@ -1103,6 +1294,87 @@ pub fn run_moe_decode(
                 quant: "",
             });
         }
+    }
+
+    // ── Escha-W2 routed experts, indexed (device-resident) routing ───────────
+    // Escha weights are in a rotated domain; the generic indexed body below
+    // would run them without the H128 pair and emit ~1e-1-wrong output with
+    // nothing to catch it. This branch runs the escha executor instead — same
+    // eight phases and the same transforms as the CPU-top-K route, with the
+    // routing never leaving the device.
+    //
+    // It returns rather than falling through: it has already accumulated the
+    // routed contribution into `out_target`, so the generic body must not run.
+    // Selection capture (off unless HIPFIRE_ESCHA_ROUTE_TRACE is set). Placed
+    // after top-k and before any routed body, so it records what the expert
+    // GEMVs are about to index with on EITHER decode route.
+    if crate::pipeline::route_trace::enabled() {
+        crate::pipeline::route_trace::record(gpu, p.topk_indices, p.batch_size, p.k);
+    }
+    if escha_indexed_supported {
+        let escha = p
+            .escha
+            .as_ref()
+            .expect("escha_indexed_supported implies escha tables");
+        // Same refusals the CPU-top-K escha branch makes, for the same
+        // reasons: the executor has no AWQ / graded-tier arm, and Hessian
+        // capture keyed on `x_norm` would record the H128 outputs instead of
+        // the raw pre-rotation activations and silently poison the Hessians.
+        if p.expert_down_awq_ptrs.is_some() || p.expert_dtype_tags.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-with-awq-or-graded-tiers",
+                arch: "",
+                quant: "",
+            });
+        }
+        if gpu.hessian_capture.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-hessian-capture-unsupported",
+                arch: "",
+                quant: "",
+            });
+        }
+        // The escha executor always folds the weighted combine into the layer
+        // (phase 8). `defer_routed_combine` promises the caller an EXPANDED,
+        // uncombined `down_expanded` it will fold itself — honouring the flag
+        // is not possible here, and ignoring it would double-count.
+        if p.defer_routed_combine {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-cannot-defer-combine",
+                arch: "",
+                quant: "",
+            });
+        }
+        return crate::pipeline::escha::escha_routed_decode_indexed(
+            gpu,
+            escha,
+            &crate::pipeline::escha::EschaIndexedRouting {
+                expert_gate_up_ptrs: p.expert_gate_up_ptrs,
+                expert_down_ptrs: p.expert_down_ptrs,
+                topk_indices: p.topk_indices,
+                topk_weights: p.topk_weights,
+                n_experts: p.n_exp,
+                // The container the expert slots hold, straight off the layer's
+                // routed dtype — the same fact `escha_indexed_supported` was
+                // resolved from, so the GEMV the executor picks and the arm the
+                // guard admitted are the same decision read twice, not two
+                // decisions that could drift.
+                gate_up_dtype: p.dtypes.routed_gate_up,
+                down_dtype: p.dtypes.routed_down,
+                gate_up_m: 2 * p.mi,
+                gate_up_k: p.routed_gate_up_k,
+                down_m: p.routed_down_m,
+                down_k: p.routed_down_k,
+            },
+            out_target,
+            p.x_norm,
+            p.hidden,
+            p.mi,
+            p.k,
+        );
     }
 
     // ── Indexed routed experts ────────────────────────────────────────────────
@@ -2041,6 +2313,47 @@ fn run_moe_decode_cpu_fallback(
             arch: "",
             quant: "",
         });
+    }
+
+    // ── 4a. Escha-W2 routed experts: the H128-wrapped, batched executor ──────
+    // Escha weights are in a rotated domain; a plain per-expert `run_auto`
+    // here would silently produce ~1e-1-wrong output. The executor also
+    // batches the transforms across the token's k experts, which is a
+    // measured hard requirement (see pipeline::escha module docs), so it
+    // replaces the loop below wholesale rather than wrapping each iteration.
+    if let Some(escha) = p.escha.as_ref() {
+        if p.expert_down_awq_ptrs.is_some() || p.expert_dtype_tags.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-with-awq-or-graded-tiers",
+                arch: "",
+                quant: "",
+            });
+        }
+        if gpu.hessian_capture.is_some() {
+            // The capture keys off the RAW pre-rotation activations; on the
+            // escha path those are the H128 outputs, not `x_norm`/`silu(g)*u`,
+            // so silently reusing the loop below's keys would poison the
+            // Hessians. Refuse rather than record the wrong thing.
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-hessian-capture-unsupported",
+                arch: "",
+                quant: "",
+            });
+        }
+        return crate::pipeline::escha::escha_routed_decode(
+            ctx,
+            gpu,
+            escha,
+            p.routed_experts,
+            &topk_indices,
+            &topk_weights,
+            p.x_norm,
+            p.x_residual,
+            p.hidden,
+            mi,
+        );
     }
 
     // ── 4. Per-expert routed loop (master's generic `weight_gemv` arm) ────────
@@ -3115,6 +3428,12 @@ pub fn run_moe_prefill(
         };
     }
 
+    // BEFORE any GPU work, and before the escha branch below: an escha layer
+    // that reaches here without its transform tables would fall into Path 1 /
+    // Path 2, which apply no Hadamard transform and raise no error. See
+    // `check_moe_prefill_supported`.
+    check_moe_prefill_supported(p.layer_is_escha, p.escha.is_some())?;
+
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
     if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE")
@@ -3150,6 +3469,79 @@ pub fn run_moe_prefill(
     // read load-time zero-dummy weights → contribute 0, so the all-reduced sum of
     // partials equals the full single-GPU routed combine.
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_batch);
+
+    // ── Escha-W2 routed experts, batched + indexed ───────────────────────────
+    //
+    // Mirrors the escha branch in `run_moe_decode`, and for the same reason:
+    // escha weights live in a ROTATED domain, so Path 1 and Path 2 below —
+    // which feed the activation straight into the expert GEMVs and combine the
+    // raw result — would omit both Hadamard transforms and emit finite,
+    // fluent, ~1e-1-wrong output with nothing to catch it. This branch RETURNS;
+    // it has already accumulated the routed contribution into `out_target`.
+    //
+    // It runs BEFORE the Path 2 scatter so escha never pays for a scatter it
+    // does not use.
+    if let Some(escha) = p.escha.as_ref() {
+        // The same four refusals the two decode escha branches make, for the
+        // same reasons. Kept verbatim rather than factored out: each one is a
+        // claim about THIS executor, and a shared helper would let a future
+        // divergence between the routes go unnoticed.
+        //
+        // AWQ / graded tiers: the escha executor has no arm for either.
+        if p.expert_down_awq_ptrs.is_some() || p.expert_dtype_tags.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-with-awq-or-graded-tiers",
+                arch: "",
+                quant: "",
+            });
+        }
+        // Hessian capture keyed on the activation would record the H128
+        // outputs instead of the raw pre-rotation activations, silently
+        // poisoning the Hessians.
+        if gpu.hessian_capture.is_some() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "escha-routed-hessian-capture-unsupported",
+                arch: "",
+                quant: "",
+            });
+        }
+        // The escha executor always folds the weighted combine into the layer
+        // (phase 8); there is no expanded, uncombined `down_expanded` to hand
+        // back. (Prefill has no `defer_routed_combine` flag today — the decode
+        // branch refuses one — so this is recorded as a comment rather than a
+        // dead check. If prefill gains the flag, it must refuse here.)
+        let slots = total_slots;
+        let scratch = hip!(gpu.ensure_escha_prefill_scratch(slots, p.hidden, mi))?;
+        return crate::pipeline::escha::escha_routed_prefill_indexed(
+            gpu,
+            escha,
+            &scratch,
+            &crate::pipeline::escha::EschaIndexedRouting {
+                expert_gate_up_ptrs: p.expert_gate_up_ptrs,
+                expert_down_ptrs: p.expert_down_ptrs,
+                topk_indices: p.topk_indices,
+                topk_weights: p.topk_weights,
+                n_experts: p.n_exp,
+                // See the decode branch: the container comes off the layer's
+                // own routed dtype, which is what the batched-prefill
+                // admission arm keyed on too.
+                gate_up_dtype: p.dtypes.routed_gate_up,
+                down_dtype: p.dtypes.routed_down,
+                gate_up_m: 2 * mi,
+                gate_up_k,
+                down_m,
+                down_k,
+            },
+            out_target,
+            p.x_norm_batch,
+            p.hidden,
+            mi,
+            k_top,
+            n,
+        );
+    }
 
     // ── Path 2 scatter pipeline ───────────────────────────────────────
     let mut path2_m_total: usize = 0;

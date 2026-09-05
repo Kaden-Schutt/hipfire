@@ -40,6 +40,8 @@ pub use dispatch::{
     MQ6G256V2_GROUP_BYTES,
 };
 pub use feature_flags::FeatureFlags;
+/// Slot-to-activation mapping for `Gpu::escha_h128_batched`'s input side.
+pub use gemv::{escha_grouped_tile, EschaXGroup};
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;
 
@@ -85,4 +87,24 @@ mod tests {
             "calib_force_bf16() must be false when HIPFIRE_CALIB_BF16 != \"1\" (OFF by default)"
         );
     }
+}
+
+/// Process-wide count of `escha_h128_in_batched` / `escha_h128_out_batched`
+/// launches. The Escha-W2 forward path is launch-bound (Task 8), so the
+/// per-token launch budget is a correctness-adjacent property: the G4 gate
+/// reads this to report the achieved launches/token instead of asserting a
+/// comment. Diagnostic only — nothing synchronises on it.
+pub static ESCHA_H128_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the H128 batched-launch tally.
+///
+/// Monotonic for the life of the process — there is NO reset, by design (an
+/// earlier version of this doc said "and optionally reset"; no such affordance
+/// exists). Callers wanting a delta snapshot the counter before and after the
+/// region of interest, which is what every escha gate does.
+///
+/// The count reflects launches ISSUED, not completed — nothing synchronises on
+/// it. Sample it after a `device_synchronize` if that distinction matters.
+pub fn escha_h128_launches() -> u64 {
+    ESCHA_H128_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }

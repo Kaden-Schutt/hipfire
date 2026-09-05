@@ -119,3 +119,129 @@ pub use carrier::{free_qwen35_bundle, load_bundle as load_qwen35_bundle, Qwen35B
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
 #[cfg(feature = "deltanet")]
 pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
+
+/// G4b (Escha-W2 port, Task 9): expose the arch-6 MoE router selection step
+/// so `examples/escha_router_contract.rs` can call the *actual* production
+/// router — not a reimplementation of it — on an arbitrary `.hfq` layer and
+/// compare its top-K expert SET against EschaLabs' shipped fixture.
+///
+/// This calls exactly the same primitives the production decode/prefill path
+/// calls (`hipfire_runtime::llama::weight_gemv` for the router GEMV, then
+/// whichever top-K kernel `hipfire_dispatch::pipeline::run_moe_decode` would
+/// pick for this GPU's arch — the fused `moe_router_softmax_topk_k8_wave64_exact`
+/// on gfx1100/gfx1151, or the reference two-launch `softmax_f32` +
+/// `moe_topk_renorm_k8` everywhere else). No selection math is duplicated
+/// here; the kernel-choice arch check itself is
+/// `hipfire_dispatch::pipeline::exact_wave64_router_predicate` — the exact
+/// function `run_moe_decode` calls, not a copy of its logic — so this
+/// helper cannot silently drift from production's actual gate.
+///
+/// This test model's `.hfq` (`gate.weight` quant_type=1/F16) does not carry
+/// escha routed-expert dtypes, so it never exercises the escha-only f16
+/// router-logits round-trip (review Fix 1); this helper intentionally omits
+/// that step to stay a pure probe of the pre-existing selection kernels.
+#[cfg(feature = "deltanet")]
+pub fn escha_router_topk_for_test(
+    hfq_path: &str,
+    layer: usize,
+    x: &[f32],
+    n_tokens: usize,
+    hidden: usize,
+    top_k: usize,
+) -> Result<Vec<u32>, String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_runtime::hfq::{load_weight_tensor_pread, HfqFile};
+    use hipfire_runtime::llama::weight_gemv;
+    use rdna_compute::{DType, Gpu};
+
+    if x.len() != n_tokens * hidden {
+        return Err(format!(
+            "escha_router_topk_for_test: x.len()={} != n_tokens*hidden={}",
+            x.len(),
+            n_tokens * hidden
+        ));
+    }
+
+    let hfq = HfqFile::open(std::path::Path::new(hfq_path)).map_err(|e| e.to_string())?;
+    let config = qwen35::config_from_hfq(&hfq)?;
+    let n_exp = config.num_experts;
+    let norm_topk = config.norm_topk_prob;
+
+    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    let ctx = DispatchCtx::new(&gpu);
+    // The *actual* predicate `run_moe_decode` (hipfire-dispatch/src/pipeline/mod.rs)
+    // uses to pick the fused exact-wave64 router kernel over the reference
+    // two-launch path — extracted to `exact_wave64_router_predicate` so this
+    // helper cannot silently drift from production's real gate (review Fix 2:
+    // the previous `is_gfx1151() || is_gfx1100()` copy here happened to agree
+    // with production for this model/GPU, but wasn't actually the same check —
+    // production also requires `n_exp == 256` and honors the
+    // `HIPFIRE_GFX1100_ROUTER_W64` override on gfx1100).
+    // HIPFIRE_MOE_ROUTER_SHARED_FUSE-gated shared-expert fusion is a pure perf
+    // variant of the same math and is left out here — it doesn't change which
+    // experts get selected.
+    let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let use_exact_wave64 = hipfire_dispatch::pipeline::exact_wave64_router_predicate(
+        n_exp,
+        &ctx.arch,
+        gfx1100_router_mode.as_deref(),
+    );
+
+    fn exact_name(s: &str) -> Vec<String> {
+        vec![s.to_string()]
+    }
+    let weight_name = format!("model.language_model.layers.{layer}.mlp.gate.weight");
+    let router = load_weight_tensor_pread(&hfq, &gpu, &weight_name, n_exp, hidden, exact_name)
+        .map_err(|e| e.to_string())?;
+
+    let logits = gpu
+        .alloc_tensor(&[n_exp], DType::F32)
+        .map_err(|e| e.to_string())?;
+    // topk_idx carries raw i32 selections in an f32-tagged buffer — the same
+    // "i32-in-F32 alias" convention `moe_ffn_decode_impl` uses for its scratch
+    // (see qwen35/forward.rs `capture_expert_stats`'s `ti[krank].to_bits()`).
+    let topk_idx = gpu
+        .alloc_tensor(&[top_k], DType::F32)
+        .map_err(|e| e.to_string())?;
+    let topk_w = gpu
+        .alloc_tensor(&[top_k], DType::F32)
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(n_tokens * top_k);
+    for t in 0..n_tokens {
+        let row = &x[t * hidden..(t + 1) * hidden];
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
+        let x_gpu = gpu
+            .upload_raw(bytes, &[hidden])
+            .map_err(|e| e.to_string())?;
+
+        weight_gemv(&mut gpu, &router, &x_gpu, &logits).map_err(|e| e.to_string())?;
+
+        if use_exact_wave64 {
+            gpu.moe_router_softmax_topk_k8_wave64_exact(
+                &logits, &topk_idx, &topk_w, n_exp, norm_topk,
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            gpu.softmax_f32(&logits).map_err(|e| e.to_string())?;
+            gpu.moe_topk_renorm_k8(&logits, &topk_idx, &topk_w, n_exp, norm_topk)
+                .map_err(|e| e.to_string())?;
+        }
+
+        gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+        let idx_f32 = gpu.download_f32(&topk_idx).map_err(|e| e.to_string())?;
+        for v in idx_f32.iter().take(top_k) {
+            out.push((v.to_bits() as i32) as u32);
+        }
+
+        let _ = gpu.free_tensor(x_gpu);
+    }
+
+    let _ = gpu.free_tensor(logits);
+    let _ = gpu.free_tensor(topk_idx);
+    let _ = gpu.free_tensor(topk_w);
+    router.free_all(&mut gpu);
+
+    Ok(out)
+}

@@ -21,6 +21,16 @@ rayon = "1"
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
+# G2 parity gate only (test_escha_decode_gpu_vs_cpu): escha_ref::reconstruct is
+# the CPU oracle the GPU tile decode is asserted bit-exact against. Note
+# hipfire-quantize already carries a dev-dependency back on rdna-compute (for
+# its own GL-codebook parity test); Cargo permits a dev-dependency cycle since
+# dev-deps are excluded from the normal build graph.
+hipfire-quantize = { path = "../hipfire-quantize" }
+# Task 9 review Fix 1 divergence proof (test_escha_router_f16_boundary): the
+# host-side oracle for "top-k of f16-widened router logits" needs an f32<->f16
+# round trip. Not a production dependency of rdna-compute itself.
+half.workspace = true
 
 # ---------------------------------------------------------------------------
 # Archived research probes.

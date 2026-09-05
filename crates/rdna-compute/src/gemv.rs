@@ -142,6 +142,78 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_E8_SOA_EXPERTS", false)
 }
 
+/// How the input activation of `escha_h128_in_batched` maps onto its slots.
+///
+/// Replaces a bare `x_batched: bool`. The bool covered the two decode cases
+/// (one shared `x`, or one `x` per slot); batched prefill needs a third — one
+/// `x` per TOKEN, shared by that token's `k` expert slots — and a bool cannot
+/// express it. Making it an enum rather than a raw `i32` means a caller cannot
+/// pass `2` when it meant "true": the grouped case has to name its group size,
+/// which is exactly the value that would otherwise be silently wrong.
+///
+/// The kernarg encoding (`<= 0` broadcast, else `slot / g`) keeps 0 and 1
+/// meaning what the bool's `false` and `true` meant, so the kernel change is
+/// backward compatible for every existing call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EschaXGroup {
+    /// One `[n]` activation shared by every slot.
+    Broadcast,
+    /// `[slots, n]` — one activation per slot.
+    PerSlot,
+    /// `[slots / g, n]` — slot `s` reads row `s / g`. `g` must divide `slots`.
+    Grouped(usize),
+}
+
+impl EschaXGroup {
+    /// The `x_group` kernarg. `PerSlot` is `Grouped(1)` by construction.
+    #[inline]
+    pub fn as_kernarg(self) -> i32 {
+        match self {
+            EschaXGroup::Broadcast => 0,
+            EschaXGroup::PerSlot => 1,
+            EschaXGroup::Grouped(g) => g as i32,
+        }
+    }
+}
+
+/// Register-tile shape of the escha grouped GEMM: `(ROWS, CTILES)` — how many
+/// of an expert's token rows one pass holds, and how many adjacent 16-wide tile
+/// columns one block owns.
+///
+/// A lane holds `ROWS * 2 * CTILES` f32 accumulators, so this is a register
+/// budget, and it trades the two traffic terms against each other: bigger ROWS
+/// re-reads the expert code fewer times (`ceil(G_e / ROWS)` passes per expert),
+/// bigger CTILES re-reads the ACTIVATION fewer times (`m / (16*CTILES)` blocks
+/// per slot instead of `m / 16`).
+///
+/// `(8, 4)` is the swept default — see
+/// `rdna-compute/examples/bench_escha_grouped_gemm.rs`, which measures the
+/// whole instantiated set at both shipped projection shapes. `CTILES` falls
+/// back when it does not divide `m / 16`; every shipped escha projection has
+/// `m ∈ {1024, 2048}`, so the fallback is unreachable today and exists so a
+/// future shape gets a smaller tile rather than a rejected launch.
+///
+/// `HIPFIRE_ESCHA_GROUPED_TILE=RxC` overrides it. That is a TUNING knob, not a
+/// route switch: every instantiation computes the same sums in the same order,
+/// so moving it changes speed and nothing else.
+pub fn escha_grouped_tile(m: usize) -> (usize, usize) {
+    static TILE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (rows, ctiles) = *TILE.get_or_init(|| {
+        std::env::var("HIPFIRE_ESCHA_GROUPED_TILE")
+            .ok()
+            .and_then(|s| {
+                let (r, c) = s.split_once('x')?;
+                Some((r.trim().parse().ok()?, c.trim().parse().ok()?))
+            })
+            .unwrap_or((8, 4))
+    });
+    let mut c = ctiles;
+    while c > 1 && m % (16 * c) != 0 {
+        c /= 2;
+    }
+    (rows, c)
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -13274,6 +13346,1374 @@ impl Gpu {
         result
     }
 
+    /// Shared validation for both `escha_decode_tiles` entry points: catches
+    /// a bad shape/K/code-length combination before it becomes an
+    /// out-of-bounds device read. The kernel launches
+    /// `(in_features/16)*(out_features/16)` blocks, each reading `16*K`
+    /// shorts starting at `tile*16*K` — a short `code` slice, an `in_features`
+    /// or `out_features` that is not a multiple of 16, or an unsupported `K`
+    /// all lead to a device-side OOB read (undefined behaviour, not just a
+    /// wrong answer) rather than a clean failure. Mirrors the assertion the
+    /// CPU oracle already makes (`escha_ref::reconstruct`).
+    fn escha_validate_tile_shape(
+        in_features: u32,
+        out_features: u32,
+        k: u32,
+        code_len: usize,
+    ) -> HipResult<()> {
+        if in_features % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_decode_tiles: in_features {in_features} is not a multiple of 16"),
+            ));
+        }
+        if out_features % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_decode_tiles: out_features {out_features} is not a multiple of 16"),
+            ));
+        }
+        if k != 2 && k != 3 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_decode_tiles: unsupported K={k} (only 2 and 3 are defined)"),
+            ));
+        }
+        let want_len = (in_features as usize / 16) * (out_features as usize / 16) * 16 * k as usize;
+        if code_len != want_len {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_decode_tiles: code length mismatch: got {code_len} shorts, expected \
+                     {want_len} for in_features={in_features} out_features={out_features} K={k}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decode an escha code stream already resident on the GPU into a bare
+    /// fp16 weight matrix `[in_features, out_features]`, also GPU-resident.
+    /// This is the load-path form: no host round trip. `escha_decode_tiles_host`
+    /// is the host-roundtrip convenience wrapper used by the G2 parity gate
+    /// and by callers that do not already have the code on-device; it calls
+    /// this function rather than duplicating the launch.
+    pub fn escha_decode_tiles(
+        &mut self,
+        code: &GpuTensor,
+        bare_out: &GpuTensor,
+        in_features: u32,
+        out_features: u32,
+        k: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Validate against the tensors' LOGICAL shapes, not `buf.size()`: pooled
+        // allocations (`alloc_tensor`) can hand back a physically larger buffer
+        // than requested (see `GpuPool::alloc`), so the physical capacity is not
+        // proof of how much real code/output data is present.
+        Self::escha_validate_tile_shape(in_features, out_features, k, code.numel())?;
+        let n_elems = (in_features as usize) * (out_features as usize);
+        if bare_out.numel() != n_elems {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_decode_tiles: bare_out has {} elements, need exactly {} for \
+                     {in_features}x{out_features} fp16",
+                    bare_out.numel(),
+                    n_elems
+                ),
+            ));
+        }
+        let n_tiles = (in_features / 16) * (out_features / 16);
+        self.ensure_kernel(
+            "escha_decode_tiles",
+            kernels::ESCHA_DECODE_TILES_SRC,
+            "escha_decode_tiles",
+        )?;
+
+        let mut code_ptr = code.buf.as_ptr();
+        let mut bare_ptr = bare_out.buf.as_ptr();
+        let mut ic = in_features as i32;
+        let mut oc = out_features as i32;
+        let mut kk = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut code_ptr as *mut _ as *mut c_void,
+            &mut bare_ptr as *mut _ as *mut c_void,
+            &mut ic as *mut _ as *mut c_void,
+            &mut oc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_decode_tiles"];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [n_tiles, 1, 1], [32, 1, 1], 0, None, &mut params)
+        }
+    }
+
+    /// Decode an escha code stream to a bare fp16 weight matrix `[ic, oc]`.
+    /// Host-side helper used by the G2 parity gate; the load path uses the
+    /// device-resident `escha_decode_tiles` above, which this calls.
+    pub fn escha_decode_tiles_host(
+        &mut self,
+        code: &[i16],
+        in_features: u32,
+        out_features: u32,
+        k: u32,
+    ) -> HipResult<Vec<u16>> {
+        self.bind_thread()?;
+        Self::escha_validate_tile_shape(in_features, out_features, k, code.len())?;
+        let n_elems = (in_features as usize) * (out_features as usize);
+        let code_bytes: Vec<u8> = code.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_code = self.upload_raw(&code_bytes, &[code.len()])?;
+        let d_bare = self.alloc_tensor(&[n_elems], DType::F16)?;
+
+        self.escha_decode_tiles(&d_code, &d_bare, in_features, out_features, k)?;
+
+        let mut out = vec![0u8; n_elems * 2];
+        self.hip.memcpy_dtoh(&mut out, &d_bare.buf)?;
+        Ok(out
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
+    }
+
+    /// Launch one of the two H128 activation-transform entry points on
+    /// already GPU-resident buffers. `entry` selects `escha_h128_in` (scale
+    /// THEN transform) or `escha_h128_out` (transform THEN scale) — see
+    /// `kernels/src/escha_h128.hip`. This is the load-bearing form for the
+    /// forward path: `escha_h128_in_host`/`escha_h128_out_host` below are
+    /// the host-roundtrip convenience wrappers used by the G3 parity gate
+    /// and the benchmark; they call this rather than duplicating the launch.
+    pub fn escha_h128(
+        &mut self,
+        entry: &str,
+        a: &GpuTensor,
+        vec_in: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let n = a.numel();
+        assert_eq!(n, vec_in.numel(), "escha_h128: a/vec_in length mismatch");
+        assert_eq!(n, out.numel(), "escha_h128: a/out length mismatch");
+        assert_eq!(n % 128, 0, "H128 needs a multiple of 128");
+        self.ensure_kernel("escha_h128", kernels::ESCHA_H128_SRC, entry)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut v_ptr = vec_in.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[entry];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(n / 128) as u32, 1, 1],
+                [128, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// `xh = f16( H128(x * rin) * RS )` on device. Host-side helper for the
+    /// G3 parity gate; the forward path uses the device-resident form above.
+    pub fn escha_h128_in_host(&mut self, x: &[f32], rin: &[f32]) -> HipResult<Vec<u16>> {
+        self.escha_h128_host_impl("escha_h128_in", x, rin)
+    }
+
+    /// `y = f16( H128(mid) * RS * rout )` on device.
+    pub fn escha_h128_out_host(&mut self, mid: &[f32], rout: &[f32]) -> HipResult<Vec<u16>> {
+        self.escha_h128_host_impl("escha_h128_out", mid, rout)
+    }
+
+    fn escha_h128_host_impl(
+        &mut self,
+        entry: &str,
+        a: &[f32],
+        vec_in: &[f32],
+    ) -> HipResult<Vec<u16>> {
+        assert_eq!(a.len(), vec_in.len());
+        assert_eq!(a.len() % 128, 0, "H128 needs a multiple of 128");
+        self.bind_thread()?;
+        let n = a.len();
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v_bytes: Vec<u8> = vec_in.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let d_a = self.upload_raw(&a_bytes, &[n])?;
+        let d_v = self.upload_raw(&v_bytes, &[n])?;
+        let d_out = self.alloc_tensor(&[n], DType::F16)?;
+
+        self.escha_h128(entry, &d_a, &d_v, &d_out)?;
+
+        let mut raw = vec![0u8; n * 2];
+        self.hip.memcpy_dtoh(&mut raw, &d_out.buf)?;
+        Ok(raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
+    }
+
+    /// One H128 launch covering ALL `slots` top-k experts of a token
+    /// (Task 10). `entry` is `escha_h128_in_batched` or
+    /// `escha_h128_out_batched`.
+    ///
+    /// This is a HARD REQUIREMENT of the escha forward path, not an
+    /// optimisation: Task 8 measured these kernels launch-bound (an empty
+    /// kernel at the same grid/block is 70-75% of a real launch's cost), so
+    /// the per-expert form costs 1280 launches/token = 3.07 ms = a 326 tok/s
+    /// ceiling before any GEMV work. The batched form is 160 launches.
+    ///
+    /// - `x_group` (INPUT side only; ignored by `escha_h128_out_batched`) says
+    ///   how many consecutive slots share one row of `a`:
+    ///   * `EschaXGroup::Broadcast` — `a` is `[n]`, every slot reads it. The
+    ///     decode gate_up input side: a token's top-k experts see the same
+    ///     post-rmsnorm activation and differ only in `rin`.
+    ///   * `EschaXGroup::PerSlot` — `a` is `[slots, n]`. The down input side.
+    ///   * `EschaXGroup::Grouped(g)` — `a` is `[slots / g, n]`; slot `s` reads
+    ///     row `s / g`. The batched-prefill gate_up input side with `g = k`:
+    ///     slots are token-major (`token * k + krank`), so all k of a token's
+    ///     experts read that token's activation. `slots % g != 0` is rejected
+    ///     rather than truncated — a ragged tail would silently read a wrong
+    ///     row for the last few slots.
+    /// - `r_table`: the whole resident `[E, n]` `escha_rin_eff` /
+    ///   `escha_rout_eff` tensor. Slot `s` reads row `ids[s]` — that indexing
+    ///   IS the batching; no per-expert vector is gathered or copied.
+    /// - `ids`: `[slots]` i32 expert ids, device-resident.
+    /// - `out`: `[slots, n]` F32 holding f16-ROUNDED values (see the kernel).
+    pub fn escha_h128_batched(
+        &mut self,
+        entry: &str,
+        a: &GpuTensor,
+        r_table: &GpuTensor,
+        ids: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        slots: usize,
+        x_group: EschaXGroup,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_h128_batched: n={n} is not a multiple of 128"),
+            ));
+        }
+        let want_a = match x_group {
+            EschaXGroup::Broadcast => n,
+            EschaXGroup::PerSlot => slots * n,
+            EschaXGroup::Grouped(g) => {
+                if g == 0 || slots % g != 0 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "escha_h128_batched: x_group={g} does not divide slots={slots}; \
+                             a ragged group would make the last slots read the wrong row of a"
+                        ),
+                    ));
+                }
+                (slots / g) * n
+            }
+        };
+        // `>=`, not `==`, for the same reason as `out` below: the kernel reads
+        // exactly `want_a` elements, so an oversized source is safe. Equality
+        // here broke batched prefill for the DENSE escha path outright. Prefill
+        // scratch is sized for the maximum chunk, so any shorter chunk was
+        // rejected for being too BIG — a 2009-token prompt yields a 217-slot
+        // chunk against 256-slot scratch and failed with "a has 1310720
+        // elements, need 1111040". The dense 27B could then only prefill
+        // token-by-token through the decode path, at ~10 tok/s.
+        if a.numel() < want_a {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: a has {} elements, need at least {want_a}",
+                    a.numel()
+                ),
+            ));
+        }
+        // `>=`, not `==`: the kernel writes exactly `slots * n` elements and
+        // never reads `out`, so an oversized destination is safe. The dense
+        // path relies on this — its `xh` scratch is sized to the LARGEST `ic`
+        // any projection uses so one buffer serves them all, and an exact
+        // check would reject every projection but the widest.
+        //
+        // Undersized is still fatal: that is a real out-of-bounds write.
+        if out.numel() < slots * n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: out has {} elements, need at least {}",
+                    out.numel(),
+                    slots * n
+                ),
+            ));
+        }
+        if r_table.numel() % n != 0 || r_table.numel() < n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: r table has {} elements, not a whole number of {n}-wide rows",
+                    r_table.numel()
+                ),
+            ));
+        }
+        if ids.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_h128_batched: ids has {} elements, need {slots}",
+                    ids.numel()
+                ),
+            ));
+        }
+        self.ensure_kernel("escha_h128", kernels::ESCHA_H128_SRC, entry)?;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut r_ptr = r_table.buf.as_ptr();
+        let mut i_ptr = ids.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut xb = x_group.as_kernarg();
+        let mut params: Vec<*mut c_void> = if entry == "escha_h128_in_batched" {
+            vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut r_ptr as *mut _ as *mut c_void,
+                &mut i_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+                &mut xb as *mut _ as *mut c_void,
+            ]
+        } else {
+            vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut r_ptr as *mut _ as *mut c_void,
+                &mut i_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ]
+        };
+        let grid = (slots * (n / 128)) as u32;
+        // Counted so the "160 H128 launches per token" budget is a MEASURED
+        // number in the G4 gate, not a claim in a comment. Relaxed ordering:
+        // this is a diagnostic tally, nothing synchronises on it.
+        crate::ESCHA_H128_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `launch_maybe_blob`, NOT a raw `launch_kernel(.., None, ..)`.
+        //
+        // This runs INSIDE the forward pass, so under graph capture a
+        // null-stream launch is not ordered against the captured stream that
+        // the surrounding GEMVs use — those go through `launch_maybe_blob`
+        // already. The mixture was a genuine data race: the G5 gate's
+        // reference arm scored 0.000361 and 0.000152 on two runs of the SAME
+        // binary against the SAME reference, which failed its own negative
+        // control and made the whole gate unusable. Setting either
+        // HIP_LAUNCH_BLOCKING=1 or HIPFIRE_GRAPH=0 restored determinism —
+        // that is what identified capture as the trigger.
+        let entry_name = entry.to_string();
+        let (a_p, r_p, i_p, o_p, n_v, xb_v) = (a_ptr, r_ptr, i_ptr, o_ptr, n_val, xb);
+        let is_in = entry == "escha_h128_in_batched";
+        self.launch_maybe_blob(
+            &entry_name,
+            [grid, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p);
+                b.push_ptr(r_p);
+                b.push_ptr(i_p);
+                b.push_ptr(o_p);
+                b.push_i32(n_v);
+                if is_in {
+                    b.push_i32(xb_v);
+                }
+                b
+            },
+        )
+    }
+
+    /// SwiGLU over the f16-rounded merged `gate_up` output, batched across
+    /// the token's top-k slots. `y` is `[slots, 2*inter]` (gate = FIRST
+    /// half), `h` is `[slots, inter]`. One launch for the whole token.
+    pub fn escha_swiglu_batched(
+        &mut self,
+        y: &GpuTensor,
+        h: &GpuTensor,
+        inter: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if y.numel() != slots * 2 * inter || h.numel() != slots * inter {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_swiglu_batched: y={} h={} for slots={slots} inter={inter}",
+                    y.numel(),
+                    h.numel()
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_h128",
+            kernels::ESCHA_H128_SRC,
+            "escha_swiglu_batched",
+        )?;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut h_ptr = h.buf.as_ptr();
+        let mut inter_i = inter as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut h_ptr as *mut _ as *mut c_void,
+            &mut inter_i as *mut _ as *mut c_void,
+        ];
+        let bx = 256u32;
+        let gx = (inter as u32).div_ceil(bx);
+        // Capture-aware, for the same reason as `escha_h128_batched` above:
+        // a null-stream launch inside the forward pass is not ordered against
+        // the captured stream the surrounding GEMVs run on.
+        let (y_p, h_p, inter_v) = (y_ptr, h_ptr, inter_i);
+        self.launch_maybe_blob(
+            "escha_swiglu_batched",
+            [gx, slots as u32, 1],
+            [bx, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(y_p);
+                b.push_ptr(h_p);
+                b.push_i32(inter_v);
+                b
+            },
+        )
+    }
+
+    /// Escha-W2 routed GEMV for the indexed (GPU-top-K) decode path: one
+    /// launch computes all `slots` experts' `y[s] = W[ids[s]] · x[s]`.
+    ///
+    /// `x_batch` is `[slots, k]`, `y_batch` is `[slots, m]`; every slot has
+    /// its own input because the escha input transform folds a per-expert
+    /// `rin_eff` row into it, and every slot keeps its own output because the
+    /// escha output transform has to run before anything is combined.
+    ///
+    /// # Numerics
+    ///
+    /// The wide/narrow choice re-uses [`Self::gemv_q8_0`]'s own `k <= 1536`
+    /// threshold, and each entry point is a verbatim transcription of the
+    /// corresponding non-indexed kernel. Both facts are load-bearing: the
+    /// escha routed path previously ran these projections through
+    /// `GemvFamily::run_auto` -> `gemv_q8_0`, and the G4 block gate's
+    /// tolerances are calibrated against those exact sums. `gemv_q8_0_wide`
+    /// folds four interleaved accumulators where `gemv_q8_0` uses one, so
+    /// choosing the other variant here would silently change the answer.
+    pub fn escha_gemv_q8_0_moe_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_gemv_q8_0_moe_k8_indexed_batched: k={k} is not a multiple of 32"),
+            ));
+        }
+        if slots == 0 || m == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_gemv_q8_0_moe_k8_indexed_batched: slots={slots} m={m}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_gemv_q8_0_moe_k8_indexed_batched: x has {} elements (need {}), y has \
+                     {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        if topk_indices.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_gemv_q8_0_moe_k8_indexed_batched: topk_indices has {} elements, need \
+                     {slots}",
+                    topk_indices.numel()
+                ),
+            ));
+        }
+        // Same rule as `gemv_q8_0`: wide kernel for small K. See the doc above
+        // — this is a NUMERICAL selection, not only a performance one.
+        let wide = k <= 1536;
+        let entry = if wide {
+            "escha_gemv_q8_0_wide_moe_k8_indexed_batched"
+        } else {
+            "escha_gemv_q8_0_moe_k8_indexed_batched"
+        };
+        self.ensure_kernel(
+            "escha_moe_gemv_k8_indexed",
+            kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
+            entry,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let (grid_x, block_x) = if wide {
+            (m.div_ceil(2) as u32, 64u32)
+        } else {
+            (m as u32, 32u32)
+        };
+        self.launch_maybe_blob(
+            entry,
+            [grid_x, slots as u32, 1],
+            [block_x, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Escha-W2 routed GEMV that reads the TRELLIS CODE DIRECTLY — the Phase-2
+    /// fused kernel. Same signature and same launch shape contract as
+    /// [`Self::escha_gemv_q8_0_moe_k8_indexed_batched`], so the executor swaps
+    /// one for the other and nothing else moves.
+    ///
+    /// `expert_ptrs` here point at the raw `[in/16, out/16, 16*trellis_k]`
+    /// int16 code stream of each expert slot — the bytes that came off disk,
+    /// never an expanded copy. `trellis_k` is 2 (`Escha2T16`, hfq qt=42) or 3
+    /// (`Escha3T16`, qt=43); the two have structurally different bit geometry
+    /// and get separate kernels rather than a runtime branch.
+    ///
+    /// # Numerics
+    ///
+    /// The wide/narrow choice re-uses the SAME `k <= 1536` threshold as the
+    /// Q8_0 sibling, and each entry point reproduces that sibling's lane
+    /// mapping, accumulator count, loop order and final reduction exactly. The
+    /// result is therefore bit-identical to running the Q8_0 kernel's
+    /// arithmetic on exactly-decoded fp16 weights — asserted against both
+    /// [`Self::escha_gemv_f16_moe_k8_indexed_batched`] and `escha_ref` by
+    /// `rdna-compute/examples/test_escha_native_gemv_gpu_vs_cpu.rs`.
+    ///
+    /// # Shape
+    ///
+    /// Grid `(m/16, slots)`, block 512: a block owns a whole 16-wide tile
+    /// column so that every tile it reads is used in full (see the .hip
+    /// header). Hence the extra `m % 16 == 0` requirement the Q8_0 sibling
+    /// does not have — satisfied by every escha projection (`2*mi` and
+    /// `hidden` are both multiples of 16), and rejected loudly rather than
+    /// silently dropping the tail rows if it ever is not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemv_native_moe_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        trellis_k: u32,
+        nt_major: bool,
+    ) -> HipResult<()> {
+        let wide = self.escha_indexed_gemv_preflight(
+            "escha_gemv_native_moe_k8_indexed_batched",
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+        )?;
+        let entry = match (trellis_k, wide) {
+            (2, false) => "escha_gemv_native_k2_moe_k8_indexed_batched",
+            (2, true) => "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
+            (3, false) => "escha_gemv_native_k3_moe_k8_indexed_batched",
+            (3, true) => "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
+            (other, _) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "escha_gemv_native_moe_k8_indexed_batched: trellis_k={other}, expected \
+                         2 (Escha2T16) or 3 (Escha3T16)"
+                    ),
+                ))
+            }
+        };
+        self.escha_launch_native_family(
+            entry,
+            expert_ptrs,
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+            Some(nt_major),
+        )
+    }
+
+    /// The F16 reference arm of [`Self::escha_gemv_native_moe_k8_indexed_batched`].
+    ///
+    /// Reads an OUT-major `[m, k]` fp16 expert slot — what `escha_bare_to_f16`
+    /// writes, i.e. the exactly-decoded weights with nothing re-quantised —
+    /// through the identical grid, lane mapping, accumulator structure and
+    /// reduction. It exists so "decoding inside the GEMV changes nothing" is a
+    /// checkable claim about the DECODE rather than about floating point.
+    ///
+    /// It is a GATE arm, not a production route: `EschaWeightStore::F16` still
+    /// runs host-routed, because that arm is what the published G5 KLD
+    /// reference is built from and changing its GEMV would move a published
+    /// number.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemv_f16_moe_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        let wide = self.escha_indexed_gemv_preflight(
+            "escha_gemv_f16_moe_k8_indexed_batched",
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+        )?;
+        let entry = if wide {
+            "escha_gemv_f16_wide_moe_k8_indexed_batched"
+        } else {
+            "escha_gemv_f16_moe_k8_indexed_batched"
+        };
+        self.escha_launch_native_family(
+            entry,
+            expert_ptrs,
+            topk_indices,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+            None,
+        )
+    }
+
+    /// Shared argument validation for the fused-native GEMV family. Returns
+    /// `wide` — the SAME `k <= 1536` variant choice the Q8_0 sibling makes,
+    /// restated here rather than duplicated as a literal so the two cannot
+    /// drift apart silently (they must agree: it is a numerical selection).
+    #[allow(clippy::too_many_arguments)]
+    fn escha_indexed_gemv_preflight(
+        &mut self,
+        what: &str,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+    ) -> HipResult<bool> {
+        self.bind_thread()?;
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: k={k} is not a multiple of 32"),
+            ));
+        }
+        // A block owns a 16-wide tile column, so a non-multiple-of-16 `m`
+        // would leave the tail rows uncomputed — reading whatever `y` held.
+        if m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: m={m} is not a multiple of 16"),
+            ));
+        }
+        if slots == 0 || m == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: slots={slots} m={m}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: x has {} elements (need {}), y has {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        if topk_indices.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: topk_indices has {} elements, need {slots}",
+                    topk_indices.numel()
+                ),
+            ));
+        }
+        // Wide (four independent accumulator chains) vs narrow (one chain with
+        // `#pragma unroll 4`). The quad structure is what hides the weight-load
+        // latency, and it needs four blocks to fill — hence K >= 128, since a
+        // block is 32 contraction elements.
+        //
+        // This used to be `k <= 1536`, inherited from the Q8_0 twin with no
+        // stated reason, which sent the one shipped escha projection above that
+        // line — gate_up at K=2048 — down the narrow path. Measured on
+        // escha-35b, rocprof kernel trace, 40 decode tokens:
+        //
+        //   gate_up narrow  83.20 us/call
+        //   gate_up wide    75.98 us/call   -8.7%
+        //
+        // down_proj (K=512) was already wide and is unchanged at ~46 us/call.
+        // The kernel source records the same effect as 33 GB/s narrow vs
+        // 105 GB/s wide, so this is the structure working as documented, not a
+        // shape-specific fluke.
+        Ok(k >= 128)
+    }
+
+    /// Launch one of the six `escha_moe_gemv_native` entry points. They all
+    /// share a kernarg list and a grid, so the launch is written once.
+    #[allow(clippy::too_many_arguments)]
+    fn escha_launch_native_family(
+        &mut self,
+        entry: &str,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        nt_major: Option<bool>,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "escha_moe_gemv_native",
+            kernels::ESCHA_MOE_GEMV_NATIVE_SRC,
+            entry,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // The escha NATIVE kernels take a trailing `int nt_major` selecting the
+        // tile-grid order; the F16 reference arm does not, so it passes `None`
+        // and its kernarg list is unchanged.
+        let nt_major_val = nt_major.map(|v| i32::from(v));
+        if let Some(v) = nt_major_val.as_ref() {
+            params.push(v as *const i32 as *mut c_void);
+        }
+        // Grid (m/16, slots), block 256: a block owns a 16-wide tile column,
+        // and each of its EIGHT warps owns two of that column's output rows
+        // (`w` and `w + 8`) because those two share a decode window. See the
+        // .hip header.
+        self.launch_maybe_blob(
+            entry,
+            [(m / 16) as u32, slots as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                // MUST mirror `params` above — this closure is the SECOND,
+                // independent kernarg description used on the capture/blob
+                // path. Updating only `params` silently sends the old arg list
+                // whenever a graph is being recorded.
+                if let Some(v) = nt_major_val {
+                    b.push_i32(v);
+                }
+                b
+            },
+        )
+    }
+
+    /// Escha-W2 routed-expert GROUPED GEMM — decode each expert's trellis code
+    /// once per (layer, batch) and spend it across every token that routed to
+    /// it, instead of once per (token, expert) slot.
+    ///
+    /// The batched-prefill replacement for
+    /// [`Self::escha_gemv_native_moe_k8_indexed_batched`]. `expert_offsets`
+    /// (`[n_exp + 1]`, exclusive scan) and `sorted_slot_index` (`[slots]`) are
+    /// what `moe_scatter_fused_k8` writes when it is run with `block_m = 1`;
+    /// `x_batch` / `y_batch` stay in the caller's ORIGINAL token-major slot
+    /// order — the sort is an index permutation the kernel follows, nothing is
+    /// physically gathered, so every other phase of the escha layer is
+    /// untouched.
+    ///
+    /// # Numerics
+    ///
+    /// Per (token, output row) this reproduces the slot-parallel NARROW form
+    /// exactly — same lane -> contraction map, same `bi` order, one sequential
+    /// accumulator, same `__shfl_down` ladder — so for a projection the
+    /// slot-parallel path also runs narrow (`k > 1536`) the two agree bit for
+    /// bit. For a projection it runs WIDE (`k <= 1536`) they do not: that form
+    /// folds four interleaved accumulators, which would cost 4x the
+    /// accumulator registers here and force the tile back to one column. See
+    /// the .hip header, and the grouped arm of the G4 block gate for the
+    /// measured cost.
+    ///
+    /// # Shape
+    ///
+    /// Grid `(m / (16*ctiles), n_exp)`, block 256. `m % (16*ctiles) == 0` and
+    /// `k % 32 == 0` are enforced rather than truncated: a block owns whole
+    /// tile columns, so a short tail would leave rows holding whatever `y`
+    /// happened to contain.
+    #[allow(clippy::too_many_arguments)]
+    /// Expert-grouped routed GEMM on the RDNA3 matrix cores.
+    ///
+    /// Same grouping contract as [`Self::escha_gemm_native_moe_grouped`] —
+    /// `expert_offsets` is the padded exclusive scan, `sorted_slot_index` maps
+    /// sorted position to flat slot, `-1` is the padding sentinel — but the
+    /// inner product runs on WMMA instead of scalar FMAs.
+    ///
+    /// Prefill is compute bound once grouping has fixed the weight traffic
+    /// (weights are ~4% of prefill time), so this is where the remaining time
+    /// is: the scalar path measured 1.75 TFLOP/s against a WMMA comparator's
+    /// 4.59.
+    ///
+    /// NOT bit-identical to the scalar grouped path: WMMA accumulates over a
+    /// different partition of the contraction. The decoded weight VALUES are
+    /// identical; only summation order moves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemm_native_moe_grouped_wmma(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        n_exp: usize,
+        trellis_k: u32,
+        nt_major: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let what = "escha_gemm_native_moe_grouped_wmma";
+        if k % 16 != 0 || m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: m={m} k={k} must both be multiples of 16"),
+            ));
+        }
+        if slots == 0 || m == 0 || n_exp == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: slots={slots} m={m} n_exp={n_exp}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: x has {} elements (need {}), y has {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        let entry = match trellis_k {
+            2 => "escha_gemm_grouped_wmma_k2",
+            3 => "escha_gemm_grouped_wmma_k3",
+            other => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{what}: unsupported trellis K={other}"),
+                ))
+            }
+        };
+        self.ensure_kernel(entry, kernels::ESCHA_MOE_GEMM_GROUPED_WMMA_SRC, entry)?;
+
+        let mut ep = expert_ptrs.buf.as_ptr();
+        let mut off = expert_offsets.buf.as_ptr();
+        let mut idx = sorted_slot_index.buf.as_ptr();
+        let mut xp = x_batch.buf.as_ptr();
+        let mut yp = y_batch.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ep as *mut _ as *mut c_void,
+            &mut off as *mut _ as *mut c_void,
+            &mut idx as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        let mut ntm = i32::from(nt_major);
+        params.push(&mut ntm as *mut _ as *mut c_void);
+        let func = &self.functions[entry];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(m / 16) as u32, n_exp as u32, 1],
+                [32, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    pub fn escha_gemm_native_moe_grouped(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        n_exp: usize,
+        trellis_k: u32,
+        nt_major: bool,
+    ) -> HipResult<()> {
+        let (rows, ctiles) = escha_grouped_tile(m);
+        self.escha_gemm_native_moe_grouped_tiled(
+            expert_ptrs,
+            expert_offsets,
+            sorted_slot_index,
+            x_batch,
+            y_batch,
+            m,
+            k,
+            slots,
+            n_exp,
+            trellis_k,
+            nt_major,
+            rows,
+            ctiles,
+        )
+    }
+
+    /// [`Self::escha_gemm_native_moe_grouped`] with the register tile named
+    /// explicitly instead of taken from [`escha_grouped_tile`].
+    ///
+    /// Exists for the sweep in `bench_escha_grouped_gemm`, which has to drive
+    /// every instantiation inside ONE process: `escha_grouped_tile` memoises
+    /// its env read in a `OnceLock`, so a sweep that went through it would
+    /// silently measure the first shape six times. Production goes through the
+    /// non-`_tiled` entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn escha_gemm_native_moe_grouped_tiled(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        slots: usize,
+        n_exp: usize,
+        trellis_k: u32,
+        nt_major: bool,
+        rows: usize,
+        ctiles: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let what = "escha_gemm_native_moe_grouped";
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: k={k} is not a multiple of 32"),
+            ));
+        }
+        if slots == 0 || m == 0 || n_exp == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: slots={slots} m={m} n_exp={n_exp}"),
+            ));
+        }
+        if x_batch.numel() < slots * k || y_batch.numel() < slots * m {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: x has {} elements (need {}), y has {} (need {})",
+                    x_batch.numel(),
+                    slots * k,
+                    y_batch.numel(),
+                    slots * m
+                ),
+            ));
+        }
+        // The kernel reads `expert_offsets[e]` and `[e+1]` for every `e` on
+        // grid.y, and dereferences `sorted_slot_index` across that range. A
+        // short table is an out-of-bounds READ — undefined behaviour, not a
+        // wrong answer — so check both exactly.
+        if expert_offsets.numel() < n_exp + 1 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: expert_offsets has {} elements, need {}",
+                    expert_offsets.numel(),
+                    n_exp + 1
+                ),
+            ));
+        }
+        if sorted_slot_index.numel() < slots {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: sorted_slot_index has {} elements, need {slots}",
+                    sorted_slot_index.numel()
+                ),
+            ));
+        }
+        if ctiles == 0 || m % (16 * ctiles) != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: m={m} is not a multiple of {}", 16 * ctiles),
+            ));
+        }
+        let entry = match (trellis_k, rows, ctiles) {
+            (2, 4, 2) => "escha_gemm_grouped_k2_r4_c2",
+            (2, 8, 2) => "escha_gemm_grouped_k2_r8_c2",
+            (2, 8, 4) => "escha_gemm_grouped_k2_r8_c4",
+            (2, 8, 8) => "escha_gemm_grouped_k2_r8_c8",
+            (2, 16, 2) => "escha_gemm_grouped_k2_r16_c2",
+            (2, 16, 4) => "escha_gemm_grouped_k2_r16_c4",
+            (3, 4, 2) => "escha_gemm_grouped_k3_r4_c2",
+            (3, 8, 2) => "escha_gemm_grouped_k3_r8_c2",
+            (3, 8, 4) => "escha_gemm_grouped_k3_r8_c4",
+            (3, 8, 8) => "escha_gemm_grouped_k3_r8_c8",
+            (3, 16, 2) => "escha_gemm_grouped_k3_r16_c2",
+            (3, 16, 4) => "escha_gemm_grouped_k3_r16_c4",
+            (tk, r, c) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{what}: no entry point for trellis_k={tk} rows={r} ctiles={c}"),
+                ))
+            }
+        };
+        self.ensure_kernel(
+            "escha_moe_gemm_grouped",
+            kernels::ESCHA_MOE_GEMM_GROUPED_SRC,
+            entry,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            entry,
+            [(m / (16 * ctiles)) as u32, n_exp as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Device-side out-of-place `f32 -> f16 -> f32` round-trip of the escha
+    /// combine weights.
+    ///
+    /// The escha combine scales each expert by `f16(score)`. The CPU-top-K
+    /// route does that on the host copy it already downloaded; the indexed
+    /// route never downloads, so it happens here. Out-of-place because
+    /// `src` is the shared `topk_weights` buffer other consumers still read
+    /// unrounded.
+    pub fn escha_round_weights_f16_rne(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if src.numel() < n || dst.numel() < n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_round_weights_f16_rne: src has {} / dst has {} elements, need {n}",
+                    src.numel(),
+                    dst.numel()
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_moe_gemv_k8_indexed",
+            kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
+            "escha_round_weights_f16_rne",
+        )?;
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let bx = 256u32;
+        self.launch_maybe_blob(
+            "escha_round_weights_f16_rne",
+            [(n as u32).div_ceil(bx), 1, 1],
+            [bx, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    /// Load path: transpose the bare in-major `[ic, oc]` fp16 that
+    /// `escha_decode_tiles` produced into hipfire's OUT-major expert slot,
+    /// re-quantising to Q8_0 in the same pass. `out` must be
+    /// `oc * (ic/32) * 34` bytes.
+    pub fn escha_bare_to_q8_0(
+        &mut self,
+        bare: &GpuTensor,
+        out: &GpuTensor,
+        ic: usize,
+        oc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if ic % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("escha_bare_to_q8_0: ic={ic} is not a multiple of 32"),
+            ));
+        }
+        if bare.numel() != ic * oc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_q8_0: bare has {} elements, need {}",
+                    bare.numel(),
+                    ic * oc
+                ),
+            ));
+        }
+        let want = oc * (ic / 32) * 34;
+        if out.byte_size() != want {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_q8_0: out is {} bytes, need {want}",
+                    out.byte_size()
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+            "escha_bare_to_q8_0",
+        )?;
+        let mut b_ptr = bare.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ic_i = ic as i32;
+        let mut oc_i = oc as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ic_i as *mut _ as *mut c_void,
+            &mut oc_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_bare_to_q8_0"];
+        let grid = (oc * (ic / 32)) as u32;
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
+        }
+    }
+
+    /// Weight-exact control arm of [`Self::escha_bare_to_q8_0`]: same
+    /// transpose, F32 store, no re-quantisation. 4 B/weight — diagnostic
+    /// only (the G4 gate uses it to separate wiring error from Q8_0 error).
+    pub fn escha_bare_to_f32(
+        &mut self,
+        bare: &GpuTensor,
+        out: &GpuTensor,
+        ic: usize,
+        oc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if bare.numel() != ic * oc || out.numel() != ic * oc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_f32: bare={} out={} need {} each",
+                    bare.numel(),
+                    out.numel(),
+                    ic * oc
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+            "escha_bare_to_f32",
+        )?;
+        let mut b_ptr = bare.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ic_i = ic as i32;
+        let mut oc_i = oc as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ic_i as *mut _ as *mut c_void,
+            &mut oc_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_bare_to_f32"];
+        let bx = 256u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(ic as u32).div_ceil(bx), oc as u32, 1],
+                [bx, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// Weight-exact arm of [`Self::escha_bare_to_q8_0`] that fits a whole
+    /// model: same transpose, F16 store, no re-quantisation.
+    ///
+    /// The decode already produced fp16, so this is pure data movement and
+    /// the stored weight is bit-identical to `escha_ref::reconstruct`.
+    /// [`Self::escha_bare_to_f32`] is equally exact but 4 B/weight, which is
+    /// 129 GB of experts on the 35B; this is 2 B/weight, and because every
+    /// per-expert buffer is separately allocated and rounded to a 2 MiB
+    /// granule it occupies the SAME 60 GiB the Q8_0 arm already occupies.
+    /// That is what makes a model-scale weight-exact KLD reference runnable
+    /// (G5, docs/plans/escha-w2-port-design.md).
+    pub fn escha_bare_to_f16(
+        &mut self,
+        bare: &GpuTensor,
+        out: &GpuTensor,
+        ic: usize,
+        oc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if bare.numel() != ic * oc || out.numel() != ic * oc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "escha_bare_to_f16: bare={} out={} need {} each",
+                    bare.numel(),
+                    out.numel(),
+                    ic * oc
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "escha_bare_to_outmajor",
+            kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+            "escha_bare_to_f16",
+        )?;
+        let mut b_ptr = bare.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ic_i = ic as i32;
+        let mut oc_i = oc as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ic_i as *mut _ as *mut c_void,
+            &mut oc_i as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["escha_bare_to_f16"];
+        let bx = 256u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(ic as u32).div_ceil(bx), oc as u32, 1],
+                [bx, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,
@@ -15616,5 +17056,28 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod escha_x_group_tests {
+    use super::EschaXGroup;
+
+    /// The kernarg encoding must keep the two meanings the old `x_batched:
+    /// bool` had, or the two pre-existing decode call sites (and G3's two
+    /// pre-existing cases) change behaviour under a change that is supposed to
+    /// be purely additive.
+    #[test]
+    fn x_group_kernarg_is_backward_compatible() {
+        assert_eq!(EschaXGroup::Broadcast.as_kernarg(), 0, "was `false`");
+        assert_eq!(EschaXGroup::PerSlot.as_kernarg(), 1, "was `true`");
+        // Grouped(1) is PerSlot by construction — the kernel computes
+        // `slot / x_group`, and `slot / 1 == slot`.
+        assert_eq!(
+            EschaXGroup::Grouped(1).as_kernarg(),
+            EschaXGroup::PerSlot.as_kernarg()
+        );
+        // The batched-prefill case: k slots per token.
+        assert_eq!(EschaXGroup::Grouped(8).as_kernarg(), 8);
     }
 }

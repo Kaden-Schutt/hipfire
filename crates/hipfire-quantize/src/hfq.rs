@@ -87,6 +87,8 @@ impl QuantType {
             49 => Some(Self::MQ3G256V2),
             50 => Some(Self::MQ2G256V2),
             51 => Some(Self::MQ2G256LloydU),
+            42 => Some(Self::ESCHA2T16),
+            43 => Some(Self::ESCHA3T16),
             _ => None,
         }
     }
@@ -235,6 +237,11 @@ pub(crate) enum QuantType {
     /// never indexed. 2.25 bpw. `K % 256 == 0`.
     /// See `docs/design/2026-08-22-maple-preview-20b-a1b.md`.
     MQ2G256LloydU = 51,
+    /// Escha-W2 trellis, K=2, 16x16 tile, cbA hash codebook (2.00 bpw).
+    /// Codes are stored verbatim from the source safetensors.
+    ESCHA2T16 = 42,
+    /// Escha-W2 trellis, K=3, 16x16 tile, cbA hash codebook (3.00 bpw).
+    ESCHA3T16 = 43,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -824,5 +831,16 @@ mod maple_dtype_tests {
                 );
             }
         }
+    }
+
+    /// from_u8 and the enum discriminants must agree — the doc comment on
+    /// from_u8 makes this a contract, and a drifted pair silently mislabels
+    /// every tensor written after it.
+    #[test]
+    fn escha_quant_types_round_trip() {
+        assert_eq!(QuantType::from_u8(42), Some(QuantType::ESCHA2T16));
+        assert_eq!(QuantType::from_u8(43), Some(QuantType::ESCHA3T16));
+        assert_eq!(QuantType::ESCHA2T16 as u8, 42);
+        assert_eq!(QuantType::ESCHA3T16 as u8, 43);
     }
 }

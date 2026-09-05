@@ -76,6 +76,8 @@
 39  MQ3G256GL     passthrough
 40  TQ2G128       passthrough  PR #597 Bonsai ternary
 41  BQ1G128       passthrough  PR #597 Bonsai 1-bit; won the qt=41 adjudication 2026-08-18
+42  ESCHA2T16     arch-loaded  Escha-W2 K=2 trellis; qwen35 escha.rs decodes it on device to Q8_0/F16 at load, so it never reaches a GEMV as itself
+43  ESCHA3T16     arch-loaded  Escha-W2 K=3 trellis; same load path as qt=42
 44  MQ4G256V2     passthrough
 45  MQ4CG256      passthrough
 47  MQ6G256V2     passthrough

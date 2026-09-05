@@ -80,6 +80,12 @@ KNOWN_QUANTS = {
     "hf4",
     "hf6",
     "q8",
+    # EschaLabs Escha-W2 trellis codec (qt=42 ESCHA2T16 / qt=43 ESCHA3T16),
+    # converted verbatim by `hipfire-quantize --format escha`. It is not an MQ
+    # format and cannot be transcoded into one without discarding exactly the
+    # quality that motivates it (docs/plans/escha-w2-port-design.md §2), so it
+    # gets its own suffix rather than being filed under an mqN.
+    "escha",
     "hfq",
 }
 # Allowlist for the optional per-entry `default_kv_mode` field (the registry is

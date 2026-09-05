@@ -1261,6 +1261,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-quantize",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
@@ -1383,6 +1384,7 @@ dependencies = [
 name = "hipfire-dispatch"
 version = "0.3.0"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "rdna-compute",
@@ -1518,6 +1520,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2707,8 +2710,10 @@ dependencies = [
 name = "rdna-compute"
 version = "0.3.0"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
+ "hipfire-quantize",
  "libloading",
  "radiowave",
  "rayon",

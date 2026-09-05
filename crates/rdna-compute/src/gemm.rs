@@ -22488,7 +22488,29 @@ impl Gpu {
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
             "gemm_q8_0_residual_wmma",
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        // Unconditional F32->F16 conversion, NOT the pointer-keyed
+        // `ensure_fp16_x` — the same call the `gemm_q8_0_wmma` sibling already
+        // makes, for the same reason, now applied to the residual variant too.
+        //
+        // `x` here is a batched-prefill activation: a FIXED scratch allocation
+        // (`dn_normed_batch`, `fa_attn_out_batch`, `ffn_hidden_batch`, ...)
+        // whose contents are rewritten EVERY layer. Pointer-keyed caching
+        // therefore hits on layer 1 and hands layer 0's activation to layer
+        // 1's weights. It went unnoticed because no shipped model reached this
+        // kernel with a per-layer buffer and no intervening conversion until
+        // Escha-W2's Q8_0 `wo` did; there the residual stream picked up a
+        // ~400x-too-large term, stayed finite and fluent, and only moved the
+        // argmax. One extra elementwise kernel per call against a full
+        // [M, K] GEMM is not a measurable cost.
+        //
+        // There is deliberately no env lever back to the pointer-keyed path:
+        // the measurement it existed for is recorded in commit d4dff4a26, and
+        // the only thing the lever could do now is reinstate the defect.
+        let x_f16_ptr = if matches!(x.dtype, DType::F16) {
+            x.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x, batch_size * k)?
+        };
 
         let mut a_p = a.buf.as_ptr();
         let mut xp = x_f16_ptr;
@@ -22971,7 +22993,29 @@ impl Gpu {
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_GFX12_SRC,
             "gemm_q8_0_residual_wmma_gfx12",
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        // Unconditional F32->F16 conversion, NOT the pointer-keyed
+        // `ensure_fp16_x` — the same call the `gemm_q8_0_wmma` sibling already
+        // makes, for the same reason, now applied to the residual variant too.
+        //
+        // `x` here is a batched-prefill activation: a FIXED scratch allocation
+        // (`dn_normed_batch`, `fa_attn_out_batch`, `ffn_hidden_batch`, ...)
+        // whose contents are rewritten EVERY layer. Pointer-keyed caching
+        // therefore hits on layer 1 and hands layer 0's activation to layer
+        // 1's weights. It went unnoticed because no shipped model reached this
+        // kernel with a per-layer buffer and no intervening conversion until
+        // Escha-W2's Q8_0 `wo` did; there the residual stream picked up a
+        // ~400x-too-large term, stayed finite and fluent, and only moved the
+        // argmax. One extra elementwise kernel per call against a full
+        // [M, K] GEMM is not a measurable cost.
+        //
+        // There is deliberately no env lever back to the pointer-keyed path:
+        // the measurement it existed for is recorded in commit d4dff4a26, and
+        // the only thing the lever could do now is reinstate the defect.
+        let x_f16_ptr = if matches!(x.dtype, DType::F16) {
+            x.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x, batch_size * k)?
+        };
 
         let mut a_p = a.buf.as_ptr();
         let mut xp = x_f16_ptr;

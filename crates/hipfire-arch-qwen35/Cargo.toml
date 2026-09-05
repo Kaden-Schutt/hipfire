@@ -23,6 +23,32 @@ hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# G4b (Escha-W2 Task 9): `examples/escha_router_contract.rs` reads the escha
+# fixture's f16 golden buffers via the same decoder the frozen CPU oracle
+# uses (`hipfire_quantize::float16::f16_to_f32`).
+hipfire-quantize = { path = "../hipfire-quantize" }
+
+[[example]]
+name = "escha_model_smoke"
+path = "examples/escha_model_smoke.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "escha_moe_block_gate"
+path = "examples/escha_moe_block_gate.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "escha_router_contract"
+path = "examples/escha_router_contract.rs"
+
+[[example]]
+name = "escha_prefill_batch_gate"
+path = "examples/escha_prefill_batch_gate.rs"
+required-features = ["deltanet"]
+
 [[example]]
 name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"

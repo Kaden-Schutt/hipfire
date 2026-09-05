@@ -204,7 +204,7 @@ Narrow roles. Do not widen a harness into a universal gate.
 
 | Harness | Path | Role | Not this harness |
 |---|---|---|---|
-| **gates.sh** | [`scripts/gates.sh`](../scripts/gates.sh) | Maintained **manual** wrapper: optional Redline capture, generic serve battery, optional fresh-process perf compare (`probe_commits.sh`). Requires `--model`. | Not CI-default. Not universal. Does not call retired coherence-gate scripts. |
+| **gates.sh** | [`scripts/gates.sh`](../scripts/gates.sh) | Maintained **manual** wrapper: optional Redline capture, generic serve battery, optional fresh-process perf compare (`probe_commits.sh`), and (opt-in, `--escha`) the Escha-W2 G1-G6 correctness battery. Requires `--model`. | Not CI-default. Not universal. Does not call retired coherence-gate scripts. The `--escha` arm is checkpoint-specific and is **off by default** — it is not a gate for any other model. |
 | **serve_harness.py** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | **Model-agnostic** user-facing serve behavior (battery / chain / session): finish reasons, runaway/empty, prefix cache, prefill/decode timing, recall hooks. | Not LFM thinking-frame specifics. Not Redline route proof. |
 | **serve_harness.py (LFM tag)** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | LFM2.5 serve smoke with the exact registry tag; use registry sampling or `recipe:nothink` for non-thinking framing. | Not a substitute for numerical parity oracles. |
 | **redline_daemon_harness.py** | [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py) | Resident-daemon **Redline** capture, phase fingerprint, shadow/parity, and timing evidence under manual-capture env. | Discovery/correctness evidence ≠ product timed-arm route proof by itself. Does not enable AQL routing. |
@@ -225,6 +225,38 @@ Use only when the claim class below names them. They are not universal.
 | Redline certification ladder | [`docs/REDLINE.md`](REDLINE.md) | What evidence is required before Redline-attributed promotion. |
 | Path-specific parity / state oracle | Arch-owned example or test named by the change (when one exists) | Hidden-state, logit, KV/conv, or graph parity. If none exists for the surface → **blocked**. |
 
+### Escha-W2 correctness gates (G1-G6)
+
+Checkpoint-specific, **manual**, GPU + model. Run them with
+`scripts/gates.sh --escha-only --model /path/to/escha-35b.hfq`, or
+individually. These are the required route for any change to the escha codec,
+the H128 transforms, the escha routed executors, or the escha loader — a green
+serve battery is **not** evidence for any of them.
+
+Measured values live in
+[`escha-w2-port-design.md`](plans/escha-w2-port-design.md) §10.6. A gate that
+passes with a number materially different from the one recorded there has not
+passed; re-derive before re-recording.
+
+| Gate | Command | Asserts | Recorded result |
+|---|---|---|---|
+| **G1** | `python3 scripts/escha-verify-roundtrip.py <src-dir> <model.hfq>` | Verbatim repack: every `escha_code` tensor byte-identical to the source safetensors. Count asserted against `model.safetensors.index.json`; fails on zero shards, zero code tensors, or a count mismatch. | 80/80 byte-identical |
+| **G2** | `cargo run --release -p rdna-compute --example test_escha_decode_gpu_vs_cpu` | GPU tile decode == `escha_ref::reconstruct`, bit-exact in fp16, at golden and 89M-element shapes. | 0 mismatched |
+| **G3** | `cargo run --release -p rdna-compute --example test_escha_h128_gpu_vs_cpu` | The H128 pair == `escha_ref`, bit-exact, every launch form (single, batched broadcast / per-slot / grouped, out_batched, swiglu). | 0 mismatched |
+| **G4b** | `cargo run --release -p hipfire-arch-qwen35 --example escha_router_contract -- <model.hfq>` | arch-6 router selects the same experts as escha's reference routing. | 0/8 differing sets |
+| **G4** | `cargo run --release -p hipfire-arch-qwen35 --example escha_moe_block_gate -- <model.hfq>` | Whole MoE block vs escha's `moeblk_out.f16`; plus indexed-vs-host and batched-vs-per-token **equality**. | F32 max 1.828e-4 / mean 9.673e-6; Q8_0 max 2.633e-4 / mean 3.027e-5; 0 differing floats on both route comparisons |
+| **G5** | `scripts/escha-kld.sh <model.hfq>` | KLD vs the weight-exact escha arm on a fixed teacher-forced corpus, with an asserted negative control and an asserted upper bound. | 0.0027576 nats (CI 0.0019491-0.0038610), PPL 7.6585, control prints 0.000000 |
+| **G6** | `cargo run --release -p hipfire-arch-qwen35 --example escha_prefill_batch_gate -- <model.hfq>` | Batched prefill vs the per-token route, whole model: argmax stable, logit deltas within measured bounds, no non-finite logits. | argmax stable; max\|delta\| 4.393e-1, mean\|delta\| 7.160e-2 |
+
+`escha_ref` (`crates/hipfire-quantize/src/escha_ref.rs`) is the **frozen
+oracle** every bit-exactness claim above rests on. It is a transcription of
+EschaLabs' `ref.py` and must not be edited to make a gate pass; a gate that
+disagrees with it is reporting a defect in hipfire.
+
+G1-G4b need only the checkpoint and the fixtures committed under
+`crates/hipfire-quantize/tests/data/escha/`. G5 and G6 load the whole model
+(37.6 GB resident) and take minutes each.
+
 ## Claim → route map
 
 | Claim / change class | Minimum route(s) | Evidence kind |
@@ -243,6 +275,7 @@ Use only when the claim class below names them. They are not universal.
 | Arch port | `methodology/arch-port-validation.md` (channel + speed; no retired coherence battery as acceptance) | Manual |
 | Model/route **admission** (registry evidence) | Row in [`admissions.yml`](admissions.yml) | Schema v2; exactly one evidence-bound record (LFM2.5-350M MQ4 gfx1201 retained-PM4). No inferred/wildcard rows. Registry admission/evidence is distinct from runtime wiring: the sealed LFM row does **not** select a runtime default and current automatic selection does not use it. |
 | MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | **Only** current automatic runtime predicate. Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; case-insensitive `.mq4r` → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic (no `arch_id` gate). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
+| Escha-W2 codec / H128 transforms / escha routed executors / escha loader | `scripts/gates.sh --escha-only --model <escha .hfq>` (G1-G6; see the Escha-W2 table above), against the recorded values in [`escha-w2-port-design.md`](plans/escha-w2-port-design.md) §10.6 | Manual GPU + model. Bit-exactness claims are against the frozen `escha_ref` oracle. **Not** `serve_harness.py`, and **not** a subset — G4's two `0 differing floats` rows are equality claims and a change that turns either into a tolerance needs its own argument |
 | Unknown surface | **Blocked** until an owner adds a row here | Fail closed |
 
 ## Retired coherence-gate scripts

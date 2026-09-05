@@ -822,11 +822,192 @@ pub fn load_mtp_head(path: &Path, gpu: &mut Gpu, max_seq: usize) -> HipResult<Qw
 /// Like [`load_mtp_head`] but opens the HFQM container at `base_offset`
 /// inside `path`. Pass `0` for a standalone `.mtp` file; for a bundled
 /// `.mq4-mtp` file pass the offset returned by [`detect_bundled_mtp_offset`].
+/// Maps a logical MTP tensor name onto the name a particular container uses.
+///
+/// A standalone `.mtp` from `mtp_extract` uses bare names (`wq`, `enorm`);
+/// an escha trunk carries the head as ordinary HF-style tensors inside its
+/// own container (`mtp.layers.0.self_attn.q_proj.weight`). Same weights,
+/// different spelling, so the loader takes the spelling as a parameter.
+pub type MtpNamer<'a> = &'a dyn Fn(&str) -> String;
+
+/// Identity: the bare names `mtp_extract` writes.
+fn bare_namer(n: &str) -> String {
+    n.to_string()
+}
+
+/// HF-style names as the escha converter passes them through from upstream.
+/// Every logical name the loader asks for has exactly one counterpart; an
+/// unmapped name is a programming error rather than a missing tensor, so it
+/// panics instead of silently looking up a name no container has.
+fn trunk_namer(n: &str) -> String {
+    let m = match n {
+        "eh_proj" => "mtp.fc.weight",
+        "enorm" => "mtp.pre_fc_norm_embedding.weight",
+        "hnorm" => "mtp.pre_fc_norm_hidden.weight",
+        "shared_head_norm" => "mtp.norm.weight",
+        "attn_norm" => "mtp.layers.0.input_layernorm.weight",
+        "attn_post_norm" => "mtp.layers.0.post_attention_layernorm.weight",
+        "attn_q_norm" => "mtp.layers.0.self_attn.q_norm.weight",
+        "attn_k_norm" => "mtp.layers.0.self_attn.k_norm.weight",
+        "wq" => "mtp.layers.0.self_attn.q_proj.weight",
+        "wk" => "mtp.layers.0.self_attn.k_proj.weight",
+        "wv" => "mtp.layers.0.self_attn.v_proj.weight",
+        "wo" => "mtp.layers.0.self_attn.o_proj.weight",
+        "ffn_gate" => "mtp.layers.0.mlp.gate_proj.weight",
+        "ffn_up" => "mtp.layers.0.mlp.up_proj.weight",
+        "ffn_down" => "mtp.layers.0.mlp.down_proj.weight",
+        "moe_router" => "mtp.layers.0.mlp.gate.weight",
+        "moe_shared_gate" => "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "moe_shared_up" => "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "moe_shared_down" => "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "moe_shared_expert_gate" => "mtp.layers.0.mlp.shared_expert_gate.weight",
+        other => panic!("trunk_namer: no HF spelling for MTP tensor '{other}'"),
+    };
+    m.to_string()
+}
+
+impl Qwen35MtpHeadConfig {
+    /// Derive the head's config from a TRUNK model's `text_config`.
+    ///
+    /// A standalone `.mtp` carries flat metadata describing the head; a trunk
+    /// carries HF config describing the trunk. The escha MTP head is one
+    /// transformer layer over the trunk's own geometry (`mtp_num_hidden_layers`
+    /// is 1 and `mtp_use_dedicated_embeddings` is false), so every dimension
+    /// comes from the trunk — verified against the shipped 27B, whose head
+    /// tensors match these exactly: q_proj `[2*head_dim*n_head, n_embd]` =
+    /// [12288, 5120] under attn_output_gate, k/v `[head_dim*n_head_kv, n_embd]`
+    /// = [1024, 5120], mlp `[intermediate_size, n_embd]` = [17408, 5120].
+    pub fn from_trunk_text_config(tc: &serde_json::Value, max_seq: usize) -> Option<Self> {
+        let gu = |k: &str| tc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+        let n_embd = gu("hidden_size")?;
+        let n_head = gu("num_attention_heads")?;
+        let n_head_kv = gu("num_key_value_heads")?;
+        let head_dim = gu("head_dim")?;
+        let moe_int = gu("moe_intermediate_size").unwrap_or(0);
+        let n_ff = gu("intermediate_size").unwrap_or(moe_int);
+        let num_experts = gu("num_experts").unwrap_or(0);
+        let ffn_kind = if num_experts > 0 {
+            Qwen35MtpFfnKind::Moe
+        } else {
+            Qwen35MtpFfnKind::Dense
+        };
+        let prf = tc
+            .get("partial_rotary_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        let rope_theta = tc
+            .get("rope_parameters")
+            .and_then(|r| r.get("rope_theta"))
+            .or_else(|| tc.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10_000_000.0) as f32;
+        Some(Self {
+            n_embd,
+            n_head,
+            n_head_kv,
+            head_dim,
+            n_ff,
+            ffn_kind,
+            num_experts,
+            num_experts_per_tok: gu("num_experts_per_tok").unwrap_or(0),
+            moe_intermediate_size: moe_int,
+            shared_expert_intermediate_size: gu("shared_expert_intermediate_size").unwrap_or(0),
+            norm_topk_prob: tc
+                .get("norm_topk_prob")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            vocab_size: gu("vocab_size")?,
+            rope_theta,
+            n_rot: (head_dim as f64 * prf) as usize,
+            rms_norm_eps: tc
+                .get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
+            max_seq,
+            tie_word_embeddings: tc
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// Load an MTP head carried as ordinary `mtp.*` tensors inside a TRUNK
+/// container, which is how the escha converter passes upstream's head
+/// through. Returns `Ok(None)` when the trunk has no such tensors.
+///
+/// This is the third MTP packaging hipfire sees, after the bundled
+/// `HFBNDMTP` trailer and the sibling `.mtp` sidecar. The escha builds ship
+/// 849 MB (27B) of head that neither of those resolvers could find.
+pub fn load_mtp_head_from_trunk(
+    path: &Path,
+    gpu: &mut Gpu,
+    max_seq: usize,
+) -> HipResult<Option<Qwen35MtpHead>> {
+    let hfq = match HfqFile::open(path) {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    if hfq.find_tensor_info("mtp.fc.weight").is_none() {
+        return Ok(None);
+    }
+    let meta: serde_json::Value = match serde_json::from_str(&hfq.metadata_json) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let tc = meta
+        .get("config")
+        .and_then(|c| c.get("text_config"))
+        .or_else(|| meta.get("config"));
+    let Some(cfg) = tc.and_then(|t| Qwen35MtpHeadConfig::from_trunk_text_config(t, max_seq)) else {
+        return Ok(None);
+    };
+    // An MoE head needs its routed experts. Upstream's 35B ships only the
+    // router and shared expert inside the trunk (17 mtp.* tensors, none of
+    // them `experts.*`), so `load_mtp_moe_ffn` would panic partway through
+    // loading 256 experts that are not there. Decline with a reason instead:
+    // the head is present but not self-sufficient.
+    if matches!(cfg.ffn_kind, Qwen35MtpFfnKind::Moe)
+        && hfq
+            .find_tensor_info("mtp.layers.0.mlp.experts.0.gate_up_proj.weight")
+            .is_none()
+        && hfq
+            .find_tensor_info("mtp.layers.0.mlp.experts.0.up_proj.weight")
+            .is_none()
+    {
+        eprintln!(
+            "  MTP head present in trunk but not loadable: MoE head with \
+             num_experts={} ships no routed experts (router and shared expert \
+             only). Speculative decode stays off.",
+            cfg.num_experts
+        );
+        return Ok(None);
+    }
+    drop(hfq);
+    let head = load_mtp_head_at_offset_named(path, gpu, max_seq, 0, &trunk_namer, Some(cfg))?;
+    Ok(Some(head))
+}
+
 pub fn load_mtp_head_at_offset(
     path: &Path,
     gpu: &mut Gpu,
     max_seq: usize,
     base_offset: u64,
+) -> HipResult<Qwen35MtpHead> {
+    load_mtp_head_at_offset_named(path, gpu, max_seq, base_offset, &bare_namer, None)
+}
+
+/// As [`load_mtp_head_at_offset`], but the caller supplies the tensor-name
+/// spelling and, when the container is a trunk rather than a `.mtp`, the
+/// already-derived head config (a trunk's metadata describes the trunk, not
+/// the head).
+pub fn load_mtp_head_at_offset_named(
+    path: &Path,
+    gpu: &mut Gpu,
+    max_seq: usize,
+    base_offset: u64,
+    namer: MtpNamer<'_>,
+    config_override: Option<Qwen35MtpHeadConfig>,
 ) -> HipResult<Qwen35MtpHead> {
     let hfq = HfqFile::open_at_offset(path, base_offset).unwrap_or_else(|e| {
         panic!(
@@ -834,17 +1015,26 @@ pub fn load_mtp_head_at_offset(
             path.display()
         )
     });
-    assert_eq!(
-        hfq.arch_id,
-        21,
-        ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
-         is this actually an MTP head extracted by mtp_extract?",
-        path.display(),
-        hfq.arch_id
-    );
+    // A standalone `.mtp` is its own container and must be arch 21. A trunk
+    // carrying the head as in-container `mtp.*` tensors is arch 5/6 and the
+    // check does not apply — `config_override` being set is exactly the
+    // signal that the caller resolved the geometry from the trunk instead.
+    if config_override.is_none() {
+        assert_eq!(
+            hfq.arch_id,
+            21,
+            ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
+             is this actually an MTP head extracted by mtp_extract?",
+            path.display(),
+            hfq.arch_id
+        );
+    }
     let meta: serde_json::Value =
         serde_json::from_str(&hfq.metadata_json).expect(".mtp metadata JSON parse failed");
-    let config = Qwen35MtpHeadConfig::from_metadata(&meta, max_seq);
+    let config = match config_override {
+        Some(c) => c,
+        None => Qwen35MtpHeadConfig::from_metadata(&meta, max_seq),
+    };
 
     // ── Norms (F32, 1D) ─────────────────────────────────────────────────
     //
@@ -859,29 +1049,29 @@ pub fn load_mtp_head_at_offset(
     // verified 2026-05-15 A/B: removing +1.0 regressed K=3 from τ=3.08 to
     // τ=2.00 on 27B-3.5 LRU bench. The MTP head trains its `mtp.norm` with
     // the trunk per-layer convention, NOT the trunk final-norm convention.
-    let shared_head_norm = load_norm_raw(&hfq, gpu, "shared_head_norm", n_embd)?;
-    let enorm = load_norm_raw(&hfq, gpu, "enorm", n_embd)?;
-    let hnorm = load_norm_raw(&hfq, gpu, "hnorm", n_embd)?;
-    let attn_norm = load_norm_raw(&hfq, gpu, "attn_norm", n_embd)?;
-    let attn_post_norm = load_norm_raw(&hfq, gpu, "attn_post_norm", n_embd)?;
-    let attn_q_norm = load_norm_raw(&hfq, gpu, "attn_q_norm", head_dim)?;
-    let attn_k_norm = load_norm_raw(&hfq, gpu, "attn_k_norm", head_dim)?;
+    let shared_head_norm = load_norm_raw(&hfq, gpu, &namer("shared_head_norm"), n_embd)?;
+    let enorm = load_norm_raw(&hfq, gpu, &namer("enorm"), n_embd)?;
+    let hnorm = load_norm_raw(&hfq, gpu, &namer("hnorm"), n_embd)?;
+    let attn_norm = load_norm_raw(&hfq, gpu, &namer("attn_norm"), n_embd)?;
+    let attn_post_norm = load_norm_raw(&hfq, gpu, &namer("attn_post_norm"), n_embd)?;
+    let attn_q_norm = load_norm_raw(&hfq, gpu, &namer("attn_q_norm"), head_dim)?;
+    let attn_k_norm = load_norm_raw(&hfq, gpu, &namer("attn_k_norm"), head_dim)?;
 
     // ── 2D weights ──────────────────────────────────────────────────────
     let q_full_dim = 2 * head_dim * config.n_head;
     let kv_dim = head_dim * config.n_head_kv;
     let q_dim = head_dim * config.n_head;
 
-    let eh_proj = load_weight_raw(&hfq, gpu, "eh_proj", n_embd, 2 * n_embd)?;
-    let wq = load_weight_raw(&hfq, gpu, "wq", q_full_dim, n_embd)?;
-    let wk = load_weight_raw(&hfq, gpu, "wk", kv_dim, n_embd)?;
-    let wv = load_weight_raw(&hfq, gpu, "wv", kv_dim, n_embd)?;
-    let wo = load_weight_raw(&hfq, gpu, "wo", n_embd, q_dim)?;
+    let eh_proj = load_weight_raw(&hfq, gpu, &namer("eh_proj"), n_embd, 2 * n_embd)?;
+    let wq = load_weight_raw(&hfq, gpu, &namer("wq"), q_full_dim, n_embd)?;
+    let wk = load_weight_raw(&hfq, gpu, &namer("wk"), kv_dim, n_embd)?;
+    let wv = load_weight_raw(&hfq, gpu, &namer("wv"), kv_dim, n_embd)?;
+    let wo = load_weight_raw(&hfq, gpu, &namer("wo"), n_embd, q_dim)?;
     let ffn = match config.ffn_kind {
         Qwen35MtpFfnKind::Dense => Qwen35MtpFfnWeights::Dense(Qwen35MtpDenseFfnWeights {
-            gate: load_weight_raw(&hfq, gpu, "ffn_gate", config.n_ff, n_embd)?,
-            up: load_weight_raw(&hfq, gpu, "ffn_up", config.n_ff, n_embd)?,
-            down: load_weight_raw(&hfq, gpu, "ffn_down", n_embd, config.n_ff)?,
+            gate: load_weight_raw(&hfq, gpu, &namer("ffn_gate"), config.n_ff, n_embd)?,
+            up: load_weight_raw(&hfq, gpu, &namer("ffn_up"), config.n_ff, n_embd)?,
+            down: load_weight_raw(&hfq, gpu, &namer("ffn_down"), n_embd, config.n_ff)?,
         }),
         Qwen35MtpFfnKind::Moe => {
             assert_eq!(
@@ -910,7 +1100,7 @@ pub fn load_mtp_head_at_offset(
             .expect("metadata claims has_compressed_lm_head_draft but lacks compressed_vocab_size")
             as usize;
         assert!(cvs > 0, "compressed_vocab_size must be positive");
-        let lm_d = load_weight_raw(&hfq, gpu, "lm_head_draft.weight", cvs, n_embd)?;
+        let lm_d = load_weight_raw(&hfq, gpu, &namer("lm_head_draft.weight"), cvs, n_embd)?;
         let (vmap_info, vmap_bytes) = hfq
             .tensor_data_vec("lm_head_draft.vocab_map")
             .expect("compressed sidecar missing vocab_map tensor");
@@ -1083,14 +1273,19 @@ fn load_mtp_moe_ffn(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
 
-    Ok(Qwen35MtpMoeFfnWeights {
+    let ffn = Qwen35MtpMoeFfnWeights {
         router,
         shared_expert,
         shared_expert_gate,
         experts,
         expert_gate_up_ptrs,
         expert_down_ptrs,
-    })
+    };
+    // Fail at LOAD, not at the first speculative step: a head that this
+    // forward cannot run correctly must not be reported as loaded.
+    // See `mtp_moe_refuse_unsupported_rotation`.
+    mtp_moe_refuse_unsupported_rotation(&ffn)?;
+    Ok(ffn)
 }
 
 /// Cross-check the on-disk shape against the caller's expected (m, k).
@@ -1716,6 +1911,70 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     Ok(())
 }
 
+/// Refuse any MTP MoE weight whose dtype needs a rotation this function does
+/// not apply.
+///
+/// # Why this exists
+///
+/// [`mtp_moe_ffn_decode`] below is a SECOND, independent MoE forward: it does
+/// not go through `hipfire_dispatch::pipeline::run_moe_decode`, so none of the
+/// escha guards there (`check_moe_decode_supported` arm (c), the escha branch
+/// that routes to `pipeline::escha`) protect it. It applies exactly one
+/// rotation, `rotate_x_mq_for`'s FWHT, and combines the raw expert outputs.
+///
+/// An Escha-W2 layer here would therefore skip BOTH Hadamard transforms and
+/// multiply rotated-domain weights by an unrotated activation — finite,
+/// fluent, ~1e-1-wrong draft tokens. Speculative decoding would then verify
+/// them against a correct trunk and reject nearly all of them: the failure
+/// would present as "the speculator is useless", not as "the speculator is
+/// wrong", which is the shape of bug that survives a release.
+///
+/// It is unreachable today by two accidents, neither of which is a decision:
+/// the MTP loader reads per-expert `moe_experts.{i}.{gate_up,down}` tensor
+/// names that an escha checkpoint does not contain, and the escha SKU ships no
+/// MTP sidecar at all. Wiring a speculator to escha must fail loudly, here.
+///
+/// The `match` is deliberately EXHAUSTIVE — no `_` arm. A new `RotationPlan`
+/// variant will not compile until someone decides whether this forward
+/// implements it or refuses it.
+fn mtp_moe_refuse_unsupported_rotation(ffn: &Qwen35MtpMoeFfnWeights) -> HipResult<()> {
+    use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
+
+    let mut check = |label: &str, dt: DType| -> HipResult<()> {
+        match dtype_rotation_plan(dt) {
+            // Applied by `rotate_x_mq_for` / folded into the kernels below.
+            RotationPlan::None
+            | RotationPlan::FwhtG256
+            | RotationPlan::FwhtG128
+            | RotationPlan::Mq8Internal
+            | RotationPlan::Givens => Ok(()),
+            RotationPlan::EschaH128 => Err(HipError::new(
+                0,
+                &format!(
+                    "MTP head: {label} is {dt:?}, whose rotation plan is EschaH128. The MTP \
+                     MoE forward is a separate implementation from run_moe_decode and applies \
+                     NO H128 pair, so it would multiply rotated-domain weights by an \
+                     unrotated activation and emit finite, fluent, ~1e-1-wrong draft tokens. \
+                     Refusing. To wire a speculator to Escha-W2, teach this forward the H128 \
+                     transforms (see hipfire_dispatch::pipeline::escha) — do not delete this \
+                     check."
+                ),
+            )),
+        }
+    };
+
+    check("moe_router", ffn.router.gpu_dtype)?;
+    check("moe_shared_expert_gate", ffn.shared_expert_gate.gpu_dtype)?;
+    check("moe_shared_gate", ffn.shared_expert.gate.gpu_dtype)?;
+    check("moe_shared_up", ffn.shared_expert.up.gpu_dtype)?;
+    check("moe_shared_down", ffn.shared_expert.down.gpu_dtype)?;
+    for (i, e) in ffn.experts.iter().enumerate() {
+        check(&format!("moe_experts.{i}.gate_up"), e.gate_up.gpu_dtype)?;
+        check(&format!("moe_experts.{i}.down"), e.down.gpu_dtype)?;
+    }
+    Ok(())
+}
+
 fn mtp_moe_ffn_decode(
     gpu: &mut Gpu,
     ffn: &Qwen35MtpMoeFfnWeights,
@@ -1724,6 +1983,12 @@ fn mtp_moe_ffn_decode(
     cfg: &Qwen35MtpHeadConfig,
     scratch: &Qwen35MtpHeadScratch,
 ) -> HipResult<()> {
+    // Before any GPU work. `load_mtp_moe_ffn` makes the same call so an escha
+    // sidecar is refused at LOAD rather than at the first speculative step;
+    // this one is the guard at the point of danger, and it is what protects a
+    // `Qwen35MtpMoeFfnWeights` built by any future path that skips the loader.
+    mtp_moe_refuse_unsupported_rotation(ffn)?;
+
     let dim = cfg.n_embd;
     let mi = cfg.moe_intermediate_size;
     let smi = cfg.shared_expert_intermediate_size;

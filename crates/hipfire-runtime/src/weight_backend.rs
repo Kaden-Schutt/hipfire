@@ -1265,6 +1265,33 @@ pub trait WeightBackend {
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
     /// Load a bias vector (f32). Only qwen2 attention biases use this today.
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
+    /// Load a bias vector if the checkpoint has one, else `None`.
+    ///
+    /// `bias` PANICS on a missing tensor, which is right for qwen2 where the
+    /// bias is mandatory. Escha's dense export makes it optional per the leaf
+    /// contract (§1.4) — an export without the end-to-end stage ships none and
+    /// must still load — so that path needs absence to be a value, not a
+    /// crash.
+    fn bias_opt(&mut self, rel: &str, n: usize) -> HipResult<Option<GpuTensor>>;
+    /// Escha trellis sidecars for a projection: `escha_rin_eff`,
+    /// `escha_rout_eff`, and a one-element device pointer table for `w`.
+    ///
+    /// `(rin, rout, ptr0)` rather than a typed struct because
+    /// `hipfire-runtime` must not depend on the arch crate that owns
+    /// `EschaProj`. `None` for any weight that is not a trellis code.
+    fn escha_sidecars(
+        &mut self,
+        rel: &str,
+        w: &WeightTensor,
+    ) -> HipResult<Option<(GpuTensor, GpuTensor, GpuTensor)>>;
+    /// `n` zeroed 32-bit slots. Used for the escha indexed GEMV's `ids`, which
+    /// holds INTEGERS declared F32 because `DType` has no integer variant —
+    /// the same deliberate reinterpretation `EschaMoeTables::ids` documents.
+    fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor>;
+    /// `0..n` as 32-bit ints. The grouped escha GEMM's `sorted_slot_index`:
+    /// a dense linear is one group in slot order, so the permutation is the
+    /// identity.
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor>;
 }
 
 /// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
@@ -1307,6 +1334,60 @@ impl<'a> WeightBackend for HfqBackend<'a> {
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         dequant_f32(self.gpu, info.quant_type, &data, n)
     }
+    fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        self.gpu.upload_f32(&vec![f32::from_bits(0); n], &[n])
+    }
+
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        let v: Vec<f32> = (0..n).map(|i| f32::from_bits(i as u32)).collect();
+        self.gpu.upload_f32(&v, &[n])
+    }
+
+
+    fn escha_sidecars(
+        &mut self,
+        rel: &str,
+        w: &WeightTensor,
+    ) -> HipResult<Option<(GpuTensor, GpuTensor, GpuTensor)>> {
+        use rdna_compute::DType;
+        if !matches!(w.gpu_dtype, DType::Escha2T16 | DType::Escha3T16) {
+            return Ok(None);
+        }
+        let read = |gpu: &mut Gpu, name: &str, want: usize| -> HipResult<GpuTensor> {
+            let (info, data) = read_first(self.hfq, name, self.candidates)
+                .ok_or_else(|| hip_bridge::HipError::new(0, &format!("escha: {name} missing")))?;
+            let t = dequant_f32(gpu, info.quant_type, &data, want)?;
+            if t.numel() != want {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("escha: {name} has {} elements, want {want}", t.numel()),
+                ));
+            }
+            Ok(t)
+        };
+        let base = hfq_plain_name(self.layer, rel);
+        let rin = read(&mut *self.gpu, &format!("{base}.escha_rin_eff"), w.k)?;
+        let rout = read(&mut *self.gpu, &format!("{base}.escha_rout_eff"), w.m)?;
+        let addr = w.buf.buf.as_ptr() as u64;
+        let ptr0 = self.gpu.upload_raw(&addr.to_le_bytes(), &[1])?;
+        Ok(Some((rin, rout, ptr0)))
+    }
+
+    fn bias_opt(&mut self, rel: &str, n: usize) -> HipResult<Option<GpuTensor>> {
+        let name = hfq_plain_name(self.layer, rel);
+        let Some((info, data)) = read_first(self.hfq, &name, self.candidates) else {
+            return Ok(None);
+        };
+        let t = dequant_f32(self.gpu, info.quant_type, &data, n)?;
+        if t.numel() != n {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("bias {name} has {} elements, expected {n}", t.numel()),
+            ));
+        }
+        Ok(Some(t))
+    }
+
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
@@ -1378,6 +1459,31 @@ impl<'a> WeightBackend for ParoBackend<'a> {
             0,
             "ParoBackend: attention biases unsupported",
         ))
+    }
+
+    /// `None`, not an error: ParoQuant checkpoints simply have no biases, and
+    /// the optional loader's contract is that absence is a value.
+    fn bias_opt(&mut self, _rel: &str, _n: usize) -> HipResult<Option<GpuTensor>> {
+        Ok(None)
+    }
+
+    fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        self.gpu.upload_f32(&vec![f32::from_bits(0); n], &[n])
+    }
+
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        let v: Vec<f32> = (0..n).map(|i| f32::from_bits(i as u32)).collect();
+        self.gpu.upload_f32(&v, &[n])
+    }
+
+
+    /// ParoQuant is not escha.
+    fn escha_sidecars(
+        &mut self,
+        _rel: &str,
+        _w: &WeightTensor,
+    ) -> HipResult<Option<(GpuTensor, GpuTensor, GpuTensor)>> {
+        Ok(None)
     }
 }
 

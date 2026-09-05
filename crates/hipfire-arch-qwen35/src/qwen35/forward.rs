@@ -621,6 +621,12 @@ fn moe_ffn_decode_impl(
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
+        // Escha-W2: same single source of truth as `MoeParams::escha` below.
+        // The loader has already turned the trellis experts into Q8_0, so the
+        // transform tables are the ONLY remaining evidence that this layer is
+        // escha — and they are also what makes the escha indexed executor
+        // callable, which is exactly what the resolver's Q8_0 arm gates on.
+        routed_escha_transforms: ffn.escha.is_some() && super::escha::escha_indexed_route_enabled(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
     // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
@@ -712,6 +718,11 @@ fn moe_ffn_decode_impl(
         topk_indices: s.topk_indices,
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
+        // Escha-W2 (Task 10). `Some` only for Escha-W2 layers; it is both the
+        // transform tables the H128-wrapped routed executor needs AND the
+        // layer's escha marker (the loader has already turned the trellis
+        // experts into Q8_0, so no routed dtype says "escha" any more).
+        escha: ffn.escha.as_ref().map(|e| e.refs()),
     };
     // Build one DispatchCtx per token (the family threads it through every
     // inner GEMV — no internal DispatchCtx::new reconstructions).
@@ -833,7 +844,7 @@ fn forward_from_x_gpu(
 
     // Run the production pipeline
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, &scratch, None, None,
+        gpu, weights, config, pos, kv_cache, dn_state, &scratch, None, None, true,
     )?;
 
     // DEBUG_LAYERS: dump per-layer residual norms
@@ -896,6 +907,19 @@ pub struct Qwen35Scratch {
     pub gate_ffn: GpuTensor,   // [hidden_dim]
     pub up: GpuTensor,         // [hidden_dim]
     pub ffn_hidden: GpuTensor, // [hidden_dim]
+    /// Escha trellis scratch: the H128-rotated activation `xh` feeding one
+    /// projection's GEMV. Sized to the LARGEST `ic` any projection uses
+    /// (hidden_dim, for down_proj) so one buffer serves them all.
+    ///
+    /// Separate from `x`/`tmp` because each escha projection rotates the SAME
+    /// input with its OWN `rin` — the whole reason the fused MQ paths cannot
+    /// serve a trellis layer. Reusing the layer input here would corrupt the
+    /// next projection's source.
+    ///
+    /// `mid` needs no buffer: `escha_h128_out_batched` stages its 128-lane
+    /// block into LDS and syncs before writing, so it is safe in place and
+    /// the projection's own output tensor serves as both.
+    pub escha_xh: GpuTensor, // [max(hidden_dim, dim)]
     pub ffn_out: GpuTensor,    // [dim]
 
     // Sampling
@@ -1068,6 +1092,9 @@ impl Qwen35Scratch {
             gate_ffn: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
             up: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
             ffn_hidden: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
+            escha_xh: tracked_tensor!(
+                gpu.alloc_tensor(&[config.hidden_dim.max(config.dim)], DType::F32)
+            ),
             ffn_out: tracked_tensor!(gpu.alloc_tensor(&[dim], DType::F32)),
 
             logits: tracked_tensor!(gpu.alloc_tensor(&[config.vocab_size], DType::F32)),
@@ -1385,6 +1412,19 @@ fn ar_graph_trace_enabled() -> bool {
     })
 }
 
+/// Whether this forward may capture or replay the plain-AR hipGraph.
+///
+/// `emit_logits == false` produces a DIFFERENT kernel sequence (no lm_head),
+/// so a logits-suppressed forward must neither capture the graph nor replay
+/// one captured from a full forward: replaying a full graph would re-run the
+/// lm_head the caller meant to skip, and capturing a suppressed one would
+/// leave a later plain decode replaying a graph that never writes
+/// `scratch.logits` — stale logits, no error, no NaN.
+#[inline]
+fn ar_graph_eligible_for(requested: bool, compact_offset: usize, emit_logits: bool) -> bool {
+    emit_logits && ar_graph_eligible_for_kv(requested, compact_offset)
+}
+
 #[inline]
 fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     // The captured single-token route is built while compact_offset is zero.
@@ -1406,6 +1446,48 @@ pub fn forward_scratch(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    forward_scratch_opts(
+        gpu, weights, config, token, pos, kv_cache, dn_state, scratch, true,
+    )
+}
+
+/// [`forward_scratch`] with the final lm_head projection made optional.
+///
+/// `emit_logits == false` runs every layer, the KV/DeltaNet state updates and
+/// the final output norm exactly as before, and stops short of the vocabulary
+/// GEMV. `scratch.tmp` (the post-output-norm hidden state) is still written, so
+/// the per-token-hidden extraction in `forward_prefill_batch`'s fallback is
+/// unaffected; only `scratch.logits` is left holding the previous call's value.
+///
+/// # Why this exists
+///
+/// A model that fails batched-prefill admission prefills through a per-token
+/// `forward_scratch` loop, and every one of those tokens computed a full
+/// `[vocab, hidden]` projection whose result the next token immediately
+/// overwrote. Only the LAST token's logits are ever read. On escha-35b
+/// (`vocab = 248 320`, Q8_0 lm_head) `rocprofv3 --kernel-trace` prices that at
+/// **2.32 ms of a 24.55 ms prefill token — 508 MB of weight traffic, 9.5 % of
+/// the token** — spent producing a value that is discarded.
+///
+/// It is a real saving rather than a bookkeeping one because this model is
+/// bandwidth-bound: the lm_head GEMV moves the whole 508 MB weight matrix per
+/// call and achieves ~219 GB/s doing it.
+///
+/// CONTRACT: pass `false` only when the caller will not read `scratch.logits`
+/// for that position. The prefill fallback passes `true` for the final token,
+/// which is the only one whose logits survive the loop.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    emit_logits: bool,
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
     // Grow before any possible AR graph capture/replay. Stable virtual
@@ -1522,8 +1604,19 @@ pub fn forward_scratch(
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
     let requested_graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
-    let graph_eligible =
-        ar_graph_eligible_for_kv(requested_graph_eligible, kv_cache.compact_offset);
+    // A logits-suppressed forward emits a DIFFERENT kernel sequence (no
+    // lm_head), so it must never capture the plain-AR graph nor replay one
+    // captured from a full forward — a replay would either re-run the lm_head
+    // this call meant to skip or, captured the other way round, leave a later
+    // plain decode reading stale logits. Today's only `emit_logits == false`
+    // caller (the prefill fallback) already sets `ar_graph_eligible = false`;
+    // this makes the invariant a property of the function rather than of its
+    // callers, so a new caller cannot reintroduce the hazard.
+    let graph_eligible = ar_graph_eligible_for(
+        requested_graph_eligible,
+        kv_cache.compact_offset,
+        emit_logits,
+    );
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
@@ -1609,7 +1702,16 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            None,
+            emit_logits,
         )?;
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
@@ -1630,7 +1732,16 @@ pub fn forward_scratch(
             gpu.active_stream.as_ref().unwrap(),
         )?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            None,
+            emit_logits,
         )?;
         gpu.graphs.end_graph_capture(
             &gpu.hip,
@@ -1653,7 +1764,16 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            None,
+            emit_logits,
         )?;
     }
     if gpu.replay.should_auto_finalize_capture() {
@@ -1764,6 +1884,7 @@ pub fn forward_scratch_with_hidden(
         scratch,
         Some(hidden_rb),
         None,
+        true,
     )?;
     hidden_rb.advance_head();
     Ok(())
@@ -1794,7 +1915,7 @@ pub fn forward_scratch_embed(
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None, true,
     )
 }
 
@@ -1885,6 +2006,7 @@ pub fn forward_scratch_mrope(
         scratch,
         None,
         Some(mc),
+        true,
     )
 }
 
@@ -1936,11 +2058,21 @@ pub fn forward_scratch_embed_mrope(
         scratch,
         None,
         Some(mc),
+        true,
     )
 }
 
 // ── Forward scratch layers (dispatch family version) ────────────────────
 
+/// `emit_logits == false` runs the whole layer stack and the final output
+/// norm but skips the lm_head GEMV. See [`forward_scratch_opts`] for why.
+/// Honoured on BOTH arms: the hand-written one below and the lowered super-op
+/// executor (`forward_scratch_layers_lowered`), which is the DEFAULT
+/// (`HIPFIRE_FORWARD_LOWERED` opts out with `0`). Threading it through only
+/// the hand arm makes the saving invisible on the default path — that mistake
+/// was made once here and caught by counting lm_head dispatches in the kernel
+/// trace, not by the wall clock, which moved 0.3 %.
+#[allow(clippy::too_many_arguments)]
 fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1951,6 +2083,7 @@ fn forward_scratch_layers(
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
+    emit_logits: bool,
 ) -> HipResult<()> {
     // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
     // single-GPU decode through the lowered super-op executor. Skipped when a
@@ -1964,7 +2097,16 @@ fn forward_scratch_layers(
     // silently reinstate sequential positions. VL therefore always takes the
     // hand arms below, which DO branch on `mrope`.
     if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() {
-        return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
+        return forward_scratch_layers_lowered(
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            s,
+            emit_logits,
+        );
     }
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -2611,9 +2753,12 @@ fn forward_scratch_layers(
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
 
-    // Final norm + logits into scratch.logits
+    // Final norm — ALWAYS. `s.tmp` is the post-norm hidden state and is read
+    // by callers that never look at the logits (per-token hidden extraction in
+    // the prefill fallback, hidden-ring staging), so it is not part of what
+    // `emit_logits == false` skips.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    {
+    if emit_logits {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
@@ -4754,6 +4899,39 @@ fn qkv_from_prerotated_mq(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// True when all four QKVZA weights sit in the container
+/// `fused_qkvza_hfq4g256` actually reads.
+///
+/// qt=6 (HFQ4G256) and qt=13 (MQ4G256) share one 136 B group layout, so MQ4
+/// has always borrowed HFQ4's kernel and that is correct — only the
+/// activations differ, which is what `precomputed_attn_x_rot` handles. NO
+/// other MQ container shares it.
+///
+/// [`qkvza_from_prerotated_mq`] hardcodes that kernel with no dtype check, so
+/// without this predicate any other MQ container on `wqkv` — or an F16
+/// sibling, which is how escha-35b stores `w_alpha`/`w_beta` — is read at
+/// HFQ4 stride. Measured: down-quantising ONLY `in_proj_qkv` on escha-35b
+/// scored KLD 12.63 / PPL 2,375,141 against a 7.68 baseline, identically
+/// under MQ6G256, MQ6G256V2 and MQ4G256V2, while `out_proj` (not in this
+/// launch) was unaffected at KLD 0.0076. Finite, fluent, wrong.
+///
+/// Same failure family as `prefill::all_q8_0`, which was added for the Q8_0
+/// arms after escha-35b made mixed layers reachable; the per-token MQ path
+/// never got the equivalent.
+fn qkvza_hfq4_container(
+    wqkv: &WeightTensor,
+    wz: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+) -> bool {
+    [wqkv, wz, w_beta, w_alpha].iter().all(|w| {
+        matches!(
+            w.gpu_dtype,
+            rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+        )
+    })
+}
+
 fn qkvza_from_prerotated_mq(
     gpu: &mut Gpu,
     wqkv: &WeightTensor,
@@ -4810,7 +4988,213 @@ fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
 }
 
+/// Run one projection op for a layer whose weights are escha trellis codes.
+///
+/// Returns `Ok(false)` when the layer is not escha, so the caller falls
+/// through to its ordinary dispatch untouched.
+///
+/// WHY THIS BYPASSES THE FUSED PATHS ENTIRELY: every escha projection rotates
+/// the SAME normed input with its OWN `rin` before its GEMV. FusedQkv /
+/// FusedQkvza / gate_up exist precisely to share one rotated activation across
+/// several weights, so there is nothing for them to share here — and they
+/// cannot read a trellis code in any case. A layer is all-escha or none
+/// (`need_eproj` enforces that at load), so the bypass is wholesale.
+///
+/// `in_proj_a` / `in_proj_b` are NOT coded — escha's `ignore` list keeps them
+/// plain — so PROJ_QKVZA runs those two through the normal GEMV.
+fn escha_run_proj(
+    gpu: &mut Gpu,
+    op: &OpBinding,
+    layer: &LayerWeights,
+    s: &Qwen35Scratch,
+    config: &Qwen35Config,
+) -> Result<bool, DispatchError> {
+    let hip = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    match (op_code(op), layer) {
+        (q35_op::PROJ_QKVZA, LayerWeights::DeltaNet(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            // Plain RMSNorm, NOT the fused rmsnorm+rotate: escha applies its
+            // own H128 per projection and a pre-rotated input would be
+            // rotated twice.
+            gpu.rmsnorm_f32(&s.x, &l.attn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.qkv.forward(gpu, &l.wqkv, &e.ids, &s.tmp, &s.escha_xh, &s.dn_qkv, &s.dn_qkv, 1, None)
+                .map_err(hip)?;
+            e.z.forward(gpu, &l.wz, &e.ids, &s.tmp, &s.escha_xh, &s.dn_z, &s.dn_z, 1, None)
+                .map_err(hip)?;
+            hipfire_runtime::llama::weight_gemv(gpu, &l.w_beta, &s.tmp, &s.dn_beta).map_err(hip)?;
+            hipfire_runtime::llama::weight_gemv(gpu, &l.w_alpha, &s.tmp, &s.dn_alpha)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        (q35_op::PROJ_QKV, LayerWeights::FullAttn(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            gpu.rmsnorm_f32(&s.x, &l.attn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.q.forward(gpu, &l.wq, &e.ids, &s.tmp, &s.escha_xh, &s.fa_q_full, &s.fa_q_full, 1, None)
+                .map_err(hip)?;
+            e.k.forward(gpu, &l.wk, &e.ids, &s.tmp, &s.escha_xh, &s.fa_k, &s.fa_k, 1, None)
+                .map_err(hip)?;
+            e.v.forward(gpu, &l.wv, &e.ids, &s.tmp, &s.escha_xh, &s.fa_v, &s.fa_v, 1, None)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::DeltaNet(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            gpu.rmsnorm_f32(&s.x, &l.ffn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1, None)
+                .map_err(hip)?;
+            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1, None)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::FullAttn(l)) => {
+            let Some(e) = l.escha.as_ref() else { return Ok(false) };
+            gpu.rmsnorm_f32(&s.x, &l.ffn_norm, &s.tmp, config.norm_eps)
+                .map_err(hip)?;
+            e.gate.forward(gpu, &l.w_gate, &e.ids, &s.tmp, &s.escha_xh, &s.gate_ffn, &s.gate_ffn, 1, None)
+                .map_err(hip)?;
+            e.up.forward(gpu, &l.w_up, &e.ids, &s.tmp, &s.escha_xh, &s.up, &s.up, 1, None)
+                .map_err(hip)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Escha counterpart of the residual ops. `out_proj` and `down_proj` write
+/// into the residual stream, which the fused epilogue normally does in one
+/// launch; here the projection and the accumulate are separate because the
+/// trellis GEMV has no residual variant.
+///
+/// Adding into `s.x` afterwards is exact, not an approximation — both the
+/// residual and the projection output are plain f32 adds.
+fn escha_run_resid(
+    gpu: &mut Gpu,
+    op: &OpBinding,
+    layer: &LayerWeights,
+    s: &Qwen35Scratch,
+) -> Result<bool, DispatchError> {
+    let hip = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    let (esch, wo, w_down, dn_in) = match layer {
+        LayerWeights::DeltaNet(l) => match l.escha.as_ref() {
+            None => return Ok(false),
+            Some(e) => (
+                (&e.o, &e.down),
+                &l.wo,
+                &l.w_down,
+                &s.dn_normed,
+            ),
+        },
+        LayerWeights::FullAttn(l) => match l.escha.as_ref() {
+            None => return Ok(false),
+            Some(e) => ((&e.o, &e.down), &l.wo, &l.w_down, &s.fa_attn_out),
+        },
+        _ => return Ok(false),
+    };
+    match op_code(op) {
+        q35_op::RESID_WO => {
+            esch.0
+                .forward(gpu, wo, escha_ids(layer), dn_in, &s.escha_xh, &s.o, &s.o, 1, None)
+                .map_err(hip)?;
+            gpu.add_inplace_f32(&s.x, &s.o).map_err(hip)?;
+            Ok(true)
+        }
+        q35_op::RESID_DOWN_SWIGLU => {
+            // SwiGLU first — the fused `weight_gemv_swiglu_residual` folds it
+            // in, but that kernel cannot read a trellis code.
+            gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)
+                .map_err(hip)?;
+            esch.1
+                .forward(
+                    gpu,
+                    w_down,
+                    escha_ids(layer),
+                    &s.ffn_hidden,
+                    &s.escha_xh,
+                    &s.ffn_out,
+                    &s.ffn_out,
+                    1,
+                    None,
+                )
+                .map_err(hip)?;
+            gpu.add_inplace_f32(&s.x, &s.ffn_out).map_err(hip)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The layer's shared zero `ids` table. Only called where `escha` is `Some`.
+fn escha_ids(layer: &LayerWeights) -> &GpuTensor {
+    match layer {
+        LayerWeights::DeltaNet(l) => &l.escha.as_ref().expect("escha layer").ids,
+        LayerWeights::FullAttn(l) => &l.escha.as_ref().expect("escha layer").ids,
+        _ => unreachable!("escha_ids on a non-escha layer kind"),
+    }
+}
+
+/// Add the escha dense export's additive output biases.
+///
+/// Applied here, at the ONE exit of `run_proj`, rather than inside each
+/// arm: every op has several branches that fill the same output buffers
+/// (prerotated / scalar-prep / execute-steps), and a bias added in some
+/// branches but not others is a silent wrong answer, not a crash.
+///
+/// Correct AFTER the projection for the same reason it is correct after a
+/// residual add — both are additive and commute.
+///
+/// No-op for every model without escha biases, which is all of them but
+/// the 27B.
+fn apply_proj_biases(
+gpu: &mut Gpu,
+op: &OpBinding,
+layer: &LayerWeights,
+s: &Qwen35Scratch,
+) -> Result<(), DispatchError> {
+    // `bias_add_f32` and not `add_inplace_f32`: the same helper serves decode
+    // (batch = 1) and the batched prefill path, so both use one primitive and
+    // cannot drift.
+    let add = |gpu: &mut Gpu, y: &GpuTensor, b: &GpuTensor| -> Result<(), DispatchError> {
+        let n = b.numel();
+        gpu.bias_add_f32(y, b, 1, n)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    };
+    match (op_code(op), layer) {
+        (q35_op::PROJ_QKVZA, LayerWeights::DeltaNet(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.dn_qkv, &b.qkv)?;
+                add(gpu, &s.dn_z, &b.z)?;
+            }
+        }
+        (q35_op::PROJ_QKV, LayerWeights::FullAttn(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.fa_q_full, &b.q)?;
+                add(gpu, &s.fa_k, &b.k)?;
+                add(gpu, &s.fa_v, &b.v)?;
+            }
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::DeltaNet(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.gate_ffn, &b.gate)?;
+                add(gpu, &s.up, &b.up)?;
+            }
+        }
+        (q35_op::PROJ_GATE_UP, LayerWeights::FullAttn(l)) => {
+            if let Some(b) = l.biases.as_ref() {
+                add(gpu, &s.gate_ffn, &b.gate)?;
+                add(gpu, &s.up, &b.up)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl<'a> ForwardBindings for Qwen35Bindings<'a> {
+
+
     fn run_proj(
         &mut self,
         gpu: &mut Gpu,
@@ -4819,6 +5203,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     ) -> Result<(), DispatchError> {
         let s = self.s;
         let config = self.config;
+        if escha_run_proj(gpu, op, self.layer, s, config)? {
+            return apply_proj_biases(gpu, op, self.layer, s);
+        }
         let res: HipResult<()> = match op_code(op) {
             q35_op::PROJ_QKV => match self.layer {
                 LayerWeights::FullAttn(l) => {
@@ -4909,7 +5296,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         ));
                     }
                 };
-                if self.precomputed_attn_x_rot {
+                if self.precomputed_attn_x_rot
+                    && qkvza_hfq4_container(wqkv, wz, w_beta, w_alpha)
+                {
                     qkvza_from_prerotated_mq(
                         gpu,
                         wqkv,
@@ -5016,8 +5405,11 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             },
             other => return Err(DispatchError::Hip(format!("unknown PROJ opcode {other}"))),
         };
-        res.map_err(|e| DispatchError::Hip(e.to_string()))
+        res.map_err(|e| DispatchError::Hip(e.to_string()))?;
+        apply_proj_biases(gpu, op, self.layer, self.s)
     }
+
+
 
     fn run_residual_gemv(
         &mut self,
@@ -5026,6 +5418,26 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         let s = self.s;
+        if escha_run_resid(gpu, op, self.layer, s)? {
+            let bias = match self.layer {
+                LayerWeights::DeltaNet(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+                LayerWeights::FullAttn(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+                _ => None,
+            };
+            if let Some((bo, bdown)) = bias {
+                let which = match op_code(op) {
+                    q35_op::RESID_WO => Some(bo),
+                    q35_op::RESID_DOWN_SWIGLU => Some(bdown),
+                    _ => None,
+                };
+                if let Some(b) = which {
+                    let n = b.numel();
+                    gpu.bias_add_f32(&s.x, b, 1, n)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
+            }
+            return Ok(());
+        }
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::RESID_WO => {
                 let (wo, input) = match self.layer {
@@ -5102,7 +5514,29 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             }
             other => Err(HipError::new(0, &format!("unknown RESID opcode {other}"))),
         })();
-        res.map_err(|e| DispatchError::Hip(e.to_string()))
+        res.map_err(|e| DispatchError::Hip(e.to_string()))?;
+        // `out_proj`/`o_proj` and `down_proj` write into the residual stream,
+        // so their bias lands on `s.x`. Adding it after the residual add is
+        // the same value as adding it before — both additive.
+        let s = self.s;
+        let bias = match self.layer {
+            LayerWeights::DeltaNet(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+            LayerWeights::FullAttn(l) => l.biases.as_ref().map(|b| (&b.o, &b.down)),
+            _ => None,
+        };
+        if let Some((bo, bdown)) = bias {
+            let which = match op_code(op) {
+                q35_op::RESID_WO => Some(bo),
+                q35_op::RESID_DOWN_SWIGLU => Some(bdown),
+                _ => None,
+            };
+            if let Some(b) = which {
+                let n = b.numel();
+                gpu.bias_add_f32(&s.x, b, 1, n)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn run_norm(
@@ -5904,6 +6338,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
 /// to `forward_scratch_layers`'s hand arms (validated byte-identical via the
 /// external committed-token md5 gate). Builds a coarse-super-op `LayerProgram`
 /// per layer and runs it through the dispatch substrate's executor.
+#[allow(clippy::too_many_arguments)]
 fn forward_scratch_layers_lowered(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -5912,6 +6347,7 @@ fn forward_scratch_layers_lowered(
     kv_cache: &mut llama::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
+    emit_logits: bool,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -5982,7 +6418,7 @@ fn forward_scratch_layers_lowered(
 
     // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    {
+    if emit_logits {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
@@ -6117,6 +6553,24 @@ mod tests {
         assert_eq!(lower_variant(Q35Variant::DeltaNet).len(), 7);
         assert_eq!(lower_variant(Q35Variant::DeltaNetMoe).len(), 6);
         assert_eq!(lower_variant(Q35Variant::FullAttnMoe).len(), 4);
+    }
+
+    /// A logits-suppressed forward must never touch the plain-AR graph.
+    ///
+    /// Without this, the prefill fallback's `emit_logits = false` tokens could
+    /// replay a graph captured from a full forward (re-running the lm_head the
+    /// skip exists to remove — the optimisation silently does nothing), or
+    /// capture a logits-free graph that a later plain decode replays, leaving
+    /// `scratch.logits` holding a previous token's values with no error and no
+    /// NaN to catch it.
+    #[test]
+    fn logits_suppressed_forward_is_never_ar_graph_eligible() {
+        // Otherwise-perfect conditions: requested, no KV compaction.
+        assert!(ar_graph_eligible_for(true, 0, true));
+        assert!(!ar_graph_eligible_for(true, 0, false));
+        // emit_logits cannot RE-enable a forward the other conditions refuse.
+        assert!(!ar_graph_eligible_for(false, 0, true));
+        assert!(!ar_graph_eligible_for(true, 128, true));
     }
 
     #[test]

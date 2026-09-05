@@ -24,6 +24,7 @@ mod maple;
 mod model_filter;
 mod pipeline;
 mod pipeline_deepseek;
+mod pipeline_escha;
 mod pipeline_gguf;
 mod pipeline_maple;
 mod quant_e8;

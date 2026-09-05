@@ -8,6 +8,8 @@
 use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
+use super::escha;
+use super::escha::EschaWeightStore;
 use super::forward::layers_have_mq6_moe;
 use super::weights::dtype_from_quant_type;
 use super::weights::mixed_expert_tag;
@@ -63,7 +65,11 @@ const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
-fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+/// Public so gates outside the loader (e.g.
+/// `examples/test_escha_dense_linear_gpu_vs_cpu.rs`) resolve names through the
+/// SAME aliasing the production load uses. A gate with its own copy of this
+/// would stop testing what actually runs the moment the two drifted.
+pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(4);
     let mut push = |s: String| {
         if !out.iter().any(|x| x == &s) {
@@ -84,6 +90,26 @@ fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
         push(format!("model.language_model.{name}"));
         push(format!("model.{name}"));
         push(name.to_string());
+    }
+
+    // Escha alias. A trellis-coded projection has NO `.weight` — it ships
+    // `escha_code` + `escha_rin` + `escha_rout`. Offering the code under the
+    // same lookup lets the ordinary `b.proj(...)` path find it and build a
+    // `WeightTensor` with dtype Escha2T16/3T16; `escha_sidecars` then attaches
+    // the rotation vectors.
+    //
+    // Ordered LAST on purpose: a checkpoint carrying both a real `.weight` and
+    // a stale `escha_code` must resolve to the weight, not silently prefer a
+    // code the runtime would then decode against the wrong activation.
+    if let Some(stem) = name.strip_suffix(".weight") {
+        let alias = format!("{stem}.escha_code");
+        if alias.starts_with("model.") {
+            push(alias);
+        } else {
+            push(format!("model.language_model.{alias}"));
+            push(format!("model.{alias}"));
+            push(alias);
+        }
     }
     out
 }
@@ -299,6 +325,56 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256Lloyd,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        42 | 43 => {
+            // Escha-W2 trellis code, kept VERBATIM — the 2-bit/3-bit stream is
+            // decoded inside the GEMV, never at load. That is the whole point
+            // of the format: an 11.16 GB resident 27B instead of 22.63 GB
+            // folded, at better quality (PPL 11.8654 vs 13.6957).
+            //
+            // Opaque raw buffer like the MQ arms above, but the resemblance
+            // ends there: an escha weight is NOT self-contained. It needs its
+            // `escha_rin_eff`/`escha_rout_eff` vectors and an H128 on both
+            // sides of the GEMV, which is why `EschaDenseLinear` exists and
+            // why the fused MQ paths (FusedQkv/FusedQkvza/gate_up) CANNOT
+            // consume one — each projection needs its own rin-rotated
+            // activation. A layer holding these must route through
+            // `escha::escha_dense_linear_forward`.
+            //
+            // `m`/`k` are the logical output/input dims; the buffer length is
+            // the tile-packed code, not m*k of anything.
+            //
+            // TILE GRID TRANSPOSED HERE, kt-major -> nt-major. Every escha
+            // kernel holds one output tile column `nt` fixed and walks `kt`;
+            // in the checkpoint's order consecutive `kt` are a full tile-row
+            // apart (139 KB on the 27B's gate_proj), so each step is a fresh
+            // 64-bit address against a cold line. Adjacent instead: measured
+            // 243.9 -> 186.3 us on the decode GEMV, 24%.
+            //
+            // ONLY THIS (DENSE) LOADER PERMUTES. MoE experts come through
+            // `escha::load_escha_moe_experts` and stay kt-major, which is why
+            // the kernels take an `nt_major` flag rather than assuming a
+            // layout — the dense call sites pass `true`, MoE passes `false`.
+            //
+            // At LOAD, not in the converter, so the payload stays verbatim
+            // from upstream: no re-convert, no re-upload, no format version.
+            // Whole tiles move and their contents are untouched, so every
+            // decoded weight is identical. Gated on mean KLD = 0.000000.
+            let permuted = escha_tiles_to_nt_major(data, m, k, quant_type)?;
+            let buf = gpu.upload_raw(&permuted, &[permuted.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: if quant_type == 42 {
+                    DType::Escha2T16
+                } else {
+                    DType::Escha3T16
+                },
                 m,
                 k,
                 row_stride: 0,
@@ -1435,6 +1511,8 @@ fn paro_load_moe_ffn(
         paro_shared: Some(shared),
         global_expert_dtypes: None,
         ep_dummy_buffers: Vec::new(),
+        // ParoQuant/paged, not Escha-W2.
+        escha: None,
     })
 }
 
@@ -3072,6 +3150,32 @@ pub fn preflight_weights_dense_tp(
     let conv = config.conv_kernel_dim;
 
     let validate_proj = |bare: &str, m: usize, k: usize| -> Result<(), String> {
+        // An escha-coded DENSE projection (Qwen3.8-27B) has no `.weight` at
+        // all — it ships `escha_code` + `escha_rin` + `escha_rout`. Validate
+        // the trio that the leaf contract makes REQUIRED (§1.4) and return;
+        // the shape lives in the code tensor's own dims and is checked when
+        // it is decoded, not here.
+        if let Some(stem) = bare.strip_suffix(".weight") {
+            let code = format!("{stem}.escha_code");
+            if let Some((info, _)) = find_qwen35_tensor(hfq, &code) {
+                if info.quant_type == 42 || info.quant_type == 43 {
+                    for leaf in ["escha_rin_eff", "escha_rout_eff"] {
+                        let n = format!("{stem}.{leaf}");
+                        if find_qwen35_tensor(hfq, &n).is_none() {
+                            return Err(format!(
+                                "preflight: {code} is escha-coded but {n} is missing — an \
+                                 incomplete escha linear must fail loudly at load, not \
+                                 decode into noise"
+                            ));
+                        }
+                    }
+                    if k % 256 != 0 {
+                        return Err(format!("preflight: {bare} K={k} not G256 aligned"));
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let (info, cand) = find_qwen35_tensor(hfq, bare)
             .ok_or_else(|| format!("preflight: missing tensor {bare}"))?;
         validate_mq4_proj_info(info, m, k, bare)?;
@@ -3625,6 +3729,8 @@ pub fn load_weights_dense_tp_rank(
                             w_gate: w_gate_opt.take().unwrap(),
                             w_up: w_up_opt.take().unwrap(),
                             w_down: w_down_opt.take().unwrap(),
+                            biases: None,
+                            escha: None,
                         }))
                     })();
                     match layer_res {
@@ -3821,6 +3927,8 @@ pub fn load_weights_dense_tp_rank(
                             w_gate: w_gate_opt.take().unwrap(),
                             w_up: w_up_opt.take().unwrap(),
                             w_down: w_down_opt.take().unwrap(),
+                            biases: None,
+                            escha: None,
                         }))
                     })();
                     match layer_res {
@@ -4357,6 +4465,40 @@ fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
 /// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
 /// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
+/// Escha-W2 expert storage. Production (Phase 2) is `Native` — the trellis
+/// code itself, 0.25/0.375 B/weight, decoded inside the routed GEMV. The three
+/// other values select DECODING stores, each of which exists to make a
+/// specific measurement possible rather than to be run:
+///
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=q8_0` (also `q8`) — Phase 1: transpose +
+///   Q8_0 re-quantise, 1.0625 B/weight, 37.55 GB resident. This is the A/B arm
+///   for every Phase-2 performance claim, and the arm every published Phase-1
+///   number (G4's Q8_0 arm, the G5 KLD headline) was measured on. It is also
+///   the only routed store that works on the per-expert HOST route, so it is
+///   what `HIPFIRE_ESCHA_INDEXED=0` needs.
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=f16` — 2 B/weight, weight-exact, ~64 GB of
+///   experts. The arm the G5 KLD reference is built with.
+/// * `HIPFIRE_ESCHA_EXPERT_STORE=f32` — 4 B/weight, ~129 GB of experts on the
+///   35B. Equally exact and does NOT fit; small-layer diagnostic only (the G4
+///   block gate uses it).
+///
+/// `f16` and `f32` lose the indexed GPU-top-K path and run host-routed;
+/// `native` REQUIRES it — there is no per-expert native GEMV, so an escha
+/// layer that reaches the host route with this store fails loudly in
+/// `GemvFamily::run_auto` (no plain GEMV exists for `RotationPlan::EschaH128`)
+/// instead of running unrotated. See `qwen35/escha.rs`.
+///
+/// An unrecognised value falls through to production rather than erroring,
+/// matching every other developer var in this loader.
+fn escha_weight_store() -> EschaWeightStore {
+    match hipfire_config::developer_var("HIPFIRE_ESCHA_EXPERT_STORE").as_deref() {
+        Ok("f32") | Ok("F32") => EschaWeightStore::F32,
+        Ok("f16") | Ok("F16") => EschaWeightStore::F16,
+        Ok("q8_0") | Ok("Q8_0") | Ok("q8") | Ok("Q8") => EschaWeightStore::Q8_0,
+        _ => EschaWeightStore::Native,
+    }
+}
+
 pub(crate) fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -4371,7 +4513,30 @@ pub(crate) fn load_moe_ffn(
         .reap_keep
         .as_ref()
         .map(|r| r.expert_plan(layer_idx as usize));
+    // Detect Escha-W2 BEFORE the EP-shard block. An escha layer carries one
+    // trellis code tensor per projection for all experts, not the per-expert
+    // `experts.{x}.gate_up_proj.weight` tensors the EP path fishes out by
+    // index — so if the EP block runs first it panics on a tensor that does
+    // not exist, and the escha refusal further down is never reached. The
+    // daemon sets an EP shard even on a single GPU, which is exactly how that
+    // happened: `hipfire bench` panicked with
+    // "tensor not found: layers.0.mlp.experts.0.gate_up_proj.weight".
+    //
+    // A single-rank shard splits nothing, so escha simply ignores it; only a
+    // genuine multi-rank split is refused (below, and again after the router
+    // load for the REAP keep-map case).
+    let escha_layer = escha::layer_is_escha(hfq, p, qwen35_tensor_name_candidates);
     let ep_shard = current_ep_expert_shard();
+    let ep_shard = match (escha_layer, ep_shard) {
+        (true, Some((ref sc, _))) if sc.tp_size > 1 => {
+            return Err(HipError::new(
+                0,
+                "qwen35: Escha-W2 routed experts do not support EP sharding across >1 rank                  (it re-maps experts across the per-expert tensors escha does not have)",
+            ))
+        }
+        (true, _) => None,
+        (_, other) => other,
+    };
     if ep.is_some() && ep_shard.is_some() {
         return Err(HipError::new(
             0,
@@ -4750,42 +4915,93 @@ pub(crate) fn load_moe_ffn(
         .map(|slot| ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot))
         .filter(|&x| owns_orig(x))
         .collect();
-    let packed = if ep_shard.is_none() && packed_mq4_experts_supported(gpu) {
+    // ── Escha-W2 routed experts (Task 10) ────────────────────────────────
+    // An Escha-W2 layer carries ONE trellis code tensor per projection for
+    // all experts, not the per-expert `experts.{x}.gate_up_proj.weight`
+    // tensors every other path fishes out by index, so it bypasses both the
+    // packed-MQ4 fast path and the generic per-expert loop below.
+    if escha_layer && (ep_shard.is_some() || ep.is_some()) {
+        return Err(HipError::new(
+            0,
+            "qwen35: Escha-W2 routed experts do not support EP sharding or a REAP keep-map \
+             (both re-map experts across the per-expert tensors escha does not have)",
+        ));
+    }
+    let escha_tables = if escha_layer {
+        let store = escha_weight_store();
+        let (experts, tables, owners) = escha::load_escha_moe_experts(
+            hfq,
+            gpu,
+            p,
+            &expert_ids,
+            n_exp,
+            config.dim,
+            mi,
+            config.num_experts_per_tok,
+            store,
+            qwen35_tensor_name_candidates,
+        )?;
+        if layer_idx == 0 {
+            eprintln!(
+                "  Escha-W2 routed experts: {} experts, store {store:?} ({}), {} per-expert \
+                 weight buffers -> 2 layer blobs",
+                experts.len(),
+                match store {
+                    EschaWeightStore::Native => "trellis code kept verbatim, decoded in the GEMV",
+                    _ => "decoded from the trellis at load",
+                },
+                2 * experts.len()
+            );
+        }
+        Some((experts, tables, owners))
+    } else {
+        None
+    };
+
+    let packed = if !escha_layer && ep_shard.is_none() && packed_mq4_experts_supported(gpu) {
         try_load_packed_mq4_experts(hfq, gpu, p, &expert_ids, mi, config.dim)?
     } else {
         None
     };
-    let (mut experts, packed_expert_owners) = if let Some((experts, owners)) = packed {
-        if layer_idx == 0 {
-            eprintln!(
-                "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
-                2 * experts.len()
-            );
-        }
-        (experts, Some(owners))
-    } else {
-        let mut experts = Vec::with_capacity(expert_ids.len());
-        for x in expert_ids {
-            let gate_up = load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
-                2 * mi,
-                config.dim,
-                qwen35_tensor_name_candidates,
-            )?;
-            let down = load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.experts.{x}.down_proj.weight"),
-                config.dim,
-                mi,
-                qwen35_tensor_name_candidates,
-            )?;
-            experts.push(ExpertWeights { gate_up, down });
-        }
-        (experts, None)
-    };
+    let (mut experts, packed_expert_owners, escha_tables) =
+        if let Some((e, t, owners)) = escha_tables {
+            // Escha expert slots are views into `owners`, exactly like the packed
+            // MQ4 path's — so they ride the SAME `packed_expert_owners` free path
+            // (`free_moe_ffn` frees per-expert metadata only, then the two blobs).
+            // Publishing them here rather than in a bespoke field is what keeps
+            // teardown from double-freeing or leaking 32 GB.
+            (e, Some(owners), Some(t))
+        } else if let Some((experts, owners)) = packed {
+            if layer_idx == 0 {
+                eprintln!(
+                    "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
+                    2 * experts.len()
+                );
+            }
+            (experts, Some(owners), None)
+        } else {
+            let mut experts = Vec::with_capacity(expert_ids.len());
+            for x in expert_ids {
+                let gate_up = load_weight_tensor(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+                    2 * mi,
+                    config.dim,
+                    qwen35_tensor_name_candidates,
+                )?;
+                let down = load_weight_tensor(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.experts.{x}.down_proj.weight"),
+                    config.dim,
+                    mi,
+                    qwen35_tensor_name_candidates,
+                )?;
+                experts.push(ExpertWeights { gate_up, down });
+            }
+            (experts, None, None)
+        };
     if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() && ep_shard.is_none() {
         let mut converted = 0usize;
         for ew in experts.iter_mut() {
@@ -4902,5 +5118,44 @@ pub(crate) fn load_moe_ffn(
         paro_shared: None,
         global_expert_dtypes: None,
         ep_dummy_buffers,
+        escha: escha_tables,
     })
+}
+
+/// Transpose an escha code blob's TILE GRID from the checkpoint's
+/// `[ic/16][oc/16]` (kt-major) to `[oc/16][ic/16]` (nt-major). See the call
+/// site. Moves whole tiles only, so it is bit-exact by construction.
+fn escha_tiles_to_nt_major(data: &[u8], m: usize, k: usize, quant_type: u8) -> HipResult<Vec<u8>> {
+    let tk = if quant_type == 42 { 2usize } else { 3usize };
+    if m % 16 != 0 || k % 16 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("escha code: m={m} k={k}; both must be multiples of 16"),
+        ));
+    }
+    let (ktiles, ntiles) = (k / 16, m / 16);
+    let tile_bytes = 16 * tk * 2;
+    let grid = ktiles * ntiles * tile_bytes;
+    if grid == 0 || data.len() % grid != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "escha code: {} bytes is not a whole number of {grid}-byte grids \
+                 (ktiles={ktiles} ntiles={ntiles})",
+                data.len()
+            ),
+        ));
+    }
+    let mut out = vec![0u8; data.len()];
+    for e in 0..(data.len() / grid) {
+        let base = e * grid;
+        for kt in 0..ktiles {
+            for nt in 0..ntiles {
+                let src = base + (kt * ntiles + nt) * tile_bytes;
+                let dst = base + (nt * ktiles + kt) * tile_bytes;
+                out[dst..dst + tile_bytes].copy_from_slice(&data[src..src + tile_bytes]);
+            }
+        }
+    }
+    Ok(out)
 }

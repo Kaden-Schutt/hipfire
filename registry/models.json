@@ -1,5 +1,5 @@
 {
-  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string→string redirects. Run scripts/registry_gen.py after editing.",
+  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string\u2192string redirects. Run scripts/registry_gen.py after editing.",
   "models": {
     "qwen3.5:0.8b": {
       "repo": "hipfire-models/qwen3.5-0.8b",
@@ -416,7 +416,253 @@
       "file": "qwen3.6-35b-a3b.mq2",
       "size_gb": 11.6,
       "min_vram_gb": 14,
-      "desc": "Floor SKU — smallest, coherent but degraded."
+      "desc": "Floor SKU \u2014 smallest, coherent but degraded."
+    },
+    "qwen3.6:35b-a3b-escha": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
+      "file": "qwen3.6-35b-a3b.escha",
+      "size_gb": 11.84,
+      "min_vram_gb": 15,
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ6. +17% decode for +0.10% PPL \u2014 the best speed/quality trade of the three. PPL 7.6940, KLD 0.0079 vs the q8 arm, 725 tok/s prefill, 55 tok/s decode, 12.45 GB resident. Experts are identical across all three; only the dense tensors differ."
+    },
+    "qwen3.6:35b-a3b-escha-pro": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
+      "file": "qwen3.6-35b-a3b.escha-pro",
+      "size_gb": 12.34,
+      "min_vram_gb": 16,
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Default and most faithful. Dense weights are a bit-exact repack of Escha's per-row int8 into per-32-block Q8_0. PPL 7.6864, 684 tok/s prefill, 47 tok/s decode, 12.94 GB resident. Experts are identical across all three; only the dense tensors differ."
+    },
+    "qwen3.6:35b-a3b-escha-xt": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
+      "file": "qwen3.6-35b-a3b.escha-xt",
+      "size_gb": 11.39,
+      "min_vram_gb": 15,
+      "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ4. Fastest, and the only one with a visible quality cost: PPL 8.0643 (+4.9%), KLD 0.0590 vs the q8 arm. 886 tok/s prefill, 63 tok/s decode, 12.04 GB resident. Experts are identical across all three; only the dense tensors differ."
+    },
+    "qwen3.8:27b-escha": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "hipfire-models/qwen3.8-27b-escha",
+      "file": "qwen3.8-27b.escha",
+      "size_gb": 10.77,
+      "min_vram_gb": 15,
+      "desc": "EschaLabs Escha-W2 2-bit trellis, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.8-27B (dense, arch 5). Default: MQ6 dense tensors, PPL 9.6753, 119 tok/s prefill, 12.1 decode. Measured on gfx1151: PPL on a fixed wikitext-2 slice, 1020 scored tokens. Beats qwen3.8-27b.mq3 on quality while being smaller; slower to decode than the plain MQ quants because it also decodes the trellis (~127 GB/s against their ~198)."
+    },
+    "qwen3.8:27b-escha-pro": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "hipfire-models/qwen3.8-27b-escha",
+      "file": "qwen3.8-27b.escha-pro",
+      "size_gb": 11.16,
+      "min_vram_gb": 15,
+      "desc": "EschaLabs Escha-W2 2-bit trellis, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.8-27B (dense, arch 5). Q8_0 dense tensors, the most faithful build: PPL 9.6486, 113 tok/s prefill, 10.8 decode. Measured on gfx1151: PPL on a fixed wikitext-2 slice, 1020 scored tokens. Beats qwen3.8-27b.mq3 on quality while being smaller; slower to decode than the plain MQ quants because it also decodes the trellis (~127 GB/s against their ~198)."
+    },
+    "qwen3.8:27b-escha-xt": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "hipfire-models/qwen3.8-27b-escha",
+      "file": "qwen3.8-27b.escha-xt",
+      "size_gb": 10.45,
+      "min_vram_gb": 14,
+      "desc": "EschaLabs Escha-W2 2-bit trellis, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.8-27B (dense, arch 5). MQ4V2 dense tensors, smallest and fastest: PPL 9.7242, 122 tok/s prefill, 12.3 decode. Measured on gfx1151: PPL on a fixed wikitext-2 slice, 1020 scored tokens. Beats qwen3.8-27b.mq3 on quality while being smaller; slower to decode than the plain MQ quants because it also decodes the trellis (~127 GB/s against their ~198)."
     },
     "qwen3.6:35b-a3b-mq3p": {
       "recommended_settings": {
@@ -460,7 +706,7 @@
       "file": "qwen3.6-35b-a3b.mq3p",
       "size_gb": 17.2,
       "min_vram_gb": 20,
-      "desc": "MQ3+P graded — MQ4 quality at MQ3 size."
+      "desc": "MQ3+P graded \u2014 MQ4 quality at MQ3 size."
     },
     "qwen3.6:35b-a3b-mq4p": {
       "recommended_settings": {
@@ -504,7 +750,7 @@
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
-      "desc": "MQ4+P graded — robust 4-bit default, beats uniform MQ4."
+      "desc": "MQ4+P graded \u2014 robust 4-bit default, beats uniform MQ4."
     },
     "qwen3.6:35b-a3b-mfp4": {
       "recommended_settings": {
@@ -548,7 +794,7 @@
       "file": "qwen3.6-35b-a3b.mfp4",
       "size_gb": 20.2,
       "min_vram_gb": 22,
-      "desc": "MFP4-E8 vector quant — the 4-bit quality leader."
+      "desc": "MFP4-E8 vector quant \u2014 the 4-bit quality leader."
     },
     "qwen3.6:35b-a3b-mq5": {
       "recommended_settings": {
@@ -592,7 +838,7 @@
       "file": "qwen3.6-35b-a3b.mq5",
       "size_gb": 23.7,
       "min_vram_gb": 26,
-      "desc": "Quality SKU — ~80% MQ4->f32."
+      "desc": "Quality SKU \u2014 ~80% MQ4->f32."
     },
     "qwen3.6:35b-a3b-mq6": {
       "recommended_settings": {
@@ -1074,7 +1320,7 @@
       "file": "qwen3.5-9b.mq3",
       "size_gb": 4.57,
       "min_vram_gb": 6.1,
-      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending — see issue #113. Sub-9B MQ3 not shipped — see #114.",
+      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending \u2014 see issue #113. Sub-9B MQ3 not shipped \u2014 see #114.",
       "default_kv_mode": "q8",
       "quant_recipe": "v3-awq-f1"
     },
@@ -1083,7 +1329,7 @@
       "file": "qwen3.5-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
+      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
     },
     "qwen3.6:27b-mq3": {
       "recommended_settings": {
@@ -1096,14 +1342,14 @@
       "file": "qwen3.6-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0)."
+      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s \u03c4=7.0)."
     },
     "qwen3.5:27b-draft-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen35-27b-dflash-mq3.hfq",
       "size_gb": 0.67,
       "min_vram_gb": 12,
-      "desc": "MQ3 DFlash draft for qwen3.5:27b — 671 MB vs 920 MB MQ4 draft. ~30% lower τ on code prompts; trades draft VRAM for ctx fit."
+      "desc": "MQ3 DFlash draft for qwen3.5:27b \u2014 671 MB vs 920 MB MQ4 draft. ~30% lower \u03c4 on code prompts; trades draft VRAM for ctx fit."
     },
     "qwen3.6:27b-draft-mq3": {
       "recommended_settings": {
@@ -1159,7 +1405,7 @@
       "file": "qwen38-27b-dflash-mq4.hfq",
       "size_gb": 1.21,
       "min_vram_gb": 16,
-      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3–MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available."
+      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3\u2013MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available."
     },
     "qwen3.8:27b-draft-mq5": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1180,14 +1426,14 @@
       "file": "qwen35-9b-dflash-mq4.hfq",
       "size_gb": 0.55,
       "min_vram_gb": 6,
-      "desc": "DFlash draft for qwen3.5:9b — pairs with target for 2-3× decode on code/instruct"
+      "desc": "DFlash draft for qwen3.5:9b \u2014 pairs with target for 2-3\u00d7 decode on code/instruct"
     },
     "qwen3.5:27b-draft": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen35-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)"
+      "desc": "DFlash draft for qwen3.5:27b \u2014 pairs with target for 4\u00d7 decode on code (212 tok/s peak)"
     },
     "qwen3.6:27b-draft": {
       "recommended_settings": {
@@ -1200,7 +1446,7 @@
       "file": "qwen36-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code (refreshed 2026-04-27 from z-lab@0919688)"
+      "desc": "DFlash draft for qwen3.6:27b \u2014 pairs with target for ~4\u00d7 decode on code (refreshed 2026-04-27 from z-lab@0919688)"
     },
     "carnice:9b": {
       "repo": "hipfire-models/carnice-9b",
@@ -1414,7 +1660,7 @@
       "sha256": "47ccfccddbef5b8e14040bae567c87129669fa9451f0c6b15d8f35964fce7503",
       "min_vram_gb": 24,
       "default_kv_mode": "q8",
-      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 — registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld.",
+      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 \u2014 registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1443,7 +1689,7 @@
       "size_bytes": 1357990400,
       "sha256": "6fc0988e51689abf24c2e43d5b1f44794be3409484f99a115d36484ea0e23d2d",
       "min_vram_gb": 26,
-      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
+      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) \u2014 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
     },
     "bonsai:27b-bq1": {
       "repo": "hipfire-models/bonsai-27b",

@@ -144,6 +144,14 @@ pub fn select_rotation_variant(
                 RotationVariant::Plain
             }
         }
+        // Escha-W2: stated explicitly rather than left to the FwhtG256 `_`
+        // fallthrough below, even though no RotationVariant here is ever
+        // actually launched for this plan — `prepare_rotation_scratch`
+        // errors on `RotationPlan::EschaH128` before `rotate()` calls
+        // `self.rotation.run()`, so whatever is returned here is inert.
+        // Do NOT read this arm as "Escha shares the FwhtG256 fusion axis";
+        // it does not — it has its own H128 transform with no kernel yet.
+        RotationPlan::EschaH128 => RotationVariant::Plain,
         // FwhtG256 shares the fusion axis.
         _ => {
             if has_swiglu {
@@ -449,6 +457,20 @@ fn prepare_rotation_scratch(
         RotationPlan::None => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "rotate-none",
+            arch: "",
+            quant: "",
+        }),
+        // Escha-W2's 128-point Hadamard has no scratch buffer / rotate kernel
+        // yet (Task 4 registers the dtype + rotation plan only). This is the
+        // guard that actually matters: it is what stops `rotate()` from ever
+        // reaching `self.rotation.run()` for these types, regardless of which
+        // RotationVariant `select_rotation_variant`'s catch-all picked for
+        // `EschaH128` above. Must become a real scratch-buffer allocation
+        // when the H128 rotate kernel lands — do not widen this to reuse the
+        // FwhtG256/FwhtG128 scratch, which is the wrong transform size.
+        RotationPlan::EschaH128 => Err(DispatchError::UnsupportedVariant {
+            family: "gemv",
+            variant: "escha-h128-rotate-unimplemented",
             arch: "",
             quant: "",
         }),

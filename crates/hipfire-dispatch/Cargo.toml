@@ -8,6 +8,10 @@ license.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+# Task 10 (Escha-W2): the routed combine must multiply by f16(score); `half`
+# is the workspace's RNE f32->f16 encoder and is already a transitive dep via
+# rdna-compute, so this adds no build cost.
+half.workspace = true
 
 [features]
 default = []

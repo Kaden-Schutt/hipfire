@@ -6,6 +6,7 @@
 //! `WeightBackend`. `load_weights` (HFQ), `load_weights_paroquant` (PaRo), and
 //! `load_layer_into` (multi-GPU HFQ) all funnel through `load_layer`.
 
+use crate::qwen35::weights::{DeltaNetBiases, DeltaNetEscha, FullAttnBiases, FullAttnEscha};
 use crate::qwen35::{
     DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
     LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
@@ -16,6 +17,61 @@ use hipfire_runtime::weight_backend::WeightBackend;
 /// Load one layer's weights. `load_moe` builds the MoE FFN block for MoE layers
 /// (format-specific: HFQ `load_moe_ffn` vs PaRo `paro_load_moe_ffn`), supplied by
 /// the caller so MoE layout stays arch-owned.
+/// Largest token batch an escha layer's `ids` table serves. Decode reads a
+/// 1-element prefix; batched prefill reads `n`. 4096 covers every prefill
+/// chunk hipfire issues and costs 16 KB per layer.
+const ESCHA_MAX_SLOTS: usize = 4096;
+
+/// Build an `EschaProj` from the backend's sidecars, or `None` when the
+/// weight is not a trellis code.
+fn eproj<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    w: &hipfire_runtime::llama::WeightTensor,
+) -> hip_bridge::HipResult<Option<crate::qwen35::escha::EschaProj>> {
+    Ok(b.escha_sidecars(rel, w)?
+        .map(|(rin, rout, ptr0)| crate::qwen35::escha::EschaProj { rin, rout, ptr0 }))
+}
+
+/// Every coded projection in a layer is escha or none is — the export does not
+/// mix. So probe one and require the rest, exactly as the biases do: a
+/// half-escha layer is a corrupt checkpoint, and falling back per projection
+/// would silently run some through the fused MQ paths on trellis bytes.
+fn need_eproj<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    w: &hipfire_runtime::llama::WeightTensor,
+) -> hip_bridge::HipResult<crate::qwen35::escha::EschaProj> {
+    eproj(b, rel, w)?.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!("{rel}: layer has escha projections but this one is not coded"),
+        )
+    })
+}
+
+/// A bias that MUST be there.
+///
+/// Escha ships all of a layer's biases together or none, so once the first
+/// probe finds one the rest are mandatory. A half-biased layer is a corrupt
+/// checkpoint, and silently substituting zeros would degrade output without
+/// failing — the same trap as the dropped MTP head.
+fn need_bias<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    n: usize,
+) -> hip_bridge::HipResult<rdna_compute::GpuTensor> {
+    b.bias_opt(rel, n)?.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{rel}: layer has some escha biases but not this one — a partially biased \
+                 layer is a corrupt checkpoint, not a model to run with zeros"
+            ),
+        )
+    })
+}
+
 pub(crate) fn load_layer<B: WeightBackend>(
     b: &mut B,
     config: &Qwen35Config,
@@ -32,10 +88,33 @@ pub(crate) fn load_layer<B: WeightBackend>(
     let o_in = config.n_heads * config.head_dim;
 
     Ok(match (config.layer_types[layer_idx], is_moe) {
-        (LayerType::LinearAttention, false) => LayerWeights::DeltaNet(DeltaNetLayerWeights {
+        (LayerType::LinearAttention, false) => {
+            // Coded projections bound to locals FIRST: the escha sidecars are
+            // keyed off each weight's dtype and device pointer, so they have
+            // to be built from the loaded tensor rather than alongside it.
+            let wqkv = b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?;
+            let wz = b.proj("linear_attn.in_proj_z", d_inner, config.dim)?;
+            let wo = b.proj("linear_attn.out_proj", config.dim, d_inner)?;
+            let w_gate = b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?;
+            let w_up = b.proj("mlp.up_proj", config.hidden_dim, config.dim)?;
+            let w_down = b.proj("mlp.down_proj", config.dim, config.hidden_dim)?;
+            let escha = match eproj(b, "linear_attn.in_proj_qkv", &wqkv)? {
+                None => None,
+                Some(qkv) => Some(DeltaNetEscha {
+                    qkv,
+                    z: need_eproj(b, "linear_attn.in_proj_z", &wz)?,
+                    o: need_eproj(b, "linear_attn.out_proj", &wo)?,
+                    gate: need_eproj(b, "mlp.gate_proj", &w_gate)?,
+                    up: need_eproj(b, "mlp.up_proj", &w_up)?,
+                    down: need_eproj(b, "mlp.down_proj", &w_down)?,
+                    ids: b.zeros_i32(ESCHA_MAX_SLOTS)?,
+                    iota: b.iota_i32(ESCHA_MAX_SLOTS)?,
+                }),
+            };
+            LayerWeights::DeltaNet(DeltaNetLayerWeights {
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
-            wqkv: b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?,
-            wz: b.proj("linear_attn.in_proj_z", d_inner, config.dim)?,
+            wqkv,
+            wz,
             w_alpha: b.proj(
                 "linear_attn.in_proj_a",
                 config.linear_num_value_heads,
@@ -53,25 +132,78 @@ pub(crate) fn load_layer<B: WeightBackend>(
                 qkv_dim * config.conv_kernel_dim,
             )?,
             norm_weight: b.raw_f32("linear_attn.norm.weight", config.linear_value_head_dim)?,
-            wo: b.proj("linear_attn.out_proj", config.dim, d_inner)?,
+            wo,
             ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-            w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
-            w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
-            w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
-        }),
-        (LayerType::FullAttention, false) => LayerWeights::FullAttn(FullAttnLayerWeights {
+            w_gate,
+            w_up,
+            w_down,
+            // Escha dense exports (Qwen3.8-27B) carry an additive output bias
+            // on every coded projection. All six are present together or not
+            // at all, so one probe decides. `in_proj_a`/`in_proj_b` have none
+            // — escha's `ignore` list keeps them as plain weights.
+            biases: match b.bias_opt("linear_attn.in_proj_qkv.bias", qkv_dim)? {
+                None => None,
+                Some(qkv) => Some(DeltaNetBiases {
+                    qkv,
+                    z: need_bias(b, "linear_attn.in_proj_z.bias", d_inner)?,
+                    o: need_bias(b, "linear_attn.out_proj.bias", config.dim)?,
+                    gate: need_bias(b, "mlp.gate_proj.bias", config.hidden_dim)?,
+                    up: need_bias(b, "mlp.up_proj.bias", config.hidden_dim)?,
+                    down: need_bias(b, "mlp.down_proj.bias", config.dim)?,
+                }),
+            },
+            escha,
+        })
+        }
+        (LayerType::FullAttention, false) => {
+            let wq = b.proj("self_attn.q_proj", q_out_dim, config.dim)?;
+            let wk = b.proj("self_attn.k_proj", kv_dim, config.dim)?;
+            let wv = b.proj("self_attn.v_proj", kv_dim, config.dim)?;
+            let wo = b.proj("self_attn.o_proj", config.dim, o_in)?;
+            let w_gate = b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?;
+            let w_up = b.proj("mlp.up_proj", config.hidden_dim, config.dim)?;
+            let w_down = b.proj("mlp.down_proj", config.dim, config.hidden_dim)?;
+            let escha = match eproj(b, "self_attn.q_proj", &wq)? {
+                None => None,
+                Some(q) => Some(FullAttnEscha {
+                    q,
+                    k: need_eproj(b, "self_attn.k_proj", &wk)?,
+                    v: need_eproj(b, "self_attn.v_proj", &wv)?,
+                    o: need_eproj(b, "self_attn.o_proj", &wo)?,
+                    gate: need_eproj(b, "mlp.gate_proj", &w_gate)?,
+                    up: need_eproj(b, "mlp.up_proj", &w_up)?,
+                    down: need_eproj(b, "mlp.down_proj", &w_down)?,
+                    ids: b.zeros_i32(ESCHA_MAX_SLOTS)?,
+                    iota: b.iota_i32(ESCHA_MAX_SLOTS)?,
+                }),
+            };
+            LayerWeights::FullAttn(FullAttnLayerWeights {
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
-            wq: b.proj("self_attn.q_proj", q_out_dim, config.dim)?,
-            wk: b.proj("self_attn.k_proj", kv_dim, config.dim)?,
-            wv: b.proj("self_attn.v_proj", kv_dim, config.dim)?,
-            wo: b.proj("self_attn.o_proj", config.dim, o_in)?,
+            wq,
+            wk,
+            wv,
+            wo,
             q_norm: b.norm("self_attn.q_norm.weight", &[config.head_dim])?,
             k_norm: b.norm("self_attn.k_norm.weight", &[config.head_dim])?,
             ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-            w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
-            w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
-            w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
-        }),
+            w_gate,
+            w_up,
+            w_down,
+            biases: match b.bias_opt("self_attn.q_proj.bias", q_out_dim)? {
+                None => None,
+                Some(q) => Some(FullAttnBiases {
+                    q,
+                    k: need_bias(b, "self_attn.k_proj.bias", kv_dim)?,
+                    v: need_bias(b, "self_attn.v_proj.bias", kv_dim)?,
+                    o: need_bias(b, "self_attn.o_proj.bias", config.dim)?,
+                    gate: need_bias(b, "mlp.gate_proj.bias", config.hidden_dim)?,
+                    up: need_bias(b, "mlp.up_proj.bias", config.hidden_dim)?,
+                    down: need_bias(b, "mlp.down_proj.bias", config.dim)?,
+                }),
+            },
+            escha,
+        })
+        }
         (LayerType::LinearAttention, true) => LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
             wqkv: b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?,

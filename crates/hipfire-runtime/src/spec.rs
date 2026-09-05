@@ -1116,6 +1116,17 @@ impl<A: MtpDrafter> MtpSpeculator<A> {
     }
 }
 
+/// Whether `HIPFIRE_MTP_ACCEPT_STATS=1` asked for per-window accept logging.
+fn mtp_accept_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("HIPFIRE_MTP_ACCEPT_STATS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Lower an [`MtpWindow`] to the generic [`SpecStep`]. `committed` already
 /// excludes the seed and includes the bonus, so it maps 1:1 to `emit`; the next
 /// window's seed is the last committed token (the daemon's `position +=
@@ -1127,6 +1138,28 @@ fn lower_mtp_window(w: MtpWindow) -> Result<SpecStep, String> {
         .committed
         .last()
         .ok_or("MtpSpeculator: drafter committed 0 tokens (would stall the decode loop)")?;
+    // Every MTP window funnels through here, so this is the one place a
+    // cumulative accept rate can be observed without threading stats out to
+    // each caller. Speed alone cannot distinguish "drafts rejected" from
+    // "drafts accepted but verification is expensive"; HIPFIRE_MTP_ACCEPT_STATS=1
+    // prints the rate a speculative-decode change has to move.
+    if mtp_accept_stats_enabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WINDOWS: AtomicUsize = AtomicUsize::new(0);
+        static DRAFTED: AtomicUsize = AtomicUsize::new(0);
+        static ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+        static EMITTED: AtomicUsize = AtomicUsize::new(0);
+        let n = WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
+        let d = DRAFTED.fetch_add(w.drafts_generated, Ordering::Relaxed) + w.drafts_generated;
+        let a = ACCEPTED.fetch_add(w.accepted, Ordering::Relaxed) + w.accepted;
+        let e = EMITTED.fetch_add(w.committed.len(), Ordering::Relaxed) + w.committed.len();
+        eprintln!(
+            "[mtp-accept] windows={n} drafted={d} accepted={a} emitted={e} \
+             accept_rate={:.3} tokens_per_window={:.3}",
+            if d > 0 { a as f64 / d as f64 } else { 0.0 },
+            e as f64 / n as f64,
+        );
+    }
     Ok(SpecStep::new(
         w.committed.iter().copied(),
         next_seed,

@@ -37,6 +37,47 @@ pub struct DeltaNetLayerWeights {
     pub w_gate: WeightTensor,   // mlp.gate_proj
     pub w_up: WeightTensor,     // mlp.up_proj
     pub w_down: WeightTensor,   // mlp.down_proj
+    /// Additive output biases, present only on escha dense exports
+    /// (Qwen3.8-27B). Base Qwen3.8-27B has `attention_bias: false` and no MLP
+    /// bias — these are Escha's end-to-end output correction, and they cannot
+    /// be folded into a weight because they are additive. `None` for every
+    /// other model, which is why they are Option rather than a zero vector:
+    /// a zero add per projection per layer is real work for no effect.
+    pub biases: Option<DeltaNetBiases>,
+    /// Escha trellis metadata, one per coded projection. `Some` only when the
+    /// weights are `Escha2T16`/`Escha3T16`, which is the signal this layer
+    /// must bypass the fused MQ paths entirely — each projection needs its
+    /// own rin-rotated activation, so FusedQkvza/gate_up have nothing to
+    /// share.
+    pub escha: Option<DeltaNetEscha>,
+}
+
+/// See `DeltaNetLayerWeights::escha`.
+pub struct DeltaNetEscha {
+    pub qkv: crate::qwen35::escha::EschaProj,
+    pub z: crate::qwen35::escha::EschaProj,
+    pub o: crate::qwen35::escha::EschaProj,
+    pub gate: crate::qwen35::escha::EschaProj,
+    pub up: crate::qwen35::escha::EschaProj,
+    pub down: crate::qwen35::escha::EschaProj,
+    /// `slots`-long run of zeros for the indexed GEMV; sized for the largest
+    /// batch the model was built for so decode (slots=1) reads a prefix.
+    pub ids: GpuTensor,
+    /// `0..MAX` — the grouped GEMM's slot permutation, which for a dense
+    /// linear is the identity.
+    pub iota: GpuTensor,
+}
+
+/// See `DeltaNetLayerWeights::biases`. Each is `[oc]` f32, applied to the
+/// projection's output. `in_proj_a`/`in_proj_b` have none — they are on
+/// escha's `ignore` list and ship as plain weights.
+pub struct DeltaNetBiases {
+    pub qkv: GpuTensor,
+    pub z: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 /// Weights for a full attention (gated) layer — similar to Qwen3 but with q+gate split.
@@ -52,6 +93,35 @@ pub struct FullAttnLayerWeights {
     pub w_gate: WeightTensor,
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
+    /// See `DeltaNetLayerWeights::biases`.
+    pub biases: Option<FullAttnBiases>,
+    /// See `DeltaNetLayerWeights::escha`.
+    pub escha: Option<FullAttnEscha>,
+}
+
+/// See `DeltaNetLayerWeights::escha`.
+pub struct FullAttnEscha {
+    pub q: crate::qwen35::escha::EschaProj,
+    pub k: crate::qwen35::escha::EschaProj,
+    pub v: crate::qwen35::escha::EschaProj,
+    pub o: crate::qwen35::escha::EschaProj,
+    pub gate: crate::qwen35::escha::EschaProj,
+    pub up: crate::qwen35::escha::EschaProj,
+    pub down: crate::qwen35::escha::EschaProj,
+    pub ids: GpuTensor,
+    /// See `DeltaNetEscha::iota`.
+    pub iota: GpuTensor,
+}
+
+/// See `DeltaNetLayerWeights::biases`.
+pub struct FullAttnBiases {
+    pub q: GpuTensor,
+    pub k: GpuTensor,
+    pub v: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 // ─── MoE FFN weights (Qwen3.5-MoE / A3B) ────────────────────────────────
@@ -83,15 +153,33 @@ pub struct ExpertWeights {
     pub down: WeightTensor,    // [hidden, moe_intermediate]
 }
 
-/// Owning storage for a layer's packed uniform-MQ4 routed experts.
+/// Owning storage for a layer's packed routed experts — one device buffer per
+/// (layer, projection) covering ALL experts.
 ///
 /// `experts` still carries one [`WeightTensor`] view per routed expert so the
 /// CPU fallback and every existing indexed dispatch keep their exact metadata
 /// and pointer-table ABI. Those views are non-owning subranges of these two
 /// buffers; only this owner pair may be returned to the GPU pool.
-pub(crate) struct PackedExpertOwners {
-    pub(crate) gate_up: GpuTensor,
-    pub(crate) down: GpuTensor,
+///
+/// Two producers build this: `try_load_packed_mq4_experts` (uniform MQ4) and
+/// `escha::load_escha_moe_experts` (Escha-W2). It is `pub` because the latter
+/// hands the owners back across the crate boundary to
+/// `examples/escha_moe_block_gate`, which loads a layer's experts directly and
+/// must free them exactly once.
+///
+/// ## Why this is not merely tidier
+///
+/// The HIP allocator rounds every allocation up to a 2 MiB granule. At A3B
+/// shapes a Q8_0 gate_up is 2.125 MiB and a Q8_0 down is 1.0625 MiB, so 20,480
+/// independent per-expert buffers (40 layers x 256 experts x 2 projections)
+/// occupy 4 MiB and 2 MiB each — 64.4 GB of granules for 34.2 GB of weights.
+/// Packing each (layer, projection) into ONE buffer pays the rounding once per
+/// buffer instead of once per expert and recovers ~30 GB. Measured: 67.9 GB ->
+/// 37.6 GB of GTT for the whole escha-35b model on gfx1151 (37 587 996 672 B
+/// delta, `scripts/escha-gtt-probe.sh`).
+pub struct PackedExpertOwners {
+    pub gate_up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 /// SP2: build the per-expert (gate_up, down) quant-tier tables that
@@ -300,6 +388,17 @@ pub struct MoeFfnWeights {
     /// non-owned storage layout. Non-owned global slots alias into the
     /// matching entry. Owned so `free_moe_ffn` can reclaim them.
     pub(crate) ep_dummy_buffers: Vec<GpuTensor>,
+
+    /// Escha-W2 (Task 10): per-layer H128 transform tables + decode scratch.
+    /// `Some` only for layers loaded from an Escha-W2 checkpoint.
+    ///
+    /// This is also the layer's escha MARKER. The loader decodes the trellis
+    /// and stores the experts as `Q8_0`, so `experts[i].gate_up.gpu_dtype` no
+    /// longer says "escha" by the time dispatch resolves the layer; only this
+    /// field does. `moe_ffn_decode_impl` threads it into
+    /// `MoeParams::escha`, whose `has_escha()` drives both the f16
+    /// router-logit round-trip and the H128-wrapped routed executor.
+    pub escha: Option<super::escha::EschaMoeTables>,
 }
 
 /// Owning storage for the per-layer shared ParoQuant rotation sidecars.
@@ -1048,6 +1147,10 @@ impl PendingEpMoeFfn {
             paro_shared: None,
             global_expert_dtypes: self.global_dtypes,
             ep_dummy_buffers: self.dummy_buffers,
+            // The EP / pending-commit path does not carry escha layers (an
+            // Escha-W2 checkpoint has one code tensor per layer, not the
+            // per-expert tensors EP sharding streams).
+            escha: None,
         }
     }
 }
@@ -1340,6 +1443,11 @@ impl MmqScreenable for Qwen35Weights {
 }
 
 fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+    // Escha-W2 transform tables + decode scratch. Owned outright (nothing
+    // aliases them), so free before the experts they describe.
+    if let Some(e) = ffn.escha {
+        e.free_gpu(gpu);
+    }
     ffn.router.free_all(gpu);
     ffn.shared_expert_gate.free_all(gpu);
     ffn.shared_expert.gate.free_all(gpu);
