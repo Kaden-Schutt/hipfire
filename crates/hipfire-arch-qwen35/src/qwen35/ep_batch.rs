@@ -13,6 +13,7 @@ use super::batch::valid_lane_mask;
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
 use super::batch::Qwen35DecodeBatchState;
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::Qwen35BatchCompatibility;
 use super::config::Qwen35BatchLoadConfig;
@@ -1540,6 +1541,7 @@ impl Qwen35DecodeBatchEpState {
                             None,
                             routed_out.as_ref(),
                             BatchSemantics::Sequential,
+                            DflashFusionCtx::Off,
                         )?;
                     }
                     if is_moe {
@@ -1802,6 +1804,7 @@ impl Qwen35DecodeBatchEpState {
                             lane_capacity: self.lane_capacity,
                             active_mask,
                         },
+                        DflashFusionCtx::Off,
                     )?;
                 }
                 if is_moe {
@@ -2445,6 +2448,7 @@ pub fn forward_prefill_batch_ep(
                 false, // needs_last_token_logits (no lm_head in band)
                 None,  // max_layer
                 routed_out,
+                DflashFusionCtx::Off,
             )?;
         }
 
@@ -4328,6 +4332,7 @@ pub fn forward_prefill_batch_multi(
                         true, // needs_last_token_logits: preserve multi-GPU post-condition
                         None, // max_layer: multi-GPU PP path runs full stack
                         None, // routed_out: PP bands are multi-layer, not EP
+                        DflashFusionCtx::Off,
                     )?;
                 }
 

@@ -91,6 +91,19 @@ pub struct MaskEmbedOverride<'a> {
     pub embed: &'a [f32],
 }
 
+/// Frozen AR/verify discriminator for the DFlash launch-fusion project.
+///
+/// `Off` is the behavior-preserving default: every hook takes the pre-change
+/// path. `ChainVerify` arms the exact-shape fast routes (linear chain verify
+/// only — tree verify stays `Off`). Computed once in
+/// `verify_dflash_block_inner` (`ChainVerify` iff `tree_verify` is `None`)
+/// and threaded through the verify forwards; every other caller passes `Off`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DflashFusionCtx {
+    Off,
+    ChainVerify,
+}
+
 #[derive(Clone, Copy)]
 pub struct TreeVerifyCtx<'a> {
     pub positions: &'a [i32],

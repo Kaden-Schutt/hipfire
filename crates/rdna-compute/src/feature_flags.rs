@@ -180,6 +180,18 @@ pub struct FeatureFlags {
     pub graph_ar: bool,
     pub graph_moe: bool,
     pub force_blob_path: bool,
+    /// `HIPFIRE_RESIDUAL_KSPLIT_OFF=1` disables the exact-gfx1100 split-K LDS
+    /// residual tier (N<=16 DFlash verify) and restores the historical base
+    /// kernel on the policy path. Default OFF (tier live). Test harnesses use
+    /// this to force the base oracle now that the tier is capture-safe.
+    /// Disables BOTH the ksplit and ldsstage kernels.
+    pub residual_ksplit_off: bool,
+    /// `HIPFIRE_RESIDUAL_LDSSTAGE=1` opts the exact-gfx1100 N<=16 tier into
+    /// the ldsstage kernel wherever K % 512 == 0. Default OFF (ks table wins):
+    /// ldsstage beats ks4 by ~8% (53% vs 48% of roofline on hipx) but missed
+    /// the 70% gate — 126 VGPRs cap it at 1 WG/CU — so ks4 stays the default
+    /// until register pressure is addressed.
+    pub residual_ldsstage: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -293,6 +305,29 @@ pub struct FeatureFlags {
     /// HIPFIRE_FUSE_QKV_BIAS_DEBUG=1. Default off. Resolved once at init so the
     /// default-on fold hot path takes no per-launch `env::var` lock.
     pub fuse_qkv_bias_debug: bool,
+
+    // ── DFlash launch-fusion kill switches (prescaffold, all no-ops) ────
+    // Each `HIPFIRE_*_OFF=1` disables its slice's fast route and restores the
+    // pre-change path. All default OFF (fast routes live once slices land);
+    // nothing reads these fields yet — composers wire them in per slice.
+    /// S1: `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1` restores the memcpy-loop snapshot.
+    pub dn_snapshot_bulk_off: bool,
+    /// S2: `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF=1` restores the row-copy loops.
+    pub hidden_scatter_fuse_off: bool,
+    /// S3: `HIPFIRE_MQ_F16_PROJECTION_OFF=1` restores F32 producers + convert.
+    pub mq_f16_projection_off: bool,
+    /// S4: `HIPFIRE_MQ_F16_RESIDUAL_OFF=1` restores F32 residual producers.
+    pub mq_f16_residual_off: bool,
+    /// S5: `HIPFIRE_GDN_PRE_FUSE_OFF=1` restores unfused GDN pre-kernels.
+    pub gdn_pre_fuse_off: bool,
+    /// S6: `HIPFIRE_FA_BATCH_FUSE_OFF=1` restores unbatched FA prep/KV writes.
+    pub fa_batch_fuse_off: bool,
+    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings.
+    pub draft_collapse_off: bool,
+    /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
+    pub ddtree_topk_direct_off: bool,
+    /// S9: `HIPFIRE_MQ_PROLOGUE_FUSE_OFF=1` restores producer+GEMM pairs.
+    pub mq_prologue_fuse_off: bool,
 }
 
 impl FeatureFlags {
@@ -505,6 +540,8 @@ impl FeatureFlags {
             graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
+            residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
+            residual_ldsstage: value("HIPFIRE_RESIDUAL_LDSSTAGE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -588,6 +625,22 @@ impl FeatureFlags {
             // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
             fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
             fuse_qkv_bias_debug: value("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
+
+            // DFlash launch-fusion kill switches: `_OFF=1` disables, all no-ops.
+            dn_snapshot_bulk_off: value("HIPFIRE_DN_SNAPSHOT_BULK_OFF").ok().as_deref()
+                == Some("1"),
+            hidden_scatter_fuse_off: value("HIPFIRE_HIDDEN_SCATTER_FUSE_OFF").ok().as_deref()
+                == Some("1"),
+            mq_f16_projection_off: value("HIPFIRE_MQ_F16_PROJECTION_OFF").ok().as_deref()
+                == Some("1"),
+            mq_f16_residual_off: value("HIPFIRE_MQ_F16_RESIDUAL_OFF").ok().as_deref() == Some("1"),
+            gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
+            fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
+            draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
+            ddtree_topk_direct_off: value("HIPFIRE_DDTREE_TOPK_DIRECT_OFF").ok().as_deref()
+                == Some("1"),
+            mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
+                == Some("1"),
         }
     }
 
@@ -748,6 +801,8 @@ impl FeatureFlags {
             graph_ar: true,
             graph_moe: true,
             force_blob_path: false,
+            residual_ksplit_off: false,
+            residual_ldsstage: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,
@@ -784,6 +839,15 @@ impl FeatureFlags {
             dflash_q8_lmhead_wmma: true,
             fuse_qkv_bias: true,
             fuse_qkv_bias_debug: false,
+            dn_snapshot_bulk_off: false,
+            hidden_scatter_fuse_off: false,
+            mq_f16_projection_off: false,
+            mq_f16_residual_off: false,
+            gdn_pre_fuse_off: false,
+            fa_batch_fuse_off: false,
+            draft_collapse_off: false,
+            ddtree_topk_direct_off: false,
+            mq_prologue_fuse_off: false,
         }
     }
 }

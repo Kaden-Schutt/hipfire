@@ -1234,6 +1234,13 @@ pub struct DflashScratch {
     // single-call requirement: max(max_ctx × num_extract*hidden,
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
+    // Launch-fusion prescaffold (S7): F16 twin of `mq_x_rot` (same element
+    // count, half the bytes). Allocated/freed but never written or read yet.
+    pub mq_x_rot_f16: Option<GpuTensor>,
+    // Launch-fusion prescaffold (S7): persistent noise-token-ID plane.
+    // S7 uploads the draft token IDs once instead of 16 scalar embeddings.
+    // i32 IDs stored as F32 (same cosmetic pattern as `positions_*`).
+    pub noise_tokens: GpuTensor, // [B]
 
     // DFlash2 optional scratch: conv temp/dynamic and selector buffers.
     // Allocated only when the loaded draft actually needs them.
@@ -1380,7 +1387,40 @@ impl DflashScratch {
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
 
-        let mq_x_rot = if with_mq {
+        // Transactional construction: every `alloc_tensor` below goes through
+        // `at!`, which records the tensor in `live`; each index is taken
+        // exactly once when the struct is built. On failure the error arm
+        // frees everything recorded so far and returns — a bare `?` would
+        // leak (`GpuTensor`/`DeviceBuffer` have no `Drop`).
+        let mut live: Vec<Option<GpuTensor>> = Vec::new();
+        macro_rules! at {
+            ($shape:expr) => {{
+                at!($shape, DType::F32)
+            }};
+            ($shape:expr, $dtype:expr) => {{
+                match gpu.alloc_tensor($shape, $dtype) {
+                    Ok(t) => {
+                        live.push(Some(t));
+                        live.len() - 1
+                    }
+                    Err(e) => {
+                        for slot in live.iter_mut() {
+                            if let Some(t) = slot.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }};
+        }
+        macro_rules! take {
+            ($i:expr) => {
+                live[$i].take().expect("dflash scratch slot taken twice")
+            };
+        }
+
+        let i_mq_x_rot = if with_mq {
             // Sized for a CHUNK of the worst-case MQ rotation, not the whole
             // first-call prefix. The rotations called through `gemm_dispatch`
             // are:
@@ -1401,93 +1441,126 @@ impl DflashScratch {
             // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
             // 1K prefix tokens (negligible vs seconds-scale prefill).
             let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
-            Some(gpu.alloc_tensor(&[widest], DType::F32)?)
+            Some(at!(&[widest]))
+        } else {
+            None
+        };
+        // Prescaffold F16 twin: same element count as `mq_x_rot`.
+        // Joins the `at!` transaction (dtype arm): a bare `?` here would
+        // leak every earlier allocation (`GpuTensor` has no `Drop`).
+        let i_mq_x_rot_f16 = if with_mq {
+            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+            Some(at!(&[widest], DType::F16))
         } else {
             None
         };
 
         // DFlash2 optional buffers: allocated only when the config declares them.
-        let (conv_temp, conv_dynamic, selector_proj, topk_ids, topk_vals) = {
-            let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
-            let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
-            let ct = if need_conv {
-                Some(gpu.alloc_tensor(&[b * h], DType::F32)?)
-            } else {
-                None
-            };
-            let cd = if need_conv {
-                let k = cfg.conv_kernel_size.unwrap();
-                let g = cfg.conv_group_size.unwrap();
-                let groups = h / g;
-                let stride = 2 * k * groups;
-                Some(gpu.alloc_tensor(&[b * stride], DType::F32)?)
-            } else {
-                None
-            };
-            let sp = if need_selector {
-                let rank = cfg.selector_rank.unwrap();
-                Some(gpu.alloc_tensor(&[b * rank], DType::F32)?)
-            } else {
-                None
-            };
-            let (ti, tv) = if need_selector {
-                let kk = cfg.selector_top_k.unwrap();
-                // ids as i32 stored in F32 buffer (reinterprets), vals as f32
-                (
-                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
-                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
-                )
-            } else {
-                (None, None)
-            };
-            (ct, cd, sp, ti, tv)
+        // Slot indices (`take!`n at the build below).
+        let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
+        let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
+        let i_conv_temp = if need_conv { Some(at!(&[b * h])) } else { None };
+        let i_conv_dynamic = if need_conv {
+            let k = cfg.conv_kernel_size.unwrap();
+            let g = cfg.conv_group_size.unwrap();
+            let groups = h / g;
+            let stride = 2 * k * groups;
+            Some(at!(&[b * stride]))
+        } else {
+            None
+        };
+        let i_selector_proj = if need_selector {
+            let rank = cfg.selector_rank.unwrap();
+            Some(at!(&[b * rank]))
+        } else {
+            None
+        };
+        let (i_topk_ids, i_topk_vals) = if need_selector {
+            let kk = cfg.selector_top_k.unwrap();
+            // ids as i32 stored in F32 buffer (reinterprets), vals as f32
+            (Some(at!(&[b * kk])), Some(at!(&[b * kk])))
+        } else {
+            (None, None)
         };
 
         // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
         // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
         // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
         // = 128 MB. Trivial vs 24 GB VRAM.
-        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
-        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut kv_idx: Vec<(usize, usize)> = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_warmed_up = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
-            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            kv_idx.push((at!(&[l * kvd]), at!(&[l * kvd])));
             draft_ffn_graphs.push(HashMap::new());
             draft_ffn_warmed_up.push(HashSet::new());
         }
 
+        let i_x = at!(&[b * h]);
+        let i_x_norm = at!(&[b * h]);
+        let i_q = at!(&[b * qd]);
+        let i_k_noise = at!(&[b * kvd]);
+        let i_v_noise = at!(&[b * kvd]);
+        let i_gate = at!(&[b * inter]);
+        let i_up = at!(&[b * inter]);
+        let i_gate_up = at!(&[b * inter]);
+        let i_attn_out = at!(&[b * qd]);
+        let i_residual = at!(&[b * h]);
+
+        let i_target_hidden = at!(&[l * ne * h]);
+        let i_target_hidden_proj = at!(&[l * h]);
+
+        let i_k_cat = at!(&[tot * kvd]);
+        let i_v_cat = at!(&[tot * kvd]);
+
+        let i_positions_q = at!(&[b]);
+        let i_positions_k = at!(&[tot]);
+
+        // Launch-fusion prescaffold (S7): persistent noise-token-ID plane
+        // ([B] i32 IDs stored as F32, same cosmetic pattern as `positions_*`).
+        // Unconditional, as before; joins the transaction so any later `at!`
+        // failure frees it.
+        let i_noise_tokens = at!(&[b]);
+
+        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        for (ik, iv) in kv_idx {
+            k_ctx_cached.push(take!(ik));
+            v_ctx_cached.push(take!(iv));
+        }
+        debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
 
-            x: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            x_norm: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            q: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            k_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            v_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            gate: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            residual: gpu.alloc_tensor(&[b * h], DType::F32)?,
+            x: take!(i_x),
+            x_norm: take!(i_x_norm),
+            q: take!(i_q),
+            k_noise: take!(i_k_noise),
+            v_noise: take!(i_v_noise),
+            gate: take!(i_gate),
+            up: take!(i_up),
+            gate_up: take!(i_gate_up),
+            attn_out: take!(i_attn_out),
+            residual: take!(i_residual),
 
-            target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
-            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
+            target_hidden: take!(i_target_hidden),
+            target_hidden_proj: take!(i_target_hidden_proj),
 
-            k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
-            v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
+            k_cat: take!(i_k_cat),
+            v_cat: take!(i_v_cat),
 
-            positions_q: gpu.alloc_tensor(&[b], DType::F32)?,
-            positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
+            positions_q: take!(i_positions_q),
+            positions_k: take!(i_positions_k),
 
-            mq_x_rot,
-            conv_temp,
-            conv_dynamic,
-            selector_proj,
-            topk_ids,
-            topk_vals,
+            mq_x_rot: i_mq_x_rot.map(|j| take!(j)),
+            mq_x_rot_f16: i_mq_x_rot_f16.map(|j| take!(j)),
+            noise_tokens: take!(i_noise_tokens),
+            conv_temp: i_conv_temp.map(|j| take!(j)),
+            conv_dynamic: i_conv_dynamic.map(|j| take!(j)),
+            selector_proj: i_selector_proj.map(|j| take!(j)),
+            topk_ids: i_topk_ids.map(|j| take!(j)),
+            topk_vals: i_topk_vals.map(|j| take!(j)),
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,
@@ -1575,6 +1648,10 @@ impl DflashScratch {
         if let Some(t) = self.mq_x_rot {
             let _ = gpu.free_tensor(t);
         }
+        if let Some(t) = self.mq_x_rot_f16 {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(self.noise_tokens);
         for t in [
             self.conv_temp,
             self.conv_dynamic,
@@ -1599,6 +1676,92 @@ impl DflashScratch {
 ///   w.buf [m × k]  weight, format depends on w.gpu_dtype
 ///   y [batch × m]  F32 output
 ///
+/// S7: pre-collapse MQ4G256 chunk loop, byte-for-byte the pre-slice dispatch.
+/// Kept as the fallback for every route predicate failure (non-gfx1100, kill
+/// switch, batch<=1, AWQ sidecar, non-default WMMA variant policy).
+fn gemm_dispatch_mq4_legacy(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &WeightTensor,
+    y: &GpuTensor,
+    batch: usize,
+    mq_x_rot: Option<&GpuTensor>,
+) -> HipResult<()> {
+    // Chunk on `batch` when the request exceeds the scratch capacity
+    // for this w.k. `mq_x_rot` is sized to MQ_X_ROT_CHUNK_ROWS × max(...)
+    // — first-call rotations against the full prefix split into
+    // `ceil(batch / max_chunk)` GEMMs.
+    let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
+    let max_chunk = (scratch.shape[0] / w.k).max(1);
+    let mut chunked: HipResult<()> = Ok(());
+    let mut row = 0;
+    while row < batch {
+        let n = std::cmp::min(max_chunk, batch - row);
+        let x_chunk = x.sub_offset(row * w.k, n * w.k);
+        let y_chunk = y.sub_offset(row * w.m, n * w.m);
+        let rot_view = scratch.sub_offset(0, n * w.k);
+        // AWQ-aware FWHT rotation. When the drafter weight ships an
+        // AWQ sidecar (`w.awq_scale.is_some()`), `_for` dispatches
+        // the `x /= awq_scale` + FWHT kernel; otherwise falls
+        // through to the plain `rotate_x_mq_batched` and is
+        // numerically identical to the prior dispatch.
+        if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
+            chunked = Err(e);
+            break;
+        }
+        if let Err(e) = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+            chunked = Err(e);
+            break;
+        }
+        row += n;
+    }
+    chunked
+}
+///
+/// S7: collapsed MQ4G256 chunk loop. Rotates F32 `x` straight to the
+/// persistent F16 twin (`mq_x_rot_f16`, same element capacity as `mq_x_rot`)
+/// and runs an overwrite WMMA whose accumulator starts at +0 — replacing
+/// rotate + convert_f32_to_f16 + pre-zero fill + residual GEMM with
+/// rotate_f16 + overwrite GEMM. `route` selects the k2 vs deterministic
+/// ksplit schedule, mirroring the default policy of the legacy path.
+/// Never touches the shared fp16 pointer cache.
+fn gemm_dispatch_mq4_collapsed(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &WeightTensor,
+    y: &GpuTensor,
+    batch: usize,
+    rot_f16_scratch: &GpuTensor,
+    route: rdna_compute::dflash_draft_fusion::DraftCollapseGemm,
+) -> HipResult<()> {
+    let max_chunk = (rot_f16_scratch.shape[0] / w.k).max(1);
+    let mut chunked: HipResult<()> = Ok(());
+    let mut row = 0;
+    while row < batch {
+        let n = std::cmp::min(max_chunk, batch - row);
+        let x_chunk = x.sub_offset(row * w.k, n * w.k);
+        let y_chunk = y.sub_offset(row * w.m, n * w.m);
+        let rot_f16 = rot_f16_scratch.sub_offset(0, n * w.k);
+        if let Err(e) = gpu.mq_rotate_x_f16_dflash(&x_chunk, &rot_f16, w.k, n) {
+            chunked = Err(e);
+            break;
+        }
+        let r = match route {
+            rdna_compute::dflash_draft_fusion::DraftCollapseGemm::OverwriteK2 => {
+                gpu.gemm_hfq4g256_overwrite_wmma_k2_dflash(&w.buf, &rot_f16, &y_chunk, w.m, w.k, n)
+            }
+            _ => gpu
+                .gemm_hfq4g256_overwrite_ksplit_det_dflash(&w.buf, &rot_f16, &y_chunk, w.m, w.k, n),
+        };
+        if let Err(e) = r {
+            chunked = Err(e);
+            break;
+        }
+        row += n;
+    }
+    chunked
+}
+
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
 /// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
 /// HFQ4-G256 GEMM kernel against the pre-rotated weights.
@@ -1609,6 +1772,7 @@ fn gemm_dispatch(
     y: &GpuTensor,
     batch: usize,
     mq_x_rot: Option<&GpuTensor>,
+    mq_x_rot_f16: Option<&GpuTensor>,
 ) -> HipResult<()> {
     // Route HFQ4/MQ4 batched paths through the WMMA lm_head helper — the
     // DFlash draft forward's per-layer projections (wq/wk/wv/wo/gate/up/down)
@@ -1635,39 +1799,18 @@ fn gemm_dispatch(
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
-            // Chunk on `batch` when the request exceeds the scratch capacity
-            // for this w.k. `mq_x_rot` is sized to MQ_X_ROT_CHUNK_ROWS × max(...)
-            // — first-call rotations against the full prefix split into
-            // `ceil(batch / max_chunk)` GEMMs.
-            let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
-            let max_chunk = (scratch.shape[0] / w.k).max(1);
-            let mut chunked: HipResult<()> = Ok(());
-            let mut row = 0;
-            while row < batch {
-                let n = std::cmp::min(max_chunk, batch - row);
-                let x_chunk = x.sub_offset(row * w.k, n * w.k);
-                let y_chunk = y.sub_offset(row * w.m, n * w.m);
-                let rot_view = scratch.sub_offset(0, n * w.k);
-                // AWQ-aware FWHT rotation. When the drafter weight ships an
-                // AWQ sidecar (`w.awq_scale.is_some()`), `_for` dispatches
-                // the `x /= awq_scale` + FWHT kernel; otherwise falls
-                // through to the plain `rotate_x_mq_batched` and is
-                // numerically identical to the prior dispatch.
-                if let Err(e) =
-                    crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
-                {
-                    chunked = Err(e);
-                    break;
-                }
-                if let Err(e) =
-                    gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
-                {
-                    chunked = Err(e);
-                    break;
-                }
-                row += n;
+            // S7 draft collapse: rotate straight to the persistent F16 twin
+            // and run an overwrite WMMA (accumulator from +0), removing the
+            // per-call convert_f32_to_f16 + pre-zero fill. Every predicate
+            // failure (non-gfx1100, kill switch, batch<=1, AWQ, non-default
+            // variant policy) falls through to the loop below byte-for-byte.
+            let route = gpu.draft_collapse_mq4_route(w.m, w.k, batch, w.awq_scale.is_some());
+            if route == rdna_compute::dflash_draft_fusion::DraftCollapseGemm::Off {
+                gemm_dispatch_mq4_legacy(gpu, x, w, y, batch, mq_x_rot)
+            } else {
+                let scratch = mq_x_rot_f16.expect("MQ4 collapse requires mq_x_rot_f16 scratch");
+                gemm_dispatch_mq4_collapsed(gpu, x, w, y, batch, scratch, route)
             }
-            chunked
         }
         DType::MQ3G256 => {
             // Mirrors the MQ4 path: pre-rotate x via FWHT (same shared signs
@@ -1748,8 +1891,17 @@ fn gemm_dispatch(
             // MQ4 v2 (qt=44): same 136 B stride as v1 but fp16 per-128 header.
             // Uses the dedicated v2 batched lm_head kernel so header decode is
             // correct; rotation is identical FWHT path.
-            let scratch = mq_x_rot.expect("MQ4V2 dispatch requires mq_x_rot scratch");
-            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            // S7: per-chunk route — chunks that hit the gfx1100 ksplit tier
+            // (batch 2..=16, default policy) rotate to F16 and run the
+            // overwrite ksplit GEMM; everything else (n==1 GEMV tails,
+            // chunked first-call prefixes, capture/replay, kill switch)
+            // keeps the legacy loop byte-for-byte.
+            let scratch_f16 = mq_x_rot_f16;
+            let max_chunk = (mq_x_rot
+                .expect("MQ4V2 dispatch requires mq_x_rot scratch")
+                .shape[0]
+                / w.k)
+                .max(1);
             let mut chunked: HipResult<()> = Ok(());
             let mut row = 0;
             while row < batch {
@@ -1766,18 +1918,42 @@ fn gemm_dispatch(
                         break;
                     }
                 } else {
-                    let rot_view = scratch.sub_offset(0, n * w.k);
-                    if let Err(e) =
-                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
-                    {
-                        chunked = Err(e);
-                        break;
-                    }
-                    if let Err(e) =
-                        gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
-                    {
-                        chunked = Err(e);
-                        break;
+                    let route = gpu.draft_collapse_mq4v2_route(w.k, n, w.awq_scale.is_some());
+                    if route == rdna_compute::dflash_draft_fusion::DraftCollapseV2::Off {
+                        let scratch = mq_x_rot.expect("MQ4V2 dispatch requires mq_x_rot scratch");
+                        let rot_view = scratch.sub_offset(0, n * w.k);
+                        if let Err(e) = crate::llama::rotate_x_mq_batched_for(
+                            gpu, w, &x_chunk, &rot_view, w.k, n,
+                        ) {
+                            chunked = Err(e);
+                            break;
+                        }
+                        if let Err(e) = gpu
+                            .gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
+                        {
+                            chunked = Err(e);
+                            break;
+                        }
+                    } else {
+                        let scratch =
+                            scratch_f16.expect("MQ4V2 collapse requires mq_x_rot_f16 scratch");
+                        let rot_f16 = scratch.sub_offset(0, n * w.k);
+                        if let Err(e) = gpu.mq_rotate_x_f16_dflash(&x_chunk, &rot_f16, w.k, n) {
+                            chunked = Err(e);
+                            break;
+                        }
+                        let rdna_compute::dflash_draft_fusion::DraftCollapseV2::OverwriteKsplit {
+                            kw,
+                        } = route
+                        else {
+                            unreachable!("route != Off here")
+                        };
+                        if let Err(e) = gpu.gemm_mq4g256v2_overwrite_ksplit_lds_dflash(
+                            &w.buf, &rot_f16, &y_chunk, w.m, w.k, n, kw,
+                        ) {
+                            chunked = Err(e);
+                            break;
+                        }
                     }
                 }
                 row += n;
@@ -2004,14 +2180,28 @@ fn draft_ffn_layer(
     eps: f32,
     graph_safe: bool,
 ) -> HipResult<()> {
-    if graph_safe {
-        gpu.memcpy_dtod_auto(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+    // S7: one dual-output RMSNorm replaces the residual memcpy + norm pair
+    // (bitwise residual capture, identical norm order). Blob-launched, so it
+    // is capturable in both graph_safe modes without a branch.
+    if gpu.draft_collapse_fused_enabled() {
+        gpu.rmsnorm_residual_dual_dflash(
+            &scratch.x,
+            &layer.ffn_norm,
+            &scratch.residual,
+            &scratch.x_norm,
+            b,
+            h,
+            eps,
+        )?;
     } else {
-        gpu.hip
-            .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+        if graph_safe {
+            gpu.memcpy_dtod_auto(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+        } else {
+            gpu.hip
+                .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+        }
+        gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
     }
-
-    gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
     gemm_dispatch(
         gpu,
         &scratch.x_norm,
@@ -2019,6 +2209,7 @@ fn draft_ffn_layer(
         &scratch.gate,
         b,
         scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
     )?;
     gemm_dispatch(
         gpu,
@@ -2027,6 +2218,7 @@ fn draft_ffn_layer(
         &scratch.up,
         b,
         scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
     )?;
     gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
     gemm_dispatch(
@@ -2036,6 +2228,7 @@ fn draft_ffn_layer(
         &scratch.x,
         b,
         scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
     )?;
     if graph_safe {
         gpu.add_f32_graph_safe(&scratch.residual, &scratch.x, &scratch.x)
@@ -2185,6 +2378,7 @@ pub fn draft_seed_backfill(
                 &thp,
                 seg_len,
                 scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
             )?;
             gpu.rmsnorm_batched(&thp, &weights.hidden_norm, &thp, seg_len, h, eps)?;
             // Last-layer wk/wv into the full_w ring (its own modulus).
@@ -2204,6 +2398,7 @@ pub fn draft_seed_backfill(
                     &k_slot,
                     step,
                     scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
                 )?;
                 gemm_dispatch(
                     gpu,
@@ -2212,6 +2407,7 @@ pub fn draft_seed_backfill(
                     &v_slot,
                     step,
                     scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
                 )?;
                 gpu.rmsnorm_batched(
                     &k_slot,
@@ -2507,6 +2703,7 @@ pub fn draft_forward_opts(
                 &thp_slice,
                 len,
                 scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
             )?;
             gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
         }
@@ -2543,12 +2740,25 @@ pub fn draft_forward_opts(
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
 
-        // Residual.
-        gpu.hip
-            .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
-
-        // attn_norm.
-        gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+        // S7: dual-output RMSNorm replaces the residual memcpy + attn_norm
+        // pair (bitwise residual capture, identical norm order).
+        if gpu.draft_collapse_fused_enabled() {
+            gpu.rmsnorm_residual_dual_dflash(
+                &scratch.x,
+                &layer.attn_norm,
+                &scratch.residual,
+                &scratch.x_norm,
+                b,
+                h,
+                eps,
+            )?;
+        } else {
+            // Residual.
+            gpu.hip
+                .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+            // attn_norm.
+            gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+        }
 
         // ── DFlash2 prepare conv before QKV (no cross-cycle history) ─────
         // After RMSNorm, project normalized hidden to dynamic kernel coeffs
@@ -2569,6 +2779,7 @@ pub fn draft_forward_opts(
                         &dyn_slice,
                         b,
                         scratch.mq_x_rot.as_ref(),
+                        scratch.mq_x_rot_f16.as_ref(),
                     )?;
                     // prepare phase offset 0, window K*G
                     gpu.dynamic_causal_conv_f32(
@@ -2610,6 +2821,7 @@ pub fn draft_forward_opts(
             &scratch.q,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
         )?;
         gemm_dispatch(
             gpu,
@@ -2618,6 +2830,7 @@ pub fn draft_forward_opts(
             &scratch.k_noise,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
         )?;
         gemm_dispatch(
             gpu,
@@ -2626,6 +2839,7 @@ pub fn draft_forward_opts(
             &scratch.v_noise,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
         )?;
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
@@ -2709,6 +2923,7 @@ pub fn draft_forward_opts(
                     &k_slot,
                     step,
                     scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
                 )?;
                 gemm_dispatch(
                     gpu,
@@ -2717,6 +2932,7 @@ pub fn draft_forward_opts(
                     &v_slot,
                     step,
                     scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
                 )?;
                 // Per-head RMSNorm on K delta rows only. batch = step × n_kv_heads.
                 gpu.rmsnorm_batched(
@@ -2881,18 +3097,43 @@ pub fn draft_forward_opts(
             None
         };
 
-        // Write the projection directly into x. The pre-attention x is already
-        // preserved in the shared residual plane, so a dedicated attn_proj
-        // allocation has no lifetime that must overlap this output.
-        gemm_dispatch(
-            gpu,
-            &scratch.attn_out,
-            &layer.wo,
-            &scratch.x,
-            b,
-            scratch.mq_x_rot.as_ref(),
-        )?;
-
+        // S7: on the DFlash2 finish path the wo projection lands in dead
+        // conv_temp instead of x, and one fused conv+residual kernel replaces
+        // the finish convolution plus the attention residual add
+        // (x = residual + conv(wo_out), identical add order). conv_temp is
+        // dead here: the prepare output it held was consumed by the QKV
+        // GEMMs above. Off-switch and legacy drafts keep today's dataflow.
+        let attn_finish_conv = matches!(
+            (&layer.attn_conv_base, &layer.attn_conv_proj),
+            (Some(_), Some(_))
+        ) && scratch.conv_dynamic.is_some()
+            && scratch.conv_temp.is_some()
+            && gpu.draft_collapse_fused_enabled();
+        if attn_finish_conv {
+            let tmp = scratch.conv_temp.as_ref().unwrap();
+            gemm_dispatch(
+                gpu,
+                &scratch.attn_out,
+                &layer.wo,
+                tmp,
+                b,
+                scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
+            )?;
+        } else {
+            // Write the projection directly into x. The pre-attention x is already
+            // preserved in the shared residual plane, so a dedicated attn_proj
+            // allocation has no lifetime that must overlap this output.
+            gemm_dispatch(
+                gpu,
+                &scratch.attn_out,
+                &layer.wo,
+                &scratch.x,
+                b,
+                scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
+            )?;
+        }
         // DFlash2 finish convolution before the attention residual add.
         if let (Some(base), Some(_proj), Some(dyn_buf), Some(tmp)) = (
             &layer.attn_conv_base,
@@ -2906,19 +3147,35 @@ pub fn draft_forward_opts(
             let stride = 2 * k * groups;
             let dyn_slice = dyn_buf.sub_offset(0, b * stride);
             let base_phase1 = base.sub_offset(k * h, k * h);
-            gpu.dynamic_causal_conv_f32(
-                &scratch.x,
-                &base_phase1,
-                &dyn_slice,
-                tmp,
-                b,
-                h,
-                k,
-                g,
-                stride,
-                k * groups,
-            )?;
-            gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
+            if attn_finish_conv {
+                gpu.dynamic_conv_residual_dflash(
+                    tmp,
+                    &base_phase1,
+                    &dyn_slice,
+                    &scratch.residual,
+                    &scratch.x,
+                    b,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    k * groups,
+                )?;
+            } else {
+                gpu.dynamic_causal_conv_f32(
+                    &scratch.x,
+                    &base_phase1,
+                    &dyn_slice,
+                    tmp,
+                    b,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    k * groups,
+                )?;
+                gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
+            }
         } else {
             gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)?;
         }
@@ -2930,9 +3187,24 @@ pub fn draft_forward_opts(
             &scratch.conv_dynamic,
             &scratch.conv_temp,
         ) {
-            gpu.hip
-                .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
-            gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+            // S7: dual-output RMSNorm replaces the FFN residual memcpy +
+            // ffn_norm pair (bitwise residual capture, identical norm order).
+            let ffn_collapse = gpu.draft_collapse_fused_enabled();
+            if ffn_collapse {
+                gpu.rmsnorm_residual_dual_dflash(
+                    &scratch.x,
+                    &layer.ffn_norm,
+                    &scratch.residual,
+                    &scratch.x_norm,
+                    b,
+                    h,
+                    eps,
+                )?;
+            } else {
+                gpu.hip
+                    .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+                gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+            }
             let k = cfg.conv_kernel_size.unwrap_or(2);
             let g = cfg.conv_group_size.unwrap_or(16);
             let groups = h / g;
@@ -2945,6 +3217,7 @@ pub fn draft_forward_opts(
                 &dyn_slice,
                 b,
                 scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
             )?;
             gpu.dynamic_causal_conv_f32(
                 &scratch.x_norm,
@@ -2965,6 +3238,7 @@ pub fn draft_forward_opts(
                 &scratch.gate,
                 b,
                 scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
             )?;
             gemm_dispatch(
                 gpu,
@@ -2973,30 +3247,64 @@ pub fn draft_forward_opts(
                 &scratch.up,
                 b,
                 scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
             )?;
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
-            gemm_dispatch(
-                gpu,
-                &scratch.gate_up,
-                &layer.w_down,
-                &scratch.x,
-                b,
-                scratch.mq_x_rot.as_ref(),
-            )?;
+            // S7: w_down lands in dead conv_temp (last read by the gate/up
+            // GEMMs above) and one fused conv+residual kernel replaces the
+            // finish convolution plus the FFN residual add
+            // (x = residual + conv(down_out), identical add order).
+            if ffn_collapse {
+                gemm_dispatch(
+                    gpu,
+                    &scratch.gate_up,
+                    &layer.w_down,
+                    tmp,
+                    b,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+            } else {
+                gemm_dispatch(
+                    gpu,
+                    &scratch.gate_up,
+                    &layer.w_down,
+                    &scratch.x,
+                    b,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+            }
             let base_phase1 = base.sub_offset(k * h, k * h);
-            gpu.dynamic_causal_conv_f32(
-                &scratch.x,
-                &base_phase1,
-                &dyn_slice,
-                tmp,
-                b,
-                h,
-                k,
-                g,
-                stride,
-                k * groups,
-            )?;
-            gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
+            if ffn_collapse {
+                gpu.dynamic_conv_residual_dflash(
+                    tmp,
+                    &base_phase1,
+                    &dyn_slice,
+                    &scratch.residual,
+                    &scratch.x,
+                    b,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    k * groups,
+                )?;
+            } else {
+                gpu.dynamic_causal_conv_f32(
+                    &scratch.x,
+                    &base_phase1,
+                    &dyn_slice,
+                    tmp,
+                    b,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    k * groups,
+                )?;
+                gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
+            }
         } else {
             let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
             draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
@@ -3277,6 +3585,7 @@ pub fn propose_candidates_host(
         &proj_slice,
         rows,
         scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
     )?;
     // D2H projected hidden
     let mut host_proj = vec![0f32; rows * rank];
@@ -3388,6 +3697,7 @@ pub fn propose_candidates_device(
         &proj_slice,
         rows,
         scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
     )?;
     let mut host_proj = vec![0f32; rows * rank];
     let bytes: &mut [u8] = unsafe {
