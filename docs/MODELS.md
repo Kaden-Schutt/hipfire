@@ -63,7 +63,7 @@ Sizes below are **registry declarations**, not a substitute for runtime MoE layo
 | `qwen3.5:35b-a3b` | `qwen3.5-35b-a3b.mq4` | 19.7 | 22 | q8 | 35B / 3B-active |
 | `qwen3.6:35b-a3b` | `qwen3.6-35b-a3b.mq4p` | 19.8 | 22 | q8 | Default graded mq4p SKU |
 | `qwen3.6:35b-a3b-mq2` | `qwen3.6-35b-a3b.mq2` | 11.6 | 14 | | Floor SKU |
-| `qwen3.6:35b-a3b-escha-xt` | `qwen3.6-35b-a3b.escha-xt` | 11.4 | 14 | q8 | Escha-W2 2-bit trellis, MQ4V2 dense. Fastest/smallest. PPL 8.0643 |
+| `qwen3.6:35b-a3b-escha-xt` | `qwen3.6-35b-a3b.escha-xt` | 11.4 | 15 | q8 | Escha-W2 2-bit trellis, MQ4V2 dense. Fastest/smallest. PPL 8.0643 |
 | `qwen3.6:35b-a3b-escha` | `qwen3.6-35b-a3b.escha` | 11.8 | 15 | q8 | **Default.** Escha-W2 2-bit trellis experts stored verbatim and decoded in the GEMV — no decode-at-load. MQ6 dense. PPL 7.6940, 725 tok/s prefill, 55 decode |
 | `qwen3.6:35b-a3b-escha-pro` | `qwen3.6-35b-a3b.escha-pro` | 12.3 | 16 | q8 | Q8_0 dense, most faithful. PPL 7.6864. KLD reference for the other two |
 | `qwen3.8:27b-escha-xt` | `qwen3.8-27b.escha-xt` | 10.5 | 14 | q8 | Escha-W2 2-bit trellis, MQ4V2 dense. PPL 9.7242, 122 tok/s prefill, 12.3 decode |

@@ -538,7 +538,7 @@
       "repo": "hipfire-models/qwen3.6-35b-a3b-escha",
       "file": "qwen3.6-35b-a3b.escha-xt",
       "size_gb": 11.39,
-      "min_vram_gb": 14,
+      "min_vram_gb": 15,
       "desc": "EschaLabs Escha-W2 2-bit trellis experts, stored verbatim and decoded inside the GEMV (no decode-at-load). Base model Qwen3.6-35B-A3B. Measured on gfx1151: Dense down-quantised to MQ4. Fastest, and the only one with a visible quality cost: PPL 8.0643 (+4.9%), KLD 0.0590 vs the q8 arm. 886 tok/s prefill, 63 tok/s decode, 12.04 GB resident. Experts are identical across all three; only the dense tensors differ."
     },
     "qwen3.8:27b-escha": {
