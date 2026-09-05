@@ -2127,6 +2127,28 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
+                // Sticky GPU fault (700/719) latched by an arch op: the HIP
+                // context is dead, so any prefill/decode would fail the same
+                // way. Fail fast instead of burning a doomed prefill per
+                // request — the gate saw the same 719 repeat across requests
+                // after a mid-decode realign fault. Only a process restart
+                // re-establishes a live context (model reload does not reset
+                // the primary context), so the latch is never cleared here.
+                if let Some(poison) = hipfire_runtime::reset_core::gpu_poison() {
+                    hipfire_generate::dense::emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        &format!(
+                            "GPU context dead after sticky HipError({}) at {}; process restart required",
+                            poison.code, poison.site,
+                        ),
+                        "gpu",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
 
                 // Fresh terminal-control transaction for this generate attempt.
                 // Cleared by TerminalControlGuard on all exits from this arm.

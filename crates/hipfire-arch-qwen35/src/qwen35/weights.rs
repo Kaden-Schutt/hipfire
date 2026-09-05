@@ -1641,37 +1641,44 @@ impl DeltaNetState {
     /// Returns `Err` on the first HIP memset/memset_async failure so production
     /// rollback can attest `rolled_back:false`.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        match gpu.active_stream.as_ref() {
-            Some(stream) => {
-                for s in &self.s_matrices {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+        // Sticky-fault poison: a 700/719 here means the context is dead (the
+        // gate saw the same 719 repeat across requests on memsets alone), so
+        // latch process-wide and let the daemon fail fast instead of burning
+        // doomed prefills. All other errors pass through unlatched.
+        let result: HipResult<()> = (|| {
+            match gpu.active_stream.as_ref() {
+                Some(stream) => {
+                    for s in &self.s_matrices {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
+                    for s in &self.s_scales {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
+                    for s in &self.conv_states {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
+                    for s in &self.s_ef_residual {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
                 }
-                for s in &self.s_scales {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
-                }
-                for s in &self.conv_states {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
-                }
-                for s in &self.s_ef_residual {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                None => {
+                    for s in &self.s_matrices {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
+                    for s in &self.s_scales {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
+                    for s in &self.conv_states {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
+                    for s in &self.s_ef_residual {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
                 }
             }
-            None => {
-                for s in &self.s_matrices {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-                for s in &self.s_scales {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-                for s in &self.conv_states {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-                for s in &self.s_ef_residual {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        hipfire_runtime::reset_core::note_hip_result(result, "qwen35::DeltaNetState::reset")
     }
 
     /// Multi-GPU companion to `new_with_quant`. Each LA-layer's state is

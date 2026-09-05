@@ -653,7 +653,10 @@ impl Speculator for DflashSpeculator {
                 ck_cap,
             )
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
+            e.to_string()
+        })?;
         if aborted {
             // Caller resets conversation state + emits aborted/done; the slot
             // guard restores the target bundle on the way out.
@@ -692,7 +695,10 @@ impl Speculator for DflashSpeculator {
                 &self.df.target_hidden_host,
                 prompt_tokens.len(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::backfill");
+                e.to_string()
+            })?;
         }
         self.df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         if let Some(ckpt) = resume_from {
@@ -707,9 +713,10 @@ impl Speculator for DflashSpeculator {
         // temp>0 uses the same host nucleus sampler as chain DFlash verify so the
         // post-prefill seed is not a special greedy exception on distribution-
         // preserving requests.
-        let first_logits = gpu
-            .download_f32(&slot.scratch.logits)
-            .map_err(|e| e.to_string())?;
+        let first_logits = gpu.download_f32(&slot.scratch.logits).map_err(|e| {
+            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::logits");
+            e.to_string()
+        })?;
         let first_token = if self.sample_temp <= 1e-6 {
             first_logits
                 .iter()
