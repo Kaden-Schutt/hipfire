@@ -94,6 +94,7 @@ impl<'a> Qwen35Emit<'a> {
         let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
+            .filter(|_| ctx.grammar)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|t| {
@@ -177,7 +178,8 @@ impl<'a> Qwen35Emit<'a> {
                     }
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[qwen35-spec] {e}");
                 self.router_malformed = true;
             }
         }
@@ -613,6 +615,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: Some(&[]),
+            grammar: true,
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -837,6 +840,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            grammar: true,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -865,6 +869,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            grammar: true,
             stop: vec!["STOP".to_string()],
             max_think: 0,
             max_tokens: 256,

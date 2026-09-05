@@ -1396,6 +1396,11 @@ pub struct SpecEmitCtx<'a> {
     /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
     /// tool-call grammar.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Arm grammar-guided decoding. Separate from `tools` on purpose: the
+    /// tool-call PARSER must follow the request carrying tools, while the
+    /// matcher follows the arch's grammar switch — coupling them left Qwen
+    /// native XML calls unparsed whenever grammar was off.
+    pub grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).

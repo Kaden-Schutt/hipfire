@@ -640,6 +640,7 @@ impl SlotBackend {
             eos: self.tokenizer.eos_id,
             im_end: self.tokenizer.special_token_id("<|im_end|>"),
             tools: None,
+            grammar: true,
             stop: Vec::new(),
             max_think: 0,
             max_tokens,

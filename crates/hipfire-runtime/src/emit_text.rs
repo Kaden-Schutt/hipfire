@@ -455,7 +455,10 @@ impl ToolOutputRouter {
                         Ok(true)
                     }
                     None => Err(self.latch_malformed(
-                        "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML",
+                        &format!(
+                            "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML; body={:?}",
+                            &body[..body.len().min(200)]
+                        ),
                     )),
                 }
             }
@@ -1680,7 +1683,9 @@ mod tests {
     fn disabled_router_keeps_tool_like_text_visible_and_non_executable() {
         let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
         let mut router = ToolOutputRouter::disabled();
-        let events = router.push(text).expect("tool-free text must remain visible");
+        let events = router
+            .push(text)
+            .expect("tool-free text must remain visible");
         assert_eq!(events.len(), 1);
         match &events[0] {
             ToolRouteEvent::VisibleText(visible) => assert_eq!(visible.as_str(), text),
