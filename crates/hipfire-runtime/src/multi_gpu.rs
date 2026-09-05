@@ -224,15 +224,6 @@ impl Gpus {
         Self::from_parts(devices, per_device.to_vec(), n_layers)
     }
 
-    /// Reserved for v1.1 — automatic VRAM-weighted band assignment. For v1
-    /// use `init_layers(...)` with hand-computed counts.
-    pub fn init_vram_weighted(_n_devices: usize, _n_layers: usize) -> HipResult<Self> {
-        Err(HipError::new(
-            0,
-            "init_vram_weighted: scheduled for v1.1; use init_layers(per_device) instead",
-        ))
-    }
-
     /// PP=1 back-compat path: wrap an existing single `Gpu` into a `Gpus`
     /// with all layers on dev 0. `output_device = 0`.
     pub fn single(gpu: Gpu, n_layers: usize) -> Self {

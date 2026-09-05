@@ -62,7 +62,6 @@ override via `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB`).
 
 Asymmetric / mixed-VRAM systems use the explicit
 `Gpus::init_layers(per_device: &[usize])` escape hatch.
-`Gpus::init_vram_weighted(...)` is reserved for v1.1.
 
 ### 3.2 `output_norm + lm_head` on dev_last (Variant 2)
 
