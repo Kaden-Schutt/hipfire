@@ -487,11 +487,16 @@ impl Qwen35MtpHeadScratch {
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             logits_compressed: None,
             flash_partials: {
-                // Same sizing as trunk's prefill_partials at qwen35.rs:2822
-                // (TILE_SIZE=128) but with batch_mult=1 since MTP forward
-                // is single-token. Allocated per scratch instance, lives
-                // for the lifetime of the slot.
-                let tile_size = 128usize;
+                // Sized with the tile the flash launch picks for this shape: a
+                // fixed 128 under-allocates 4x where the arch picks 32 (gfx1100
+                // at max_seq <= 8192) and the tile kernel page-faults.
+                let tile_size = rdna_compute::attention::q8_flash_tile_size(
+                    &gpu.arch,
+                    config.n_head,
+                    config.n_head_kv,
+                    config.head_dim,
+                    config.max_seq,
+                );
                 let max_tiles = (config.max_seq + tile_size - 1) / tile_size;
                 gpu.alloc_tensor(
                     &[config.n_head * max_tiles * (2 + config.head_dim)],
@@ -1615,21 +1620,21 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     //   per Phase 1 fwht4 commit `c64c0e3f`).
     // KV write + attention via the shared KV-usage abstraction. kv.inner is
     // built per kv_mode (new_gpu_q8/asym3/fwht4), so kv.inner.tier_inputs()
-    // produces exactly the tier kv.kv_mode used to dispatch: Q8→AttnQ8_0Kv
-    // (non-flash), Asym3→AttnFlashAsym3, Fwht4→AttnFlashAsym4Fwht — byte-
-    // identical kernels (incl. the Givens cos/sin + v_mode_bits sub-plan). The
-    // dispatch arm computes seq_len = pos+1, so pos = seq_len_hint-1 reproduces
-    // the hand seq_len_hint exactly (the write position flows via pos_buf).
-    // SPEC-DECODE: draft logits stay byte-identical → τ unchanged (validated by
-    // coherence-gate-dflash.sh + a τ A/B). flash_partials is always Some (the Q8
-    // non-flash arm ignores it; asym3/fwht4 require it). Q8 non-flash is
-    // unconditional → derive returns AttnQ8_0Kv at seq_len_hint<=15000 (the
-    // documented >15k Q8-fidelity edge).
+    // produces the tier kv.kv_mode dispatches on — byte-identical kernels
+    // (incl. the Givens cos/sin + v_mode_bits sub-plan). The dispatch arm
+    // computes seq_len = pos+1, so pos = seq_len_hint-1 reproduces the hand
+    // seq_len_hint exactly (the write position flows via pos_buf).
+    // `tier_inputs()` reports flash_mode 0, which would pin the Q8 tier to the
+    // non-flash AttnQ8_0Kv at any context (10 ms per draft step at 33k against
+    // 0.3 ms on the flash tile), so the head takes the trunk's flash policy.
+    // flash_partials is always Some and sized with the same tile the launch
+    // picks (see `Qwen35MtpHeadScratch::new`).
     let dispatch_pos = seq_len_hint - 1;
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
         hipfire_dispatch::families::kv_tier::KvTierInputs {
             pos: dispatch_pos,
+            flash_mode: hipfire_runtime::llama::attention_flash_mode(&gpu.arch),
             ..kv.inner.tier_inputs()
         },
     )

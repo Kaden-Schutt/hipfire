@@ -3758,8 +3758,12 @@ fn llama_forward_lowered_enabled() -> bool {
     })
 }
 
+/// Numeric attention flash policy for `HIPFIRE_ATTN_FLASH` (`config.attention_flash_mode`):
+/// `0` never, `1` auto (flash at long context), `2` always. `auto` resolves to
+/// `2` on graph-capable archs (gfx11/gfx12) so direct and captured forwards run
+/// the same kernel, and to `1` elsewhere.
 #[inline]
-fn llama_attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
+pub fn attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
     match mode {
         "never" | "0" | "off" => 0,
         "always" | "2" | "force" => 2,
@@ -3768,9 +3772,10 @@ fn llama_attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
     }
 }
 
+/// [`attention_flash_mode_for`] against the process configuration.
 #[inline]
-fn llama_attention_flash_mode(gpu_arch: &str) -> usize {
-    llama_attention_flash_mode_for(crate::config::get().attention_flash_mode.as_str(), gpu_arch)
+pub fn attention_flash_mode(gpu_arch: &str) -> usize {
+    attention_flash_mode_for(crate::config::get().attention_flash_mode.as_str(), gpu_arch)
 }
 
 #[inline]
@@ -3810,7 +3815,7 @@ fn llama_kv_write_attend(
         let ctx = DispatchCtx::new(gpu);
         let plan = KvTierPlan::derive(KvTierInputs {
             pos,
-            flash_mode: llama_attention_flash_mode(&gpu.arch),
+            flash_mode: attention_flash_mode(&gpu.arch),
             ..kv_cache.tier_inputs()
         })
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -4064,7 +4069,7 @@ fn forward_scratch_layers_lowered(
         config,
         scratch,
         kv_cache: &*kv_cache,
-        flash_mode: llama_attention_flash_mode(&gpu.arch),
+        flash_mode: attention_flash_mode(&gpu.arch),
         knobs,
         pos,
     };
@@ -7901,11 +7906,11 @@ mod tests {
 
     #[test]
     fn qwen3_flash_mode_policy_matches_rdna_generation() {
-        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1100"), 2);
-        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1201"), 2);
-        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1030"), 1);
-        assert_eq!(llama_attention_flash_mode_for("never", "gfx1100"), 0);
-        assert_eq!(llama_attention_flash_mode_for("always", "gfx1030"), 2);
+        assert_eq!(attention_flash_mode_for("auto", "gfx1100"), 2);
+        assert_eq!(attention_flash_mode_for("auto", "gfx1201"), 2);
+        assert_eq!(attention_flash_mode_for("auto", "gfx1030"), 1);
+        assert_eq!(attention_flash_mode_for("never", "gfx1100"), 0);
+        assert_eq!(attention_flash_mode_for("always", "gfx1030"), 2);
     }
 
     #[test]
