@@ -470,6 +470,15 @@ pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
     RAW_CODECS.iter().find(|c| c.quant_type == quant_type)
 }
 
+/// Return the compute representation used for a raw HFQ weight payload.
+///
+/// Host-decoded source types (F16/F32/BF16) intentionally return `None`;
+/// callers must widen those payloads before upload so the result matches the
+/// established LLaMA loader semantics.
+pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
+    raw_codec(quant_type).map(|codec| codec.dtype)
+}
+
 /// Decode a passthrough quant format: enforce the K%256 guard (via DType),
 /// upload bytes verbatim, build the `WeightTensor` with the dtype + its
 /// DType-derived row_stride. `name` is the caller context for the guard panic.
