@@ -2054,6 +2054,32 @@ fn finish_qwen35_load(
                 }
             }
         }
+        // Third packaging: the head carried as ordinary `mtp.*` tensors inside
+        // the trunk's own container, which is how the escha converter passes
+        // upstream's head through. Neither the HFBNDMTP trailer nor a sibling
+        // `.mtp` exists for those builds, so without this the 849 MB head in
+        // qwen3.8-27b.escha is downloaded and never used.
+        if head_opt.is_none() {
+            match hipfire_arch_qwen35::mtp_head::load_mtp_head_from_trunk(
+                trunk_path,
+                ctx.gpu,
+                physical_cap,
+            ) {
+                Ok(Some(h)) => {
+                    eprintln!(
+                        "  MTP head loaded (in-trunk mtp.* tensors): n_embd={} vocab={}",
+                        h.config.n_embd, h.config.vocab_size
+                    );
+                    head_opt = Some(h);
+                    load_err = None;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    load_err = Some(format!("in-trunk mtp.* load failed: {e}"));
+                }
+            }
+        }
+
         if head_opt.is_none() {
             if ctx.spec.mtp == Some(true) {
                 return Err(rollback_unfinished_qwen35(
