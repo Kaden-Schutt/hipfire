@@ -26,6 +26,9 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+# Re-added: S4 (#719) introduced hipfire_config readers in this crate after the
+# machete pass that removed it, so the "unused" finding is no longer true.
+hipfire-config = { path = "../hipfire-config" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-engine = { path = "../hipfire-engine" }
 hipfire-pflash = { path = "../hipfire-pflash" }
