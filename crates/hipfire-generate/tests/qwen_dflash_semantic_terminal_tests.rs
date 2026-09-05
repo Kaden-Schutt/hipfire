@@ -621,10 +621,35 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     }
 
     #[test]
-    fn terminal_marker_mid_window_strict_prefix_realigns() {
+    fn terminal_strict_prefix_resets_without_realign() {
+        use hipfire_generate::qwen::{
+            spec_strict_prefix_action, SpecStrictPrefixAction,
+        };
+
+        assert_eq!(
+            spec_strict_prefix_action(9, 11, true),
+            SpecStrictPrefixAction::ResetForTerminal
+        );
+        assert_eq!(
+            spec_strict_prefix_action(9, 11, false),
+            SpecStrictPrefixAction::Realign
+        );
+        assert_eq!(
+            spec_strict_prefix_action(11, 11, true),
+            SpecStrictPrefixAction::None
+        );
+        assert_eq!(
+            spec_strict_prefix_action(12, 11, false),
+            SpecStrictPrefixAction::None
+        );
+    }
+
+    #[test]
+    fn terminal_marker_mid_window_tracks_exact_host_prefix() {
         // Spec window emits body + im_end + unobserved tail. Semantic loop
-        // consumes only through the terminal marker; host + realign plan must
-        // land exactly on that prefix (no unobserved tail in conversation or KV).
+        // consumes only through the terminal marker; host bookkeeping must
+        // exclude the unobserved tail even though terminal repair resets the
+        // resident state instead of replaying this exact prefix.
         let tok = test_tokenizer();
         let prompt = vec![4u32, 5];
         let first_token = tok.encode("hi")[0];

@@ -3411,6 +3411,7 @@ pub fn generate_spec(
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
     // first sampled token was already a terminator (see the guard above).
+    let mut terminal_cache_invalidated = false;
     while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
@@ -3592,9 +3593,10 @@ pub fn generate_spec(
         };
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter via conservative reset + production prefill of the
-        // exact KV-resident prefix (`spec_prefix_realign_plan`). Full-window
-        // observe keeps the step's already-committed GPU state.
+        // target + drafter. Continue-generation paths rebuild the exact
+        // KV-resident prefix; completed requests reset and invalidate cache
+        // metadata so they do not pay a full-history replay before returning.
+        // Full-window observe keeps the step's already-committed GPU state.
         //
         // Capacity-aware: admit BEFORE reset/prefill. Realign is full-history
         // replay after reset (compact_offset cleared) — never overrun
@@ -3602,7 +3604,52 @@ pub fn generate_spec(
         // state from an invalid oversize history. Abort/prefill errors share
         // the single fail-closed terminal (no second done/error).
         let keep = consumed.min(committed_tail.len());
-        if keep < committed_tail.len() {
+        let strict_prefix_action = spec_strict_prefix_action(
+            keep,
+            committed_tail.len(),
+            hit_eos || think_cap_hit,
+        );
+        if strict_prefix_action == SpecStrictPrefixAction::ResetForTerminal {
+            // The request is already terminal, so replaying the entire prompt plus
+            // generated prefix only delays the completed response. Drop the polluted
+            // speculative tail and invalidate the resident prompt-cache state; a later
+            // request will rebuild it through the normal cold-prefill path.
+            let reset_error = slot
+                .reset_recurrent(gpu)
+                .err()
+                .map(|e| format!("reset_recurrent: {e}"))
+                .or_else(|| {
+                    spec.reset_for_realign(gpu)
+                        .err()
+                        .map(|e| format!("spec.reset_for_realign: {e}"))
+                });
+            if let Some(msg) = reset_error {
+                let ep = production_fail_closed_rollback_live(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    slot,
+                    spec.as_mut(),
+                );
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("terminal prefix reset failed: {msg}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
+                drop(guard);
+                return None;
+            }
+            terminal_cache_invalidated = true;
+            pending_seed_committable = false;
+            position = 0;
+        }
+        if strict_prefix_action == SpecStrictPrefixAction::Realign {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
             let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
             if let Err(msg) = spec_prefix_realign_admit(
@@ -3962,7 +4009,12 @@ pub fn generate_spec(
     // only the decoded portion (`emitted`), making the next non-dflash turn
     // full-reset because no system/user prefix was present.
     // Host raw/conversation stay exact even when client events were held.
-    m.conversation_tokens = {
+    m.conversation_tokens = if terminal_cache_invalidated {
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        m.asst_turn_cache.clear();
+        Vec::new()
+    } else {
         let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
         v.extend_from_slice(&prompt_tokens);
         v.extend_from_slice(&emitted);
@@ -5630,6 +5682,30 @@ pub fn spec_should_flush_pending_seed(
     pending_seed_committable: bool,
 ) -> bool {
     !grammar_violated && pending_seed_committable
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecStrictPrefixAction {
+    None,
+    Realign,
+    ResetForTerminal,
+}
+
+/// Decide how to repair target and drafter state after observing only a strict
+/// prefix of a speculative window. A completed request does not need its exact
+/// prefix replayed; resetting makes the next request take the cold-prefill path.
+pub fn spec_strict_prefix_action(
+    consumed: usize,
+    committed: usize,
+    terminal: bool,
+) -> SpecStrictPrefixAction {
+    if consumed >= committed {
+        SpecStrictPrefixAction::None
+    } else if terminal {
+        SpecStrictPrefixAction::ResetForTerminal
+    } else {
+        SpecStrictPrefixAction::Realign
+    }
 }
 
 pub fn spec_prefix_realign_plan(

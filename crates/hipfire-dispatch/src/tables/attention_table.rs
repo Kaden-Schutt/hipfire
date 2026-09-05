@@ -386,7 +386,17 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     // No scalar floor for F16 — fall to AttnFullF32 at caller level.
 
-    // AttnFullF32: non-causal, F32 K/V
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32,
+        arch_required: ArchPredicate::HasWmmaW32,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::BatchEq(16),
+            ShapePredicate::HeadDimEq(128),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashN64,
+    });
     registry.register(KernelVariant {
         key: KernelKey::AttnFullF32,
         arch_required: ArchPredicate::HasWmma,
