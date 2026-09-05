@@ -3081,7 +3081,9 @@ impl ProcessConfig {
             if is_developer_key(key) {
                 continue;
             }
-            let schema = field(key).expect("ConfigLayer::validate accepted stable key");
+            let Some(schema) = field(key) else {
+                return Err(ConfigError::UnknownKey(key.clone()));
+            };
             if schema.env_compat.is_none() {
                 return Err(ConfigError::InvalidValue {
                     key: key.clone(),
@@ -3736,7 +3738,9 @@ fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
                     .into(),
             });
         }
-        let schema = field(key).expect("validated configuration field");
+        let Some(schema) = field(key) else {
+            return Err(ConfigError::UnknownKey(key.clone()));
+        };
         if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
             return Err(ConfigError::InvalidValue {
                 key: key.clone(),

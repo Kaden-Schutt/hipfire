@@ -49,10 +49,11 @@ Docker works the same with `docker build …`. Rootful Docker does **not**
 implement Podman's `--group-add keep-groups` token — omit that flag under
 Docker (see run section).
 
-Daemon build inside the image matches the project default:
+Daemon and CLI builds inside the image (Containerfile builder stage):
 
 ```text
-cargo build --release --locked --features deltanet --example daemon -p hipfire-runtime
+cargo build --release --locked -p hipfire-daemon
+cargo build --release --locked -p hipfire-cli
 ```
 
 ## Run the runtime image (GPU required)

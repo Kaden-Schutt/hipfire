@@ -592,11 +592,6 @@ pub fn run_moe_decode(
     p: &crate::families::moe::MoeParams,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoeResolution;
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
 
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
     // that would be stripped in release). batch_size=1 is the only valid
@@ -1801,11 +1796,6 @@ fn run_moe_decode_cpu_fallback(
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
 
     // EP (Ship 6 substrate-EP) is not wired through the generic CPU-top-K
     // fallback yet — it still accumulates into x_residual directly. The
@@ -2146,11 +2136,6 @@ pub fn run_moe_decode_bias_aware(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeBiasAwareParams,
 ) -> Result<(), DispatchError> {
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     if p.batch_size != 1 {
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
@@ -2182,11 +2167,6 @@ pub fn run_moe_decode_selected(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeSelectedParams,
 ) -> Result<(), DispatchError> {
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     if p.batch_size != 1 {
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
@@ -2523,11 +2503,6 @@ pub fn run_moe_prefill_bias_aware(
     p: &crate::families::moe::MoeBiasAwarePrefillParams,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoePrefillRouting;
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     let (hidden, im, n_exp, k_top, batch_size) = (p.hidden, p.mi, p.n_exp, p.k_top, p.batch_size);
 
     // ── Routing → topk_indices / topk_weights ────────────────────────────────
@@ -2898,11 +2873,6 @@ fn dispatch_grouped_gemm(
     paro_i8: bool,
     paro_i8_k8: bool,
 ) -> Result<(), DispatchError> {
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     // Mixed per-expert: the merged grouped kernel carries the per-expert stride
     // via the dtype_tags table; takes priority over the uniform dtype dispatch.
     if let Some(tags) = expert_dtype_tags {
@@ -3109,11 +3079,6 @@ pub fn run_moe_prefill(
     p: &crate::families::moe::MoePrefillParams,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoePrefillResolution;
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
@@ -3736,11 +3701,6 @@ pub fn dispatch_fused(
         PipelineParams::Linear(p) => p,
         PipelineParams::Moe(p) => return run_moe_decode(ctx, gpu, p),
     };
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
     match key {
         KernelKey::GemvMfp4G32Fused => {
             gpu.ensure_mq_signs()

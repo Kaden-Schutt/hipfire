@@ -8,8 +8,8 @@
 //! greedy token sequence matches for ≥ 100 decoded tokens (temp=0,
 //! same prompt token).
 //!
-//! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime \
-//!         --release --features deltanet --example pp_parity -- \
+//! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p saddle-lab \
+//!         --release --features arch-qwen35,deltanet --example pp_parity -- \
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4
 
 use hipfire_arch_qwen35::qwen35::{

@@ -383,11 +383,6 @@ impl GemmFamily {
                 w.dtype, key
             )));
         }
-        macro_rules! hip {
-            ($e:expr) => {
-                $e.map_err(|e| DispatchError::Hip(e.to_string()))
-            };
-        }
 
         use KernelKey as K;
         match key {

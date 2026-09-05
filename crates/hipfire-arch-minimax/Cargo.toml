@@ -22,8 +22,8 @@ hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 # ---------------------------------------------------------------------------
 # Archived research probes.

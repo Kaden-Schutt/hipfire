@@ -12,7 +12,6 @@ lab = []
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 libloading.workspace = true
-thiserror = "2"
 
 [dev-dependencies]
 hip-bridge = { path = "../hip-bridge" }

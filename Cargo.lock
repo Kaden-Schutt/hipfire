@@ -1102,7 +1102,6 @@ dependencies = [
  "hipfire-config",
  "libloading",
  "redline-rocr",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1129,7 +1128,6 @@ dependencies = [
  "hipfire-reap",
  "hipfire-runtime",
  "libloading",
- "memmap2",
  "rdna-compute",
  "saddle-core",
  "serde",
@@ -1158,7 +1156,6 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
- "serde",
  "serde_json",
 ]
 
@@ -1171,7 +1168,6 @@ dependencies = [
  "image",
  "libm",
  "rdna-compute",
- "serde",
  "serde_json",
 ]
 
@@ -1236,7 +1232,6 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
- "serde",
  "serde_json",
 ]
 
@@ -1278,7 +1273,6 @@ dependencies = [
  "hipfire-runtime",
  "image",
  "rdna-compute",
- "serde",
  "serde_json",
 ]
 
@@ -1286,7 +1280,6 @@ dependencies = [
 name = "hipfire-arch-toy"
 version = "0.3.0"
 dependencies = [
- "hip-bridge",
  "hipfire-runtime",
  "rdna-compute",
 ]
@@ -1331,7 +1324,6 @@ name = "hipfire-client"
 version = "0.3.0"
 dependencies = [
  "hipfire-config",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "ureq",
@@ -1355,7 +1347,6 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35",
  "hipfire-config",
- "hipfire-dispatch",
  "hipfire-engine",
  "hipfire-generate",
  "hipfire-loader",
@@ -1363,8 +1354,6 @@ dependencies = [
  "hipfire-runtime",
  "libc",
  "rdna-compute",
- "saddle-core",
- "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -1417,15 +1406,11 @@ name = "hipfire-engine"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
- "hipfire-config",
- "hipfire-dispatch",
  "hipfire-loader",
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
- "serde",
  "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -1448,14 +1433,12 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
- "hipfire-dispatch",
  "hipfire-engine",
  "hipfire-loader",
  "hipfire-pflash",
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
- "serde",
  "serde_json",
  "tracing",
 ]
@@ -1495,8 +1478,6 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1547,7 +1528,6 @@ dependencies = [
 name = "hipfire-runtime"
 version = "0.3.0"
 dependencies = [
- "base64",
  "byteorder",
  "half",
  "hip-bridge",
@@ -1591,6 +1571,7 @@ name = "hipfire-tui"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "hipfire-client",
  "hipfire-config",
@@ -1608,7 +1589,6 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "libloading",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2879,49 +2859,28 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
- "serde",
 ]
 
 [[package]]
 name = "saddle-lab"
 version = "0.3.0"
 dependencies = [
- "base64",
  "byteorder",
- "half",
  "hip-bridge",
- "hipfire-arch-cohere2moe",
- "hipfire-arch-deepseek4",
- "hipfire-arch-dots-ocr",
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
- "hipfire-arch-minimax",
  "hipfire-arch-muse-glimmer",
- "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
- "hipfire-atlas",
  "hipfire-config",
  "hipfire-detect",
  "hipfire-dispatch",
- "hipfire-engine",
- "hipfire-loader",
- "hipfire-pflash",
  "hipfire-runtime",
  "libc",
- "memmap2",
- "minijinja",
- "minijinja-contrib",
- "rayon",
  "rdna-compute",
- "regex",
- "saddle-core",
- "safetensors",
  "serde",
  "serde_json",
- "smallvec",
- "tracing",
 ]
 
 [[package]]
@@ -2929,13 +2888,9 @@ name = "saddle-quant"
 version = "0.3.0"
 dependencies = [
  "clap",
- "half",
- "hipfire-config",
- "hipfire-runtime",
  "memmap2",
  "minijinja",
  "minijinja-contrib",
- "rayon",
  "serde",
  "serde_json",
  "sha2",

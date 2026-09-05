@@ -13,5 +13,4 @@ description = "Reference template for new arch crates: faithful skeleton of the 
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
-hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

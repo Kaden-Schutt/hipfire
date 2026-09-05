@@ -232,12 +232,6 @@ impl KernelFamily for FusedQkvFamily {
     }
 }
 
-macro_rules! hip {
-    ($e:expr) => {
-        $e.map_err(|e| DispatchError::Hip(e.to_string()))
-    };
-}
-
 fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), DispatchError> {
     // Guard: never route V2 bytes through a v1 kernel or vice-versa.
     guard_fused_qkv_dtype_key(params.weights, params.kind)?;

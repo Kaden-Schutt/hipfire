@@ -55,15 +55,16 @@ the case we want filed.
 ```bash
 git clone https://github.com/warpfront/hipfire
 cd hipfire
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release --locked -p hipfire-daemon
+cargo build --release --locked -p hipfire-cli
 cargo build --release --features deltanet --example test_kernels -p hipfire-runtime
 cargo build --release -p hipfire-quantize
 ./scripts/install-hooks.sh
 ```
-
-Requires Rust 1.75+ and ROCm 6+ (the dev workflow needs `hipcc` for
-kernel JIT). Pre-compiled kernel blobs ship for gfx1010 / gfx1030 /
-gfx1100 / gfx1200; other arches JIT-compile on first load.
+Requires current stable Rust (CI tracks `stable`; 1.98 is what the
+maintainers build with — no MSRV is declared yet) and ROCm 6+ (the dev
+workflow needs `hipcc` for kernel JIT). Pre-compiled kernel blobs ship for
+gfx1010 / gfx1030 / gfx1100 / gfx1200; other arches JIT-compile on first load.
 
 `scripts/install-hooks.sh` is idempotent; it sets
 `core.hooksPath=.githooks` and makes the local pre-commit hook

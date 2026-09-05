@@ -6,8 +6,8 @@ experts out of an existing full quant (`deepseek-v4-flash.mq2lloyd`).
 
 The keep-map loader is now **arch-generic** (crate `hipfire-reap`), wired into
 `deepseek4`, `qwen35`, `lfm2moe`, `minimax`. Activate on any of them with
-`HIPFIRE_REAP_PLAN=<dir>` (a `reap_plan.json`). `cohere2moe` gets the same wiring
-once it merges to master. See `docs/superpowers/specs/2026-06-11-generic-moe-reap-design.md`.
+`HIPFIRE_REAP_PLAN=<dir>` (a `reap_plan.json`). `cohere2moe` is not wired —
+no REAP hook exists in `crates/hipfire-arch-cohere2moe`. See `docs/superpowers/specs/2026-06-11-generic-moe-reap-design.md`.
 
 A REAP prune is a *pure expert selection*: the kept experts (and the router rows
 for them) are byte-identical to the full model; only the hash-router `tid2eid`

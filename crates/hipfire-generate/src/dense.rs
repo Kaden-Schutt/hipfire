@@ -8185,7 +8185,7 @@ pub fn generate_maple(
     // `<|endoftext|>` (151643) is not Maple's declared eos — config.json says
     // 151645 — but emitting it mid-chat is a terminal condition either way, and
     // continuing past it produces garbage. Stop on both.
-    let eos_set: [u32; 2] = [eos_tok, 151643];
+    let eos_set: [u32; 2] = [eos_tok, hipfire_runtime::chatml::ENDOFTEXT];
     let mut hit_eos = false;
     // Explicit thinking cap enforcement. The HTTP layer resolves `max_think_tokens`
     // via the QwenJinja contract; without this router Maple would ignore it and

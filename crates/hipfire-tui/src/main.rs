@@ -11,6 +11,7 @@ use std::{io, panic};
 
 use anyhow::Result;
 use app::App;
+use base64::Engine as _;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -166,31 +167,8 @@ fn emit_clipboard(text: &str) {
 
 /// The OSC 52 set-clipboard escape frame for `text` (extracted for testing).
 fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
-}
-
-/// Minimal standard-alphabet base64 (OSC 52 payload); avoids a new dependency.
-fn base64_encode(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
-            | *chunk.get(2).unwrap_or(&0) as u32;
-        out.push(T[(n >> 18 & 63) as usize] as char);
-        out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    use base64::engine::general_purpose::STANDARD;
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text.as_bytes()))
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
@@ -373,16 +351,23 @@ mod tests {
 
     #[test]
     fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        // High bytes (0x80-0xFF) — the `& 63` masking keeps table indexing valid.
-        assert_eq!(base64_encode(&[0xFF, 0x00, 0x80]), "/wCA");
+        use base64::engine::general_purpose::STANDARD;
+        assert_eq!(STANDARD.encode(b""), "");
+        assert_eq!(STANDARD.encode(b"f"), "Zg==");
+        assert_eq!(STANDARD.encode(b"fo"), "Zm8=");
+        assert_eq!(STANDARD.encode(b"foo"), "Zm9v");
+        assert_eq!(STANDARD.encode(b"foob"), "Zm9vYg==");
+        assert_eq!(STANDARD.encode(b"foobar"), "Zm9vYmFy");
+        // High bytes exercise the full 6-bit table range.
+        assert_eq!(STANDARD.encode([0xFF, 0x00, 0x80]), "/wCA");
         // Multibyte UTF-8 round-trips through the byte encoder.
-        assert_eq!(base64_encode("é".as_bytes()), "w6k=");
+        assert_eq!(STANDARD.encode("é".as_bytes()), "w6k=");
+        // 32-byte blob (OSC 52 payloads are rarely tiny): bytes 0..32.
+        let blob: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            STANDARD.encode(&blob),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        );
     }
 
     #[test]
