@@ -27,6 +27,7 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
+use hipfire_runtime::device_mesh::DimKind;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode;
@@ -3107,6 +3108,17 @@ fn load_model_ep_ds4(
             "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
+    // Bind the recorded mesh to the loaded topology: `init_ep` is the only
+    // thing distinguishing this `Gpus` from a TP one (identical devices,
+    // bands, and pre-flight), so fail loudly here — where both the mesh and
+    // the rank count are known — if a future constructor ever records the
+    // wrong axis instead of loading silently mislabeled.
+    let ep = gpus.mesh.size_of(DimKind::Ep);
+    if ep != n {
+        return Err(format!(
+            "init_ep mesh records Ep={ep} for {n} devices, expected tp={tp} (mesh axis out of sync with constructed ranks)"
+        ));
+    }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
     let shard = ShardConfig::new_uneven_experts(
         tp,
@@ -3335,6 +3347,17 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
             "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
+    // Bind the recorded mesh to the loaded topology: `init_ep` is the only
+    // thing distinguishing this `Gpus` from a TP one (identical devices,
+    // bands, and pre-flight), so fail loudly here — where both the mesh and
+    // the rank count are known — if a future constructor ever records the
+    // wrong axis instead of loading silently mislabeled.
+    let ep = gpus.mesh.size_of(DimKind::Ep);
+    if ep != n {
+        return Err(format!(
+            "init_ep mesh records Ep={ep} for {n} devices, expected tp={tp} (mesh axis out of sync with constructed ranks)"
+        ));
+    }
     eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
     let shard = ShardConfig::new(
         tp,
@@ -3477,6 +3500,17 @@ fn load_model_ep_qwen35(
     if n != tp {
         return Err(format!(
             "init_ep gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    // Bind the recorded mesh to the loaded topology: `init_ep` is the only
+    // thing distinguishing this `Gpus` from a TP one (identical devices,
+    // bands, and pre-flight), so fail loudly here — where both the mesh and
+    // the rank count are known — if a future constructor ever records the
+    // wrong axis instead of loading silently mislabeled.
+    let ep = gpus.mesh.size_of(DimKind::Ep);
+    if ep != n {
+        return Err(format!(
+            "init_ep mesh records Ep={ep} for {n} devices, expected tp={tp} (mesh axis out of sync with constructed ranks)"
         ));
     }
     for (idx, dev) in gpus.devices.iter().enumerate() {
