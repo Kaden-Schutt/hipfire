@@ -96,6 +96,16 @@ def test_legacy_spellings_alias_to_the_canonical_tag():
         assert aliases.get(legacy) == CANONICAL, f"{legacy} must alias to {CANONICAL}"
 
 
+def test_fast_aliases_point_at_the_mq4r_speed_sku():
+    # `:fast` is the speed SKU, as for qwen3.8 and muse-glimmer. The bare tag
+    # stays on the plain MQ4 trunk; the MQ4V2 router-fix artifact (PR #664,
+    # ~206 vs ~140 tok/s AR on gfx1201) is reached through -mq4r or :fast.
+    curated = _curated()
+    for alias in ("ornith-1.5:fast", "ornith-1.5:35b-a3b-fast"):
+        assert curated["aliases"].get(alias) == "ornith-1.5:35b-a3b-mq4r", alias
+    assert curated["models"]["ornith-1.5:35b-a3b-mq4r"]["file"] == "ornith-1.5-35b-a3b.mq4r"
+
+
 def test_every_curated_alias_target_has_an_arch_mapping():
     # An alias may only point at a tag that itself maps, otherwise the alias is
     # a live grenade: it resolves for users but the target aborts the run.

@@ -747,6 +747,13 @@ mod tests {
 
         let (tag, model) = registry.model("ornith-1.5:35b-a3b-mq4r").unwrap();
         assert_eq!(tag, "ornith-1.5:35b-a3b-mq4r");
+        for alias in ["ornith-1.5:fast", "ornith-1.5:35b-a3b-fast"] {
+            let (resolved, fast) = registry
+                .model(alias)
+                .unwrap_or_else(|| panic!("{alias} must resolve"));
+            assert_eq!(resolved, "ornith-1.5:35b-a3b-mq4r", "{alias} is the MQ4R speed SKU");
+            assert_eq!(fast.file, "ornith-1.5-35b-a3b.mq4r");
+        }
         assert_eq!(model.file, "ornith-1.5-35b-a3b.mq4r");
         assert_eq!(model.quant.as_deref(), Some("mq4r"));
         assert_eq!(model.size_bytes, Some(18_700_570_368));

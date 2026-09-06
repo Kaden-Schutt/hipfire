@@ -1611,6 +1611,8 @@
     "ornith-1.5": "ornith-1.5:35b-a3b",
     "ornith1.5": "ornith-1.5:35b-a3b",
     "ornith1.5:35b-a3b": "ornith-1.5:35b-a3b",
+    "ornith-1.5:fast": "ornith-1.5:35b-a3b-mq4r",
+    "ornith-1.5:35b-a3b-fast": "ornith-1.5:35b-a3b-mq4r",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",
