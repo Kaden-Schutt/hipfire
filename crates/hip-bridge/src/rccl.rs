@@ -101,13 +101,18 @@ impl RcclComms {
     /// `ncclCommInitAll`. Each comm[i] binds to `device_ids[i]`.
     pub fn init_all(device_ids: &[i32]) -> RcclResult<Self> {
         let lib = unsafe {
-            // Resolved ROCm roots first, bare sonames last, so RCCL is found on
-            // side-by-side and /opt/rocm/core-<ver> installs too.
-            let candidates = hipfire_config::rocm::library_candidates(&[
-                "librccl.so",
-                "librccl.so.1",
-                "librccl.so.1.0",
-            ]);
+            // `HIPFIRE_RCCL_LIB` first, then the resolved ROCm root.
+            // `library_candidates` stops at the selected root on purpose (an
+            // explicit root is authoritative; see `hipfire_config::rocm`), and
+            // RCCL follows that policy. The override is for distributions whose
+            // ROCm prefix does not carry RCCL: nixpkgs ships librccl in its own
+            // store path next to `rocmtoolkit-merged`.
+            const SONAMES: [&str; 3] = ["librccl.so", "librccl.so.1", "librccl.so.1.0"];
+            let mut candidates = Vec::new();
+            if let Ok(explicit) = hipfire_config::developer_var("HIPFIRE_RCCL_LIB") {
+                candidates.push(explicit);
+            }
+            candidates.extend(hipfire_config::rocm::library_candidates(&SONAMES));
             let mut loaded = None;
             for name in &candidates {
                 if let Ok(l) = Library::new(name) {
@@ -118,7 +123,7 @@ impl RcclComms {
             loaded.ok_or_else(|| RcclError {
                 status: 0,
                 context: format!(
-                    "failed to dlopen librccl.so. Tried: {:?}. Is RCCL installed (apt install rccl, or /opt/rocm/lib/librccl.so.1)?",
+                    "failed to dlopen librccl.so. Tried: {:?}. Is RCCL installed (apt install rccl, or /opt/rocm/lib/librccl.so.1)? If it lives outside the ROCm root, set HIPFIRE_RCCL_LIB=/path/to/librccl.so.",
                     candidates
                 ),
             })?
