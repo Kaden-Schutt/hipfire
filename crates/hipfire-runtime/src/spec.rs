@@ -112,6 +112,18 @@ impl SpecStep {
     }
 }
 
+/// Tokens that must be re-forwarded after restoring a speculative window's
+/// pre-verify snapshot. The final consumed token remains pending and is
+/// committed by the caller's ordinary terminal flush.
+pub fn terminal_prefix_replay(window_seed: u32, consumed: &[u32]) -> SmallVec<[u32; 8]> {
+    let mut replay = SmallVec::with_capacity(consumed.len());
+    if !consumed.is_empty() {
+        replay.push(window_seed);
+        replay.extend_from_slice(&consumed[..consumed.len() - 1]);
+    }
+    replay
+}
+
 /// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GreedyAccept {
@@ -760,6 +772,25 @@ pub trait Speculator {
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
         let _ = (gpu, target, tokens, start_pos, abort);
+        Ok(false)
+    }
+
+    /// Repair a terminal that consumed only a strict prefix of the most recent
+    /// speculative window. Implementations with a retained pre-window snapshot
+    /// restore it and replay only the state-committable prefix, leaving the last
+    /// consumed token pending for the caller's normal terminal flush.
+    ///
+    /// Returns `true` when the resident target and drafter caches are repaired.
+    /// The default is unsupported; callers retain the conservative reset path.
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, window_start, window_seed, consumed);
         Ok(false)
     }
 
