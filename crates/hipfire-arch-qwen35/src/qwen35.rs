@@ -46,8 +46,8 @@ pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped,
     forward_prefill_batch_single_chunk_captured, forward_prefill_batch_single_chunk_captured_opts,
     forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts,
-    prefill_batch_pbs_eligible, prefill_max_batch, qwen35_layer_batch_admissible,
-    upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
+    prefill_batch_pbs_eligible, prefill_max_batch, prefill_max_batch_tp,
+    qwen35_layer_batch_admissible, upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
 };
 pub(crate) use prefill::{
     moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,

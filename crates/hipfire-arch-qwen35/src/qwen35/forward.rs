@@ -4309,7 +4309,10 @@ pub fn forward_prefill_dense_tp(
             _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
         }
     }
-    let cap = crate::qwen35::prefill::prefill_max_batch(&gpus.devices[0]);
+    // Size the scratch to the call, not to the arch ceiling: an 8-token verify
+    // would otherwise allocate and free a 512-row PBS per rank on every cycle.
+    let cap =
+        crate::qwen35::prefill::prefill_max_batch_tp(&gpus.devices[0], tp).min(tokens.len().max(1));
     if cap == 0 {
         return Err(HipError::new(0, "prefill_max_batch is zero"));
     }
