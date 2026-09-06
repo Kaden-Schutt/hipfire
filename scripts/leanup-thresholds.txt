@@ -27,7 +27,11 @@ required_features_daemon    == 0
 # hipfire-daemon/src/main.rs. Was 43,696 as hipfire-runtime/examples/daemon.rs
 # on master; the saddle layering moved it into a crate. Raised 4155 -> 4176 on
 # 2026-09-02 for the G2 source-aware admission block (see commit message).
-daemon_lines                <= 4176
+# Raised 4176 -> 4204 on 2026-09-06: the 7b16762b0 reconciliation merged the
+# G2 block (28 net lines once the DS4 tp>1 refusal moved before admission)
+# with the sticky GPU-fault latch (370592d17) and DFlash sidecar plumbing
+# (351c326e0). See commit message.
+daemon_lines                <= 4204
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
