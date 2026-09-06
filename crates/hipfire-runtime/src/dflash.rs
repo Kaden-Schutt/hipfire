@@ -1130,6 +1130,14 @@ impl DflashWeights {
 /// the #462 class): that error is now defined out of existence — it does not
 /// compile.
 mod target_hidden_log {
+    #[derive(Clone, Copy, Debug)]
+    pub struct TargetHiddenLogMark {
+        uploaded_rows: usize,
+        abs_positions_len: usize,
+        proj_cached_rows: usize,
+        full_cached_rows: usize,
+    }
+
     /// See module-level intent. Construct via [`TargetHiddenLog::new`].
     #[derive(Default)]
     pub struct TargetHiddenLog {
@@ -1167,6 +1175,33 @@ mod target_hidden_log {
         /// (windowed mode; mirrors `proj_cached_rows` in Legacy).
         pub fn full_cached_rows(&self) -> usize {
             self.full_cached_rows
+        }
+
+        /// Lightweight rollback point for one speculative window. The backing
+        /// tensors are append-only here, so restoring metadata is sufficient;
+        /// stale tail rows are ignored and overwritten by the next append.
+        pub fn mark(&self) -> TargetHiddenLogMark {
+            TargetHiddenLogMark {
+                uploaded_rows: self.uploaded_rows,
+                abs_positions_len: self.abs_positions.len(),
+                proj_cached_rows: self.proj_cached_rows,
+                full_cached_rows: self.full_cached_rows,
+            }
+        }
+
+        pub fn restore(&mut self, mark: TargetHiddenLogMark) -> Result<(), String> {
+            if mark.abs_positions_len > self.abs_positions.len() {
+                return Err(format!(
+                    "target-hidden rollback mark {} exceeds live rows {}",
+                    mark.abs_positions_len,
+                    self.abs_positions.len()
+                ));
+            }
+            self.abs_positions.truncate(mark.abs_positions_len);
+            self.uploaded_rows = mark.uploaded_rows;
+            self.proj_cached_rows = mark.proj_cached_rows;
+            self.full_cached_rows = mark.full_cached_rows;
+            Ok(())
         }
 
         // ── invariant-preserving mutations ────────────────────────────────
@@ -1275,7 +1310,7 @@ mod target_hidden_log {
         }
     }
 }
-pub use target_hidden_log::TargetHiddenLog;
+pub use target_hidden_log::{TargetHiddenLog, TargetHiddenLogMark};
 
 // ─── Scratch ───────────────────────────────────────────────────────────────
 
@@ -3499,7 +3534,7 @@ pub fn draft_forward_opts(
 
 #[cfg(test)]
 mod ring_tests {
-    use super::ring_segments;
+    use super::{ring_segments, TargetHiddenLog};
 
     #[test]
     fn identity_modulus_is_single_segment() {
@@ -3537,6 +3572,25 @@ mod ring_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn target_hidden_log_restores_a_speculative_append() {
+        let mut log = TargetHiddenLog::new();
+        log.seed_prompt(4);
+        log.mark_proj_cached(3);
+        log.mark_full_cached(4);
+        let mark = log.mark();
+
+        log.append_committed(4, 2, 0);
+        log.mark_proj_cached(6);
+        assert_eq!(log.abs_positions(), &[0, 1, 2, 3, 4, 5]);
+
+        log.restore(mark).unwrap();
+        assert_eq!(log.uploaded_rows(), 4);
+        assert_eq!(log.abs_positions(), &[0, 1, 2, 3]);
+        assert_eq!(log.proj_cached_rows(), 3);
+        assert_eq!(log.full_cached_rows(), 4);
     }
 }
 

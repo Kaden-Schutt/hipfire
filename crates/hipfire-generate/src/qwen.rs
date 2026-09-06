@@ -3445,6 +3445,7 @@ pub fn generate_spec(
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = max_tokens.saturating_sub(generated);
+        let window_seed = seed_token;
         let step = match spec.step(
             gpu,
             slot,
@@ -3604,25 +3605,63 @@ pub fn generate_spec(
         // state from an invalid oversize history. Abort/prefill errors share
         // the single fail-closed terminal (no second done/error).
         let keep = consumed.min(committed_tail.len());
-        let strict_prefix_action = spec_strict_prefix_action(
-            keep,
-            committed_tail.len(),
-            hit_eos || think_cap_hit,
-        );
-        if strict_prefix_action == SpecStrictPrefixAction::ResetForTerminal {
-            // The request is already terminal, so replaying the entire prompt plus
-            // generated prefix only delays the completed response. Drop the polluted
-            // speculative tail and invalidate the resident prompt-cache state; a later
-            // request will rebuild it through the normal cold-prefill path.
-            let reset_error = slot
-                .reset_recurrent(gpu)
-                .err()
-                .map(|e| format!("reset_recurrent: {e}"))
-                .or_else(|| {
-                    spec.reset_for_realign(gpu)
-                        .err()
-                        .map(|e| format!("spec.reset_for_realign: {e}"))
-                });
+        let strict_prefix_action =
+            spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
+        if strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal {
+            // Prefer a window-local repair: restore the pre-window target/drafter
+            // snapshot and replay only the consumed prefix. Speculators without
+            // that capability retain the conservative reset + cache invalidation.
+            let repaired = match spec.repair_terminal_prefix(
+                gpu,
+                slot,
+                position_before,
+                window_seed,
+                &committed_tail[..keep],
+            ) {
+                Ok(repaired) => repaired,
+                Err(e) => {
+                    let ep = production_fail_closed_rollback_live(
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        slot,
+                        spec.as_mut(),
+                    );
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &format!("terminal prefix repair failed: {e}"),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
+                    drop(guard);
+                    return None;
+                }
+            };
+            if repaired
+                && std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+            {
+                eprintln!(
+                    "[qwen-cache terminal-repair] window_start={} consumed={} replayed={}",
+                    position_before, keep, keep
+                );
+            }
+            let reset_error = if repaired {
+                None
+            } else {
+                slot.reset_recurrent(gpu)
+                    .err()
+                    .map(|e| format!("reset_recurrent: {e}"))
+                    .or_else(|| {
+                        spec.reset_for_realign(gpu)
+                            .err()
+                            .map(|e| format!("spec.reset_for_realign: {e}"))
+                    })
+            };
             if let Some(msg) = reset_error {
                 let ep = production_fail_closed_rollback_live(
                     &mut m.seq_pos,
@@ -3645,9 +3684,11 @@ pub fn generate_spec(
                 drop(guard);
                 return None;
             }
-            terminal_cache_invalidated = true;
-            pending_seed_committable = false;
-            position = 0;
+            if !repaired {
+                terminal_cache_invalidated = true;
+                pending_seed_committable = false;
+                position = 0;
+            }
         }
         if strict_prefix_action == SpecStrictPrefixAction::Realign {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
@@ -5688,12 +5729,12 @@ pub fn spec_should_flush_pending_seed(
 pub enum SpecStrictPrefixAction {
     None,
     Realign,
-    ResetForTerminal,
+    RepairForTerminal,
 }
 
 /// Decide how to repair target and drafter state after observing only a strict
-/// prefix of a speculative window. A completed request does not need its exact
-/// prefix replayed; resetting makes the next request take the cold-prefill path.
+/// prefix of a speculative window. Terminal requests prefer a window-local
+/// rollback; speculators without that capability fall back to a full reset.
 pub fn spec_strict_prefix_action(
     consumed: usize,
     committed: usize,
@@ -5702,7 +5743,7 @@ pub fn spec_strict_prefix_action(
     if consumed >= committed {
         SpecStrictPrefixAction::None
     } else if terminal {
-        SpecStrictPrefixAction::ResetForTerminal
+        SpecStrictPrefixAction::RepairForTerminal
     } else {
         SpecStrictPrefixAction::Realign
     }
