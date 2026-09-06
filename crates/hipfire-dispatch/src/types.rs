@@ -76,6 +76,7 @@ pub enum TileImpl {
     DflashV5Gfx12,
     DflashN128,
     // Vision/dflash F32-K/V rungs
+    DflashN64,
     DflashM32,
     DflashWmmaF32,
     // Causal (F16-K/V rungs)

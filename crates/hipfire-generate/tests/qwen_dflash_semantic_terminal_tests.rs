@@ -621,10 +621,46 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     }
 
     #[test]
-    fn terminal_marker_mid_window_strict_prefix_realigns() {
+    fn terminal_strict_prefix_uses_window_repair() {
+        use hipfire_generate::qwen::{
+            spec_strict_prefix_action, SpecStrictPrefixAction,
+        };
+
+        assert_eq!(
+            spec_strict_prefix_action(9, 11, true),
+            SpecStrictPrefixAction::RepairForTerminal
+        );
+
+        use hipfire_runtime::spec::terminal_prefix_replay;
+        assert_eq!(
+            terminal_prefix_replay(7, &[]).as_slice(),
+            &[] as &[u32]
+        );
+        assert_eq!(terminal_prefix_replay(7, &[8]).as_slice(), &[7]);
+        assert_eq!(
+            terminal_prefix_replay(7, &[8, 9, 10]).as_slice(),
+            &[7, 8, 9]
+        );
+        assert_eq!(
+            spec_strict_prefix_action(9, 11, false),
+            SpecStrictPrefixAction::Realign
+        );
+        assert_eq!(
+            spec_strict_prefix_action(11, 11, true),
+            SpecStrictPrefixAction::None
+        );
+        assert_eq!(
+            spec_strict_prefix_action(12, 11, false),
+            SpecStrictPrefixAction::None
+        );
+    }
+
+    #[test]
+    fn terminal_marker_mid_window_tracks_exact_host_prefix() {
         // Spec window emits body + im_end + unobserved tail. Semantic loop
-        // consumes only through the terminal marker; host + realign plan must
-        // land exactly on that prefix (no unobserved tail in conversation or KV).
+        // consumes only through the terminal marker; host bookkeeping must
+        // exclude the unobserved tail; window-local repair replays this exact
+        // prefix while leaving the terminal token for the ordinary flush.
         let tok = test_tokenizer();
         let prompt = vec![4u32, 5];
         let first_token = tok.encode("hi")[0];

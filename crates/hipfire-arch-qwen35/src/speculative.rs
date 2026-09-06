@@ -231,6 +231,11 @@ fn dflash_verify_graph_env_eligible(
     if arch == "gfx1100" && is_mq_v2 {
         return env_value == Some("1");
     }
+    if arch == "gfx1100" && output_dtype == rdna_compute::DType::MQ4G256 {
+        // Direct batched HIP is faster for the measured Qwen MQ4 workload;
+        // keep graph available as an explicit diagnostic opt-in.
+        return env_value == Some("1");
+    }
     true
 }
 

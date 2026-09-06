@@ -262,6 +262,14 @@ fn dispatch_full_attention(
             Ok(())
         }
         // ── Non-causal, F32 K/V ──
+        TileImpl::DflashN64 => {
+            debug_assert_eq!(key, AttnFullF32);
+            hip!(gpu.attention_dflash_wmma_n64_f32(
+                io.q, io.k, io.v, io.out, io.n, io.seq_len,
+                io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
         TileImpl::DflashM32 => {
             debug_assert_eq!(key, AttnFullF32);
             hip!(gpu.attention_dflash_wmma_m32_f32(
@@ -1681,8 +1689,28 @@ fn dispatch_attend(
                     // gate. The scalar variant keeps its measured break-even.
                     // It computes in f16 (relative L2 ~1e-3 vs the f32
                     // reference) — a real precision/speed trade, hence opt-in.
-                    let variant = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                        .unwrap_or_else(|_| "wmma".to_owned());
+                    let variant_override = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL").ok();
+                    let variant = variant_override.clone().unwrap_or_else(|| {
+                        if gpu.arch.starts_with("gfx11")
+                            && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
+                        {
+                            "batched".to_owned()
+                        } else {
+                            "wmma".to_owned()
+                        }
+                    });
+                    // Explicit A/B route for speculative verify. Batched
+                    // flash keeps all query rows in one tiled launch and
+                    // avoids the slower query-tiled WMMA path on gfx11.
+                    if variant == "batched" {
+                        let fp = io.flash_partials.unwrap();
+                        return hip!(gpu.attention_flash_q8_0_batched_masked(
+                            io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                            io.n_heads, io.n_kv_heads, io.head_dim,
+                            io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                            io.tree_bias, io.block_start, io.block_cols,
+                        ));
+                    }
                     // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
                     // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
                     let wmma_ok = variant != "scalar"
@@ -2163,6 +2191,7 @@ mod tests {
             TileImpl::DflashV5,
             TileImpl::DflashV5Gfx12,
             TileImpl::DflashN128,
+            TileImpl::DflashN64,
             TileImpl::DflashM32,
             TileImpl::DflashWmmaF32,
             TileImpl::DflashScalar,

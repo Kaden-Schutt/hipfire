@@ -19,11 +19,11 @@ use crate::speculative::{
     spec_step_dflash, xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, GdnTape,
     HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
-use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
+use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights, TargetHiddenLogMark};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
-    request_rng_state, EvictRetain, PrefillOutcome, SpecGrammar, SpecRequestConfig, SpecStep,
-    SpecTarget, Speculator,
+    request_rng_state, terminal_prefix_replay, EvictRetain, PrefillOutcome, SpecGrammar,
+    SpecRequestConfig, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -550,6 +550,14 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    last_window: Option<DflashWindowMark>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DflashWindowMark {
+    position: usize,
+    seed: u32,
+    target_hidden: TargetHiddenLogMark,
 }
 
 impl DflashSpeculator {
@@ -574,6 +582,7 @@ impl DflashSpeculator {
             resume_enabled,
             ck_interval,
             ck_cap,
+            last_window: None,
         }
     }
 
@@ -604,6 +613,7 @@ impl Speculator for DflashSpeculator {
         resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        self.last_window = None;
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -852,6 +862,12 @@ impl Speculator for DflashSpeculator {
         // accepted drafts + bonus = emit; max accepted drafts = max_emit - 1.
         let max_accept = Some(max_emit.saturating_sub(1));
 
+        let window_mark = DflashWindowMark {
+            position,
+            seed,
+            target_hidden: self.df.draft_scratch.thlog.mark(),
+        };
+
         // Two-way dispatch: DDTree-batched (SWOR) when a tree is configured
         // (never for DFlash2 selector — load refused construction), else
         // chain-mode DFlash. Selector chain uses sparse-q rejection at temp>0.
@@ -935,14 +951,17 @@ impl Speculator for DflashSpeculator {
             )
         };
 
-        result
+        let lowered = result
             .map(lower_qwen35)
             // Defense only — accept stage already committed ≤ max_emit.
             .map(|s| s.cap_emit(max_emit))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        self.last_window = lowered.as_ref().ok().map(|_| window_mark);
+        lowered
     }
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
+        self.last_window = None;
         // Compact the drafter's cached target-hidden rows to match the target KV
         // after the FlashCASK eviction the daemon already applied to the target.
         let ne = self.df.draft_config.num_extract();
@@ -963,10 +982,79 @@ impl Speculator for DflashSpeculator {
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle).
         self.df.draft_scratch.reset_upload_tracking();
+        self.last_window = None;
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
         Ok(())
+    }
+
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let mark = self
+            .last_window
+            .take()
+            .ok_or("DflashSpeculator: no completed window available for terminal repair")?;
+        if mark.position != window_start || mark.seed != window_seed {
+            return Err(format!(
+                "DflashSpeculator: terminal repair window mismatch (saved pos={} seed={}, requested pos={} seed={})",
+                mark.position, mark.seed, window_start, window_seed
+            ));
+        }
+
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        self.df
+            .target_snap
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("DeltaNetSnapshot::restore_to: {e}"))?;
+        self.df.draft_scratch.thlog.restore(mark.target_hidden)?;
+
+        // Before the ordinary terminal flush, target state must include the
+        // old pending seed and every consumed token except the new pending
+        // terminal token. For consumed=[] there is nothing to replay.
+        let replay = terminal_prefix_replay(window_seed, consumed);
+        if replay.is_empty() {
+            return Ok(true);
+        }
+
+        let aborted = seed_target_hidden_suffix_abortable(
+            gpu,
+            slot,
+            &mut self.df.hidden_rb,
+            &replay,
+            window_start,
+            &|| false,
+            self.resume_enabled.then_some(&mut self.checkpoints),
+            self.ck_interval,
+            self.ck_cap,
+        )
+        .map_err(|e| e.to_string())?;
+        debug_assert!(!aborted, "terminal repair uses a non-aborting callback");
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            &self.df.hidden_rb,
+            &self.df.draft_scratch.target_hidden,
+            window_start,
+            replay.len(),
+            replay.len(),
+            self.df.draft_scratch.ctx_modulus(),
+        )
+        .map_err(|e| e.to_string())?;
+        let co = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0) as i32;
+        self.df
+            .draft_scratch
+            .thlog
+            .append_committed(window_start, replay.len(), co);
+        Ok(true)
     }
 
     fn reset_state_evidence(&self) -> Option<hipfire_runtime::spec::SpecResetEvidence> {
@@ -1028,6 +1116,7 @@ impl Speculator for DflashSpeculator {
         self.sample_top_k = cfg.top_k;
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
+        self.last_window = None;
     }
 
     fn requires_greedy(&self) -> bool {
