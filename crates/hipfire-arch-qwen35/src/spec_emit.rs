@@ -94,6 +94,7 @@ impl<'a> Qwen35Emit<'a> {
         let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
+            .filter(|_| ctx.enable_grammar)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|t| {
@@ -613,6 +614,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: Some(&[]),
+            enable_grammar: true,
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -707,6 +709,57 @@ mod tests {
         let calls = held_calls(&finish);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn xml_tool_call_held_when_tools_present_and_grammar_off() {
+        // Qwen3.5/3.8 XML-native: grammar stays off, but tools must still
+        // enable ToolOutputRouter or `<tool_call>` leaks as assistant text.
+        let tok = test_tokenizer();
+        let tools = [serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_time",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&tools),
+            enable_grammar: false,
+            stop: Vec::new(),
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+        let text = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+        let ids = tok.encode(text);
+        assert!(!ids.is_empty());
+        let mut stream = Vec::new();
+        let mut first = true;
+        for id in &ids {
+            let outcome = if first {
+                first = false;
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            stream.extend(outcome.events);
+            if outcome.stop.is_some() {
+                break;
+            }
+        }
+        let finish = emit.finish();
+        assert!(!tokens_text(&stream).contains("<tool_call>"));
+        assert_eq!(finish.finish_reason, "tool_calls");
+        assert_eq!(finish.tool_calls, 1);
+        let calls = held_calls(&finish);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
     }
 
     #[test]
@@ -837,6 +890,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -865,6 +919,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec!["STOP".to_string()],
             max_think: 0,
             max_tokens: 256,
