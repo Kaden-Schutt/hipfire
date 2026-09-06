@@ -3643,7 +3643,7 @@ pub fn generate_spec(
                 }
             };
             if repaired
-                && std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
             {
                 eprintln!(
                     "[qwen-cache terminal-repair] window_start={} consumed={} replayed={}",
