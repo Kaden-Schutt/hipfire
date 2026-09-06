@@ -1423,10 +1423,14 @@ pub struct SpecEmitCtx<'a> {
     pub eos: u32,
     /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
     pub im_end: Option<u32>,
-    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
-    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
-    /// tool-call grammar.
+    /// Raw tool definitions from the request (OpenAI-shape JSON). `Some` enables
+    /// the tool-call *parser* (XML or JSON) even when constrained grammar is off.
+    /// `None` ⇒ tool-looking text is ordinary assistant content.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Constrained tool-call grammar. Independent of [`Self::tools`]: Qwen3.5/3.8
+    /// XML-native cards keep this false (default `qwen35_grammar_on`) so the
+    /// matcher does not force Hermes-JSON, but still parse `<tool_call>` XML.
+    pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
