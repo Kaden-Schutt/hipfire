@@ -1253,8 +1253,11 @@ pub fn fail_closed_epilogue_after_sync(
 /// + the slot's eos + the tokenizer and calls `carrier.make_spec_emitter`.
 pub struct SpecEmitRequest {
     pub im_end: Option<u32>,
-    /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
+    /// Raw tool definitions (OpenAI-shape JSON); `None` ⇒ no tool-call parser.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Constrained tool grammar. False on XML-native Qwen3.5/3.8 (parser still
+    /// runs when `tools` is `Some`).
+    pub enable_grammar: bool,
     pub stop: Vec<String>,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
